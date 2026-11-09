@@ -2237,4 +2237,99 @@ mod tests {
         assert_eq!(parsed.subject_logon_id.as_deref(), Some("0x37b4d"));
         assert_eq!(parsed.backup_path, None);
     }
+
+    #[test]
+    fn element_text_ignores_attributes_namespace_prefix_and_case() {
+        let block = "<e:EventID Qualifiers='16384'>7045</e:EventID>";
+        assert_eq!(element_text(block, "EventID"), Some("7045"));
+        assert_eq!(element_text(block, "eventid"), Some("7045"));
+    }
+
+    #[test]
+    fn element_text_skips_closing_tags_and_longer_names() {
+        let block = "</System><EventIDX>1</EventIDX><EventID>2</EventID>";
+        assert_eq!(element_text(block, "EventID"), Some("2"));
+    }
+
+    #[test]
+    fn element_text_is_none_for_an_unclosed_or_absent_element() {
+        assert_eq!(element_text("<EventID>5", "EventID"), None);
+        assert_eq!(element_text("<Other>5</Other>", "EventID"), None);
+    }
+
+    #[test]
+    fn event_field_reads_both_the_data_name_and_the_plain_element_shapes() {
+        let data = "<EventData><Data Name=\"FilePath\">a</Data></EventData>";
+        let plain = "<UserData><R><FilePath>b</FilePath></R></UserData>";
+        assert_eq!(event_field(data, "filepath"), Some("a"));
+        assert_eq!(event_field(plain, "FILEPATH"), Some("b"));
+    }
+
+    #[test]
+    fn event_field_does_not_mistake_a_longer_element_name() {
+        let block = "<FullFilePath>x</FullFilePath><FilePath>y</FilePath>";
+        assert_eq!(event_field(block, "FilePath"), Some("y"));
+        assert_eq!(event_field(block, "Missing"), None);
+    }
+
+    #[test]
+    fn attribute_value_accepts_both_quote_styles_and_spaces_around_equals() {
+        let tag = "Execution ProcessID='4' ThreadID=\"8\" Name = 'x'";
+        assert_eq!(attribute_value(tag, "ProcessID"), Some("4"));
+        assert_eq!(attribute_value(tag, "threadid"), Some("8"));
+        assert_eq!(attribute_value(tag, "Name"), Some("x"));
+        assert_eq!(attribute_value(tag, "Missing"), None);
+    }
+
+    #[test]
+    fn attribute_value_skips_an_unquoted_value() {
+        let tag = "a=1 b='2'";
+        assert_eq!(attribute_value(tag, "a"), None);
+        assert_eq!(attribute_value(tag, "b"), Some("2"));
+    }
+
+    #[test]
+    fn data_field_trims_unescapes_and_drops_empty_values() {
+        let block = "<Data Name='Threat Name'> A&amp;B </Data><Data Name='Path'>  </Data>";
+        assert_eq!(data_field(block, "Threat Name").as_deref(), Some("A&B"));
+        assert_eq!(data_field(block, "Path"), None);
+        assert_eq!(data_u32("<Data Name='N'>x</Data>", "N"), None);
+        assert_eq!(data_u32("<Data Name='N'> 7 </Data>", "N"), Some(7));
+    }
+
+    #[test]
+    fn opt_data_drops_the_dash_sentinel_and_keeps_entities_escaped() {
+        let block = "<Data Name='IpAddress'>-</Data><Data Name='User'> a&amp;b </Data>";
+        assert_eq!(opt_data(block, "IpAddress"), None);
+        assert_eq!(opt_data(block, "User").as_deref(), Some("a&amp;b"));
+    }
+
+    #[test]
+    fn user_data_field_unescapes_and_reads_only_inside_user_data() {
+        let block = "<System><User>outside</User></System><UserData><X><User> a&lt;b </User></X></UserData>";
+        assert_eq!(user_data_field(block, "User").as_deref(), Some("a<b"));
+        assert_eq!(user_data_field("<User>x</User>", "User"), None);
+    }
+
+    #[test]
+    fn system_header_defaults_a_missing_event_id_and_pid_to_zero() {
+        let full =
+            "<EventID> 21 </EventID><EventRecordID>9</EventRecordID><Execution ProcessID='5'/>";
+        assert_eq!(system_header(full), Some((9, 21, 5)));
+        assert_eq!(
+            system_header("<EventRecordID>9</EventRecordID>"),
+            Some((9, 0, 0))
+        );
+        assert_eq!(system_header("<EventID>21</EventID>"), None);
+    }
+
+    #[test]
+    fn security_user_id_reads_the_header_in_either_quote_style() {
+        let single = "<System><Security UserID='S-1-5-18'/></System>";
+        let double = "<System><Security UserID=\"S-1-5-20\"/></System>";
+        let outside = "<System></System><Security UserID='S-1-5-18'/>";
+        assert_eq!(security_user_id(single).as_deref(), Some("S-1-5-18"));
+        assert_eq!(security_user_id(double).as_deref(), Some("S-1-5-20"));
+        assert_eq!(security_user_id(outside), None);
+    }
 }
