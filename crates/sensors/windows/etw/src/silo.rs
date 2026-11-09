@@ -324,17 +324,38 @@ pub(crate) fn parse_process_list(json: &str) -> Vec<(u32, String)> {
         .collect()
 }
 
+/// Why a Host Compute Service lookup gave no answer. An `HRESULT` is printed
+/// the way the service's own logs print it, as 8 hex digits.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub(crate) enum HcsError {
+    /// `computecore.dll` is missing or lacks one of the functions used.
+    #[error("computecore.dll unavailable")]
+    Unavailable,
+    /// `HcsCreateOperation` returned no operation.
+    #[error("HcsCreateOperation failed")]
+    CreateOperation,
+    /// `HcsOpenComputeSystem` failed: the container is gone or access was refused.
+    #[error("HcsOpenComputeSystem: HRESULT 0x{:08X}", .0.cast_unsigned())]
+    OpenSystem(i32),
+    /// The call that starts an operation failed.
+    #[error("HRESULT 0x{:08X}", .0.cast_unsigned())]
+    Start(i32),
+    /// The operation ran and failed; `document` is the error document it answered.
+    #[error("HRESULT 0x{:08X}: {document}", .hresult.cast_unsigned())]
+    Operation { hresult: i32, document: String },
+}
+
 /// Where a resolver pass gets its containers from: the Host Compute Service on
 /// a real host, a fake in tests.
 pub(crate) trait ContainerSource {
     /// # Errors
     ///
     /// The service cannot be reached or answered an error.
-    fn container_ids(&self) -> Result<Vec<String>, String>;
+    fn container_ids(&self) -> Result<Vec<String>, HcsError>;
     /// # Errors
     ///
     /// The container is gone or the service answered an error.
-    fn processes(&self, container_id: &str) -> Result<Vec<(u32, String)>, String>;
+    fn processes(&self, container_id: &str) -> Result<Vec<(u32, String)>, HcsError>;
 }
 
 /// The resolver loop: each request (a silo id an event could not name) runs one
@@ -594,22 +615,57 @@ mod tests {
         }
     }
 
+    /// `HCS_E_SYSTEM_NOT_FOUND`.
+    const HCS_E_SYSTEM_NOT_FOUND: i32 = 0x8037_0102_u32.cast_signed();
+    /// `HCS_E_SERVICE_NOT_AVAILABLE`.
+    const HCS_E_SERVICE_NOT_AVAILABLE: i32 = 0x8037_0114_u32.cast_signed();
+
+    /// The resolver logs these as its `error` field: same wording as the
+    /// strings they replaced.
+    #[test]
+    fn hcs_error_messages_print_the_hresult_as_hex() {
+        assert_eq!(
+            HcsError::Unavailable.to_string(),
+            "computecore.dll unavailable"
+        );
+        assert_eq!(
+            HcsError::CreateOperation.to_string(),
+            "HcsCreateOperation failed"
+        );
+        assert_eq!(
+            HcsError::OpenSystem(HCS_E_SYSTEM_NOT_FOUND).to_string(),
+            "HcsOpenComputeSystem: HRESULT 0x80370102"
+        );
+        assert_eq!(
+            HcsError::Start(HCS_E_SERVICE_NOT_AVAILABLE).to_string(),
+            "HRESULT 0x80370114"
+        );
+        assert_eq!(
+            HcsError::Operation {
+                hresult: 1,
+                document: r#"{"Error":-2143878910}"#.to_string(),
+            }
+            .to_string(),
+            r#"HRESULT 0x00000001: {"Error":-2143878910}"#
+        );
+    }
+
     struct FakeHcs {
         containers: Vec<HcsContainer>,
         listed: std::cell::RefCell<Vec<String>>,
     }
 
     impl ContainerSource for FakeHcs {
-        fn container_ids(&self) -> Result<Vec<String>, String> {
+        fn container_ids(&self) -> Result<Vec<String>, HcsError> {
             Ok(self.containers.iter().map(|c| c.id.clone()).collect())
         }
-        fn processes(&self, container_id: &str) -> Result<Vec<(u32, String)>, String> {
+        fn processes(&self, container_id: &str) -> Result<Vec<(u32, String)>, HcsError> {
             self.listed.borrow_mut().push(container_id.to_string());
             self.containers
                 .iter()
                 .find(|c| c.id == container_id)
                 .map(|c| c.processes.clone())
-                .ok_or_else(|| "gone".to_string())
+                .ok_or(HcsError::OpenSystem(HCS_E_SYSTEM_NOT_FOUND))
         }
     }
 
@@ -651,10 +707,10 @@ mod tests {
     }
 
     impl ContainerSource for ReuseDuringPass<'_> {
-        fn container_ids(&self) -> Result<Vec<String>, String> {
+        fn container_ids(&self) -> Result<Vec<String>, HcsError> {
             self.inner.container_ids()
         }
-        fn processes(&self, container_id: &str) -> Result<Vec<(u32, String)>, String> {
+        fn processes(&self, container_id: &str) -> Result<Vec<(u32, String)>, HcsError> {
             let processes = self.inner.processes(container_id);
             let mut dir = self.directory.lock().unwrap();
             dir.forget(self.silo);
@@ -738,10 +794,10 @@ mod tests {
     struct DownHcs;
 
     impl ContainerSource for DownHcs {
-        fn container_ids(&self) -> Result<Vec<String>, String> {
-            Err("0x80370114".to_string())
+        fn container_ids(&self) -> Result<Vec<String>, HcsError> {
+            Err(HcsError::Start(HCS_E_SERVICE_NOT_AVAILABLE))
         }
-        fn processes(&self, _: &str) -> Result<Vec<(u32, String)>, String> {
+        fn processes(&self, _: &str) -> Result<Vec<(u32, String)>, HcsError> {
             unreachable!("no container was listed")
         }
     }

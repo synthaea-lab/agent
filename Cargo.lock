@@ -2777,6 +2777,7 @@ dependencies = [
  "proptest",
  "schema",
  "serde_json",
+ "thiserror 2.0.21",
  "tracing",
  "windows-sys 0.61.2",
 ]
@@ -2788,6 +2789,7 @@ dependencies = [
  "proptest",
  "schema",
  "tempfile",
+ "thiserror 2.0.21",
  "time",
  "tracing",
  "tracing-subscriber",

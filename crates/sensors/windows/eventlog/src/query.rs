@@ -16,7 +16,7 @@ use windows_sys::Win32::{
     },
 };
 
-use crate::subscribe::render_event_xml;
+use crate::{error::EventQueryError, subscribe::render_event_xml};
 
 /// How long one `EvtNext` may wait for the service. A local channel query answers in
 /// milliseconds; a call that hangs this long fails the poll tick, which the loop retries, rather
@@ -63,7 +63,7 @@ pub(crate) fn query_events(
     xpath: &str,
     direction: Direction,
     limit: Option<usize>,
-) -> Result<Vec<String>, String> {
+) -> Result<Vec<String>, EventQueryError> {
     let channel_wide: Vec<u16> = channel.encode_utf16().chain(std::iter::once(0)).collect();
     let query_wide: Vec<u16> = xpath.encode_utf16().chain(std::iter::once(0)).collect();
     let flags = EvtQueryChannelPath
@@ -77,9 +77,10 @@ pub(crate) fn query_events(
     if results == 0 {
         // SAFETY: no precondition; read right after the call that failed.
         let error = unsafe { GetLastError() };
-        return Err(format!(
-            "EvtQuery on {channel} failed with Win32 error {error}"
-        ));
+        return Err(EventQueryError::Query {
+            channel: channel.to_string(),
+            code: error,
+        });
     }
     let results = Handle(results);
 
@@ -107,9 +108,10 @@ pub(crate) fn query_events(
             if error == ERROR_NO_MORE_ITEMS {
                 break;
             }
-            return Err(format!(
-                "EvtNext on {channel} failed with Win32 error {error}"
-            ));
+            return Err(EventQueryError::Next {
+                channel: channel.to_string(),
+                code: error,
+            });
         }
         let fetched = returned.min(want) as usize;
         // Every handle `EvtNext` returned is owned from here on, so each is closed even if an

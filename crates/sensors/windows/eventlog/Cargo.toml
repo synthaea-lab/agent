@@ -11,6 +11,7 @@ workspace = true
 
 [dependencies]
 schema = { path = "../../../schema" }
+thiserror = { workspace = true }
 tracing = { workspace = true }
 
 # `EvtSubscribe`-backed transport (issue #322) — the push-based alternative to
