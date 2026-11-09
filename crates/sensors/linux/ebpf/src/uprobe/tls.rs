@@ -27,8 +27,13 @@ static TLS_SCRATCH: PerCpuArray<TlsCaptureEvent> = PerCpuArray::with_max_entries
 /// `SSL_read(SSL *ssl, void *buf, int num)` fills `buf` on success, so we need to
 /// stash the arguments at entry and read the buffer at return (uretprobe).
 /// The `lib_type` (0=OpenSSL, 1=BoringSSL, 2=GnuTLS) is passed from entry to exit.
+///
+/// Three `u64`s, not `(u64, u32, u8)`: that tuple has 3 bytes of padding that are never
+/// written, and the 5.15 and 6.1 verifiers refuse to pass uninitialized stack bytes to
+/// `bpf_map_update_elem` (`invalid indirect read from stack`), so the `SSL_read` entry probes
+/// did not load there (#204). 6.18 accepts it.
 #[map]
-static SSL_READ_ARGS: HashMap<u64, (u64, u32, u8)> = HashMap::with_max_entries(1024, 0);
+static SSL_READ_ARGS: HashMap<u64, (u64, u64, u64)> = HashMap::with_max_entries(1024, 0);
 
 /// Uprobe on `SSL_write` entry for OpenSSL (pre-encryption plaintext capture).
 /// Signature: `int SSL_write(SSL *ssl, const void *buf, int num)`
@@ -143,7 +148,8 @@ fn try_ssl_read_entry(ctx: ProbeContext, lib_type: u8) -> u32 {
         && num > 0
     {
         let pid_tgid = bpf_get_current_pid_tgid();
-        let _ = SSL_READ_ARGS.insert(&pid_tgid, &(buf_ptr, num as u32, lib_type), 0);
+        let args = (buf_ptr, u64::from(num as u32), u64::from(lib_type));
+        let _ = SSL_READ_ARGS.insert(&pid_tgid, &args, 0);
     }
     0
 }
@@ -200,7 +206,7 @@ fn try_ssl_read_exit(ctx: RetProbeContext) -> Result<u32, u32> {
         }
 
         (*e).direction = 0; // read (post-decryption)
-        (*e).lib_type = lib_type; // Retrieved from entry probe (OpenSSL=0, BoringSSL=1, GnuTLS=2)
+        (*e).lib_type = lib_type as u8; // Retrieved from entry probe (OpenSSL=0, BoringSSL=1, GnuTLS=2)
 
         // Capture first N bytes of plaintext (budget: MAX_TLS_CAPTURE).
         let to_read = if retval as usize > MAX_TLS_CAPTURE {
