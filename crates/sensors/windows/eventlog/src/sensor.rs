@@ -8,7 +8,6 @@
 use std::{
     fs::File,
     io::Read,
-    net::IpAddr,
     path::Path,
     process::Command,
     sync::{
@@ -21,15 +20,20 @@ use std::{
 use schema::{
     AuthEvent, AuthKind, AuthOutcome, DefenderEvent, DefenderEventKind, Event, EventMeta,
     FLAG_PERSISTENCE_ACCOUNT_ARTIFACT, FLAG_PERSISTENCE_ARTIFACT, FLAG_PERSISTENCE_TASK_ARTIFACT,
-    FLAG_PERSISTENCE_TASK_UPDATE_ARTIFACT, FileOpenEvent, KerberosDelegationFailureEvent,
-    KerberosDelegationFailureKind, LogClearedEvent, POLICY_MECHANISM_APPLOCKER,
-    POLICY_MECHANISM_WDAC, PolicyDenialEvent, SessionEvent, SessionState, User,
+    FLAG_PERSISTENCE_TASK_UPDATE_ARTIFACT, FileOpenEvent, POLICY_MECHANISM_APPLOCKER,
+    POLICY_MECHANISM_WDAC, PolicyDenialEvent, User,
     sensor::{Capabilities, EventSink, Sensor, SensorError},
     time::now_ns,
 };
 
 use crate::{
     query::{Direction, query_events},
+    targets::{
+        ParsedBlock,
+        kerberos::normalize_kerberos_delegation_failure_block,
+        log_cleared::normalize_log_cleared_block,
+        session::{normalize_rdp_connection_block, normalize_session_lifecycle_block},
+    },
     xml::{self, LogonEvent},
 };
 
@@ -85,11 +89,6 @@ const LSASS_COMM: &str = "lsass.exe";
 // block into a `schema::Event`, count it, hand it to the sink. Only the
 // query, the parser, and the normalization differ per target, so those live
 // in a [`PollTarget`] and the machine exists once.
-
-/// What [`PollTarget::parse_block`] yields for one `<Event>` XML block.
-/// `None`: not even parseable. `Some((record_id, None))`: parsed but skipped
-/// as unusable. `Some((record_id, Some(event)))`: a normalized event.
-pub(crate) type ParsedBlock = Option<(u64, Option<Event>)>;
 
 /// One poll target: a channel + `EventID` filter, and how its raw XML blocks
 /// become normalized events. Reused as-is by the push-based `subscribe`
@@ -1039,73 +1038,9 @@ static WDAC_OP: PollTarget = PollTarget {
     enabled: |c| c.wdac_enabled,
 };
 
-// ── Terminal Services session lifecycle (#285) ──────────────────────────────
+// ── Terminal Services sessions, log clears, Kerberos delegation failures ────
 //
-// What 4624 cannot say: new session or reconnect, disconnected (left alive)
-// or logged off, and which client each step came from. Both channels are on by
-// default on every SKU, RDP host or not: the console session logs 21/23 too
-// (`Address` `LOCAL`), and a host without an RDP listener simply never writes
-// a 1149. No audit toggle.
-
-const SESSION_LOGON: u32 = 21;
-const SESSION_LOGOFF: u32 = 23;
-const SESSION_DISCONNECT: u32 = 24;
-const SESSION_RECONNECT: u32 = 25;
-const RDP_AUTHENTICATED: u32 = 1149;
-
-/// `(source_address, console)` from the event's client field. `LOCAL` is the
-/// console; anything else that is not an IP address (a gateway name, a shape
-/// not seen yet) is reported as no address rather than guessed at.
-fn session_origin(address: Option<&str>) -> (Option<IpAddr>, bool) {
-    match address {
-        Some(a) if a.eq_ignore_ascii_case("LOCAL") => (None, true),
-        Some(a) => (a.parse().ok(), false),
-        None => (None, false),
-    }
-}
-
-fn session_event(ev: xml::TerminalSessionEvent, state: SessionState) -> Event {
-    let (source_address, console) = session_origin(ev.address.as_deref());
-    Event::Session(SessionEvent {
-        meta: EventMeta {
-            pid: ev.pid,
-            ppid: 0,
-            user: User::Unknown,
-            timestamp_ns: ev.time_created_ns.unwrap_or_else(now_ns),
-            comm: String::new(),
-            container: None, // attributed by the ETW sensor only (https://github.com/synthaea-lab/agent/issues/39)
-            process_generation: None,
-            parent_process_generation: None,
-        },
-        state,
-        session_id: ev.session_id,
-        target_user: ev.user.unwrap_or_default(),
-        source_address,
-        console,
-    })
-}
-
-/// Normalizes a `LocalSessionManager` 21/23/24/25 into a [`SessionEvent`].
-///
-/// Skipped (cursor still advances): a block without a `SessionID` (every
-/// consumer keys on it), and any event id the `XPath` filter let through
-/// that this function has no state for. 22 (shell start) is not subscribed:
-/// it repeats the 21 it follows.
-fn normalize_session_lifecycle_block(block: &str) -> ParsedBlock {
-    let ev = xml::parse_local_session_event(block)?;
-    let record_id = ev.record_id;
-    let state = match ev.event_id {
-        SESSION_LOGON => SessionState::Logon,
-        SESSION_LOGOFF => SessionState::Logoff,
-        SESSION_DISCONNECT => SessionState::Disconnect,
-        SESSION_RECONNECT => SessionState::Reconnect,
-        _ => return Some((record_id, None)),
-    };
-    if ev.session_id.is_none() {
-        return Some((record_id, None));
-    }
-    Some((record_id, Some(session_event(ev, state))))
-}
+// Normalization lives in `targets::{session, log_cleared, kerberos}`.
 
 /// `LocalSessionManager` also writes an RPC trace (59) for every session
 /// capability query: 1 444 of 1 588 records on the 2026-10-05 host. The
@@ -1121,22 +1056,6 @@ static SESSION_LIFECYCLE: PollTarget = PollTarget {
     enabled: |c| c.terminal_sessions_enabled,
 };
 
-/// Normalizes a `RemoteConnectionManager` 1149 (a client authenticated to the
-/// RDP listener) into a [`SessionEvent`] with [`SessionState::Connect`]. With
-/// Network Level Authentication on (the default) that means the credentials
-/// were good; without it, only that a client connected. 4625 is where failed
-/// attempts land, and it carries the source address too.
-///
-/// Skipped: a block naming neither a user nor a client, and any other id.
-fn normalize_rdp_connection_block(block: &str) -> ParsedBlock {
-    let ev = xml::parse_remote_connection_event(block)?;
-    let record_id = ev.record_id;
-    if ev.event_id != RDP_AUTHENTICATED || (ev.user.is_none() && ev.address.is_none()) {
-        return Some((record_id, None));
-    }
-    Some((record_id, Some(session_event(ev, SessionState::Connect))))
-}
-
 static RDP_CONNECTIONS: PollTarget = PollTarget {
     label: "rdp-connection",
     heartbeat: "windows-eventlog:rdp-connection",
@@ -1147,62 +1066,6 @@ static RDP_CONNECTIONS: PollTarget = PollTarget {
     enable_audit: None,
     enabled: |c| c.terminal_sessions_enabled,
 };
-
-// ── Security 1102 / System 104 — an event log cleared (T1070.001, #799) ──────
-//
-// The Event Log service writes these itself as the first record of the log it
-// has just emptied, whatever asked for the clear (`wevtutil`, `EvtClearLog`,
-// .NET, a renamed copy of a tool), and no audit subcategory gates them: the
-// command-line rule cannot see the API paths, these can.
-
-const SECURITY_LOG_CLEARED: u32 = 1102;
-const LOG_FILE_CLEARED: u32 = 104;
-
-/// Normalizes a 1102 or a 104 into a [`LogClearedEvent`].
-///
-/// Skipped (cursor still advances): any other id the filter let through, and
-/// a 104 that does not name the channel it cleared — an alert that cannot say
-/// which log is gone is not worth guessing at.
-fn normalize_log_cleared_block(block: &str) -> ParsedBlock {
-    let record = xml::parse_log_cleared_event(block)?;
-    let record_id = record.record_id;
-    let channel = match record.event_id {
-        SECURITY_LOG_CLEARED => "Security".to_string(),
-        LOG_FILE_CLEARED => match record.cleared_channel {
-            Some(channel) => channel,
-            None => return Some((record_id, None)),
-        },
-        _ => return Some((record_id, None)),
-    };
-    let subject_user = match (record.subject_domain_name, record.subject_user_name) {
-        (Some(domain), Some(name)) => format!("{domain}\\{name}"),
-        (None, Some(name)) => name,
-        (_, None) => String::new(),
-    };
-    let user = record
-        .subject_sid
-        .map_or(User::Unknown, |sid| User::Windows {
-            sid,
-            integrity_level: None,
-        });
-    let event = Event::LogCleared(LogClearedEvent {
-        meta: EventMeta {
-            pid: record.client_pid.unwrap_or(record.pid),
-            ppid: 0,
-            user,
-            timestamp_ns: record.time_created_ns.unwrap_or_else(now_ns),
-            comm: String::new(),
-            container: None, // Windows: no container support
-            process_generation: None,
-            parent_process_generation: None,
-        },
-        channel,
-        subject_user,
-        subject_logon_id: record.subject_logon_id,
-        backup_path: record.backup_path,
-    });
-    Some((record_id, Some(event)))
-}
 
 static SECURITY_LOG_CLEARS: PollTarget = PollTarget {
     label: "security-log-cleared",
@@ -1227,51 +1090,6 @@ static LOG_FILE_CLEARS: PollTarget = PollTarget {
     enable_audit: None,
     enabled: |c| c.log_clears_enabled,
 };
-
-/// `Microsoft-Windows-Kerberos/Operational` into a [`KerberosDelegationFailureEvent`] (#364):
-/// EID 201 (unconstrained delegation denied) or 202 (TGT session-key export denied). Skipped
-/// (cursor still advances): a block the `EventRecordID`/`EventID` extraction fails on, or any
-/// id the `XPath` filter let through that this function has no state for.
-///
-/// This channel is off by default on a clean install (checked on this host,
-/// `docs/sensors/sources.md`); unlike the `auditpol` subcategories other targets in this file
-/// enable, nothing here turns it on — same open question as #786's point 1 for
-/// `TaskScheduler/Operational`, not duplicated here. A disabled channel is still reported, not
-/// silently idle, by this module's existing start-up check (`warn_about_disabled_channels`).
-fn normalize_kerberos_delegation_failure_block(block: &str) -> ParsedBlock {
-    let record = xml::parse_kerberos_delegation_failure_block(block)?;
-    let record_id = record.record_id;
-    let kind = match record.event_id {
-        201 => KerberosDelegationFailureKind::UnconstrainedDelegationDenied,
-        202 => KerberosDelegationFailureKind::TgtSessionKeyExportDenied,
-        _ => return Some((record_id, None)),
-    };
-    let comm = record
-        .process_name
-        .as_deref()
-        .and_then(|path| path.rsplit(['/', '\\']).next())
-        .unwrap_or_default()
-        .to_string();
-    let event = Event::KerberosDelegationFailure(KerberosDelegationFailureEvent {
-        meta: EventMeta {
-            pid: record.caller_pid.unwrap_or(0),
-            ppid: 0,
-            user: User::Unknown,
-            timestamp_ns: record.time_created_ns.unwrap_or_else(now_ns),
-            comm,
-            container: None, // Windows: no container support
-            process_generation: None,
-            parent_process_generation: None,
-        },
-        kind,
-        target_server: record.target_server.unwrap_or_default(),
-        target_user: record.target_user.unwrap_or_default(),
-        target_domain: record.target_domain.unwrap_or_default(),
-        caller_user: record.client_user_name.unwrap_or_default(),
-        caller_domain: record.client_domain_name.unwrap_or_default(),
-    });
-    Some((record_id, Some(event)))
-}
 
 static KERBEROS_DELEGATION_FAILURES: PollTarget = PollTarget {
     label: "kerberos-delegation-failure",
@@ -2728,314 +2546,14 @@ mod defender_wdac_tests {
 }
 
 #[cfg(test)]
-mod session_tests {
+mod target_wiring_tests {
     use super::*;
-
-    fn lsm_block(event_id: u32, user_data: &str) -> String {
-        format!(
-            "<Event><System><EventID>{event_id}</EventID><EventRecordID>40</EventRecordID><Execution ProcessID='2312' ThreadID='1'/></System><UserData><EventXML xmlns='Event_NS'>{user_data}</EventXML></UserData></Event>"
-        )
-    }
-
-    fn session(parsed: ParsedBlock) -> SessionEvent {
-        let (record_id, event) = parsed.expect("should parse");
-        assert_eq!(record_id, 40);
-        match event.expect("should normalize") {
-            Event::Session(e) => e,
-            other => panic!("expected a SessionEvent, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn a_remote_reconnect_carries_session_and_client_address() {
-        let e = session(normalize_session_lifecycle_block(&lsm_block(
-            25,
-            r"<User>LAB\alice</User><SessionID>2</SessionID><Address>198.51.100.40</Address>",
-        )));
-        assert_eq!(e.state, SessionState::Reconnect);
-        assert_eq!(e.session_id, Some(2));
-        assert_eq!(e.target_user, r"LAB\alice");
-        assert_eq!(e.source_address, Some("198.51.100.40".parse().unwrap()));
-        assert!(!e.console);
-        assert_eq!(e.meta.pid, 2312);
-    }
-
-    #[test]
-    fn local_is_the_console_not_an_address() {
-        let e = session(normalize_session_lifecycle_block(&lsm_block(
-            24,
-            r"<User>LAB\alice</User><SessionID>1</SessionID><Address>LOCAL</Address>",
-        )));
-        assert_eq!(e.state, SessionState::Disconnect);
-        assert!(e.console);
-        assert_eq!(e.source_address, None);
-    }
-
-    #[test]
-    fn an_ipv6_client_address_is_kept() {
-        let e = session(normalize_session_lifecycle_block(&lsm_block(
-            21,
-            r"<User>LAB\alice</User><SessionID>3</SessionID><Address>2001:db8::7</Address>",
-        )));
-        assert_eq!(e.source_address, Some("2001:db8::7".parse().unwrap()));
-    }
-
-    #[test]
-    fn an_unparseable_client_is_no_address_and_not_the_console() {
-        let e = session(normalize_session_lifecycle_block(&lsm_block(
-            25,
-            r"<User>LAB\alice</User><SessionID>2</SessionID><Address>gw.lab.example</Address>",
-        )));
-        assert_eq!(e.source_address, None);
-        assert!(!e.console);
-    }
-
-    #[test]
-    fn a_logoff_names_no_client() {
-        let e = session(normalize_session_lifecycle_block(&lsm_block(
-            23,
-            r"<User>LAB\alice</User><SessionID>2</SessionID>",
-        )));
-        assert_eq!(e.state, SessionState::Logoff);
-        assert_eq!((e.source_address, e.console), (None, false));
-    }
-
-    #[test]
-    fn a_lifecycle_event_without_session_id_is_skipped() {
-        let block = lsm_block(25, r"<User>LAB\alice</User><Address>LOCAL</Address>");
-        assert!(matches!(
-            normalize_session_lifecycle_block(&block),
-            Some((40, None))
-        ));
-    }
-
-    #[test]
-    fn other_session_manager_ids_are_skipped() {
-        // 59 is the RPC trace that makes up most of the channel.
-        let block = lsm_block(59, "<SessionId>0</SessionId>");
-        assert!(matches!(
-            normalize_session_lifecycle_block(&block),
-            Some((40, None))
-        ));
-    }
-
-    #[test]
-    fn an_rdp_authentication_is_a_connect_with_no_session() {
-        let block = lsm_block(
-            1149,
-            "<Param1>alice</Param1><Param2>LAB</Param2><Param3>198.51.100.40</Param3>",
-        );
-        let e = session(normalize_rdp_connection_block(&block));
-        assert_eq!(e.state, SessionState::Connect);
-        assert_eq!(e.session_id, None);
-        assert_eq!(e.target_user, r"LAB\alice");
-        assert_eq!(e.source_address, Some("198.51.100.40".parse().unwrap()));
-    }
-
-    #[test]
-    fn an_rdp_authentication_naming_nothing_is_skipped() {
-        let block = lsm_block(1149, "<Param1></Param1><Param2></Param2><Param3></Param3>");
-        assert!(matches!(
-            normalize_rdp_connection_block(&block),
-            Some((40, None))
-        ));
-    }
 
     #[test]
     fn session_targets_poll_only_the_lifecycle_ids() {
         assert!(!SESSION_LIFECYCLE.id_filter.contains("59"));
         assert!(!SESSION_LIFECYCLE.id_filter.contains("EventID=22"));
         assert_eq!(RDP_CONNECTIONS.id_filter, "EventID=1149");
-    }
-}
-
-#[cfg(test)]
-mod log_cleared_tests {
-    use super::*;
-
-    // Trimmed from the real 104 and 1102 captured in the lab (#799, see xml/records/log_cleared.rs).
-    const BLOCK_104: &str = "<Event><System><EventID>104</EventID>\
-        <TimeCreated SystemTime='2026-10-15T12:50:01.7166040Z'/><EventRecordID>78381</EventRecordID>\
-        <Execution ProcessID='3792' ThreadID='44592'/><Channel>System</Channel>\
-        <Security UserID='S-1-5-21-1-2-3-1001'/></System><UserData><LogFileCleared>\
-        <SubjectUserName>analyst</SubjectUserName><SubjectDomainName>LAB-W11</SubjectDomainName>\
-        <Channel>OpenSSH/Operational</Channel><BackupPath>C:\\Users\\analyst\\ssh.evtx</BackupPath>\
-        <ClientProcessId>41684</ClientProcessId></LogFileCleared></UserData></Event>";
-    const BLOCK_1102: &str = "<Event><System><EventID>1102</EventID>\
-        <EventRecordID>1399119</EventRecordID><Execution ProcessID='3792' ThreadID='47044'/>\
-        <Channel>Security</Channel><Security/></System><UserData><LogFileCleared>\
-        <SubjectUserSid>S-1-5-21-1-2-3-1001</SubjectUserSid><SubjectUserName>analyst</SubjectUserName>\
-        <SubjectDomainName>LAB-W11</SubjectDomainName><SubjectLogonId>0x37b4d</SubjectLogonId>\
-        <ClientProcessId>41684</ClientProcessId></LogFileCleared></UserData></Event>";
-
-    fn log_cleared(block: &str) -> LogClearedEvent {
-        match normalize_log_cleared_block(block) {
-            Some((_, Some(Event::LogCleared(e)))) => e,
-            other => panic!("expected a LogCleared event, got {other:?}"),
-        }
-    }
-
-    fn windows_user(sid: &str) -> User {
-        User::Windows {
-            sid: sid.into(),
-            integrity_level: None,
-        }
-    }
-
-    #[test]
-    fn a_104_reports_the_cleared_channel_and_the_clearing_process() {
-        let event = log_cleared(BLOCK_104);
-        assert_eq!(event.channel, "OpenSSH/Operational");
-        assert_eq!(event.subject_user, r"LAB-W11\analyst");
-        assert_eq!(event.meta.user, windows_user("S-1-5-21-1-2-3-1001"));
-        // The clearing process, not the Event Log service (3792).
-        assert_eq!(event.meta.pid, 41684);
-        assert_eq!(event.meta.timestamp_ns, 1_792_068_601_716_604_000);
-        assert_eq!(event.subject_logon_id, None);
-        assert_eq!(
-            event.backup_path.as_deref(),
-            Some(r"C:\Users\analyst\ssh.evtx")
-        );
-    }
-
-    #[test]
-    fn a_1102_is_the_security_log_with_its_logon_session() {
-        let event = log_cleared(BLOCK_1102);
-        assert_eq!(event.channel, "Security");
-        assert_eq!(event.subject_user, r"LAB-W11\analyst");
-        assert_eq!(event.meta.user, windows_user("S-1-5-21-1-2-3-1001"));
-        assert_eq!(event.meta.pid, 41684);
-        assert_eq!(event.subject_logon_id.as_deref(), Some("0x37b4d"));
-        assert_eq!(event.backup_path, None);
-    }
-
-    #[test]
-    fn without_a_client_pid_the_event_log_service_stands_in() {
-        let block = BLOCK_1102.replace("<ClientProcessId>41684</ClientProcessId>", "");
-        assert_eq!(log_cleared(&block).meta.pid, 3792);
-    }
-
-    #[test]
-    fn without_a_subject_the_account_is_unknown_not_guessed() {
-        let block = BLOCK_1102
-            .replace("<SubjectUserSid>S-1-5-21-1-2-3-1001</SubjectUserSid>", "")
-            .replace("<SubjectUserName>analyst</SubjectUserName>", "");
-        let event = log_cleared(&block);
-        assert_eq!(event.meta.user, User::Unknown);
-        assert_eq!(event.subject_user, "");
-    }
-
-    #[test]
-    fn a_104_without_a_channel_and_other_ids_are_skipped_but_advance_the_cursor() {
-        let no_channel = BLOCK_104.replace("<Channel>OpenSSH/Operational</Channel>", "");
-        assert!(matches!(
-            normalize_log_cleared_block(&no_channel),
-            Some((78381, None))
-        ));
-        let other_id = BLOCK_1102.replace("<EventID>1102</EventID>", "<EventID>1100</EventID>");
-        assert!(matches!(
-            normalize_log_cleared_block(&other_id),
-            Some((1_399_119, None))
-        ));
-    }
-}
-
-#[cfg(test)]
-mod kerberos_delegation_failure_tests {
-    use super::*;
-
-    // Field names and order from the provider's own manifest
-    // (`Microsoft-Windows-Security-Kerberos`, `wevtutil gp ... /ge:true /gm:true`, checked on
-    // this host, #364): EID 201 and 202 share one nine-field template.
-    const BLOCK_201: &str = "<Event><System><EventID>201</EventID>\
-        <TimeCreated SystemTime='2026-10-23T09:15:30.0000000Z'/><EventRecordID>5201</EventRecordID>\
-        <Channel>Microsoft-Windows-Kerberos/Operational</Channel></System><EventData>\
-        <Data Name='TargetName'>cifs/dc01.lab.internal</Data><Data Name='UserName'>analyst</Data>\
-        <Data Name='DomainName'>LAB</Data><Data Name='CallerPID'>4120</Data>\
-        <Data Name='ProcessName'>C:\\Windows\\System32\\fileserver.exe</Data>\
-        <Data Name='ClientLUID'>0x3e7</Data><Data Name='ClientUserName'>svc_fileserver</Data>\
-        <Data Name='ClientDomainName'>LAB</Data><Data Name='MechanismOID'>1.2.840.113554.1.2.2</Data>\
-        </EventData></Event>";
-    const BLOCK_202: &str = "<Event><System><EventID>202</EventID>\
-        <TimeCreated SystemTime='2026-10-23T09:16:00.0000000Z'/><EventRecordID>5202</EventRecordID>\
-        <Channel>Microsoft-Windows-Kerberos/Operational</Channel></System><EventData>\
-        <Data Name='TargetName'>HTTP/app01.lab.internal</Data><Data Name='UserName'>svc_app</Data>\
-        <Data Name='DomainName'>LAB</Data><Data Name='CallerPID'>8800</Data>\
-        <Data Name='ProcessName'>C:\\inetpub\\w3wp.exe</Data>\
-        <Data Name='ClientLUID'>0x3e4</Data><Data Name='ClientUserName'>w3wp</Data>\
-        <Data Name='ClientDomainName'>LAB</Data><Data Name='MechanismOID'>1.2.840.113554.1.2.2</Data>\
-        </EventData></Event>";
-
-    fn kerberos_failure(block: &str) -> KerberosDelegationFailureEvent {
-        match normalize_kerberos_delegation_failure_block(block) {
-            Some((_, Some(Event::KerberosDelegationFailure(e)))) => e,
-            other => panic!("expected a KerberosDelegationFailure event, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn a_201_is_unconstrained_delegation_denied_with_the_caller_process() {
-        let event = kerberos_failure(BLOCK_201);
-        assert_eq!(
-            event.kind,
-            KerberosDelegationFailureKind::UnconstrainedDelegationDenied
-        );
-        assert_eq!(event.target_server, "cifs/dc01.lab.internal");
-        assert_eq!(event.target_user, "analyst");
-        assert_eq!(event.target_domain, "LAB");
-        assert_eq!(event.meta.pid, 4120);
-        assert_eq!(event.meta.comm, "fileserver.exe");
-        assert_eq!(event.caller_user, "svc_fileserver");
-        assert_eq!(event.caller_domain, "LAB");
-        assert_eq!(event.meta.user, User::Unknown);
-        assert_eq!(
-            event.meta.timestamp_ns,
-            xml::time_created_ns(BLOCK_201).unwrap(),
-            "timestamp should come from TimeCreated, not the time the agent happened to parse it"
-        );
-    }
-
-    #[test]
-    fn a_missing_time_created_falls_back_to_now_rather_than_zero() {
-        let block = BLOCK_201.replacen(
-            "<TimeCreated SystemTime='2026-10-23T09:15:30.0000000Z'/>",
-            "",
-            1,
-        );
-        let before = now_ns();
-        let event = kerberos_failure(&block);
-        assert!(
-            event.meta.timestamp_ns >= before,
-            "{}",
-            event.meta.timestamp_ns
-        );
-    }
-
-    #[test]
-    fn a_202_is_tgt_session_key_export_denied() {
-        let event = kerberos_failure(BLOCK_202);
-        assert_eq!(
-            event.kind,
-            KerberosDelegationFailureKind::TgtSessionKeyExportDenied
-        );
-        assert_eq!(event.target_server, "HTTP/app01.lab.internal");
-        assert_eq!(event.meta.pid, 8800);
-        assert_eq!(event.meta.comm, "w3wp.exe");
-    }
-
-    #[test]
-    fn other_ids_are_skipped_but_advance_the_cursor() {
-        let other = BLOCK_201.replace("<EventID>201</EventID>", "<EventID>203</EventID>");
-        assert!(matches!(
-            normalize_kerberos_delegation_failure_block(&other),
-            Some((5201, None))
-        ));
-    }
-
-    #[test]
-    fn a_missing_caller_pid_is_zero_not_guessed() {
-        let block = BLOCK_201.replace("<Data Name='CallerPID'>4120</Data>", "");
-        assert_eq!(kerberos_failure(&block).meta.pid, 0);
     }
 }
 

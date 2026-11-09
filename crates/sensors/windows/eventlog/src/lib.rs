@@ -210,8 +210,11 @@ mod query;
 mod sensor;
 // The `EvtSubscribe` transport (issue #322) — enabled per-host via
 // `EventLogConfig::transport`. Gated `#[cfg(windows)]` because it binds
-// against `windows-sys`; the Linux CI leg keeps compiling `xml`.
+// against `windows-sys`; the Linux CI leg keeps compiling `xml` and `targets`.
 #[cfg(windows)]
 mod subscribe;
+// Only `sensor.rs` calls into it outside tests, so it is dead code off Windows.
+#[cfg_attr(not(windows), allow(dead_code))]
+mod targets;
 #[cfg(windows)]
 pub use sensor::{EventLogConfig, EventLogCounters, EventLogSensor, EventLogTransport};
