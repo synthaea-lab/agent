@@ -24,7 +24,7 @@ mod linux {
     use aya::{Btf, Ebpf, programs::Program};
 
     pub(crate) fn run() -> Result<ExitCode, Box<dyn Error>> {
-        let allowed = allowed_refusals();
+        let allowed = allowed_refusals(std::env::args().skip(1))?;
         let mut ebpf = Ebpf::load(aya::include_bytes_aligned!(concat!(
             env!("OUT_DIR"),
             "/sensor-linux-ebpf"
@@ -32,6 +32,9 @@ mod linux {
         let btf = Btf::from_sys_fs()?;
         let mut names: Vec<String> = ebpf.programs().map(|(name, _)| name.to_string()).collect();
         names.sort();
+        if let Some(unknown) = allowed.iter().find(|name| !names.contains(name)) {
+            return Err(format!("--allow {unknown}: no such program in the eBPF object").into());
+        }
 
         let mut refused = 0_usize;
         for name in &names {
@@ -40,6 +43,8 @@ mod linux {
                 Program::UProbe(p) => p.load(),
                 Program::RawTracePoint(p) => p.load(),
                 Program::TracePoint(p) => p.load(),
+                // Each LSM program is named after its hook (`#[lsm(hook = "...")]` on a fn of
+                // the same name), which is also how `attach_inode_setattr` loads it.
                 Program::Lsm(p) => p.load(name, &btf),
                 other => {
                     println!("SKIP {name} {:?}", other.prog_type());
@@ -72,18 +77,23 @@ mod linux {
         })
     }
 
-    /// The programs named by `--allow`, which may be refused without failing the run.
-    fn allowed_refusals() -> BTreeSet<String> {
-        let mut args = std::env::args().skip(1);
+    /// The programs named by `--allow`, which may be refused without failing the run. Any
+    /// other argument, or a trailing `--allow` with no name, is an error rather than ignored:
+    /// a mistyped flag must not quietly turn a refusal into a pass.
+    fn allowed_refusals(
+        mut args: impl Iterator<Item = String>,
+    ) -> Result<BTreeSet<String>, Box<dyn Error>> {
         let mut allowed = BTreeSet::new();
         while let Some(arg) = args.next() {
-            if arg == "--allow"
-                && let Some(name) = args.next()
-            {
-                allowed.insert(name);
+            if arg != "--allow" {
+                return Err(
+                    format!("unknown argument `{arg}` (usage: [--allow <program>]...)").into(),
+                );
             }
+            let name = args.next().ok_or("--allow needs a program name")?;
+            allowed.insert(name);
         }
-        allowed
+        Ok(allowed)
     }
 }
 
