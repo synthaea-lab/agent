@@ -1,7 +1,7 @@
 Name:           synthaea-agent
 # The release PR bumps this with the workspace version (release-please-config.json).
 # x-release-please-start-version
-Version:        0.0.0
+Version:        0.0.1
 # x-release-please-end
 Release:        1%{?dist}
 Summary:        Synthaea EDR Agent - Endpoint detection and response
