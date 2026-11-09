@@ -11,7 +11,7 @@ Generated from ATT&CK technique identifiers tagged in source (`crates/rules`, `c
 | --- | --- | --- |
 | T1078 | 3 | `rules:crates/rules/src/auth_state.rs` |
 | T1189 | 3 | `sigma:rules/sigma/linux/browser_spawned_shell.yml`, `sigma:rules/sigma/windows/browser_spawned_interpreter.yml` |
-| T1190 | 3 | `rules:crates/rules/src/stateless.rs`, `sigma:rules/sigma/macos/web_server_spawned_shell.yml`, `sigma:rules/sigma/windows/iis_worker_spawned_interpreter.yml`, `sigma:rules/sigma/windows/web_server_spawned_interpreter.yml` |
+| T1190 | 3 | `rules:crates/rules/src/stateless/initial_access.rs`, `sigma:rules/sigma/macos/web_server_spawned_shell.yml`, `sigma:rules/sigma/windows/iis_worker_spawned_interpreter.yml`, `sigma:rules/sigma/windows/web_server_spawned_interpreter.yml` |
 | T1566.001 | 3 | `rules:crates/rules/src/download_state.rs` |
 
 ## Execution
@@ -20,9 +20,9 @@ Generated from ATT&CK technique identifiers tagged in source (`crates/rules`, `c
 | --- | --- | --- |
 | T1047 | 3 | `sigma:rules/sigma/windows/wmic_remote_process_inline_password.yml` |
 | T1059 | 3, 6 | `correlator:crates/correlator/src/rules.rs`, `rules:crates/rules/src/amsi.rs`, `rules:crates/rules/src/state.rs`, `sigma:rules/sigma/linux/susp_tmp_exec.yml`, `sigma:rules/sigma/windows/susp_appdata_exec.yml`, `sigma:rules/sigma/windows/web_server_spawned_interpreter.yml` |
-| T1059.001 | 3 | `rules:crates/rules/src/amsi.rs`, `rules:crates/rules/src/stateless.rs`, `sigma:rules/sigma/windows/browser_spawned_interpreter.yml`, `sigma:rules/sigma/windows/iis_worker_spawned_interpreter.yml`, `sigma:rules/sigma/windows/office_spawned_interpreter.yml`, `sigma:rules/sigma/windows/powershell_encoded.yml` |
+| T1059.001 | 3 | `rules:crates/rules/src/amsi.rs`, `rules:crates/rules/src/stateless/execution.rs`, `sigma:rules/sigma/windows/browser_spawned_interpreter.yml`, `sigma:rules/sigma/windows/iis_worker_spawned_interpreter.yml`, `sigma:rules/sigma/windows/office_spawned_interpreter.yml`, `sigma:rules/sigma/windows/powershell_encoded.yml` |
 | T1059.002 | 3 | `rules:crates/rules/src/osascript.rs` |
-| T1059.004 | 3 | `rules:crates/rules/src/stateless.rs`, `sigma:rules/sigma/linux/base64_pipe_shell.yml`, `sigma:rules/sigma/linux/browser_spawned_shell.yml`, `sigma:rules/sigma/linux/lolbin_shell_breakout.yml`, `sigma:rules/sigma/linux/reverse_shell.yml`, `sigma:rules/sigma/macos/web_server_spawned_shell.yml` |
+| T1059.004 | 3 | `rules:crates/rules/src/stateless/execution.rs`, `sigma:rules/sigma/linux/base64_pipe_shell.yml`, `sigma:rules/sigma/linux/browser_spawned_shell.yml`, `sigma:rules/sigma/linux/lolbin_shell_breakout.yml`, `sigma:rules/sigma/linux/reverse_shell.yml`, `sigma:rules/sigma/macos/web_server_spawned_shell.yml` |
 | T1204 | 3 | `rules:crates/rules/src/state.rs`, `sigma:rules/sigma/windows/office_spawned_interpreter.yml` |
 | T1204.002 | 3 | `rules:crates/rules/src/download_state.rs` |
 
@@ -30,16 +30,16 @@ Generated from ATT&CK technique identifiers tagged in source (`crates/rules`, `c
 
 | Technique | Layer(s) | Source(s) |
 | --- | --- | --- |
-| T1037.004 | 3 | `rules:crates/rules/src/stateless.rs` |
-| T1053.003 | 3 | `rules:crates/rules/src/stateless.rs`, `sigma:rules/sigma/linux/persistence.yml` |
-| T1053.005 | 3 | `rules:crates/rules/src/stateless.rs`, `sigma:rules/sigma/windows/remote_scheduled_task_system.yml` |
+| T1037.004 | 3 | `rules:crates/rules/src/stateless/persistence.rs` |
+| T1053.003 | 3 | `rules:crates/rules/src/stateless/persistence.rs`, `sigma:rules/sigma/linux/persistence.yml` |
+| T1053.005 | 3 | `rules:crates/rules/src/stateless/persistence.rs`, `sigma:rules/sigma/windows/remote_scheduled_task_system.yml` |
 | T1098.004 | 3 | `sigma:rules/sigma/linux/persistence.yml` |
-| T1136.001 | 3 | `rules:crates/rules/src/stateless.rs` |
-| T1543.001 | 3 | `rules:crates/rules/src/stateless.rs` |
-| T1543.002 | 3 | `rules:crates/rules/src/stateless.rs`, `sigma:rules/sigma/linux/persistence.yml` |
-| T1543.003 | 3 | `rules:crates/rules/src/stateless.rs`, `sigma:rules/sigma/windows/remote_service_shell_command.yml`, `sigma:rules/sigma/windows/service_created_with_shell_binpath.yml` |
-| T1546.004 | 3 | `rules:crates/rules/src/stateless.rs` |
-| T1547.015 | 3 | `rules:crates/rules/src/stateless.rs` |
+| T1136.001 | 3 | `rules:crates/rules/src/stateless/persistence.rs` |
+| T1543.001 | 3 | `rules:crates/rules/src/stateless/persistence.rs` |
+| T1543.002 | 3 | `rules:crates/rules/src/stateless/persistence.rs`, `sigma:rules/sigma/linux/persistence.yml` |
+| T1543.003 | 3 | `rules:crates/rules/src/stateless/persistence.rs`, `sigma:rules/sigma/windows/remote_service_shell_command.yml`, `sigma:rules/sigma/windows/service_created_with_shell_binpath.yml` |
+| T1546.004 | 3 | `rules:crates/rules/src/stateless/persistence.rs` |
+| T1547.015 | 3 | `rules:crates/rules/src/stateless/persistence.rs` |
 
 ## Privilege Escalation
 
@@ -47,28 +47,28 @@ Generated from ATT&CK technique identifiers tagged in source (`crates/rules`, `c
 | --- | --- | --- |
 | T1548 | 3 | `sigma:rules/sigma/linux/lolbin_shell_breakout.yml`, `sigma:rules/sigma/linux/setcap_shell_uid.yml` |
 | T1548.001 | 3 | `rules:crates/rules/src/privesc.rs` |
-| T1611 | 3 | `rules:crates/rules/src/stateless.rs` |
+| T1611 | 3 | `rules:crates/rules/src/stateless/privilege_escalation.rs` |
 
 ## Defense Evasion
 
 | Technique | Layer(s) | Source(s) |
 | --- | --- | --- |
-| T1006 | 3 | `rules:crates/rules/src/stateless.rs` |
+| T1006 | 3 | `rules:crates/rules/src/stateless/defense_evasion.rs` |
 | T1027 | 3 | `sigma:rules/sigma/linux/base64_pipe_shell.yml`, `sigma:rules/sigma/windows/powershell_encoded.yml` |
 | T1036 | 3 | `sigma:rules/sigma/linux/susp_tmp_exec.yml`, `sigma:rules/sigma/windows/susp_appdata_exec.yml` |
-| T1036.005 | 3 | `rules:crates/rules/src/stateless.rs` |
+| T1036.005 | 3 | `rules:crates/rules/src/stateless/defense_evasion.rs` |
 | T1055 | 3, 6 | `correlator:crates/correlator/src/rules.rs`, `rules:crates/rules/src/lsass.rs` |
-| T1070.001 | 3 | `rules:crates/rules/src/stateless.rs` |
-| T1070.002 | 3 | `rules:crates/rules/src/stateless.rs` |
-| T1070.006 | 3 | `rules:crates/rules/src/stateless.rs` |
+| T1070.001 | 3 | `rules:crates/rules/src/stateless/indicator_removal.rs` |
+| T1070.002 | 3 | `rules:crates/rules/src/stateless/indicator_removal.rs` |
+| T1070.006 | 3 | `rules:crates/rules/src/stateless/indicator_removal.rs` |
 | T1127 | 3 | `rules:crates/rules/src/state.rs` |
 | T1197 | 3 | `rules:crates/rules/src/download_state.rs` |
 | T1218 | 3 | `rules:crates/rules/src/state.rs` |
 | T1218.011 | 3 | `sigma:rules/sigma/windows/lolbas_rundll32.yml` |
 | T1553.005 | 3 | `rules:crates/rules/src/download_state.rs` |
-| T1562.001 | 3 | `rules:crates/rules/src/amsi.rs`, `rules:crates/rules/src/defender.rs`, `rules:crates/rules/src/securitytool.rs`, `rules:crates/rules/src/stateless.rs`, `rules:crates/rules/src/unitstop.rs`, `sigma:rules/sigma/linux/audit_collection_disabled.yml`, `sigma:rules/sigma/linux/audit_service_masked_now.yml`, `sigma:rules/sigma/windows/defender_realtime_disable.yml`, `sigma:rules/sigma/windows/security_service_start_disabled.yml` |
+| T1562.001 | 3 | `rules:crates/rules/src/amsi.rs`, `rules:crates/rules/src/defender.rs`, `rules:crates/rules/src/securitytool.rs`, `rules:crates/rules/src/stateless/impair_defenses.rs`, `rules:crates/rules/src/unitstop.rs`, `sigma:rules/sigma/linux/audit_collection_disabled.yml`, `sigma:rules/sigma/linux/audit_service_masked_now.yml`, `sigma:rules/sigma/windows/defender_realtime_disable.yml`, `sigma:rules/sigma/windows/security_service_start_disabled.yml` |
 | T1562.004 | 3 | `sigma:rules/sigma/windows/firewall_allprofiles_disabled.yml` |
-| T1574.006 | 3 | `rules:crates/rules/src/stateless.rs` |
+| T1574.006 | 3 | `rules:crates/rules/src/stateless/privilege_escalation.rs` |
 | T1620 | 3, 6 | `correlator:crates/correlator/src/rules.rs`, `rules:crates/rules/src/amsi.rs`, `rules:crates/rules/src/memfd_state.rs` |
 
 ## Credential Access
@@ -116,8 +116,8 @@ Generated from ATT&CK technique identifiers tagged in source (`crates/rules`, `c
 
 | Technique | Layer(s) | Source(s) |
 | --- | --- | --- |
-| T1071 | 3, 6 | `correlator:crates/correlator/src/rules.rs`, `rules:crates/rules/src/network_state.rs`, `rules:crates/rules/src/stateless.rs`, `sigma:rules/sigma/linux/reverse_shell.yml` |
-| T1071.004 | 3, 6 | `correlator:crates/correlator/src/rules.rs`, `rules:crates/rules/src/stateless.rs` |
+| T1071 | 3, 6 | `correlator:crates/correlator/src/rules.rs`, `rules:crates/rules/src/network_state.rs`, `rules:crates/rules/src/stateless/command_and_control.rs`, `sigma:rules/sigma/linux/reverse_shell.yml` |
+| T1071.004 | 3, 6 | `correlator:crates/correlator/src/rules.rs`, `rules:crates/rules/src/stateless/command_and_control.rs` |
 | T1105 | 1, 3, 6 | `correlator:crates/correlator/src/rules.rs`, `rules:crates/rules/src/amsi.rs`, `rules:crates/rules/src/download_state.rs`, `yara:rules/yara/lab/synthaea_lab_payload.yar` |
 | T1571 | 3 | `rules:crates/rules/src/drift_state.rs` |
 
@@ -135,7 +135,7 @@ Generated from ATT&CK technique identifiers tagged in source (`crates/rules`, `c
 | Technique | Layer(s) | Source(s) |
 | --- | --- | --- |
 | T1489 | 3 | `rules:crates/rules/src/state.rs` |
-| T1490 | 3 | `rules:crates/rules/src/stateless.rs` |
+| T1490 | 3 | `rules:crates/rules/src/stateless/impact.rs` |
 | T1529 | 3 | `rules:crates/rules/src/state.rs` |
 
 ## Unmapped — add to TECHNIQUE_TACTIC
@@ -143,7 +143,7 @@ Generated from ATT&CK technique identifiers tagged in source (`crates/rules`, `c
 | Technique | Layer(s) | Source(s) |
 | --- | --- | --- |
 | T1021.001 | 3 | `rules:crates/rules/src/rdp.rs` |
-| T1027.010 | 3 | `rules:crates/rules/src/stateless.rs` |
+| T1027.010 | 3 | `rules:crates/rules/src/stateless/defense_evasion.rs` |
 | T1046 | 3 | `rules:crates/rules/src/network_state.rs` |
 | T1048 | 3 | `rules:crates/rules/src/network_state.rs` |
 | T1059.005 | 3 | `rules:crates/rules/src/amsi.rs` |
@@ -158,14 +158,14 @@ Generated from ATT&CK technique identifiers tagged in source (`crates/rules`, `c
 | T1505.003 | 1, 6 | `correlator:crates/correlator/src/rules.rs`, `yara:rules/yara/webshell/webshell_jsp_runtime_exec.yar`, `yara:rules/yara/webshell/webshell_php_superglobal_exec.yar` |
 | T1548.003 | 3 | `rules:crates/rules/src/sudo.rs`, `sigma:rules/sigma/linux/sudo_vim_shell_escape.yml` |
 | T1557 | 3 | `rules:crates/rules/src/ntlm.rs` |
-| T1558 | 3 | `rules:crates/rules/src/stateless.rs` |
+| T1558 | 3 | `rules:crates/rules/src/stateless/credential_access.rs` |
 | T1558.003 | 3 | `rules:crates/rules/src/ldap.rs` |
 | T1558.004 | 3 | `rules:crates/rules/src/ldap.rs` |
 | T1560 | 3 | `rules:crates/rules/src/network_state.rs` |
 | T1560.001 | 3 | `sigma:rules/sigma/linux/passworded_home_archive.yml`, `sigma:rules/sigma/windows/passworded_user_data_archive.yml` |
 | T1562 | 3 | `rules:crates/rules/src/drift_state.rs` |
-| T1562.002 | 3 | `rules:crates/rules/src/stateless.rs` |
-| T1564.004 | 3 | `rules:crates/rules/src/stateless.rs` |
+| T1562.002 | 3 | `rules:crates/rules/src/stateless/impair_defenses.rs` |
+| T1564.004 | 3 | `rules:crates/rules/src/stateless/defense_evasion.rs` |
 
 ## Not verified
 

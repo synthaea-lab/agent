@@ -99,6 +99,8 @@ def yara_meta(path: pathlib.Path) -> set[str]:
 # (source label, root the glob is relative to, glob, extractor, detection layer)
 SOURCES = [
     ("rules", REPO_ROOT, "crates/rules/src/*.rs", rust_technique_field, 3),
+    # `src/tests/` is left out: its expected-alert literals are not detections.
+    ("rules", REPO_ROOT, "crates/rules/src/stateless/*.rs", rust_technique_field, 3),
     ("correlator", REPO_ROOT, "crates/correlator/src/rules.rs", rust_technique_field, 6),
     ("sigma", SIBLINGS_ROOT, "rules/sigma/**/*.yml", sigma_tags, 3),
     ("yara", SIBLINGS_ROOT, "rules/yara/**/*.yar", yara_meta, 1),
