@@ -3,7 +3,7 @@
 The [`rules`](../../crates/rules/src/lib.rs) crate holds the agent's built-in detections. Each
 one is a Rust function aimed at one ATT&CK technique. They come in two kinds:
 
-- **Stateless rules**, in [`stateless.rs`](../../crates/rules/src/stateless.rs) and a few small
+- **Stateless rules**, in [`stateless/`](../../crates/rules/src/stateless/mod.rs) (one module per tactic) and a few small
   modules. A single event decides. They are pure functions of the event.
 - **Stateful rules**, the methods of [`RuleState`](../../crates/rules/src/state.rs) and the
   helper modules it owns. They need a bounded history of recent events: a download followed
@@ -22,7 +22,7 @@ crate-internal; they are re-exported under `#[cfg(test)]` only, for the tests un
 
 | Entry point | Event | Kind |
 | --- | --- | --- |
-| [`evaluate_exec`](../../crates/rules/src/stateless.rs) | `ExecEvent` | stateless |
+| [`evaluate_exec`](../../crates/rules/src/stateless/mod.rs) | `ExecEvent` | stateless |
 | `evaluate_file_open`, `evaluate_file_delete`, `evaluate_file_set_time`, `evaluate_raw_volume_open` | file events | stateless |
 | `evaluate_connect`, `evaluate_signal`, `evaluate_log_cleared`, `evaluate_kerberos_delegation_failure` | as named | stateless |
 | [`evaluate_amsi_content`](../../crates/rules/src/amsi.rs), [`evaluate_defender_event`](../../crates/rules/src/defender.rs), [`evaluate_ldap_search`](../../crates/rules/src/ldap.rs), [`evaluate_ntlm_auth`](../../crates/rules/src/ntlm.rs), [`evaluate_package_change`](../../crates/rules/src/inventory.rs) | Windows/inventory events | stateless |
