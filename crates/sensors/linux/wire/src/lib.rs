@@ -18,6 +18,7 @@
 #[cfg(feature = "user")]
 extern crate std;
 
+mod layout;
 mod path_filter;
 pub use path_filter::is_filtered_path;
 
