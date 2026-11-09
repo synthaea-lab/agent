@@ -35,7 +35,8 @@ const USER_EXECUTION_TECHNIQUE: &str = "T1204.002";
 const MAIL_ATTACHMENT_TECHNIQUE: &str = "T1566.001/T1204.002";
 
 /// The freedesktop.org "Common extended attributes" xattr holding a downloaded file's URL.
-/// `wget` and `curl --xattr` set it; which browsers do is not verified (no Linux capture).
+/// Captured on Fedora 43 (agent#221): `wget`, `wget2` and `curl --xattr` set it with `fsetxattr(2)`,
+/// which the sensor does not hook; headless Chromium 156 and Firefox 159 set no xattr at all.
 /// The Linux download-provenance mark (<https://github.com/synthaea-lab/agent/issues/17>).
 pub(crate) const XDG_ORIGIN_URL_XATTR: &str = "user.xdg.origin.url";
 

@@ -265,7 +265,7 @@ verification and window calibration are tracked in
 | Parent not in the cache and gone from `/proc` | parent-name rules cannot fire for that exec |
 | Linux `comm` truncated to 15 bytes | T1105 compares `comm` to the downloaded file's basename, so a longer name does not match |
 | A downloaded script run through an interpreter | image is the interpreter; T1204.002 and T1105 do not join |
-| Linux download mark (T1204.002) | `on_file_setxattr` maps a `user.xdg.origin.url` set to a `FileQuarantine` mark and the macOS/Windows join runs unchanged. The sensor sends the xattr name, not its value, so the finding says `origin: unrecorded`, and `marked by` is the writer's `comm`. `fsetxattr`/`lsetxattr` are not hooked, so a browser using them leaves no mark. `cp -a`, `rsync -X` and restores copy the xattr and re-mark a file. Unit-tested only; no real Linux capture |
+| Linux download mark (T1204.002) | `on_file_setxattr` maps a `setxattr(2)` of `user.xdg.origin.url` to a `FileQuarantine` mark and the macOS/Windows join runs unchanged. Captured on Fedora 43 (agent#221, `lab/captures/test-221-20261109`): `wget`, `wget2` and `curl --xattr` set the xattr with `fsetxattr(2)`, which is not hooked, so **no mark is produced for them**; headless Chromium 156 and Firefox 159 set no xattr, so a browser download leaves no mark either. The producer therefore fires for no tool tested so far. The sensor sends the xattr name, not its value (`origin: unrecorded`). `cp -a`, `rsync -X` and restores copy the xattr and would re-mark a file. Unit-tested only |
 | Events out of order across sensor threads | windows tolerate it; deferred findings wait for the clock |
 | No generation stamp (macOS) | pid-only behaviour, recycled pids possible |
 

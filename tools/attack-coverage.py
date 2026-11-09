@@ -249,15 +249,16 @@ UNVERIFIED_NOTES = [
     "it, is still to be observed. Thunderbird is not verified. Neither is in the "
     "rule until a lab capture shows the mark and its writer "
     "(https://github.com/synthaea-lab/agent/issues/17).",
-    "T1204.002 on Linux joins a `setxattr` of `user.xdg.origin.url` to a later exec "
-    "(unit tests only, **no real Linux capture**). Not verified: that Firefox and "
-    "Chromium-based browsers set it with `setxattr(2)` rather than the unhooked "
-    "`fsetxattr`/`lsetxattr`, that they set it on the final path an exec reports, "
-    "or from which process. The URL value is not captured (the sensor reports the "
-    "xattr name only), so the finding says origin unrecorded. Copies that preserve "
-    "xattrs (`cp -a`, `rsync -X`, a restore) re-mark a file and can alert on a run "
-    "within the window. T1566 (browser or webmail delivery) is not tagged on Linux: "
-    "the xattr does not say how the link reached the user "
+    "T1204.002 on Linux joins a `setxattr(2)` of `user.xdg.origin.url` to a later exec "
+    "(unit tests only). A capture on Fedora 43 "
+    "(https://github.com/synthaea-lab/agent/issues/221) shows it fires for none of the "
+    "tools tried: `wget`, `wget2` and `curl --xattr` set the xattr with `fsetxattr(2)`, "
+    "which the sensor does not hook, and headless Chromium 156 and Firefox 159 set no "
+    "xattr at all, so a browser download leaves no mark. Headed browsers were not tried. "
+    "The URL value is not captured (the sensor reports the xattr name only), so the "
+    "finding says origin unrecorded. Copies that preserve xattrs (`cp -a`, `rsync -X`, a "
+    "restore) would re-mark a file. T1566 (browser or webmail delivery) is not tagged on "
+    "Linux: the xattr does not say how the link reached the user "
     "(https://github.com/synthaea-lab/agent/issues/17).",
 ]
 
