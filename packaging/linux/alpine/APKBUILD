@@ -120,13 +120,13 @@ build() {
 	local ort_lib_location="${ORT_LIB_LOCATION:-}"
 	if [ -z "$ort_lib_location" ]; then
 		msg "Building static ONNX Runtime from source (packaging/toolchain/build-onnxruntime-static.sh)..."
-		"$builddir/toolchain/build-onnxruntime-static.sh"
+		"$builddir/packaging/toolchain/build-onnxruntime-static.sh"
 		ort_lib_location="$builddir/onnxruntime/build/Linux/Release"
 	fi
 
 	export ORT_LIB_LOCATION="$ort_lib_location"
 	local ort_flags
-	ort_flags="$(bash "$builddir/toolchain/ort-static-link-flags.sh")" \
+	ort_flags="$(bash "$builddir/packaging/toolchain/ort-static-link-flags.sh")" \
 		|| die "ort-static-link-flags.sh failed: ONNX Runtime cannot be linked statically"
 	case "$ort_flags" in
 		*"-l static="*) ;;
