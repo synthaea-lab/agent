@@ -1,19 +1,16 @@
-# sensors/macos
+# crates/sensors/macos
 
-macOS telemetry. Primary mechanism is EndpointSecurity (`endpoint-security/`);
-`network-extension/` adds the network/DNS visibility ES does not carry. Both run as
-system extensions with their respective entitlements.
+macOS telemetry, one crate per system facility. The EndpointSecurity and libproc calls go
+through small C shims compiled on macOS only.
 
-Coverage targets:
-
-| Telemetry source | Mechanism | Where |
+| Crate | Package | Mechanism |
 | --- | --- | --- |
-| Process exec/fork/exit (argv, code signing info, TCC) | ES NOTIFY/AUTH exec | `endpoint-security/` |
-| File open/write/rename/delete/mmap | ES file events | `endpoint-security/` |
-| Persistence (launchd plists, login items, cron) | ES file events on known paths + ES_EVENT_BTM | `endpoint-security/` |
-| Credential access (keychain files), TCC bypass attempts | ES file/auth events | `endpoint-security/` |
-| Injection/tamper (task_for_pid, ptrace, cs invalidation) | ES proc events | `endpoint-security/` |
-| Network flows with process attribution, inbound + outbound | NEFilterDataProvider | `network-extension/` |
-| DNS queries/responses | NEDNSProxyProvider | `network-extension/` |
-| sudo auth, TCC decisions, Gatekeeper verdicts | Unified log (`log stream`, strict predicates) | `unifiedlog/` |
-| Listening ports + LISTENER-DRIFT baseline (no entitlement) | libproc socket-table snapshots | `sockets/` |
+| `endpoint-security/` | `sensor-macos` | EndpointSecurity client: exec, file, persistence, session and XPC events |
+| `unifiedlog/` | `sensor-macos-unifiedlog` | sudo, TCC and Gatekeeper events from `log stream` |
+| `sockets/` | `sensor-macos-sockets` | libproc socket-table snapshots for listener-drift detection, no entitlement needed |
+| `network-extension/` | `sensor-macos-network-extension` | Flows and DNS from a Network Extension; the Swift providers are in [`extension/`](network-extension/extension/README.md) |
+
+EndpointSecurity and the Network Extension need restricted entitlements granted by Apple, and
+the extension must be hosted by a signed app bundle; [packaging/macos](../../../packaging/macos/README.md)
+describes the bundle and the approval flow. The [macOS sensor guide](../../../docs/sensors/macos/README.md)
+covers each source.

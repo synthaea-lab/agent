@@ -1,323 +1,118 @@
-# Linux Packaging - Debian (.deb) and RPM
+# packaging/linux
 
-This directory contains packaging infrastructure for distributing the Synthaea EDR agent on Linux distributions.
+Linux packages for the agent: a static musl `.deb` for Debian and Ubuntu, an `.apk` for
+Alpine, and an `.rpm` for RHEL, Rocky and Fedora. All three install the same layout and run
+the agent under its watchdog as a service. The design, the systemd unit's sandboxing and
+capabilities, and the CI checks are described in
+[docs/packaging.md](../../docs/packaging.md#linux).
 
-**Status:** Complete (Debian + RPM with systemd integration)
+| Path | Contents |
+| --- | --- |
+| [`build-deb.sh`](build-deb.sh) | Builds the static `.deb` (run on Alpine) |
+| [`alpine/`](alpine) | `APKBUILD` and the OpenRC service script |
+| [`build-rpm.sh`](build-rpm.sh), [`rpm/`](rpm) | Builds the `.rpm` from the spec template |
+| [`systemd/`](systemd) | The `synthaea-agent` unit, sysusers and tmpfiles, shared by `.deb` and `.rpm` |
+| [`debian/`](debian) | Debian maintainer scripts |
 
----
+## Installed layout
 
-## Overview
+The package owns the bootstrap binaries; the self-updater owns `versions/` and the
+`current` link. A package upgrade replaces `bootstrap/` and never touches what the updater
+installed.
 
-The packaging follows the **bootstrap model** where:
-- **Package installs:** Infrastructure (directories, systemd units, system user) and bootstrap binaries
-- **Updater manages:** Actual agent versions in `/var/lib/synthaea/versions/` and the `current` symlink
-
-This separation ensures that package managers (apt/dnf) and the updater never conflict.
-
-### Directory Layout (FHS-Compliant)
-
-```
+```text
 /var/lib/synthaea/
-├── bootstrap/          # Package-installed binaries (never modified by updater)
-│   ├── agent
-│   ├── watchdog
-│   └── cli
-├── current -> bootstrap    # Symlink (updater-managed, initially points to bootstrap)
-├── versions/           # Updater-managed version directories, named by the signed
-│   ├── v1/             # manifest's monotone release_version (ADR-0015), not semver
-│   ├── v2/             # a `.healthy` file appears here once the release's agent has
-│   │                   # shown progress after promotion (watchdog probation, #30)
-│   └── .stage-3/       # a release being downloaded (`agent apply-release`); renamed to
-│                       # v3 only once complete, so a crash never leaves a partial vN
-└── banned_versions.json  # Release versions that failed a health check on this
-                           # install and are refused even if offered again (ADR-0015
-                           # Decision 6). Bare JSON array, unsigned — created on the
-                           # first rollback, absent otherwise.
-
-/var/log/synthaea/      # Log directory (owned by synthaea user)
-├── agent.log           # Agent stdout/stderr
-└── alerts.ndjson       # Detection alerts
-
-/etc/synthaea/          # Configuration directory
-└── agent.toml          # Default template (ADR-0013); every control-plane field
-                         # is a # CHANGE ME placeholder, offline_fallback = true
-                         # lets the agent run as shipped
-
-/usr/bin/
-└── synthaea-ctl        # Root-owned package asset, a copy of cli (#897) —
-                         # NOT a symlink into current/, which the unprivileged
-                         # synthaea user owns and could otherwise repoint to
-                         # get root via `sudo synthaea-ctl`
+├── bootstrap/            agent, watchdog, cli as installed by the package
+├── current -> bootstrap  the release that runs; the updater repoints it
+├── versions/             releases installed by the updater, by release number
+└── banned_versions.json  releases that failed their health check (after a rollback)
+/var/log/synthaea/        alerts.ndjson, the detections
+/etc/synthaea/agent.toml  configuration; runs as shipped, uploads once a control plane is set
+/usr/bin/synthaea-ctl     root-owned copy of cli
 ```
 
----
+`synthaea-ctl` is a copy, not a link into `current/`: the unprivileged `synthaea` user owns
+`current` and could otherwise repoint it to gain root through `sudo synthaea-ctl`.
 
-## Building Packages
+## Build
 
-### Prerequisites
+The `.deb` is built on an x86_64 Alpine host provisioned with
+[`alpine-toolchain.sh`](../toolchain/alpine-toolchain.sh). The binaries are static, so one
+package runs on any x86_64 Debian or Ubuntu release. The first run builds ONNX Runtime from
+source, which takes several gigabytes of disk and a long time; point `ORT_LIB_LOCATION` at
+an existing musl static build to skip it.
 
-**Static .deb:** build on an x86_64 Alpine/musl host with the toolchain provisioned by
-`packaging/toolchain/alpine-toolchain.sh`. The build creates ONNX Runtime from source and
-needs several gigabytes of disk and build time on first run. The resulting binaries are
-static musl executables, so one `.deb` runs on glibc-based Debian and Ubuntu versions
-without inheriting the build host's glibc or libstdc++ baseline.
-
-**RHEL/Fedora (.rpm):**
-```bash
-# RPM tools
-sudo dnf install rpm-build rpmlint
-
-# Rust toolchain (if not already installed)
-curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
-```
-
-### Build Debian Package
-
-On an x86_64 Alpine host with `packaging/toolchain/alpine-toolchain.sh` already run:
-
-```bash
+```sh
 ./packaging/linux/build-deb.sh
 ```
 
-The script builds and tests ML with source-built static ONNX Runtime, builds the agent,
-watchdog and CLI for `x86_64-unknown-linux-musl`, checks that none has a program
-interpreter, then packages those exact artifacts. `ORT_LIB_LOCATION` may point to an
-existing ONNX Runtime 1.30.0 musl static build; otherwise the first run builds it under
-`onnxruntime/build/Linux/Release`.
+The package is written to `target/debian/synthaea-agent_<version>-1_amd64.deb`.
 
-Output: `target/debian/synthaea-agent_<version>-1_amd64.deb`
+The `.apk` is built on the same kind of host, as a user in the `abuild` group with a signing
+key (`abuild-keygen -a -i`), and with `ORT_LIB_LOCATION` pointing at a static ONNX Runtime
+build:
 
-### Build RPM Package
-
-```bash
-cd packaging/linux
-./build-rpm.sh
+```sh
+./packaging/toolchain/build-onnxruntime-static.sh
+export ORT_LIB_LOCATION="$PWD/onnxruntime/build/Linux/Release"
+cd packaging/linux/alpine && abuild -r
 ```
 
-Output: `packaging/output/synthaea-agent-0.1.0-1.fc40.x86_64.rpm`
+The `.rpm` is built on a Fedora or RHEL host with `rpm-build` and a Rust toolchain. It links
+ONNX Runtime dynamically.
 
----
-
-## Installation
-
-### Debian/Ubuntu
-
-```bash
-# Install package
-sudo dpkg -i synthaea-agent_*.deb
-sudo apt-get install -f  # Resolve dependencies
-
-# Verify installation
-systemctl status synthaea-agent
-id synthaea
-ls -la /var/lib/synthaea
+```sh
+./packaging/linux/build-rpm.sh
 ```
 
-### RHEL/Fedora/Rocky
+The package is copied to `packaging/output/`.
 
-```bash
-# Install package
-sudo dnf install ./synthaea-agent-*.rpm
+## Install, upgrade and remove
 
-# Verify installation
-systemctl status synthaea-agent
-id synthaea
-ls -la /var/lib/synthaea
+| | Debian and Ubuntu | Alpine | RHEL, Rocky, Fedora |
+| --- | --- | --- | --- |
+| Install or upgrade | `sudo apt install ./synthaea-agent_*.deb` | `sudo apk add --allow-untrusted ./synthaea-agent-*.apk` | `sudo dnf install ./synthaea-agent-*.rpm` |
+| Remove | `sudo apt remove synthaea-agent` keeps data and logs | `sudo apk del synthaea-agent` removes state and the user, keeps logs | `sudo dnf remove synthaea-agent` keeps data and logs |
+| Remove everything | `sudo apt purge synthaea-agent` | `apk del`, then `sudo rm -rf /var/log/synthaea` | see below |
+
+On Alpine, enable and start the service with `sudo rc-update add synthaea-agent default`
+and `sudo rc-service synthaea-agent start`. On systemd hosts the package starts it; check it
+with `systemctl status synthaea-agent` and `journalctl -u synthaea-agent`. Upgrades keep
+`/etc/synthaea/agent.toml` and `/var/lib/synthaea/versions/`.
+
+RPM has no purge step. A full cleanup after `dnf remove` is manual, including the SELinux
+file-context rules the package added:
+
+```sh
+sudo rm -rf /var/lib/synthaea /var/log/synthaea
+sudo userdel synthaea
+sudo semanage fcontext -d '/var/lib/synthaea/bootstrap(/.*)?'
+sudo semanage fcontext -d '/var/lib/synthaea/versions/[^/]+/.+'
 ```
 
----
+## SELinux
 
-## Testing
+Files under `/var/lib/synthaea` default to `var_lib_t`, which `init_t` may not execute: an
+unlabeled install fails with `status=203/EXEC`. The RPM's `%post` adds file-context rules
+that label the binaries `bin_t` and runs `restorecon`; the service then runs as
+`unconfined_service_t`. `agent apply-release` relabels each release it stages, and on an
+enforcing host refuses a release it cannot relabel.
 
-### Test Checklist
+To investigate a denial, read the journal (`ausearch` finds nothing when `auditd` is not
+running), check the labels, and relabel after copying binaries by hand:
 
-**1. Fresh Installation**
-- [ ] User `synthaea` exists: `id synthaea`
-- [ ] Directories created: `ls -la /var/lib/synthaea`
-- [ ] Bootstrap binaries present: `ls /var/lib/synthaea/bootstrap/`
-- [ ] Current symlink: `readlink /var/lib/synthaea/current` → `bootstrap`
-- [ ] Service running: `systemctl status synthaea-agent`
-- [ ] Service enabled: `systemctl is-enabled synthaea-agent`
-- [ ] Logs in journal: `journalctl -u synthaea-agent -n 20`
-
-**2. Reboot Persistence**
-```bash
-sudo reboot
-# After reboot:
-systemctl status synthaea-agent  # Must be active
+```sh
+sudo journalctl _TRANSPORT=audit | grep AVC | grep synthaea
+ls -Z /var/lib/synthaea/bootstrap
+sudo restorecon -R /var/lib/synthaea /var/log/synthaea
 ```
-
-**3. Upgrade**
-```bash
-# Debian:
-sudo dpkg -i synthaea-agent_0.2.0-1_amd64.deb
-
-# RHEL:
-sudo dnf upgrade ./synthaea-agent-0.2.0-1.rpm
-```
-
-Verify:
-- [ ] Service restarted cleanly
-- [ ] Data preserved: `/var/lib/synthaea/versions/` intact
-- [ ] Config preserved: `/etc/synthaea/agent.toml` unchanged
-
-**4. Clean Uninstall**
-
-Debian:
-```bash
-sudo apt-get remove synthaea-agent   # Remove but preserve data
-sudo apt-get purge synthaea-agent    # Full cleanup
-```
-
-RHEL:
-```bash
-sudo dnf remove synthaea-agent       # Remove but preserve data (#861: used to be a full cleanup,
-                                      # deleting alerts.ndjson and orphaning deception's canaries -
-                                      # RPM has no separate purge trigger to hook, so it now matches
-                                      # the .deb's plain `remove` instead)
-sudo rm -rf /var/lib/synthaea /var/log/synthaea && sudo userdel synthaea  # Full cleanup, by hand
-sudo semanage fcontext -d '/var/lib/synthaea/bootstrap(/.*)?'            # Also drops the %post
-sudo semanage fcontext -d '/var/lib/synthaea/versions/[^/]+/.+'         # SELinux fcontext rules,
-                                                                          # which `dnf remove` leaves behind
-```
-
-Verify:
-- [ ] Service stopped and disabled
-- [ ] Binaries removed
-- [ ] `/var/lib/synthaea` and `/var/log/synthaea` preserved on a plain remove, gone only after the manual full-cleanup command above
-- [ ] No residue: `systemctl list-unit-files | grep -v synthaea`
-
-### Test Matrix
-
-| Distribution | Version | systemd | Status |
-|--------------|---------|---------|--------|
-| Debian | Trixie (13) | 257+ | Primary .deb target |
-| Ubuntu | 26.04 LTS | 257+ | Primary .deb target |
-| Ubuntu | 24.04 LTS | 255 | Backward compat |
-| RHEL | 9.x | 252 | Primary .rpm target (Rocky/Alma) |
-| RHEL | 8.x | 239 | Backward compat (CentOS Stream) |
-| Fedora | 40 | 255 | Latest .rpm target |
-
----
 
 ## Troubleshooting
 
-### Package Installation Fails
+If the service does not start, read `journalctl -u synthaea-agent -n 50`, then check that
+`/var/lib/synthaea/bootstrap/` holds the three binaries, that
+`readlink /var/lib/synthaea/current` resolves, and that the `synthaea` user exists. A
+missing user is created with `sudo systemd-sysusers /usr/lib/sysusers.d/synthaea.conf`.
 
-**Symptom:** `dpkg: dependency problems`
-
-**Solution:**
-```bash
-sudo apt-get install -f  # Resolve dependencies
-```
-
-### Service Won't Start
-
-**Check logs:**
-```bash
-journalctl -u synthaea-agent -n 50
-```
-
-**Common causes:**
-- Missing binaries: `ls /var/lib/synthaea/bootstrap/`
-- Broken symlink: `readlink /var/lib/synthaea/current`
-- Permissions: `ls -la /var/lib/synthaea`
-
-### User Creation Failed
-
-**Symptom:** Service fails with "User synthaea not found"
-
-**Manual fix:**
-```bash
-sudo systemd-sysusers /usr/lib/sysusers.d/synthaea.conf
-```
-
-### SELinux Denials (RHEL/Fedora)
-
-The binaries live under `/var/lib/synthaea`, whose default type is `var_lib_t`,
-and `init_t` may not execute that type: an unlabelled install dies with
-`status=203/EXEC`, `Permission denied`. The RPM's `%post` therefore adds file-context
-rules that label the binaries `bin_t` (`semanage fcontext`, then `restorecon`); the
-service then runs as `unconfined_service_t`. A custom policy is still deferred.
-
-**Check for denials.** `ausearch` reads `/var/log/audit/audit.log`, which does not
-exist unless `auditd` runs (it does not on a default Fedora cloud image), so it
-answers "no matches" whatever happened. Read the journal instead:
-```bash
-sudo journalctl _TRANSPORT=audit | grep AVC | grep synthaea
-```
-
-**Check the labels:**
-```bash
-ls -Z /var/lib/synthaea/bootstrap        # expect bin_t
-sudo semanage fcontext -l | grep synthaea
-```
-
-**Repair after a manual copy:**
-```bash
-sudo restorecon -R /var/lib/synthaea /var/log/synthaea
-```
-Files written by the updater into `versions/vN/` inherit `var_lib_t` from the
-directory and need a `restorecon` before they can be executed on an Enforcing host.
-`agent apply-release` runs `restorecon -R` on the staged release itself, before it
-promotes it (#559): on an Enforcing host it refuses the release, leaving `current`
-untouched, if `restorecon` is missing or fails; on a Permissive host it warns and
-promotes. A manual copy still needs the command above.
-
-**Temporary workaround (testing only):**
-```bash
-sudo setenforce 0  # Permissive mode
-```
-
----
-
-## Development Mode
-
-The packaging coexists with development mode. When a package is installed:
-- `watchdog install` detects `/usr/lib/systemd/system/synthaea-agent.service` and uses it
-- Manual `watchdog install` (no package) still generates `/etc/systemd/system/synthaea-agent.service`
-
-Package-owned units take precedence (in `/usr/lib`), preserving backward compatibility.
-
----
-
-## File Structure
-
-```
-packaging/linux/
-├── README.md                          # This file
-├── build-deb.sh                       # Debian build script
-├── build-rpm.sh                       # RPM build script
-├── systemd/
-│   ├── synthaea-agent.service         # systemd unit (shared by .deb and .rpm)
-│   ├── synthaea.sysusers              # User creation manifest
-│   └── synthaea.tmpfiles              # Runtime directory creation
-├── debian/
-│   └── maintainer-scripts/
-│       ├── postinst                   # Post-install (create symlinks, enable service)
-│       ├── prerm                      # Pre-removal (stop service)
-│       └── postrm                     # Post-removal (cleanup on purge)
-└── rpm/
-    └── synthaea-agent.spec.template   # RPM spec file with scriptlets
-```
-
----
-
-## Future Work
-
-1. **Package Signing** - GPG signatures for production deployment
-2. **APT/YUM Repository** - Host packages in proper repos for `apt install synthaea-agent`
-3. **musl Static Builds** - `.tar.gz` distribution for containers
-4. **SELinux Custom Policy** - RHEL hardening (deferred)
-5. **Capability Management** - The unit grants a minimal ambient capability set (ADR-0014); `CAP_SYS_PTRACE`, `CAP_CHOWN`/`CAP_FOWNER` and the audit capabilities are added with the features that need them
-
----
-
-## References
-
-- **CLAUDE.md:** Project conventions and dependency rules
-- **packaging/README.md:** Cross-platform packaging overview
-
----
-
-For questions or issues, file a GitHub issue at https://github.com/synthaea-lab/agent/issues
+The packages ship their unit in `/usr/lib/systemd/system/`. A manual `watchdog install` on
+a host without a package writes its own to `/etc/systemd/system/synthaea-agent.service`.

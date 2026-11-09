@@ -1,32 +1,19 @@
-# crates/sensors — Platform Sensors
+# crates/sensors
 
-One folder per platform, one crate per collection mechanism inside it. Every sensor
-implements the same `Sensor`/`EventSink` contract from `schema`. This folder is the
-**only** place in the workspace where platform-specific code and target-gated
-dependencies are allowed; each sensor compiles to an empty stub on foreign targets so
-`cargo check --workspace` works everywhere.
+Platform sensors, one folder per operating system and one crate per collection mechanism.
+Each crate turns one OS facility into `schema::Event` values through the `Sensor`/`EventSink`
+contract defined in [`schema`](../schema/src/sensor.rs).
 
-| Path | Package | Mechanism | Notes |
-| --- | --- | --- | --- |
-| `linux/userspace` | `sensor-linux` | eBPF userspace loader | pairs with `linux/ebpf` |
-| `linux/ebpf` | `sensor-linux-ebpf` | eBPF kernel probes | GPL-2.0-only OR MIT ("Dual MIT/GPL"), not a default member, eBPF toolchain |
-| `linux/audit` | `sensor-linux-audit` | auditd + fanotify | fallback where eBPF is unavailable |
-| `linux/uprobes` | `sensor-linux-uprobes` | eBPF uprobes | TLS plaintext taps, shell readline |
-| `linux/lsm` | `sensor-linux-lsm` | BPF-LSM hooks | io_uring-proof observation + inline blocking |
-| `linux/netlink` | `sensor-linux-netlink` | sock_diag/conntrack/proc-connector | zero-probe supplementary source |
-| `linux/journal` | `sensor-linux-journal` | journald | logins, service lifecycle |
-| `windows/eventlog` | `sensor-windows-eventlog` | EvtSubscribe channels | driverless logons/service-install telemetry |
-| `macos/unifiedlog` | `sensor-macos-unifiedlog` | OSLog predicates | auth/TCC/Gatekeeper context |
-| `windows/etw` | `sensor-windows` | ETW subscriptions | the user-mode base (audit P1–P8 scope) |
-| `windows/driver` | — | kernel driver (minifilter, ELAM/PPL) | long-term, own build/signing pipeline, not a member |
-| `macos/endpoint-security` | `sensor-macos` | EndpointSecurity client | needs the ES entitlement |
-| `macos/network-extension` | `sensor-macos-network-extension` | NetworkExtension | DNS + flow telemetry ES lacks |
+This folder is the only place in the workspace where platform-specific code and
+target-gated dependencies are allowed. Every sensor compiles to an empty stub on other
+targets, so `cargo check` and `cargo test` work on any host, and the pure parsing and
+normalization code is tested on all three operating systems.
 
-The full mechanism inventory (used / planned / rejected-with-reason) lives in
-`docs/sensors/sources.md`. Each platform folder has a README with its
-telemetry-source coverage matrix — which
-sources exist, which mechanism carries them, and what lands where.
+| Folder | Mechanisms | Guide |
+| --- | --- | --- |
+| [`linux/`](linux/README.md) | eBPF probes and loader, BPF-LSM, uprobes, netlink, journald, service logs, process memory, audit fallback | [docs/sensors/linux](../../docs/sensors/linux/README.md) |
+| [`windows/`](windows/README.md) | ETW, Event Log, socket-table snapshots, minifilter client and kernel driver | [docs/sensors/windows](../../docs/sensors/windows/README.md) |
+| [`macos/`](macos/README.md) | EndpointSecurity, unified log, socket-table snapshots, Network Extension | [docs/sensors/macos](../../docs/sensors/macos/README.md) |
 
-Sensors depend only on `schema` — never on detection crates or each other.
-Per-platform capability differences are measured by the conformance suite
-(`docs/sensors/contract.md`), not papered over.
+Sensors depend only on `schema`, never on a detection crate or on each other;
+[`tools/check-deps.py`](../../tools/check-deps.py) enforces it.

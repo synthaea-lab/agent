@@ -1,45 +1,34 @@
 # Fuzzing
 
-Coverage-guided (libFuzzer) fuzzing for the byte parsers — the deeper sibling
-of the deterministic robustness suites in each crate's `tests/`. The contract
-under test is the same everywhere: any input may fail to parse, none may panic,
-because a panic on the drain path kills the sensor.
-
-## Targets
+Coverage-guided fuzzing (libFuzzer, through `cargo-fuzz`) for the parsers that read kernel
+and attacker-influenced bytes. The contract is the same for every target: any input may fail
+to parse, none may panic, because a panic on a drain path stops the sensor. The deterministic
+robustness suites in each crate's `tests/` pin the same contract on every `cargo test`.
 
 | Target | Exercises |
 | --- | --- |
-| `audit_parse` | `sensor_linux_audit::parse_audit_message` (audit netlink wire) |
-| `netlink_parse` | `DiagMsg` / `ProcEvent` / `ConntrackFlow` decoders (sock_diag, proc connector, conntrack attribute walks) |
-| `exec_record_parse` | `sensor_linux_wire::parse_exec_record`, the variable-length exec record and its argv windows (https://github.com/synthaea-lab/agent/issues/48, ADR-0045) |
+| `audit_parse` | the audit netlink message parser (`sensor-linux-audit`) |
+| `netlink_parse` | the `sock_diag`, proc connector and conntrack decoders (`sensor-linux-netlink`) |
+| `exec_record_parse` | the variable-length exec record and its argv windows (`sensor-linux-wire`) |
+| `logs_parse` | the web access log and MySQL error log parsers (`sensor-linux-logs`) |
+
+This crate is excluded from the workspace: it needs a nightly toolchain and libFuzzer
+instrumentation, and runs on Linux or macOS.
 
 ## Running
 
-Needs nightly and `cargo-fuzz` (`cargo install cargo-fuzz`). From the repo root:
+Install `cargo-fuzz` once, then run a target from the repository root:
 
-```bash
+```sh
+cargo install cargo-fuzz
 cargo +nightly fuzz run --fuzz-dir tests/fuzz audit_parse -- -max_total_time=300
-cargo +nightly fuzz run --fuzz-dir tests/fuzz netlink_parse -- -max_total_time=300
 ```
 
-A crash drops a reproducer under `tests/fuzz/artifacts/<target>/`; minimize with
-`cargo +nightly fuzz tmin --fuzz-dir tests/fuzz <target> <artifact>`, then pin the minimized input as
-a regression test in the owning crate's robustness suite (named after the
-behavior, per code-style.md) — the fuzz corpus itself stays untracked.
+A crash writes a reproducer under `tests/fuzz/artifacts/<target>/`. Minimize it:
 
-## Cadence
+```sh
+cargo +nightly fuzz tmin --fuzz-dir tests/fuzz <target> <artifact>
+```
 
-`.github/workflows/fuzz.yml` runs every target for 10 minutes on Monday and
-Thursday (and on demand: Actions > Fuzz > Run workflow, with a `seconds`
-input). Each run restores the previous run's corpus from the Actions cache and
-saves the grown one, so coverage accumulates; the twice-weekly rhythm keeps the
-cache under GitHub's 7-day eviction. The corpus stays untracked.
-
-A crash fails the job for that target (the other still runs) and uploads the
-reproducer as the `fuzz-crash-<target>` artifact. Then follow the steps above:
-minimize, pin as a regression test, fix. GitHub disables scheduled workflows
-after 60 days without repository activity; re-enable it from the Actions tab if
-that ever happens.
-
-Baseline at introduction (2026-09-22, 90s each): `audit_parse` 43M execs,
-`netlink_parse` 18M execs, zero crashes.
+then add the minimized input as a regression test to the owning crate's robustness suite,
+named after the behavior, and fix the parser. The corpus and artifacts are not committed.

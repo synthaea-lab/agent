@@ -1,131 +1,74 @@
-# packaging/windows - MSI (#37)
+# packaging/windows
 
-Builds `SynthaeaAgent.msi`: installs `agent.exe` + `watchdog.exe` into
-`Program Files\Synthaea` and, on install, runs `watchdog.exe install` to
-register the `SynthaEDR` Windows service (the watchdog self-registers - see
-`apps/watchdog/src/service/windows.rs` - this MSI does not duplicate that with
-WiX's own ServiceInstall/ServiceControl elements). On uninstall it runs
-`watchdog.exe uninstall`, then force-deletes everything left under
-`INSTALLFOLDER` via a `cmd.exe /c rd /s /q` custom action - including files
-the running agent/watchdog wrote at runtime (`alerts.ndjson`,
-`alerts.heartbeat`, `events.jsonl`) that MSI itself never installed and would
-otherwise leave behind (see `Product.wxs`'s `CleanupInstallFolder` comment
-for why, and why it isn't done via WiX's `util:RemoveFolderEx`).
+Builds `SynthaeaAgent.msi`, which installs `agent.exe` and `watchdog.exe` into
+`Program Files\Synthaea` and registers the `SynthaEDR` Windows service. The watchdog
+registers the service itself (`watchdog.exe install` and `uninstall`, run as MSI custom
+actions), so the MSI does not duplicate it with WiX service elements.
 
-**Status: build-tested (2026-09-18) end to end on a real Windows 11 machine**
-(install, service running, uninstall, service and all files gone). Issues
-found and fixed during that pass, already reflected in `Product.wxs`/
-`build.ps1`: ICE80 (needed `Win64="yes"` on both components plus
-`Platform="x64"` on `<Package>`), and incomplete uninstall cleanup (MSI only
-removes files it installed itself, not the runtime-generated ones - now
-handled by the `CleanupInstallFolder` custom action). First-pass authoring
-notes below are kept for context but the "not yet build-tested" caveat no
-longer applies.
+The MSI is not published with releases yet, and neither it nor the binaries are code-signed.
+Unsigned binaries trigger SmartScreen and can be blocked by AppLocker or WDAC policies; use
+these builds on test machines only.
 
-## Install WiX v3
+## Build
 
-A standalone toolset (no dotnet/NuGet needed to install or to build with it,
-unlike WiX v4/v5):
+Install WiX Toolset v3.14. It is a standalone toolset with no .NET or NuGet dependency, and
+`build.ps1` looks for it in `C:\Program Files (x86)\WiX Toolset v3.14\`:
 
 ```powershell
 Invoke-WebRequest -Uri "https://github.com/wixtoolset/wix3/releases/download/wix3141rtm/wix314.exe" -OutFile "$env:TEMP\wix314.exe"
 Start-Process -FilePath "$env:TEMP\wix314.exe" -ArgumentList "/quiet" -Wait
 ```
 
-Installs to `C:\Program Files (x86)\WiX Toolset v3.14\` - `build.ps1` below
-looks for it there.
-
-## Build
-
-From the repo root, with a release build already on disk:
+Then, from the repository root:
 
 ```powershell
 cargo build --release --no-default-features --features agent/dynamic-onnx -p agent -p watchdog
 .\packaging\windows\build.ps1
 ```
 
-`--no-default-features` is what keeps the public test signing key out of the MSI
-(ADR-0027, https://github.com/synthaea-lab/agent/issues/43): the agent's default features include `test-key`, which embeds a key whose
-seed is in the repository, so anyone who can serve the release routes could sign for it.
-`--features agent/dynamic-onnx` puts back the one other default feature, so the MSI keeps
-the onnxruntime it ships with today. `build.ps1` scans `agent.exe` and `watchdog.exe` for the
-test-key marker and refuses to build the MSI if it finds it, so a plain
-`cargo build --release -p agent -p watchdog` (which has the test key) cannot be packaged by
-mistake. A lab that applies releases with a package needs its own build with the feature
-(`docs/operations/binary-releases.md`).
+The MSI is written to `packaging\windows\out\SynthaeaAgent.msi`.
 
-Produces `packaging\windows\out\SynthaeaAgent.msi`.
+`--no-default-features` keeps the public test signing keys out of the package: the agent's
+default `test-key` feature embeds updater keys whose seeds are public. `--features
+agent/dynamic-onnx` restores the other default feature, the ONNX Runtime library. `build.ps1`
+scans both executables for the test-key marker and refuses to package a build that carries
+it.
 
-## Test install/uninstall (elevated PowerShell)
+## Install and uninstall
+
+From an elevated PowerShell prompt:
 
 ```powershell
 msiexec /i packaging\windows\out\SynthaeaAgent.msi /quiet /l*v install.log
-sc query SynthaEDR
+sc.exe query SynthaEDR
 Get-Process agent, watchdog
 
 msiexec /x packaging\windows\out\SynthaeaAgent.msi /quiet /l*v uninstall.log
-sc query SynthaEDR   # should report "service does not exist"
-Get-ChildItem "C:\Program Files\Synthaea" -ErrorAction SilentlyContinue  # should be empty/gone
+sc.exe query SynthaEDR
 ```
 
-`install.log` / `uninstall.log` (the `/l*v` verbose MSI log) are the first
-place to look if either step fails - in particular around the
-`InstallService` / `UninstallService` / `CleanupInstallFolder` custom actions
-in `Product.wxs`. Note: right after `msiexec` returns, the Windows Installer
-service can still be finishing asynchronously - if a verification command
-run immediately after shows nothing, wait a moment and re-check before
-concluding it failed. Also run each `msiexec` call as its own step, not
-back-to-back with the next one pasted immediately after - a second `msiexec`
-invocation started before the first has actually finished can produce
-confusing, hard-to-read results.
+After uninstall the service no longer exists and `C:\Program Files\Synthaea` is gone. The
+verbose logs are the first place to look when a step fails, around the `InstallService`,
+`UninstallService` and `CleanupInstallFolder` custom actions in
+[`Product.wxs`](Product.wxs). Windows Installer can still be finishing in the background when
+`msiexec` returns; run each `msiexec` on its own and wait for it before checking the result.
 
-## Uninstall data retention - deliberate choice, not a default
-
-The `CleanupInstallFolder` custom action deletes `events.jsonl`/
-`alerts.ndjson`/`alerts.heartbeat` along with the binaries on uninstall. This
-trades away forensic value (an EDR's own local logs surviving after someone
-removes the agent, useful for incident response) in favor of
-`packaging/README.md`'s stated rule that uninstall must be clean and
-complete. If the team later decides log retention-after-uninstall matters
-more for a given deployment, that needs an explicit, separate decision (e.g.
-an MSI property to opt out of the cleanup) - not a silent revert of this
-behavior.
-
-## Signing - not yet decided
-
-`Done when` in #37 doesn't require this, but GPO/Intune deployment in
-practice wants a signed MSI and signed `agent.exe`/`watchdog.exe` (unsigned
-binaries trip SmartScreen and can be blocked outright by AppLocker/WDAC
-policies on managed endpoints). That needs a real code-signing certificate
-(EV/OV from a CA, or an internal one issued by the org) plus a `signtool.exe`
-step added to `build.ps1` - a procurement/infra decision, not a code change,
-so it is deliberately left out of this first pass. A self-signed cert is fine
-for lab-only testing (`New-SelfSignedCertificate` + `Set-AuthenticodeSignature`)
-but is not a substitute for the real thing before this goes anywhere near a
-managed fleet.
+Uninstall deletes the whole install folder, including the files the agent wrote at run time
+(`alerts.ndjson`, `alerts.heartbeat`, `events.jsonl`). This favors a clean uninstall over
+keeping the agent's local logs for later investigation.
 
 ## Containers
 
-A host install covers **process-isolated** containers: their processes run on the
-host kernel and carry the container id (https://github.com/synthaea-lab/agent/issues/39, `docs/sensors/windows.md`). It does
-not cover:
+A host install covers process-isolated containers: their processes run on the host kernel
+and carry the container ID. It does not cover:
 
-- **Hyper-V-isolated containers**: each runs its own kernel in a utility VM. Treat
-  one as a separate machine (the agent inside it), or run the workload
-  process-isolated where the image's build allows it.
-- **WSL2 distributions and Docker Desktop's Linux engine**: Linux in a VM. Install
-  the Linux package (`packaging/linux`) inside the distribution;
-  Docker Desktop's own `docker-desktop` distribution is not an install target.
+- Hyper-V isolated containers, which run their own kernel in a utility VM. Treat one as a
+  separate machine with its own agent, or run the workload process-isolated.
+- WSL 2 distributions and Docker Desktop's Linux engine, which are Linux in a VM. Install the
+  [Linux package](../linux/README.md) inside the distribution.
 
-## Known gaps (first pass, #37)
+## Not included yet
 
-- `rules/sigma` and `rules/yara` content directories are not included -
-  `agent.exe` runs fine without them (see `apps/agent/src/sink.rs`'s
-  `content_dir` doc), so this is deferred until there is real content to
-  ship, not because it is hard to add (one more `Directory`/`Component`
-  pair mirroring `INSTALLFOLDER`).
-- No Start Menu shortcut / Add-Remove-Programs icon polish - irrelevant for
-  a background service with no UI.
-- `light.exe` may emit ICE validation warnings (common, usually benign) -
-  read them once on the first real build rather than assuming they are all
-  noise.
+- The detection content directories (`rules/sigma`, `rules/yara`): the agent runs without
+  them.
+- Code signing of the MSI and the executables.

@@ -1,19 +1,18 @@
-# extension/ — the Swift system-extension half of this sensor
+# Network extension (Swift)
 
-`NEFilterDataProvider` (flows, inbound + outbound, audit-token process
-attribution, byte counts at flow close) and `NEDNSProxyProvider` (DNS
-query/response pairs, minimal wire-format parse), writing the NDJSON records
-`src/wire.rs` defines over the agent's Unix socket. `EventPipe.swift`'s
-`wireVersion` must match `wire::WIRE_VERSION` — bump both together.
+The Swift half of `sensor-macos-network-extension`. `NEFilterDataProvider` reports flows,
+inbound and outbound, with audit-token process attribution and byte counts at flow close.
+`NEDNSProxyProvider` reports DNS query and response pairs from a minimal wire-format parse.
+Both write the NDJSON records defined in [`../src/wire.rs`](../src/wire.rs) to the agent's
+Unix socket. `wireVersion` in `EventPipe.swift` must match `wire::WIRE_VERSION`; change both
+together.
 
-Not built by cargo. Type-check locally (drift against the SDK becomes a
-diagnostic, not a runtime surprise):
+Cargo does not build these sources. Type-check them on a Mac to catch SDK drift:
 
 ```sh
 swiftc -typecheck -sdk "$(xcrun --show-sdk-path)" Sources/*.swift
 ```
 
-Known deprecations: the `NWHostEndpoint`-based flow APIs are deprecated as
-of macOS 15 in favor of the Network-framework endpoint accessors — a
-contained migration once the packaged extension exists. Packaging, signing,
-entitlements, and the approval flow: `packaging/macos/README.md`.
+The flow APIs based on `NWHostEndpoint` are deprecated as of macOS 15 in favor of the
+Network framework endpoint accessors. Packaging, signing, entitlements and the approval flow
+are described in [packaging/macos](../../../../../packaging/macos/README.md).

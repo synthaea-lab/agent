@@ -1,149 +1,151 @@
-# Synthaea
+# Synthaea agent
 
-> This repo is the Rust agent workspace. The control plane
-> ([synthaea-lab/server](https://github.com/synthaea-lab/server)), the ML pipeline
-> ([synthaea-lab/ml](https://github.com/synthaea-lab/ml)) and the detection content
-> ([synthaea-lab/rules](https://github.com/synthaea-lab/rules)) and the attack scenarios
-> ([synthaea-lab/scenarios](https://github.com/synthaea-lab/scenarios)) are separate public
-> repos. Contract tests that read one of them skip when it is not checked out next to this
-> repo (see [Sibling checkouts](#sibling-checkouts)).
+Synthaea is an open-source endpoint detection and response (EDR) system for Linux, Windows
+and macOS. This repository is the endpoint agent: the sensors that collect telemetry from the
+operating system, the detection engines that evaluate it on the host, the correlator that
+turns detections into scored cases, the response actions, and the channel that uploads events
+and detections to the [control plane](https://github.com/synthaea-lab/server).
 
-**An open-source, truly multi-platform EDR/XDR with on-device ML detection.**
+The agent is written in Rust. Detection runs on the endpoint and keeps working when the host
+is offline; the control plane is optional for a single machine.
 
-> **Status: Linux walking skeleton proven, detection depth landing.** The Linux
-> pipeline runs end to end on real kernel telemetry — eBPF probes accepted by the
-> verifier, events normalized, four detection engines evaluating, alerts firing on
-> live attack scenarios in the lab, watchdog surviving SIGKILL. The remaining
-> platforms, the control plane, and the fleet features are structured and
-> issue-tracked.
+> [!WARNING]
+> Synthaea is **alpha** software. Linux is the most complete platform, Windows follows, and
+> macOS is at an early stage. Interfaces, configuration and on-disk formats change between
+> versions. Run it on test machines, not on production endpoints.
+> [docs/capabilities.md](docs/capabilities.md) lists what is built, partial and planned, with
+> the code and tests behind each entry.
 
-## Goals
+## Features
 
-- **True multi-platform agent** — Windows (ETW / driver), Linux (eBPF), macOS
-  (EndpointSecurity), behind one formal sensor contract. No reference platform.
-- **On-device ML detection** — models trained offline (Python), exported to ONNX,
-  scored on the endpoint alongside the deterministic engines; every score carries
-  per-feature attributions and traces to a registry model card.
-- **Correlation, not alert spam** — detections are evidence, correlated into cases,
-  on the host and across the fleet.
-- **A control plane designed in from day one** — enrollment, policy, ingest, triage,
-  and the fleet-derived signals (prevalence, cross-endpoint correlation) an attacker
-  cannot reproduce by reading our code.
+- **One sensor contract across three platforms.** Every telemetry source produces the same
+  event schema, so the detection engines do not depend on the operating system.
+- **Several detection engines on the host.** Stateless and stateful behavioral rules, a
+  Sigma subset, YARA-X file and process-memory scanning, IOC matching on hashes, IP addresses
+  and domains, and ONNX models scored on the device. Every ML score carries per-feature
+  attributions.
+- **Correlation instead of alert floods.** Detections are evidence: the correlator combines
+  them per process tree into a Bayesian score, and a verdict is raised when the evidence
+  crosses a threshold.
+- **Deception.** Canary files and decoy credentials unique to each host act as tripwires
+  with a near-zero false-positive rate.
+- **Policy-gated response.** Process kill and file quarantine are observe-only by default and
+  enabled explicitly. Every action is logged, and quarantined files can be restored.
+- **Self-protection.** A watchdog supervises the agent, restarts it with backoff, detects a
+  stalled or silent sensor, and rolls back an update that fails its health check.
+- **Signed updates and content.** Detection content and models are distributed through
+  signed manifests in staged rollout rings. Signed binary self-update with rollback is
+  available on Linux.
 
-## The detection stack
+Detection content (Sigma, YARA and IOC feeds) lives in
+[synthaea-lab/rules](https://github.com/synthaea-lab/rules). The techniques it covers are
+listed in [docs/attack-coverage.md](docs/attack-coverage.md).
 
-Ten layers of defense in depth, mapped one-to-one to components: signatures/hashes → static
-ML → behavioral rules → behavioral ML → prevalence → attack-chain correlation →
-cross-endpoint correlation → identity/network/cloud → threat intel → human/MDR.
-Layers 1–4 and 6 run on-device (milliseconds, works offline); the rest is where the
-control plane earns its keep — including **retrospective detection**: new intel
-replayed over the telemetry lake, turning yesterday's unknown into today's case.
-The techniques with named detection content today are listed in
-[docs/attack-coverage.md](docs/attack-coverage.md) (generated, CI-checked).
+## Platform support
 
-## Architecture
+| Platform | Telemetry sources | State |
+| --- | --- | --- |
+| Linux (x86_64) | eBPF tracepoints, BPF-LSM, uprobes (TLS, shell readline, DNS), netlink (sock_diag, conntrack, proc connector), journald, service logs; audit netlink fallback when eBPF is unavailable | Most complete. Kernel 5.8 or later with BTF. |
+| Windows (x86_64) | ETW, Event Log, socket-table snapshots; file-system minifilter | Sensors built; MSI and minifilter at an early stage. |
+| macOS (Apple Silicon) | EndpointSecurity, unified log, socket-table snapshots, Network Extension | Early. EndpointSecurity and Network Extension need entitlements granted by Apple. |
 
+The per-source details and their limits are in the sensor guides for
+[Linux](docs/sensors/linux/README.md), [Windows](docs/sensors/windows/README.md) and
+[macOS](docs/sensors/macos/README.md).
+
+## Getting started
+
+No binary release has been published yet. The agent builds from source on Linux, Windows
+and macOS.
+
+### Requirements
+
+- [rustup](https://rustup.rs). The compiler version is pinned in
+  [rust-toolchain.toml](rust-toolchain.toml), and rustup installs it on the first build.
+- The default build downloads a prebuilt ONNX Runtime, which needs a recent C++ runtime: it
+  does not link on Debian 12 or Ubuntu 22.04. The static build that packages use is
+  described in [docs/packaging.md](docs/packaging.md).
+- On Linux, the eBPF probes are compiled only when the eBPF toolchain and `bpf-linker` are
+  installed. [packaging/toolchain/linux-toolchain.sh](packaging/toolchain/linux-toolchain.sh)
+  provisions them. Without them the build still succeeds: `agent status` reports the
+  missing probes, and `agent run` falls back to the reduced-fidelity audit sensor.
+
+### Build
+
+```sh
+git clone https://github.com/synthaea-lab/agent.git
+cd agent
+cargo build --release -p agent -p watchdog -p cli
 ```
-┌───────────────────────────── ENDPOINT ──────────────────────────────┐
-│  kernel/OS: ETW+EventLog (Win) · eBPF/LSM/uprobes/netlink/journald  │
-│             (Linux) · EndpointSecurity+NE+UnifiedLog (macOS)        │
-│        │  one sensor contract; sources inventoried, never assumed   │
-│  ┌─────▼───────────────────────────────────────────────────┐        │
-│  │ sensors → schema events → enrich (hash · signature)      │        │
-│  │     │                                                    │        │
-│  │  store — bounded state · durable spool                   │        │
-│  │  ┌──┴──────┬───────┬───────┬────────┬──────────┐         │        │
-│  │  rules   sigma   yara    ml(ONNX)  intel   deception     │        │
-│  │  └──┬──────┴───────┴───────┴────────┴──────────┘         │        │
-│  │  correlator — detections → scored cases (Bayesian LLR)   │        │
-│  │     │                                                    │        │
-│  │  verdict ─► response — kill·quarantine·isolate + live    │        │
-│  │     │        sessions (policy-gated, audited)            │        │
-│  │  sinks · transport (mTLS, spooled) · tamper · mesh (P2P  │        │
-│  │  peer attestation + posture gossip)                      │        │
-│  └─────┬──────────────────────────────┬─────────────────────┘        │
-│   ipc: ui (tray) · cli      watchdog · updater (canary rings)        │
-└───────────────────────────────────────┼──────────────────────────────┘
-                                        ▼
-┌────────────────────────── CONTROL PLANE ────────────────────────────┐
-│  Next.js + PostgreSQL (ADR-0001) · better-auth tenancy (ADR-0003)   │
-│  ingest → datalake (full-fidelity telemetry)                        │
-│  cloud-detection — streaming · scheduled · RETROSPECTIVE            │
-│  fleet — cross-machine cases + adaptive posture   graph — entities  │
-│  prevalence — first-seen/rarity     hunt — saved hunts → content    │
-│  forensics — DFIR workbench    disruption — isolate·suspend·block   │
-│  assistant — grounded LLM (narrates, never scores)                  │
-│  ops — fleet health   integrations — SOAR/ticketing   export — SIEM │
-│  api/console — enrollment·PKI · policy · triage · audit             │
-└─────────────────────────────────────────────────────────────────────┘
+
+A source build with default features embeds public test signing keys and is meant for
+evaluation only. Packaged builds exclude them; see
+[docs/packaging.md](docs/packaging.md#test-key-exclusion).
+
+### Run on Linux
+
+The agent refuses to start without a valid configuration file. The committed template runs
+as shipped: its control-plane fields are placeholders, and the agent keeps detecting locally
+when it cannot upload.
+
+```sh
+sudo ./target/release/agent --config crates/config/data/default-agent.toml status
+sudo ./target/release/agent --config crates/config/data/default-agent.toml run --alerts alerts.ndjson
 ```
 
-What's real today: the full left column on Linux (sensors → enrich → store → four
-engines → correlator → alerts, plus watchdog), validated live in the lab. The rest
-is skeletoned with its design recorded in place and an issue per component.
+`status` checks that the kernel accepts the probes without attaching them. `run` starts the
+sensors and the detection pipeline and appends alerts to `alerts.ndjson` until Ctrl-C.
+Every key of `agent.toml`, and the paths used on Windows and macOS, are documented in
+[docs/configuration.md](docs/configuration.md). Installing the agent as a service with its
+watchdog is covered in [docs/packaging.md](docs/packaging.md).
 
-**Technical documentation:** [docs/README.md](docs/README.md) explains every mechanism with
-links into the code, indexed for contributors, detection engineers and operators.
-What is built, partial or planned is in [docs/capabilities.md](docs/capabilities.md), and
-what comes next in [docs/roadmap.md](docs/roadmap.md).
+## Documentation
 
-## What makes it different
+The [technical documentation](docs/README.md) explains each mechanism with links into the
+code, with reading paths for contributors, detection engineers and operators. Good starting
+points:
 
-- **The fleet-derived half** — prevalence, cross-endpoint correlation, adaptive
-  posture (a detection on one machine raises the alertness of its neighbors, over
-  the server and over the P2P mesh), per-site model adaptation: signals an attacker
-  cannot derive from our public code and content.
-- **Deception** — per-host-unique canaries and decoy credentials: a near-zero-FP
-  tripwire layer, seed-derived so decoys never transfer between hosts.
-- **Detection as code** — all content versioned, PR-reviewed, and CI-enforced:
-  every shipped rule must compile *and* fire on a crafted sample (this pipeline has
-  already caught a rule that was silently dead in the previous iteration).
-- **Honest engineering as a feature** — capability matrices generated from
-  conformance runs, telemetry-source inventory with *rejected-with-reason* entries,
-  observable loss counters on every bounded buffer,
-  model cards required before any model ships, and ADRs for every locked decision.
+- [Architecture](docs/architecture.md): binaries, crates and dependency rules.
+- [Event lifecycle](docs/lifecycle.md): one event from the sensor to the alert log and the
+  control plane.
+- [Detection](docs/detection/README.md) and [correlation](docs/correlation.md): the engines
+  and how their results are combined.
+- [Security model](docs/security-model.md): trust boundaries, privileges and what is not
+  defended.
+- [Capabilities](docs/capabilities.md) and [roadmap](docs/roadmap.md): what works today and
+  what comes next.
 
-## Repository layout
+User guides for installing and operating Synthaea are published at
+<https://www.synthaea.com/docs>.
 
-| Path | Purpose |
+## Related repositories
+
+| Repository | Contents |
 | --- | --- |
-| `crates/` | The agent's Rust modules — full table in [crates/README.md](crates/README.md) |
-| `crates/sensors/` | Platform sensors by mechanism — [coverage matrices](crates/sensors/README.md) |
-| `apps/agent/` · `apps/watchdog/` · `apps/cli/` | The agent binaries |
-| `packaging/` | MSI · notarized pkg · deb/rpm/apk + service integration |
-| `packaging/toolchain/` | Build-machine toolchain scripts (eBPF, ONNX Runtime) |
-| `docs/` | [Technical documentation](docs/README.md), capabilities, roadmap, generated [ATT&CK coverage matrix](docs/attack-coverage.md) |
-| `tests/fuzz/` | Coverage-guided parser fuzzing (cargo-fuzz, workspace-excluded) |
-| `tools/` | check-deps and developer tooling; `tools/release/` is the offline release signer |
+| [synthaea-lab/server](https://github.com/synthaea-lab/server) | The control plane: enrollment, ingest, fleet-wide detection and triage. |
+| [synthaea-lab/rules](https://github.com/synthaea-lab/rules) | Detection content: Sigma rules, YARA rules and IOC feeds. |
+| [synthaea-lab/ml](https://github.com/synthaea-lab/ml) | Training, evaluation and export of the on-device models. |
+| [synthaea-lab/scenarios](https://github.com/synthaea-lab/scenarios) | Benign attack simulations that check the detections end to end. |
+| [synthaea-lab/rig](https://github.com/synthaea-lab/rig) | Virtual-machine test rig that runs the scenarios against a live agent. |
 
-## Building
+Some tests in this repository check contracts shared with these repositories. They skip when
+the other repository is not checked out next to this one; see
+[docs/development.md](docs/development.md#sibling-repositories).
 
-`cargo check` / `cargo test` build the default members on any OS (toolchain pinned).
-CI enforces fmt, dependency direction, cargo-deny, clippy `-D warnings`, and tests on
-Linux/Windows/macOS, plus the detection-content suites. The eBPF probes build on a
-Linux build machine provisioned with `packaging/toolchain/linux-toolchain.sh` (or the Alpine/Arch
-variants).
+## Contributing
 
-### Sibling checkouts
+Contributions are welcome, including well-argued objections to a design decision. Read
+[CONTRIBUTING.md](CONTRIBUTING.md) for the ground rules and the sign-off requirement (DCO, no
+CLA), and [docs/development.md](docs/development.md) for building, testing and the checks a
+pull request must pass.
 
-The public repos that test against each other are cloned side by side in one
-directory:
+## Security
 
-```
-synthaea/
-  agent/      synthaea-lab/agent (this repo)
-  server/     synthaea-lab/server
-  ml/         synthaea-lab/ml
-  rules/      synthaea-lab/rules
-  scenarios/  synthaea-lab/scenarios (attack scenarios, optional)
-```
-
-Cross-repo contract tests (golden fixtures from `server/` and `ml/`, the shipped content
-in `rules/`) read the siblings through `crates/siblings`. `SYNTHAEA_ROOT` points at the
-directory holding them (default: this repo's parent); a missing sibling skips the test
-with one `skipped: ...` line, and `SYNTHAEA_REQUIRE_SIBLINGS=1` (set in CI) turns that
-skip into a failure. Everything else builds and tests with this repo alone.
+Do not report vulnerabilities in public issues. [SECURITY.md](SECURITY.md) describes the
+private reporting channel and what is in scope.
 
 ## License
 
-Apache-2.0, except the Linux eBPF probes, which are dual-licensed GPL-2.0-only OR MIT (the kernel verifier requires a GPL-compatible license). See NOTICE.
+Apache License 2.0 ([LICENSE](LICENSE)). The Linux eBPF probes in
+`crates/sensors/linux/ebpf/` are dual-licensed GPL-2.0-only OR MIT, because the kernel
+verifier requires a GPL-compatible license for the helpers they use. See [NOTICE](NOTICE).
