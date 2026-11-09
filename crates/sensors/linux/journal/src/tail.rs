@@ -16,7 +16,7 @@ use std::{collections::VecDeque, io::BufRead};
 
 use crate::{
     JournalError, JournalEvent, JournalRecord,
-    bounded_lines::{BoundedLines, Line},
+    bounded_lines::{BoundedLines, Line, MAX_LINE_BYTES},
     classify,
     classify::pam_sss_reports_user_unknown,
     parse_record,
@@ -43,6 +43,15 @@ const RECENT_PAM_FAILURES_CAP: usize = 64;
 /// measurement from a real stacked host — nothing here has verified it against
 /// a real sssd-stacked `sudo`.
 const DOUBLE_LOG_DEDUP_WINDOW_US: u64 = 1_000_000;
+
+/// Whether the `count`th dropped oversize line is logged: the first, then every
+/// [`OVERSIZE_LOG_EVERY`]th, so a flood leaves a trace without becoming a flood of logs.
+fn should_report_oversize(count: u64) -> bool {
+    count == 1 || count.is_multiple_of(OVERSIZE_LOG_EVERY)
+}
+
+/// Spacing of the oversize-line warnings after the first one.
+const OVERSIZE_LOG_EVERY: u64 = 1000;
 
 /// Which PAM module logged a `PamAuthFailure` line — the signal
 /// [`ClassifiedJournal::is_duplicate_pam_failure`] keys on, since only a
@@ -149,6 +158,13 @@ impl<R: BufRead> ClassifiedJournal<R> {
                 // Dropped unparsed, but it still proves `journalctl` is delivering.
                 Ok(Line::Oversize) => {
                     self.oversize_lines += 1;
+                    if should_report_oversize(self.oversize_lines) {
+                        tracing::warn!(
+                            dropped = self.oversize_lines,
+                            max_bytes = MAX_LINE_BYTES,
+                            "journal tail: line over the size cap dropped"
+                        );
+                    }
                     if let Some(hook) = self.on_line.as_mut() {
                         hook();
                     }
@@ -453,6 +469,64 @@ mod tests {
 
     fn capped_journal(input: String) -> ClassifiedJournal<Cursor<String>> {
         ClassifiedJournal::from_lines(BoundedLines::with_cap(Cursor::new(input), CAPPED_AT))
+    }
+
+    /// Collects what `tracing` writes, so a test can read the warnings back.
+    #[derive(Clone, Default)]
+    struct Captured(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for Captured {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Captured {
+        type Writer = Self;
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    #[test]
+    fn the_first_oversize_line_logs_a_warning_without_its_content() {
+        let captured = Captured::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(captured.clone())
+            .with_ansi(false)
+            .finish();
+        let secret = "SECRETPAYLOAD";
+        let input = format!(
+            r#"{{"__CURSOR":"big","MESSAGE":"{secret}{}"}}"#,
+            "x".repeat(CAPPED_AT)
+        );
+
+        tracing::subscriber::with_default(subscriber, || {
+            let mut it = capped_journal(input);
+            assert!(it.next().is_none());
+        });
+
+        let out = String::from_utf8(captured.0.lock().unwrap().clone()).unwrap();
+        assert!(out.contains("line over the size cap dropped"), "{out}");
+        assert!(out.contains("dropped=1"), "{out}");
+        assert!(
+            !out.contains(secret),
+            "the payload must not be logged: {out}"
+        );
+    }
+
+    #[test]
+    fn oversize_warnings_are_rate_limited() {
+        assert!(should_report_oversize(1));
+        assert!(!should_report_oversize(2));
+        assert!(!should_report_oversize(999));
+        assert!(should_report_oversize(1000));
+        assert!(!should_report_oversize(1001));
+        assert!(should_report_oversize(2000));
     }
 
     #[test]

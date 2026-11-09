@@ -6,7 +6,7 @@
 
 use std::io::{self, BufRead, ErrorKind};
 
-/// The longest line kept, in bytes, newline excluded. `journalctl -o json` writes a field
+/// The longest line kept, in bytes, `\n` excluded. A trailing `\r` counts toward it. `journalctl -o json` writes a field
 /// larger than 4096 bytes as `null`, so a record of ordinary size is a few kilobytes; the
 /// cap is 256 maximum-size fields. A memory bound chosen by reasoning, not measured on a
 /// busy host.
@@ -28,6 +28,10 @@ pub(crate) enum Line {
 pub(crate) struct BoundedLines<R> {
     reader: R,
     max_bytes: usize,
+    /// The line being read. Kept here, not local to `next`, so a read error in the middle of
+    /// a line does not lose the state: the next call goes on with the same line.
+    line: Vec<u8>,
+    oversize: bool,
 }
 
 impl<R: BufRead> BoundedLines<R> {
@@ -36,7 +40,12 @@ impl<R: BufRead> BoundedLines<R> {
     }
 
     pub(crate) fn with_cap(reader: R, max_bytes: usize) -> Self {
-        Self { reader, max_bytes }
+        Self {
+            reader,
+            max_bytes,
+            line: Vec::new(),
+            oversize: false,
+        }
     }
 }
 
@@ -44,8 +53,6 @@ impl<R: BufRead> Iterator for BoundedLines<R> {
     type Item = io::Result<Line>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        let mut line = Vec::new();
-        let mut oversize = false;
         loop {
             let chunk = match self.reader.fill_buf() {
                 Ok(chunk) => chunk,
@@ -53,6 +60,8 @@ impl<R: BufRead> Iterator for BoundedLines<R> {
                 Err(e) => return Some(Err(e)),
             };
             if chunk.is_empty() {
+                let oversize = std::mem::take(&mut self.oversize);
+                let line = std::mem::take(&mut self.line);
                 return match (oversize, line.is_empty()) {
                     (true, _) => Some(Ok(Line::Oversize)),
                     (false, true) => None,
@@ -61,17 +70,19 @@ impl<R: BufRead> Iterator for BoundedLines<R> {
             }
             let newline = chunk.iter().position(|&byte| byte == b'\n');
             let body = &chunk[..newline.unwrap_or(chunk.len())];
-            if !oversize {
-                if line.len() + body.len() > self.max_bytes {
-                    oversize = true;
-                    line = Vec::new();
+            if !self.oversize {
+                if self.line.len() + body.len() > self.max_bytes {
+                    self.oversize = true;
+                    self.line = Vec::new();
                 } else {
-                    line.extend_from_slice(body);
+                    self.line.extend_from_slice(body);
                 }
             }
             let used = newline.map_or(chunk.len(), |at| at + 1);
             self.reader.consume(used);
             if newline.is_some() {
+                let oversize = std::mem::take(&mut self.oversize);
+                let line = std::mem::take(&mut self.line);
                 return Some(if oversize {
                     Ok(Line::Oversize)
                 } else {
@@ -183,5 +194,103 @@ mod tests {
             .map(Result::unwrap)
             .collect();
         assert_eq!(got, vec![Line::Text(kept), Line::Oversize]);
+    }
+
+    /// Reference answer for one `\n`-separated segment of the input.
+    fn expected(segment: &[u8], cap: usize) -> Result<Line, ()> {
+        if segment.len() > cap {
+            return Ok(Line::Oversize);
+        }
+        let body = segment.strip_suffix(b"\r").unwrap_or(segment);
+        String::from_utf8(body.to_vec())
+            .map(Line::Text)
+            .map_err(|_| ())
+    }
+
+    #[test]
+    fn random_bytes_with_random_caps_never_panic_and_cover_every_segment() {
+        // xorshift64: a fixed seed keeps a failure reproducible without a dependency.
+        let mut state = 0x9E37_79B9_7F4A_7C15_u64;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        for _ in 0..2000 {
+            let len = (next() % 200) as usize;
+            let input: Vec<u8> = (0..len)
+                .map(|_| match next() % 8 {
+                    0 => b'\n',
+                    1 => b'\r',
+                    2 => 0xFF,
+                    _ => b'a' + (next() % 26) as u8,
+                })
+                .collect();
+            let cap = (next() % 40) as usize;
+            let buffer = 1 + (next() % 16) as usize;
+
+            let got: Vec<_> =
+                BoundedLines::with_cap(BufReader::with_capacity(buffer, Cursor::new(&input)), cap)
+                    .map(|item| item.map_err(|_| ()))
+                    .collect();
+
+            let mut segments: Vec<&[u8]> = input.split(|&b| b == b'\n').collect();
+            if segments.last().is_some_and(|last| last.is_empty()) {
+                segments.pop();
+            }
+            let want: Vec<_> = segments.iter().map(|s| expected(s, cap)).collect();
+            assert_eq!(got, want, "input {input:?}, cap {cap}, buffer {buffer}");
+        }
+    }
+
+    /// Serves its parts one after the other; an `Err` part fails once, then reading goes on.
+    struct FailsOnce {
+        parts: Vec<io::Result<Vec<u8>>>,
+        current: Vec<u8>,
+    }
+
+    impl io::Read for FailsOnce {
+        fn read(&mut self, _: &mut [u8]) -> io::Result<usize> {
+            unreachable!("only BufRead is used")
+        }
+    }
+
+    impl BufRead for FailsOnce {
+        fn fill_buf(&mut self) -> io::Result<&[u8]> {
+            if self.current.is_empty() && !self.parts.is_empty() {
+                self.current = self.parts.remove(0)?;
+            }
+            Ok(&self.current)
+        }
+        fn consume(&mut self, amount: usize) {
+            self.current.drain(..amount);
+        }
+    }
+
+    #[test]
+    fn a_read_error_in_the_middle_of_an_oversize_line_does_not_turn_its_tail_into_a_line() {
+        let reader = FailsOnce {
+            parts: vec![
+                Ok(b"xxxxxxxxxx".to_vec()),
+                Err(io::Error::other("boom")),
+                Ok(b"yyyy\nnext\n".to_vec()),
+            ],
+            current: Vec::new(),
+        };
+        let mut it = BoundedLines::with_cap(reader, 4);
+        assert!(it.next().unwrap().is_err());
+        assert_eq!(it.next().unwrap().unwrap(), Line::Oversize);
+        assert_eq!(it.next().unwrap().unwrap(), text("next"));
+        assert!(it.next().is_none());
+    }
+
+    #[test]
+    fn a_crlf_line_counts_its_carriage_return_toward_the_cap() {
+        let got = lines(b"abcd\r\nabc\r\n", 4);
+        assert_eq!(
+            got.into_iter().map(Result::unwrap).collect::<Vec<_>>(),
+            vec![Line::Oversize, text("abc")]
+        );
     }
 }
