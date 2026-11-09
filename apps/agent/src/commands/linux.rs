@@ -27,10 +27,11 @@ use crate::{
 /// incidental activity (cron, the agent's own files, network chatter, journald's
 /// own baseline logging) almost always beats it, keeping the false-positive rate
 /// on an idle-but-healthy sensor low. The netlink poller ticks every
-/// [`NETLINK_POLL_INTERVAL`] regardless of host activity — a real canary — so its
+/// `sensor_linux_netlink::POLL_INTERVAL` regardless of host activity — a real canary — so its
 /// deadline can be tight: three missed polls is a genuine stall, not bad luck.
 const NO_CANARY_SILENCE_DEADLINE_NS: u64 = 120_000_000_000; // 120s
-const NETLINK_SILENCE_DEADLINE_NS: u64 = 3 * NETLINK_POLL_INTERVAL.as_secs() * 1_000_000_000;
+const NETLINK_SILENCE_DEADLINE_NS: u64 =
+    3 * sensor_linux_netlink::POLL_INTERVAL.as_secs() * 1_000_000_000;
 /// Same shape as `NETLINK_SILENCE_DEADLINE_NS`: [`spawn_avc_reader`]'s `drain` call
 /// returning at all, whether or not anything was queued, is its canary — three missed
 /// cycles of [`AVC_POLL_TIMEOUT_MS`] (6s) is a genuine stall. In practice the
@@ -483,99 +484,29 @@ pub(crate) fn cmd_run(opts: super::RunOptions) -> anyhow::Result<()> {
     result.map_err(|e| anyhow::anyhow!("sensor failed: {e}"))
 }
 
-/// Polling interval for [`spawn_netlink_poller`]. `crates/rules`' BEACON window is
-/// 60s and needs 3 distinct flows inside it to ever alert — frequent enough to
-/// leave room for that, without dumping the kernel's socket/conntrack tables on
-/// every tick.
-const NETLINK_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(10);
-
-/// Spawns the background thread that periodically snapshots `sock_diag`
-/// (listen-port drift) and dumps conntrack (beacon volume features), handing the
-/// resulting events to `sink` — the caller `sensor_linux_netlink`'s own crate doc
-/// says doesn't exist yet: that crate produces `schema::Event`s but leaves the
-/// polling cadence and the handoff to `EventSink` entirely to its caller.
-///
-/// Registers itself with `shutdown` (#316): the poll loop exits within one sleep
-/// slice of the stop. (`EnrichQueue` and `yara::ScanQueue` workers still end with
-/// the process.)
+/// Runs `sensor_linux_netlink::NetlinkPollSensor` on its own thread, pulsing
+/// `heartbeat` on each successful poll, and registers it with `shutdown` (#316).
 fn spawn_netlink_poller(
     sink: Arc<DetectionSink>,
     heartbeat: SensorHeartbeat,
     shutdown: &mut ShutdownPlan,
 ) {
-    let stop = Arc::new(AtomicBool::new(false));
-    let worker_stop = Arc::clone(&stop);
+    let mut sensor = sensor_linux_netlink::NetlinkPollSensor::new(move || heartbeat.pulse());
+    let stop = sensor.stop_handle();
     let handle = std::thread::Builder::new()
         .name("netlink-poll".into())
         .spawn(move || {
-            let mut listen_warned = false;
-            let mut conntrack_warned = false;
-            while !worker_stop.load(Ordering::SeqCst) {
-                let ts = schema::time::now_ns();
-                forward_netlink_events(
-                    sensor_linux_netlink::listen_port_events(ts),
-                    &sink,
-                    &heartbeat,
-                    &mut listen_warned,
-                    "listen-port",
-                );
-                forward_netlink_events(
-                    sensor_linux_netlink::conntrack_flow_events(ts),
-                    &sink,
-                    &heartbeat,
-                    &mut conntrack_warned,
-                    "conntrack",
-                );
-                sleep_unless_stopped(&worker_stop, NETLINK_POLL_INTERVAL);
+            if let Err(e) = sensor.run(Box::new(sink)) {
+                tracing::warn!(error = %e, "netlink poller stopped");
             }
         })
         .expect("spawning the netlink poll thread");
-    shutdown.register(
-        "netlink-poll",
-        move || stop.store(true, Ordering::SeqCst),
-        handle,
-    );
-}
-
-/// Forwards one poll's events to `sink`, or logs a kernel error — once per
-/// distinct failure streak (`warned`) rather than every `NETLINK_POLL_INTERVAL`,
-/// since an unprivileged agent (conntrack's reachability isn't characterized
-/// unprivileged, see `sensor_linux_netlink`'s crate doc) would otherwise log the
-/// same `EPERM` forever. Pulses `heartbeat` on a successful poll regardless of
-/// event count (#71): the poll attempt succeeding is itself the netlink
-/// sensor's canary — silence here means the poll is failing or the thread is
-/// stuck, not merely that the host has nothing to report.
-fn forward_netlink_events(
-    result: Result<Vec<schema::Event>, sensor_linux_netlink::NetlinkError>,
-    sink: &DetectionSink,
-    heartbeat: &SensorHeartbeat,
-    warned: &mut bool,
-    source: &str,
-) {
-    match result {
-        Ok(events) => {
-            *warned = false;
-            heartbeat.pulse();
-            for event in events {
-                sink.on_event(event);
-            }
-        }
-        Err(e) => {
-            if !*warned {
-                *warned = true;
-                tracing::warn!(
-                    source,
-                    error = %e,
-                    "netlink poll failed — further identical errors this run are suppressed"
-                );
-            }
-        }
-    }
+    shutdown.register("netlink-poll", move || stop.stop(), handle);
 }
 
 /// How long `sensor_linux_audit::AvcReader::drain` blocks waiting for the socket
 /// before returning control to [`spawn_avc_reader`] for its own stop check and
-/// heartbeat pulse. Tighter than [`NETLINK_POLL_INTERVAL`]: AVC denials are a
+/// heartbeat pulse. Tighter than the netlink poll interval: AVC denials are a
 /// real-time stream, not a snapshot to poll on a cadence, so there is no reason
 /// to hold one back once it has arrived.
 const AVC_POLL_TIMEOUT_MS: i32 = 2000;
