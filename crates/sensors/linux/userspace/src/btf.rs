@@ -533,6 +533,30 @@ fn read_u32(data: &[u8], offset: usize, endianness: Endianness) -> Result<u32, &
 mod tests {
     use super::*;
 
+    fn string_offset(strings: &[u8], needle: &[u8]) -> u32 {
+        strings
+            .windows(needle.len() + 1)
+            .position(|window| window == [needle, &[0]].concat())
+            .expect("string exists") as u32
+    }
+
+    /// A little-endian BTF blob: header, then the type section, then the string section.
+    fn assemble_btf(types: &[u8], strings: &[u8]) -> Vec<u8> {
+        let mut btf = vec![0x9f, 0xeb, 1, 0];
+        for value in [
+            BTF_HEADER_LEN as u32,
+            0,
+            types.len() as u32,
+            types.len() as u32,
+            strings.len() as u32,
+        ] {
+            btf.extend_from_slice(&value.to_le_bytes());
+        }
+        btf.extend_from_slice(types);
+        btf.extend_from_slice(strings);
+        btf
+    }
+
     type RegisterFixture = (&'static [(&'static [u8], u32)], (&'static [u8], u32));
 
     fn minimal_btf(include_syscall_nr: bool) -> Vec<u8> {
@@ -573,12 +597,7 @@ mod tests {
             strings.extend_from_slice(syscall_nr.0);
             strings.push(0);
         }
-        let offset = |needle: &[u8]| {
-            strings
-                .windows(needle.len() + 1)
-                .position(|window| window == [needle, &[0]].concat())
-                .expect("string exists") as u32
-        };
+        let offset = |needle: &[u8]| string_offset(&strings, needle);
         let mut types = Vec::new();
         let mut push_u32 = |value: u32| types.extend_from_slice(&value.to_le_bytes());
 
@@ -631,19 +650,7 @@ mod tests {
             push_u32(bit_offset);
         }
 
-        let mut btf = vec![0x9f, 0xeb, 1, 0];
-        for value in [
-            BTF_HEADER_LEN as u32,
-            0,
-            types.len() as u32,
-            types.len() as u32,
-            strings.len() as u32,
-        ] {
-            btf.extend_from_slice(&value.to_le_bytes());
-        }
-        btf.extend(types);
-        btf.extend_from_slice(&strings);
-        btf
+        assemble_btf(&types, &strings)
     }
 
     #[test]
@@ -678,12 +685,7 @@ mod tests {
     /// the generic lookup exists for).
     fn setattr_btf(params: &[&str]) -> Vec<u8> {
         let strings = b"\0int\0iattr\0ia_valid\0ia_atime\0ia_mtime\0dentry\0d_parent\0d_name\0qstr\0name\0hash_len\0bpf_lsm_inode_setattr\0idmap\0attr\0extra\0".to_vec();
-        let offset = |needle: &[u8]| {
-            strings
-                .windows(needle.len() + 1)
-                .position(|window| window == [needle, &[0]].concat())
-                .expect("string exists") as u32
-        };
+        let offset = |needle: &[u8]| string_offset(&strings, needle);
         let mut types = Vec::new();
         let mut push_u32 = |value: u32| types.extend_from_slice(&value.to_le_bytes());
         // 1: int
@@ -741,19 +743,7 @@ mod tests {
         push_u32(offset(b"bpf_lsm_inode_setattr"));
         push_u32(BTF_KIND_FUNC << 24);
         push_u32(6);
-        let mut btf = vec![0x9f, 0xeb, 1, 0];
-        for value in [
-            BTF_HEADER_LEN as u32,
-            0,
-            types.len() as u32,
-            types.len() as u32,
-            strings.len() as u32,
-        ] {
-            btf.extend_from_slice(&value.to_le_bytes());
-        }
-        btf.extend(types);
-        btf.extend_from_slice(&strings);
-        btf
+        assemble_btf(&types, &strings)
     }
 
     const CURRENT_HOOK: [&str; 3] = ["idmap", "dentry", "attr"];
@@ -810,6 +800,129 @@ mod tests {
             // `arg_end` follows `arg_start` (two `unsigned long`s side by side).
             assert_eq!(offsets.mm_arg_end, offsets.mm_arg_start + 8);
             assert!(offsets.task_mm < 8192);
+        }
+    }
+
+    /// `task_struct { struct { mm } (anonymous) }` and `mm_struct { struct { arg_start; arg_end }
+    /// (anonymous) }`, the shape the exec probe's lookup has to look through.
+    fn exec_argv_btf() -> Vec<u8> {
+        let strings = b"\0int\0task_struct\0mm\0mm_struct\0arg_start\0arg_end\0".to_vec();
+        let offset = |needle: &[u8]| string_offset(&strings, needle);
+        let mut types = Vec::new();
+        let mut push_u32 = |value: u32| types.extend_from_slice(&value.to_le_bytes());
+        // 1: int
+        push_u32(offset(b"int"));
+        push_u32(BTF_KIND_INT << 24);
+        push_u32(4);
+        push_u32(32);
+        // 2: struct { int mm; } (anonymous), mm at byte 8
+        push_u32(0);
+        push_u32((BTF_KIND_STRUCT << 24) | 1);
+        push_u32(16);
+        push_u32(offset(b"mm"));
+        push_u32(1);
+        push_u32(8 * 8);
+        // 3: struct task_struct { <anon struct 2> at byte 1000 }
+        push_u32(offset(b"task_struct"));
+        push_u32((BTF_KIND_STRUCT << 24) | 1);
+        push_u32(2048);
+        push_u32(0);
+        push_u32(2);
+        push_u32(1000 * 8);
+        // 4: struct { int arg_start; int arg_end; } (anonymous)
+        push_u32(0);
+        push_u32((BTF_KIND_STRUCT << 24) | 2);
+        push_u32(16);
+        for (name, byte) in [(&b"arg_start"[..], 0), (&b"arg_end"[..], 8)] {
+            push_u32(offset(name));
+            push_u32(1);
+            push_u32(byte * 8);
+        }
+        // 5: struct mm_struct { <anon struct 4> at byte 320 }
+        push_u32(offset(b"mm_struct"));
+        push_u32((BTF_KIND_STRUCT << 24) | 1);
+        push_u32(1024);
+        push_u32(0);
+        push_u32(4);
+        push_u32(320 * 8);
+        assemble_btf(&types, &strings)
+    }
+
+    #[test]
+    fn parses_exec_argv_offsets_through_anonymous_structs() {
+        assert_eq!(
+            parse_exec_argv_offsets(&exec_argv_btf()).unwrap(),
+            ExecArgvOffsets {
+                task_mm: 1008,
+                mm_arg_start: 320,
+                mm_arg_end: 328,
+            }
+        );
+    }
+
+    #[test]
+    fn exec_argv_offsets_are_refused_when_a_struct_is_missing() {
+        assert!(parse_exec_argv_offsets(&minimal_btf(true)).is_err());
+    }
+
+    fn parse_all(data: &[u8]) -> [bool; 3] {
+        [
+            parse_scheduler_field_offsets(data).is_ok(),
+            parse_inode_setattr_offsets(data).is_ok(),
+            parse_exec_argv_offsets(data).is_ok(),
+        ]
+    }
+
+    #[test]
+    fn every_truncation_of_a_valid_blob_is_rejected() {
+        for btf in [
+            minimal_btf(true),
+            setattr_btf(&CURRENT_HOOK),
+            exec_argv_btf(),
+        ] {
+            for len in 0..btf.len() {
+                assert_eq!(parse_all(&btf[..len]), [false; 3], "prefix of {len} bytes");
+            }
+        }
+    }
+
+    /// Deterministic xorshift, so a failing input reproduces from the seed.
+    struct Xorshift(u64);
+
+    impl Xorshift {
+        fn next(&mut self) -> u64 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            self.0
+        }
+
+        fn below(&mut self, bound: usize) -> usize {
+            (self.next() % bound as u64) as usize
+        }
+    }
+
+    #[test]
+    fn arbitrary_bytes_never_panic_the_parser() {
+        let mut rng = Xorshift(0x5eed_b7f0_0dd1_ce55);
+        let valid = [
+            minimal_btf(true),
+            setattr_btf(&CURRENT_HOOK),
+            exec_argv_btf(),
+        ];
+        for round in 0..20_000 {
+            let mut data = if round % 2 == 0 {
+                valid[rng.below(valid.len())].clone()
+            } else {
+                let mut random = vec![0x9f, 0xeb, 1, 0];
+                random.extend((0..rng.below(512)).map(|_| rng.next() as u8));
+                random
+            };
+            for _ in 0..=rng.below(8) {
+                let at = rng.below(data.len());
+                data[at] = rng.next() as u8;
+            }
+            parse_all(&data);
         }
     }
 
