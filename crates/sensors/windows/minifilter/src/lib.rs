@@ -92,6 +92,8 @@ pub mod wire;
 pub mod channel;
 #[cfg(windows)]
 mod port;
+#[cfg(any(windows, test))]
+mod session;
 #[cfg(windows)]
 pub use port::{DriverPort, ReceiveBuffer, ReceiveError};
 
