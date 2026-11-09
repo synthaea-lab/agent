@@ -3,7 +3,7 @@
 pkgname=synthaea-agent
 # The release PR bumps this with the workspace version (release-please-config.json).
 # x-release-please-start-version
-pkgver=0.0.0
+pkgver=0.0.1
 # x-release-please-end
 pkgrel=0
 pkgdesc="Synthaea EDR Agent - on-device eBPF detection and response"
