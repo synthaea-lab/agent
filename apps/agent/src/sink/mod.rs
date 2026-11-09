@@ -19,7 +19,6 @@ use std::{
     time::Duration,
 };
 
-use policy::ResponsePolicy;
 use schema::{Event, sensor::EventSink};
 use sinks::JsonlWriter;
 
@@ -32,24 +31,11 @@ use crate::{
 mod baseline;
 mod canary;
 mod recording;
+mod response;
 
 pub(crate) use baseline::BaselineSink;
 use recording::{Finding, record_ioc_hit, record_rule_alert, spool_on_worker};
-
-/// Wires issue #25's automated response into the sink once `enable_response` sets it
-/// (Linux only for this pass — see `commands::linux::cmd_run`). Held behind
-/// `Arc<Mutex<Option<_>>>` rather than a constructor parameter because the YARA scan
-/// queue's callback closure is created inside `DetectionSink::new` itself, before a
-/// caller has a `&DetectionSink` to configure — the shared cell lets both `correlate`
-/// and that closure read whatever was set (or nothing, on a platform that never
-/// calls `enable_response`) without restructuring construction order.
-struct ResponseHooks {
-    policy: ResponsePolicy,
-    /// The actual OS-level kill call, injected by the caller: `response` is
-    /// base-tier-only and platform dispatch belongs to the binary (CLAUDE.md).
-    terminate: Box<dyn Fn(u32) -> std::io::Result<()> + Send + Sync>,
-    quarantine_dir: PathBuf,
-}
+use response::{DAMAGE_MANIFEST_MAX, ResponseCell, crosses_kill_gate};
 
 /// Dispatches every event to the detection engines and the output sinks. `Mutex`
 /// around the mutable state (`RuleState`) rather than no synchronization: the
@@ -114,9 +100,9 @@ pub(crate) struct DetectionSink {
     /// "the process is scheduled" — to `watchdog::supervise::HeartbeatMonitor`.
     /// See `progress_handle`.
     progress: Arc<AtomicU64>,
-    /// Issue #25's automated response, `None` until (if ever) `enable_response` sets
-    /// it — see [`ResponseHooks`].
-    response: Arc<Mutex<Option<ResponseHooks>>>,
+    /// Issue #25's automated response, empty until (if ever) `enable_response` sets it.
+    /// Shared with the YARA worker, which quarantines through it.
+    response: Arc<ResponseCell>,
     /// Issue #131: cross-engine verdict fusion, keyed the same way the correlator
     /// keys its own belief state (`(ppid, comm)` — see `verdict::EntityKey`). Every
     /// rule/Sigma/correlator finding folds in here alongside reaching the alert
@@ -159,20 +145,8 @@ const MEMFD_EXEC_TECHNIQUE: &str = "T1620";
 /// damage manifest of the process's recent renames and deletions (#82).
 const RANSOMWARE_TECHNIQUE: &str = "T1486";
 
-/// The reason the audit line gives when the ransomware reflex kills (#82). A trigger of its
-/// own, never severity or the Bayes gate: it needs both the burst rule and a canary touch
-/// from the same process (`crate::ransomware_join`).
-const RANSOMWARE_REFLEX_REASON: &str =
-    "a corroborated ransomware signal (burst rule + canary touch)";
-
-/// Most renames and deletions a ransomware detection carries beyond its triggering event.
-/// A bound on the size of one detection: the correlator window is 60 s, and a fast
-/// encryptor renames far more than this in it. The trigger plus the manifest must fit in
-/// [`SERVER_MAX_EVENTS`], or the server drops the tail of the manifest.
-const DAMAGE_MANIFEST_MAX: usize = 100;
-
 /// The events the server keeps per detection (`MAX_EVENTS`, server/lib/detection-payload.ts,
-/// #1060); a server unit test reads this line and fails when the two differ.
+/// #1060); a server unit test reads this line, in this file, and fails when the two differ.
 const SERVER_MAX_EVENTS: usize = 128;
 // The trigger plus the manifest: `1 + DAMAGE_MANIFEST_MAX <= SERVER_MAX_EVENTS`.
 const _: () = assert!(DAMAGE_MANIFEST_MAX < SERVER_MAX_EVENTS);
@@ -184,7 +158,7 @@ const _: () = assert!(DAMAGE_MANIFEST_MAX < SERVER_MAX_EVENTS);
 /// warrants it raises one `RESPONSE-ESCALATE` audit alert. Never kills or
 /// quarantines, and works with or without `enable_response`.
 fn escalate_if_warranted(alert_log: &AlertLog, fused: &verdict::Verdict) {
-    if !response::should_escalate(fused.severity) {
+    if !::response::should_escalate(fused.severity) {
         return;
     }
     let message = format!(
@@ -230,40 +204,6 @@ fn correlator_case_id(entity: &verdict::EntityKey) -> String {
 /// reacts to the same event a few lines later), short enough that a genuine
 /// second occurrence of the same technique still gets its own finding.
 const VERDICT_DEDUP_WINDOW_NS: u64 = 30_000_000_000; // 30s
-
-/// Whether an alert raised by the correlator makes its process eligible for
-/// `response`'s kill (issue #25). Deliberately its own question, not "severity is
-/// `Critical`": a Sigma rule's `level: critical` is an analyst-facing ranking
-/// written by a rule author, not a belief the correlator has earned, and a
-/// severity that merely feeds the verdict must never widen what the agent kills
-/// (issue #131 follow-up). Only the correlator's belief crossing its threshold
-/// qualifies. (`BAYES` also carries `Critical` severity, but that is a coincidence
-/// of the ranking, not what gates the kill.)
-fn crosses_kill_gate(technique: &str) -> bool {
-    technique == "BAYES"
-}
-
-/// Why the kill gate refuses a system service's main process (#652, ADR-0028).
-// Review of #755 (SherlockOmss, 2026-10-19): the old wording ("package-owned
-// binary") claimed more than `service_main_path_is_trusted` checks — nothing
-// here asks whether a package actually owns the file, only where it lives and
-// who started it. An analyst reading `alerts.ndjson` would otherwise take
-// "package-owned" as verified.
-const SERVICE_MAIN_REFUSAL: &str = "main process of a system service (image under a system path, started by init); escalated, not killed";
-
-/// Why the kill gate refuses the process holding a login session (<https://github.com/synthaea-lab/agent/issues/50>, ADR-0028).
-/// Same care as [`SERVICE_MAIN_REFUSAL`]: it states what was checked (the image and
-/// its parent's image), not that the session is legitimate, nor that the parent was
-/// started by init: the listener's exec is usually never seen.
-const LOGIN_SESSION_REFUSAL: &str = "holds a login session (sshd-session, or sshd before OpenSSH 9.8, exec'd by sshd, both images under a system path); escalated, not killed";
-
-/// The refusal reason the kill gate records for `shield`.
-fn shield_refusal(shield: correlator::KillShield) -> &'static str {
-    match shield {
-        correlator::KillShield::ServiceMain => SERVICE_MAIN_REFUSAL,
-        correlator::KillShield::LoginSession => LOGIN_SESSION_REFUSAL,
-    }
-}
 
 /// ATT&CK technique ids folded into a [`schema::detection::Detection`] from the
 /// `technique` string this crate already uses as the dedup/alert-log key.
@@ -462,7 +402,7 @@ impl DetectionSink {
             },
             move |detection| spool_on_worker(worker_spool.as_deref(), detection),
         );
-        let response: Arc<Mutex<Option<ResponseHooks>>> = Arc::new(Mutex::new(None));
+        let response = Arc::new(ResponseCell::new());
         Ok(Self {
             rule_state: Mutex::new(rule_state),
             correlator,
@@ -628,28 +568,6 @@ impl DetectionSink {
         )?)
     }
 
-    /// Activates issue #25's automated response — process kill on a high-confidence
-    /// correlated (`BAYES`) verdict, quarantine on a confirmed YARA match. Not called
-    /// at all on a platform that doesn't wire it (Windows, for this pass), so
-    /// `response` stays `None` and every action reports
-    /// [`response::KillOutcome::ObserveOnly`]/[`response::QuarantineOutcome::ObserveOnly`]
-    /// regardless of `policy` — the same as if this were never called, which is
-    /// deliberate: not opting in and opting in with policy fully disabled must look
-    /// identical to an audit consumer.
-    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-    pub(crate) fn enable_response(
-        &self,
-        policy: ResponsePolicy,
-        terminate: impl Fn(u32) -> std::io::Result<()> + Send + Sync + 'static,
-        quarantine_dir: PathBuf,
-    ) {
-        *self.response.lock_recovering() = Some(ResponseHooks {
-            policy,
-            terminate: Box::new(terminate),
-            quarantine_dir,
-        });
-    }
-
     /// Returns a reference to the enrichment queue for health telemetry.
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     pub(crate) fn enrich_queue(&self) -> &EnrichQueue {
@@ -787,26 +705,6 @@ impl DetectionSink {
         }
     }
 
-    /// The damage manifest of a ransomware alert (issue #82): the file renames and
-    /// deletions of the alerting process incarnation that the rule state remembers (the
-    /// newest `DAMAGE_MANIFEST_MAX`), oldest first, without the triggering event (which is
-    /// the detection's first event already). It rides in `Detection::events`, so no schema
-    /// change: the control plane keeps events after the first as the detection's further
-    /// triggering events, and a restoration tool reads the scope from them.
-    ///
-    /// Takes the rule-state lock: callers must not hold it (see `detect_file_rename`).
-    fn damage_manifest(&self, trigger: &Event) -> Vec<Event> {
-        let meta = trigger.meta();
-        let mut touched = self
-            .rule_state
-            .lock_recovering()
-            .touched_files(meta.pid, meta.process_generation);
-        touched.retain(|e| e != trigger);
-        let excess = touched.len().saturating_sub(DAMAGE_MANIFEST_MAX);
-        touched.drain(..excess);
-        touched
-    }
-
     /// Cross-event correlation (co-occurrence rules + Bayesian belief).
     ///
     /// ML correlation scorer (issue #46 Phase 3, #47 Phase 2): if available, scores
@@ -868,84 +766,9 @@ impl DetectionSink {
         let shield = engine.kill_shield(pid, generation);
         drop(engine); // Unlock correlator before alert emission (log I/O).
 
-        // Fold co-occurrence rules and Bayesian belief into the entity's fused
-        // verdict (issue #131) for evidence/severity bookkeeping. The kill gate
-        // itself stays scoped to *this event's own* evidence — whether the alert
-        // actually raised here crosses it ([`crosses_kill_gate`], the pre-#131 bare
-        // `technique == "BAYES"` check) — not the entity's fused, sticky
-        // severity: that's a max over everything ever seen for `(ppid, comm)`,
-        // so gating kill on it would let one sibling process's Bayes crossing
-        // condemn every later, unrelated sibling that merely shares the same
-        // parent and `comm` (PR #502 review; pinned by
-        // `a_siblings_weak_alert_never_triggers_kill_from_anothers_bayes_crossing`).
+        // The kill gate reads this event's own alerts, never the entity's sticky fused
+        // verdict (PR #502 review; docs/response.md, "What can trigger a kill").
         self.emit_correlator_alerts(&alerts, Some(event), shield);
-    }
-
-    /// Issue #25: policy-gates killing the process behind a high-confidence
-    /// correlated verdict. A no-op whenever `enable_response` was never called.
-    ///
-    /// `shield` is the correlator's provenance verdict for `pid` (issues #652, <https://github.com/synthaea-lab/agent/issues/50>): a
-    /// system service's main process (its image under a system path, started by init —
-    /// see the comment above `SERVICE_MAIN_REFUSAL`'s definition for why this is not
-    /// phrased as "package-owned"), or the process holding a login, exec'd by `sshd`
-    /// (`sshd-session`, or `sshd` itself before OpenSSH 9.8).
-    /// A Bayesian crossing alone does not justify killing either, so it is refused, in
-    /// observe mode too, and the verdict still escalates. Corroborating evidence does
-    /// not lift it: the refusal is about what the process is, not how much evidence
-    /// there is (ADR-0028).
-    fn maybe_kill(&self, pid: u32, shield: Option<correlator::KillShield>) {
-        self.kill_for(pid, "a high-confidence correlated verdict", shield);
-    }
-
-    /// The policy-gated kill behind every automated trigger; `reason` names which one, in
-    /// the audit line (`RESPONSE-KILL`). `shield` makes it refuse (ADR-0028); only the
-    /// correlator's verdict sets it, a trigger with its own evidence (the ransomware reflex)
-    /// passes `None`.
-    fn kill_for(&self, pid: u32, reason: &str, shield: Option<correlator::KillShield>) {
-        let guard = self.response.lock_recovering();
-        let Some(hooks) = guard.as_ref() else {
-            return;
-        };
-        let outcome = if let Some(shield) = shield {
-            response::KillOutcome::Refused {
-                pid,
-                reason: shield_refusal(shield),
-            }
-        } else {
-            response::kill_process(pid, &hooks.policy, |p| (hooks.terminate)(p))
-        };
-        drop(guard);
-        let message = match outcome {
-            response::KillOutcome::Killed { pid } => format!("killed pid {pid} on {reason}"),
-            response::KillOutcome::ObserveOnly { pid } => {
-                format!("pid {pid} would have been killed on {reason} (observe-only)")
-            }
-            response::KillOutcome::Failed { pid, error } => {
-                format!("failed to kill pid {pid} on {reason}: {error}")
-            }
-            response::KillOutcome::Refused { pid, reason: why } => {
-                format!("refused to kill pid {pid} on {reason}: {why}")
-            }
-        };
-        self.emit("RESPONSE-KILL", &message);
-    }
-
-    /// The process behind `event` raised the ransomware burst rule (#82). True when it also
-    /// touched a canary in the window: the corroborated signal. The caller records the
-    /// detection first and then calls [`Self::ransomware_reflex`].
-    fn note_ransomware_burst(&self, event: &Event) -> bool {
-        let meta = event.meta();
-        self.ransomware_join.lock_recovering().note_burst(
-            meta.pid,
-            meta.process_generation,
-            meta.timestamp_ns,
-        )
-    }
-
-    /// The reflex: the policy-gated kill of the corroborated process. Observe-only unless
-    /// kill is enabled, like every other automated kill.
-    fn ransomware_reflex(&self, pid: u32) {
-        self.kill_for(pid, RANSOMWARE_REFLEX_REASON, None);
     }
 
     /// Exec events: stateless rules, stateful rules, then Sigma.
@@ -1644,7 +1467,7 @@ fn load_common_set_capped(
 fn start_yara(
     content_root: &Path,
     alert_log: Arc<AlertLog>,
-    response: Arc<Mutex<Option<ResponseHooks>>>,
+    response: Arc<ResponseCell>,
     verdict: Arc<Mutex<verdict::VerdictEngine>>,
 ) -> Load<(yara::ScanQueue, usize)> {
     let dir = content_root.join("rules/yara");
@@ -1800,12 +1623,11 @@ fn fuse_yara_match(
 /// Issue #25: policy-gates quarantining a YARA-confirmed payload. A no-op whenever
 /// `enable_response` was never called — same posture as `DetectionSink::maybe_kill`.
 fn quarantine_matched_payload(
-    response: &Mutex<Option<ResponseHooks>>,
+    response: &ResponseCell,
     path: &std::path::Path,
     alert_log: &AlertLog,
 ) {
-    let guard = response.lock_recovering();
-    let Some(hooks) = guard.as_ref() else {
+    let Some(hooks) = response.get() else {
         return;
     };
     // A quarantined file is written under `quarantine_dir` — that write is itself a
@@ -1816,10 +1638,9 @@ fn quarantine_matched_payload(
     if path.starts_with(&hooks.quarantine_dir) {
         return;
     }
-    let outcome = response::quarantine_file(path, &hooks.quarantine_dir, &hooks.policy);
-    drop(guard);
+    let outcome = ::response::quarantine_file(path, &hooks.quarantine_dir, &hooks.policy);
     let message = match outcome {
-        response::QuarantineOutcome::Quarantined {
+        ::response::QuarantineOutcome::Quarantined {
             original,
             quarantined_at,
             sha256_hex,
@@ -1828,11 +1649,11 @@ fn quarantine_matched_payload(
             original.display(),
             quarantined_at.display()
         ),
-        response::QuarantineOutcome::ObserveOnly { path } => format!(
+        ::response::QuarantineOutcome::ObserveOnly { path } => format!(
             "{} would have been quarantined on a confirmed YARA match (observe-only)",
             path.display()
         ),
-        response::QuarantineOutcome::Failed { path, error } => {
+        ::response::QuarantineOutcome::Failed { path, error } => {
             format!(
                 "failed to quarantine {} on a confirmed YARA match: {error}",
                 path.display()

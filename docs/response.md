@@ -52,14 +52,16 @@ flowchart TD
     EL --> AL
 ```
 
-The hooks live in [`ResponseHooks`](../apps/agent/src/sink/mod.rs): the policy, the injected
-`terminate` closure and the quarantine directory. They sit in an
-`Arc<Mutex<Option<_>>>` rather than a constructor argument because the YARA worker's
-callback is created inside [`DetectionSink::new`](../apps/agent/src/sink/mod.rs), before any
-caller can configure the sink; the shared cell lets both the capture thread and that
-callback read whatever was set later.
+The hooks live in [`ResponseHooks`](../apps/agent/src/sink/response.rs): the policy, the injected
+`terminate` closure and the quarantine directory. They sit in an `Arc<OnceLock<_>>`
+rather than a constructor argument because the YARA worker's callback is created inside
+[`DetectionSink::new`](../apps/agent/src/sink/mod.rs), before any caller can configure the
+sink; the shared cell lets both the capture thread and that callback read whatever was
+set later.
 
-[`DetectionSink::enable_response`](../apps/agent/src/sink/mod.rs) fills the cell. Only the
+[`DetectionSink::enable_response`](../apps/agent/src/sink/response.rs) fills the cell, once:
+a second call is ignored with a warning, so the policy in force never changes under a
+running agent (pinned by `enable_response_twice_keeps_the_first_policy`). Only the
 Linux `run` command calls it ([`commands/linux.rs`](../apps/agent/src/commands/linux.rs)),
 from the `--enable-kill` and `--enable-quarantine` flags of `agent run`
 ([`main.rs`](../apps/agent/src/main.rs)). `isolate_enabled` is always `false` there. When
@@ -72,18 +74,18 @@ anything: on Windows and macOS the flags are accepted and ignored, and no
 
 ### What can trigger a kill
 
-Exactly two triggers reach [`DetectionSink::kill_for`](../apps/agent/src/sink/mod.rs):
+Exactly two triggers reach [`DetectionSink::kill_for`](../apps/agent/src/sink/response.rs):
 
 1. **A `BAYES` alert raised by this event.** In
    [`emit_correlator_alerts`](../apps/agent/src/sink/mod.rs), after every correlator alert has
    been recorded, the pid of the last alert for which
-   [`crosses_kill_gate`](../apps/agent/src/sink/mod.rs) is true (technique `BAYES`) is passed to
-   [`maybe_kill`](../apps/agent/src/sink/mod.rs). The audit reason is "a high-confidence
+   [`crosses_kill_gate`](../apps/agent/src/sink/response.rs) is true (technique `BAYES`) is passed to
+   [`maybe_kill`](../apps/agent/src/sink/response.rs). The audit reason is "a high-confidence
    correlated verdict".
 2. **The ransomware reflex.** [`RansomwareJoin`](../apps/agent/src/ransomware_join.rs)
    records, per process incarnation, the last ransomware burst rule (T1486) and the
    last canary touch. When both are fresh within 60 s of each other, in either order,
-   [`ransomware_reflex`](../apps/agent/src/sink/mod.rs) kills that pid. Neither signal kills
+   [`ransomware_reflex`](../apps/agent/src/sink/response.rs) kills that pid. Neither signal kills
    alone: a burst alone is a backup or an archiver; a canary touch alone is an indexer
    nobody listed. The join tracks at most 256 incarnations and counts evictions; a
    touch judged only after the canary hold expired does not trigger it.
@@ -106,7 +108,7 @@ but that is incidental. Pinned by `a_critical_sigma_hit_never_triggers_a_kill`,
 [`CorrelationEngine::kill_shield`](../crates/correlator/src/engine.rs) for the event's
 pid and incarnation, before releasing the correlator lock. If a shield is set,
 `kill_for` reports [`KillOutcome::Refused`](../crates/response/src/kill.rs) with a
-fixed reason ([`shield_refusal`](../apps/agent/src/sink/mod.rs)) and never calls the policy or
+fixed reason ([`shield_refusal`](../apps/agent/src/sink/response.rs)) and never calls the policy or
 `terminate`:
 
 | Shield | Refusal text names |
@@ -335,7 +337,7 @@ The Windows enforcement primitive (WFP) is tracked in
 
 | Technique | Written by | Messages |
 | --- | --- | --- |
-| `RESPONSE-KILL` | [`kill_for`](../apps/agent/src/sink/mod.rs) | `killed pid N on <reason>`, `pid N would have been killed on <reason> (observe-only)`, `failed to kill pid N on <reason>: <error>`, `refused to kill pid N on <reason>: <why>` |
+| `RESPONSE-KILL` | [`kill_for`](../apps/agent/src/sink/response.rs) | `killed pid N on <reason>`, `pid N would have been killed on <reason> (observe-only)`, `failed to kill pid N on <reason>: <error>`, `refused to kill pid N on <reason>: <why>` |
 | `RESPONSE-QUARANTINE` | [`quarantine_matched_payload`](../apps/agent/src/sink/tests.rs) | `quarantined <path> (<sha256>) to <dir> ...`, `... would have been quarantined ... (observe-only)`, `failed to quarantine <path> ...: <error>` |
 | `RESPONSE-UNQUARANTINE` | [`cmd_quarantine_restore`](../apps/agent/src/quarantine_cmd.rs) | restored, or failed with the error |
 | `RESPONSE-ESCALATE` | [`escalate_if_warranted`](../apps/agent/src/sink/mod.rs) | `escalated <ppid>:<comm> at <severity> severity across N source(s): <techniques>` |
@@ -355,9 +357,9 @@ The Windows enforcement primitive (WFP) is tracked in
 
 ## Concurrency
 
-The response cell is a `Mutex<Option<ResponseHooks>>`. `kill_for` and
-`quarantine_matched_payload` hold it only while deciding and calling `terminate` or
-`quarantine_file`, then drop it before writing the audit line. Kills run on the
+The response cell is a `OnceLock<ResponseHooks>`: written once by `enable_response`,
+then only read, so `kill_for` and `quarantine_matched_payload` take no lock to reach the
+hooks. Kills run on the
 capture thread; quarantine runs on the YARA worker thread, so a slow move never stalls
 event capture.
 

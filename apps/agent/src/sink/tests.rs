@@ -422,14 +422,14 @@ fn quarantine_fixture(
     quarantine_enabled: bool,
 ) -> (
     std::path::PathBuf,
-    Mutex<Option<super::ResponseHooks>>,
+    super::response::ResponseCell,
     crate::alerts::AlertLog,
     std::path::PathBuf,
 ) {
     let dir = tmp(name);
     let payload = dir.join("payload.bin");
     std::fs::write(&payload, b"marker payload").unwrap();
-    let hooks = super::ResponseHooks {
+    let hooks = super::response::ResponseHooks {
         policy: policy::ResponsePolicy {
             kill_enabled: false,
             quarantine_enabled,
@@ -439,7 +439,12 @@ fn quarantine_fixture(
         quarantine_dir: dir.join("quarantine"),
     };
     let log = crate::alerts::AlertLog::open(&dir.join("alerts.ndjson"), 8).unwrap();
-    (dir, Mutex::new(Some(hooks)), log, payload)
+    (
+        dir,
+        super::response::ResponseCell::from(hooks),
+        log,
+        payload,
+    )
 }
 
 #[test]
@@ -1534,6 +1539,32 @@ fn bayes_crossing_with_kill_enabled_calls_terminate_on_the_verdict_pid() {
         *killed.lock().unwrap(),
         vec![4244],
         "the injected terminate runs, exactly once"
+    );
+}
+
+#[test]
+fn enable_response_twice_keeps_the_first_policy() {
+    let dir = tmp("bayes-enable-twice");
+    let sink = sink_in(&dir);
+    sink.enable_response(
+        policy::ResponsePolicy {
+            kill_enabled: false,
+            quarantine_enabled: false,
+            isolate_enabled: false,
+        },
+        |_| panic!("kill is disabled by the first policy"),
+        dir.join("quarantine"),
+    );
+    let killed = enable_recording_kill(&sink, &dir);
+    drive_bayes_crossing(&sink, 4245);
+    let alerts = alerts_in(&dir);
+    assert!(
+        alerts.contains("pid 4245 would have been killed"),
+        "the first (observe-only) policy stays in force: {alerts}"
+    );
+    assert!(
+        killed.lock().unwrap().is_empty(),
+        "the second call's terminate must never run"
     );
 }
 

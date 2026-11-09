@@ -38,7 +38,7 @@ Two outputs of the correlator matter downstream:
   within the window".
 - **The `BAYES` alert**: raised once when an entity's belief crosses the threshold.
   It is the only alert that can make a process eligible for an automated kill
-  ([`crosses_kill_gate`](../apps/agent/src/sink/mod.rs)).
+  ([`crosses_kill_gate`](../apps/agent/src/sink/response.rs)).
 
 ## The event bus: the correlator's short-term memory
 

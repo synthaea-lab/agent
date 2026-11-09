@@ -81,9 +81,9 @@ The worker records gated findings when it reaches them, which can be after the c
 
 ### 5. Automated response
 
-Response is wired only on Linux, by [`DetectionSink::enable_response`](../apps/agent/src/sink/mod.rs) in `cmd_run`. It is observe-only unless `--enable-kill` / `--enable-quarantine` is given.
+Response is wired only on Linux, by [`DetectionSink::enable_response`](../apps/agent/src/sink/response.rs) in `cmd_run`. It is observe-only unless `--enable-kill` / `--enable-quarantine` is given.
 
-- **Kill gate.** Only a correlator `BAYES` alert ([`crosses_kill_gate`](../apps/agent/src/sink/mod.rs)) makes a process eligible for a kill. A Sigma `level: critical` does not. The gate looks only at the triggering event's own alert, never at the entity's accumulated verdict. That verdict is a running maximum over every process sharing `(ppid, comm)`, so gating on it would let one sibling's crossing condemn another. A `KillShield` from the correlator refuses the kill, even in observe mode, for a system service's main process or a login-session holder. Every outcome is audited as `RESPONSE-KILL`.
+- **Kill gate.** Only a correlator `BAYES` alert ([`crosses_kill_gate`](../apps/agent/src/sink/response.rs)) makes a process eligible for a kill. A Sigma `level: critical` does not. The gate looks only at the triggering event's own alert, never at the entity's accumulated verdict. That verdict is a running maximum over every process sharing `(ppid, comm)`, so gating on it would let one sibling's crossing condemn another. A `KillShield` from the correlator refuses the kill, even in observe mode, for a system service's main process or a login-session holder. Every outcome is audited as `RESPONSE-KILL`.
 - **Ransomware reflex.** A T1486 burst that is corroborated by a canary touch from the same process incarnation goes through the same policy-gated kill, without the shield.
 - **Quarantine.** A YARA match on a written payload is moved to `quarantine/` next to the alerts file when quarantine is enabled ([`quarantine_matched_payload`](../apps/agent/src/sink/mod.rs)).
 
