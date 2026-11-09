@@ -88,7 +88,7 @@ before yielding:
 The iterator yields allowlisted records only, so an idle host would look like a silent sensor. The
 agent pulses the heartbeat from
 [`with_line_hook`](../../../crates/sensors/linux/journal/src/tail.rs), which sees every non-blank
-line, and writes its own canary line every 30 s over journald's native socket
+line (a dropped oversize line included), and writes its own canary line every 30 s over journald's native socket
 ([`send_canary`](../../../crates/sensors/linux/journal/src/canary.rs), identifier
 `synthaea-agent-canary`, priority 7). The canary proves end-to-end delivery: journald accepted,
 stored and returned it through `journalctl -f`. It never matches the allowlist.
@@ -105,6 +105,13 @@ restart. The first start begins at "now".
 - `su`/`sshd` failure and `sudo`/`su` wrong-password parsing follow the documented formats and are
   unit-tested; a system-manager `JOB_TYPE=stop` record has not been captured on a real host.
 - Unit failures are classified but not mapped to an event.
+- A line over 1 MiB (`MAX_LINE_BYTES`, a trailing `\r` included) is read to its end without being
+  kept, then dropped; the tail goes on with the next line and `ClassifiedJournal::oversize_lines_dropped`
+  counts it. The line hook still fires for it. The crate logs a warning for the first drop and then
+  every 1000th, with the running count and never the content. `journalctl -o json` writes a field
+  over 4096 bytes as `null`, so a record of ordinary size is a few kilobytes: the cap bounds memory
+  against a flood and is not calibrated on a real busy host. The count is not reported to the
+  agent's health surface yet.
 
 ## Testing
 

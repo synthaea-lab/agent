@@ -31,15 +31,18 @@ const PTRACE_PID_OFFSET: usize = 24;
 const PTRACE_ADDR_OFFSET: usize = 32;
 #[cfg(any(bpf_target_arch = "x86_64", bpf_target_arch = "aarch64"))]
 const PTRACE_DATA_OFFSET: usize = 40;
-/// i686: inferred, not independently verified (see `sys_enter_open`'s i686 note).
+/// i686: argument `i` at `12 + 4*i`, the `sys_enter_openat` i686 layout (8-byte
+/// `trace_entry`, 4-byte `__syscall_nr`, then 4-byte `unsigned long` arguments). Derived,
+/// not read from an i686 kernel; the first version started at 16 and read every argument
+/// one slot late. `tools/check-ebpf-offsets.py` holds every pair to this rule.
 #[cfg(bpf_target_arch = "x86")]
-const PTRACE_REQUEST_OFFSET: usize = 16;
+const PTRACE_REQUEST_OFFSET: usize = 12;
 #[cfg(bpf_target_arch = "x86")]
-const PTRACE_PID_OFFSET: usize = 20;
+const PTRACE_PID_OFFSET: usize = 16;
 #[cfg(bpf_target_arch = "x86")]
-const PTRACE_ADDR_OFFSET: usize = 24;
+const PTRACE_ADDR_OFFSET: usize = 20;
 #[cfg(bpf_target_arch = "x86")]
-const PTRACE_DATA_OFFSET: usize = 28;
+const PTRACE_DATA_OFFSET: usize = 24;
 
 pub fn sys_enter_ptrace(ctx: TracePointContext) -> u32 {
     into_ret(try_sys_enter_ptrace(ctx))
