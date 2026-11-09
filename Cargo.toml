@@ -111,7 +111,7 @@ default-members = [
 [workspace.package]
 # One version for every crate, bumped by the release PR (docs/release.md); the
 # packaging files that carry it are listed in release-please-config.json.
-version = "0.0.0"
+version = "0.0.1"
 publish = false
 license = "Apache-2.0"
 edition = "2024"
