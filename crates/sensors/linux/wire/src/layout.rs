@@ -5,12 +5,31 @@
 //! What it can break is what is outside this crate: the BTF-relocated reads that fill them, the
 //! `bpf_ringbuf_output` sizes, and the variable-length exec record. These pins make any layout
 //! change a deliberate, reviewed edit: change the table here and bump [`crate::WIRE_VERSION`] in
-//! the same change. The values were taken from the structs as they stood on 2026-11-09 (AS-030);
-//! every field type here has the same size and alignment on bpfel and on the 64-bit hosts.
+//! the same change, together with [`PINNED_WIRE_VERSION`]. That constant only enforces one
+//! direction: a version bump that does not revisit this table fails to compile, but a table
+//! edit without a bump still compiles, so the bump stays a review item. The values were taken
+//! from the structs as they stood on 2026-11-09 (AS-030).
+//!
+//! 64-bit hosts only. Every field type here has the same size and alignment on bpfel and on
+//! `x86_64`/`aarch64`, but `u64` aligns to 4 on i686, so a 32-bit userspace would read these
+//! structs at other offsets than the probes write them. The `usize` assert below turns that
+//! into one clear build error instead of a page of offset mismatches.
 
 use core::mem::{align_of, offset_of, size_of};
 
 use crate::*;
+
+/// The [`WIRE_VERSION`] this table was last checked against. Bump both together.
+const PINNED_WIRE_VERSION: u32 = 28;
+
+const _: () = assert!(
+    PINNED_WIRE_VERSION == WIRE_VERSION,
+    "WIRE_VERSION changed: re-check the pins below, then update PINNED_WIRE_VERSION",
+);
+const _: () = assert!(
+    size_of::<usize>() == 8,
+    "the wire layout is pinned for 64-bit targets only (u64 aligns to 4 on i686)",
+);
 
 /// Asserts at compile time that `$ty` has exactly this size, alignment and field offsets.
 macro_rules! pin_layout {
