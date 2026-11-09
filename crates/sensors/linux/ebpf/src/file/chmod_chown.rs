@@ -30,7 +30,7 @@ static FILE_CHOWN_EVENTS: RingBuf = RingBuf::with_byte_size(256 * 1024, 0);
 #[map]
 static CHOWN_SCRATCH: PerCpuArray<FileChownEvent> = PerCpuArray::with_max_entries(1, 0);
 
-/// Offsets of the `syscalls:sys_enter_chmod` tracepoint (`x86_64/aarch64)`: `filename`(16),
+/// Offsets of the `syscalls:sys_enter_chmod` tracepoint (`x86_64`/`aarch64`): `filename`(16),
 /// `mode`(24). Verified on 2026-09-22 on Alpine (kernel 6.18.50-0-virt, `x86_64`) via
 /// `/sys/kernel/tracing/events/syscalls/sys_enter_chmod/format`.
 ///
@@ -38,7 +38,7 @@ static CHOWN_SCRATCH: PerCpuArray<FileChownEvent> = PerCpuArray::with_max_entrie
 const CHMOD_FILENAME_PTR_OFFSET: usize = arg_offset(0);
 const CHMOD_MODE_OFFSET: usize = arg_offset(1);
 
-/// Offsets of the `syscalls:sys_enter_fchmodat` tracepoint (`x86_64/aarch64)`: `dfd`(16),
+/// Offsets of the `syscalls:sys_enter_fchmodat` tracepoint (`x86_64`/`aarch64`): `dfd`(16),
 /// `filename`(24), `mode`(32). Verified on 2026-09-22 on Alpine (kernel 6.18.50-0-virt,
 /// `x86_64`) via `/sys/kernel/tracing/events/syscalls/sys_enter_fchmodat/format`.
 ///
@@ -115,7 +115,7 @@ fn emit_file_chmod_event(
     Ok(0)
 }
 
-/// Offsets of the `syscalls:sys_enter_chown` tracepoint (`x86_64/aarch64)`: `filename`(16),
+/// Offsets of the `syscalls:sys_enter_chown` tracepoint (`x86_64`/`aarch64`): `filename`(16),
 /// `user`(24), `group`(32). Verified on 2026-09-22 on Alpine (kernel 6.18.50-0-virt,
 /// `x86_64`) via `/sys/kernel/tracing/events/syscalls/sys_enter_chown/format`.
 ///
@@ -124,7 +124,7 @@ const CHOWN_FILENAME_PTR_OFFSET: usize = arg_offset(0);
 const CHOWN_USER_OFFSET: usize = arg_offset(1);
 const CHOWN_GROUP_OFFSET: usize = arg_offset(2);
 
-/// Offsets of the `syscalls:sys_enter_lchown` tracepoint (`x86_64/aarch64)`: identical
+/// Offsets of the `syscalls:sys_enter_lchown` tracepoint (`x86_64`/`aarch64`): identical
 /// shape to `sys_enter_chown` above — `filename`(16), `user`(24), `group`(32). Verified
 /// on 2026-09-22 on Alpine (kernel 6.18.50-0-virt, `x86_64`) via
 /// `/sys/kernel/tracing/events/syscalls/sys_enter_lchown/format`.
@@ -134,7 +134,7 @@ const LCHOWN_FILENAME_PTR_OFFSET: usize = arg_offset(0);
 const LCHOWN_USER_OFFSET: usize = arg_offset(1);
 const LCHOWN_GROUP_OFFSET: usize = arg_offset(2);
 
-/// Offsets of the `syscalls:sys_enter_fchownat` tracepoint (`x86_64/aarch64)`: `dfd`(16),
+/// Offsets of the `syscalls:sys_enter_fchownat` tracepoint (`x86_64`/`aarch64`): `dfd`(16),
 /// `filename`(24), `user`(32), `group`(40), `flag`(48). Verified on 2026-09-22 on Alpine
 /// (kernel 6.18.50-0-virt, `x86_64`) via
 /// `/sys/kernel/tracing/events/syscalls/sys_enter_fchownat/format`.

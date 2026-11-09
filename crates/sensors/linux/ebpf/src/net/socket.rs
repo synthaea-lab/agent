@@ -63,7 +63,7 @@ const SOCK_NONBLOCK_FLAG: i32 = 0o4000;
 /// review).
 const AF_UNIX: i32 = 1;
 
-/// Offsets of the `syscalls:sys_enter_socket` tracepoint (`x86_64/aarch64)`:
+/// Offsets of the `syscalls:sys_enter_socket` tracepoint (`x86_64`/`aarch64`):
 /// `domain`(16), `type`(24), `protocol`(32) — the standard three-plain-argument
 /// layout also verified for `tgkill`'s `(tgid, tid, sig)`. Verified on 2026-10-07
 /// on Alpine (kernel 6.18.50-0-virt, `x86_64`) via

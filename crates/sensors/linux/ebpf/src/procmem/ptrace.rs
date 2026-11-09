@@ -22,7 +22,7 @@ static PTRACE_EVENTS: RingBuf = RingBuf::with_byte_size(256 * 1024, 0);
 #[map]
 static PTRACE_SCRATCH: PerCpuArray<PtraceEvent> = PerCpuArray::with_max_entries(1, 0);
 
-/// Offsets of the `syscalls:sys_enter_ptrace` tracepoint (`x86_64/aarch64)`:
+/// Offsets of the `syscalls:sys_enter_ptrace` tracepoint (`x86_64`/`aarch64`):
 /// `request`(16), `pid`(24), `addr`(32), `data`(40). Verified on 2026-09-22 on
 /// Arch (kernel 6.6.9-arch1-1, `x86_64`) via
 /// `/sys/kernel/tracing/events/syscalls/sys_enter_ptrace/format`.
