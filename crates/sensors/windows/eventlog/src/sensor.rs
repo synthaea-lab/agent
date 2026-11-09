@@ -27,6 +27,7 @@ use schema::{
 };
 
 use crate::{
+    error::EventQueryError,
     query::{Direction, query_events},
     targets::{
         ParsedBlock,
@@ -121,7 +122,7 @@ pub(crate) struct PollTarget {
 }
 
 /// `EventRecordID` of the newest matching event already in the channel.
-fn last_known_record_id(target: &PollTarget) -> Result<u64, String> {
+fn last_known_record_id(target: &PollTarget) -> Result<u64, EventQueryError> {
     let blocks = query_events(
         target.channel,
         &target_xpath(target, None),
@@ -138,7 +139,7 @@ fn last_known_record_id(target: &PollTarget) -> Result<u64, String> {
 fn new_blocks(
     target: &PollTarget,
     since_record_id: u64,
-) -> Result<Vec<(u64, Option<Event>)>, String> {
+) -> Result<Vec<(u64, Option<Event>)>, EventQueryError> {
     let blocks = query_events(
         target.channel,
         &target_xpath(target, Some(since_record_id)),
@@ -170,7 +171,7 @@ fn poll_once(
     cursor: Option<u64>,
     sink: &dyn EventSink,
     counters: &EventLogCounters,
-) -> Result<u64, String> {
+) -> Result<u64, EventQueryError> {
     let Some(since) = cursor else {
         return last_known_record_id(target);
     };
@@ -1872,14 +1873,14 @@ mod query_tests {
     fn a_failing_query_is_an_error_not_an_empty_result() {
         let err = query_events("Synthaea-No-Such-Channel", "*", Direction::Reverse, Some(1))
             .expect_err("an unknown channel must not look like a quiet one");
-        assert!(err.contains("Win32 error"), "{err}");
+        assert!(err.to_string().contains("Win32 error"), "{err}");
     }
 
     #[test]
     fn a_malformed_query_is_an_error() {
         let err = query_events("System", "*[System[(EventID=", Direction::Forward, None)
             .expect_err("a malformed XPath fails every poll, so it must be an error");
-        assert!(err.contains("Win32 error"), "{err}");
+        assert!(err.to_string().contains("Win32 error"), "{err}");
     }
 
     #[test]

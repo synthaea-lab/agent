@@ -203,6 +203,9 @@ pub mod xml;
 // than polled in silence (#786).
 #[cfg(windows)]
 mod channel;
+// Portable so its messages are tested on every host.
+#[cfg_attr(not(windows), allow(dead_code))]
+mod error;
 // The polling transport's channel read (`EvtQuery`, UTF-16), #1126.
 #[cfg(windows)]
 mod query;

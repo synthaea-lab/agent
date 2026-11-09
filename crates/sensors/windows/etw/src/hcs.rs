@@ -17,7 +17,7 @@ use windows_sys::{
     core::{HRESULT, PCWSTR, PWSTR},
 };
 
-use crate::silo::{self, ContainerSource};
+use crate::silo::{self, ContainerSource, HcsError};
 
 /// Per call: the service answers in milliseconds, and a resolver pass that
 /// waits on a hung service only delays attribution, never an event.
@@ -54,16 +54,16 @@ pub(crate) struct Hcs {
 }
 
 impl Hcs {
-    fn api(&self) -> Result<&Api, String> {
+    fn api(&self) -> Result<&Api, HcsError> {
         self.api
             .get_or_init(load)
             .as_ref()
-            .ok_or_else(|| "computecore.dll unavailable".to_string())
+            .ok_or(HcsError::Unavailable)
     }
 }
 
 impl ContainerSource for Hcs {
-    fn container_ids(&self) -> Result<Vec<String>, String> {
+    fn container_ids(&self) -> Result<Vec<String>, HcsError> {
         let api = self.api()?;
         let query = wide(ALL_SYSTEMS_QUERY);
         // SAFETY: `query` is NUL-terminated and outlives the call, which
@@ -72,7 +72,7 @@ impl ContainerSource for Hcs {
         Ok(silo::parse_container_ids(&json))
     }
 
-    fn processes(&self, container_id: &str) -> Result<Vec<(u32, String)>, String> {
+    fn processes(&self, container_id: &str) -> Result<Vec<(u32, String)>, HcsError> {
         let api = self.api()?;
         let id = wide(container_id);
         let query = wide(PROCESS_LIST_QUERY);
@@ -82,7 +82,7 @@ impl ContainerSource for Hcs {
             let mut system: HcsSystem = core::ptr::null_mut();
             let hr = (api.open_system)(id.as_ptr(), GENERIC_ALL, &mut system);
             if hr < 0 || system.is_null() {
-                return Err(format!("HcsOpenComputeSystem: {}", hresult(hr)));
+                return Err(HcsError::OpenSystem(hr));
             }
             let json = run_operation(api, |op| (api.properties)(system, op, query.as_ptr()));
             (api.close_system)(system);
@@ -136,7 +136,7 @@ fn load() -> Option<Api> {
 unsafe fn run_operation(
     api: &Api,
     start: impl FnOnce(HcsOperation) -> HRESULT,
-) -> Result<String, String> {
+) -> Result<String, HcsError> {
     // SAFETY: the operation is null-checked and closed on every path; the
     // result document is owned by us once returned and freed with LocalFree:
     // "The caller is responsible for releasing the returned string using
@@ -144,12 +144,12 @@ unsafe fn run_operation(
     unsafe {
         let op = (api.create_operation)(core::ptr::null(), core::ptr::null());
         if op.is_null() {
-            return Err("HcsCreateOperation failed".to_string());
+            return Err(HcsError::CreateOperation);
         }
         let hr = start(op);
         if hr < 0 {
             (api.close_operation)(op);
-            return Err(hresult(hr));
+            return Err(HcsError::Start(hr));
         }
         let mut document: PWSTR = core::ptr::null_mut();
         let hr = (api.wait)(op, TIMEOUT_MS, &mut document);
@@ -162,7 +162,10 @@ unsafe fn run_operation(
         };
         (api.close_operation)(op);
         if hr < 0 {
-            return Err(format!("{}: {text}", hresult(hr)));
+            return Err(HcsError::Operation {
+                hresult: hr,
+                document: text,
+            });
         }
         Ok(text)
     }
@@ -187,10 +190,6 @@ fn wide(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(std::iter::once(0)).collect()
 }
 
-fn hresult(hr: HRESULT) -> String {
-    format!("HRESULT 0x{:08X}", hr.cast_unsigned())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -205,7 +204,7 @@ mod tests {
         assert!(started.elapsed() < bound);
         match answer {
             Ok(ids) => assert!(ids.iter().all(|id| !id.is_empty())),
-            Err(reason) => assert!(!reason.is_empty()),
+            Err(reason) => assert!(!reason.to_string().is_empty()),
         }
     }
 }
