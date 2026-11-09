@@ -81,7 +81,7 @@ pub(crate) struct ImpactState {
     /// pid → (timestamp, path) of unlinks that found no creation to pair with yet.
     /// The kernel always creates `X.suffix` before unlinking `X`, but userspace drains
     /// the open and delete ring buffers independently, so the delete can be processed
-    /// first (the same ordering hazard as `RuleState`'s `pending_proc_fd_exec`, #503); the
+    /// first (the same ordering hazard as `MemfdState`'s `pending_proc_fd_exec`, #503); the
     /// creation then pairs with it on arrival. Same bounds as `recent_creates`.
     pending_unlinks: BoundedMap<u32, VecDeque<(u64, String)>>,
     /// pid → the newest renames and deletions seen for it (oldest first): the damage

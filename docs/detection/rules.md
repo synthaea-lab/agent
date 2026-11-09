@@ -86,9 +86,11 @@ the authentication rules (`auth_failures`, `logon_baseline`, `odd_hours`, `rdp_s
 `sudo_success`, `session_hijack`) in [`AuthState`](../../crates/rules/src/auth_state.rs), and
 SETUID-ROOT-REQUEST's deferred judgement (`pending_identity`, `exec_history`,
 `setuid_root_alerted`) in `IdentityRequests` ([`privesc.rs`](../../crates/rules/src/privesc.rs)),
-and the download-to-execution joins (`recent_writes`, `recent_quarantines`,
+the download-to-execution joins (`recent_writes`, `recent_quarantines`,
 `recent_bits_downloads`, `recent_motw_removals`) in
-[`DownloadState`](../../crates/rules/src/download_state.rs). The main families:
+[`DownloadState`](../../crates/rules/src/download_state.rs), and the T1620 memfd-exec
+correlation (`recent_memfd_creates`, `pending_proc_fd_exec`) in
+[`MemfdState`](../../crates/rules/src/memfd_state.rs). The main families:
 
 | Family | Fields (examples) | Key | Feeds |
 | --- | --- | --- | --- |
