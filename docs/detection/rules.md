@@ -81,7 +81,11 @@ split out keeps its tables in its own type, held by `RuleState` as one field: th
 (`beacon`, `beacon_flow_dedup`, `scan_*`, `egress_*`, `dns_class`, `archive_*`, `staged_archives`)
 live in [`NetworkState`](../../crates/rules/src/network_state.rs), and the file-impact rules
 (`ransomware_*`, `recent_creates`, `pending_unlinks`, `write_volume`, `rename_count`,
-`touched_files`, `set_time_alerted`) in [`ImpactState`](../../crates/rules/src/impact_state.rs).
+`touched_files`, `set_time_alerted`) in [`ImpactState`](../../crates/rules/src/impact_state.rs),
+the authentication rules (`auth_failures`, `logon_baseline`, `odd_hours`, `rdp_success`,
+`sudo_success`, `session_hijack`) in [`AuthState`](../../crates/rules/src/auth_state.rs), and
+SETUID-ROOT-REQUEST's deferred judgement (`pending_identity`, `exec_history`,
+`setuid_root_alerted`) in `IdentityRequests` ([`privesc.rs`](../../crates/rules/src/privesc.rs)).
 The main families:
 
 | Family | Fields (examples) | Key | Feeds |
@@ -121,7 +125,7 @@ are known and differ, so a recycled pid never inherits its predecessor's name or
 exec'd, such as a web server's respawned workers. Without it, a shell spawned by such a worker
 would not be recognised as a web-server child.
 
-`RuleState::image_as_of(pid, generation, t)` answers "which image did this pid run at time
+`IdentityRequests::image_as_of(pid, generation, t)` answers "which image did this pid run at time
 *t*", from the last few execs per pid (`exec_history`). SETUID-ROOT-REQUEST needs it, because
 an identity change can be judged after the process exec'd again.
 
