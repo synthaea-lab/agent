@@ -13,7 +13,7 @@ use aya_ebpf::{
 use aya_log_ebpf::warn;
 use sensor_linux_wire::{MAX_TLS_CAPTURE, TASK_COMM_LEN, TlsCaptureEvent};
 
-use crate::fill_lineage;
+use crate::{fill_lineage, into_ret};
 
 /// Ring buffer for TLS capture events.
 #[map]
@@ -35,29 +35,20 @@ static SSL_READ_ARGS: HashMap<u64, (u64, u32, u8)> = HashMap::with_max_entries(1
 /// Captures the first MAX_TLS_CAPTURE bytes of `buf` before encryption.
 #[uprobe]
 pub fn ssl_write_openssl(ctx: ProbeContext) -> u32 {
-    match try_ssl_write(ctx, 0) {
-        Ok(ret) => ret,
-        Err(ret) => ret,
-    }
+    into_ret(try_ssl_write(ctx, 0))
 }
 
 /// Uprobe on SSL_write entry for BoringSSL (pre-encryption plaintext capture).
 #[uprobe]
 pub fn ssl_write_boringssl(ctx: ProbeContext) -> u32 {
-    match try_ssl_write(ctx, 1) {
-        Ok(ret) => ret,
-        Err(ret) => ret,
-    }
+    into_ret(try_ssl_write(ctx, 1))
 }
 
 /// Uprobe on gnutls_record_send entry for GnuTLS (pre-encryption plaintext capture).
 /// Signature: `ssize_t gnutls_record_send(gnutls_session_t session, const void *data, size_t data_size)`
 #[uprobe]
 pub fn ssl_write_gnutls(ctx: ProbeContext) -> u32 {
-    match try_ssl_write(ctx, 2) {
-        Ok(ret) => ret,
-        Err(ret) => ret,
-    }
+    into_ret(try_ssl_write(ctx, 2))
 }
 
 fn try_ssl_write(ctx: ProbeContext, lib_type: u8) -> Result<u32, u32> {
@@ -160,28 +151,19 @@ fn try_ssl_read_entry(ctx: ProbeContext, lib_type: u8) -> u32 {
 /// The return value is the number of bytes read, or <= 0 on error.
 #[uretprobe]
 pub fn ssl_read_exit_openssl(ctx: RetProbeContext) -> u32 {
-    match try_ssl_read_exit(ctx) {
-        Ok(ret) => ret,
-        Err(ret) => ret,
-    }
+    into_ret(try_ssl_read_exit(ctx))
 }
 
 /// Uretprobe on SSL_read return for BoringSSL: capture decrypted plaintext.
 #[uretprobe]
 pub fn ssl_read_exit_boringssl(ctx: RetProbeContext) -> u32 {
-    match try_ssl_read_exit(ctx) {
-        Ok(ret) => ret,
-        Err(ret) => ret,
-    }
+    into_ret(try_ssl_read_exit(ctx))
 }
 
 /// Uretprobe on gnutls_record_recv return for GnuTLS: capture decrypted plaintext.
 #[uretprobe]
 pub fn ssl_read_exit_gnutls(ctx: RetProbeContext) -> u32 {
-    match try_ssl_read_exit(ctx) {
-        Ok(ret) => ret,
-        Err(ret) => ret,
-    }
+    into_ret(try_ssl_read_exit(ctx))
 }
 
 fn try_ssl_read_exit(ctx: RetProbeContext) -> Result<u32, u32> {

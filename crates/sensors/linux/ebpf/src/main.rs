@@ -59,6 +59,15 @@ const SYS_EXIT_RET_OFFSET: usize = 12;
 const AF_INET: u16 = 2;
 const AF_INET6: u16 = 10;
 
+/// The `u32`/`i32` an eBPF program returns, from its `try_*` body: the success value and the
+/// early-exit code are both just the return code, so the two arms collapse (AS-028).
+#[inline(always)]
+pub(crate) fn into_ret<T>(result: Result<T, T>) -> T {
+    match result {
+        Ok(ret) | Err(ret) => ret,
+    }
+}
+
 #[cfg(not(test))]
 #[panic_handler]
 fn panic(_info: &core::panic::PanicInfo) -> ! {

@@ -9,7 +9,7 @@ use aya_ebpf::{
 use aya_log_ebpf::warn;
 use sensor_linux_wire::{FileChmodEvent, FileChownEvent, TASK_COMM_LEN, is_filtered_path};
 
-use crate::fill_lineage;
+use crate::{fill_lineage, into_ret};
 
 /// Ring buffer shared with userspace for `chmod`/`fchmodat` events.
 #[map]
@@ -54,10 +54,7 @@ const FCHMODAT_FILENAME_PTR_OFFSET: usize = 16;
 const FCHMODAT_MODE_OFFSET: usize = 20;
 
 pub fn sys_enter_chmod(ctx: TracePointContext) -> u32 {
-    match try_sys_enter_chmod(ctx) {
-        Ok(ret) => ret,
-        Err(ret) => ret,
-    }
+    into_ret(try_sys_enter_chmod(ctx))
 }
 
 fn try_sys_enter_chmod(ctx: TracePointContext) -> Result<u32, u32> {
@@ -77,10 +74,7 @@ fn try_sys_enter_chmod(ctx: TracePointContext) -> Result<u32, u32> {
 }
 
 pub fn sys_enter_fchmodat(ctx: TracePointContext) -> u32 {
-    match try_sys_enter_fchmodat(ctx) {
-        Ok(ret) => ret,
-        Err(ret) => ret,
-    }
+    into_ret(try_sys_enter_fchmodat(ctx))
 }
 
 fn try_sys_enter_fchmodat(ctx: TracePointContext) -> Result<u32, u32> {
@@ -203,10 +197,7 @@ const FCHOWNAT_USER_OFFSET: usize = 20;
 const FCHOWNAT_GROUP_OFFSET: usize = 24;
 
 pub fn sys_enter_chown(ctx: TracePointContext) -> u32 {
-    match try_sys_enter_chown(ctx) {
-        Ok(ret) => ret,
-        Err(ret) => ret,
-    }
+    into_ret(try_sys_enter_chown(ctx))
 }
 
 fn try_sys_enter_chown(ctx: TracePointContext) -> Result<u32, u32> {
@@ -230,10 +221,7 @@ fn try_sys_enter_chown(ctx: TracePointContext) -> Result<u32, u32> {
 }
 
 pub fn sys_enter_lchown(ctx: TracePointContext) -> u32 {
-    match try_sys_enter_lchown(ctx) {
-        Ok(ret) => ret,
-        Err(ret) => ret,
-    }
+    into_ret(try_sys_enter_lchown(ctx))
 }
 
 fn try_sys_enter_lchown(ctx: TracePointContext) -> Result<u32, u32> {
@@ -257,10 +245,7 @@ fn try_sys_enter_lchown(ctx: TracePointContext) -> Result<u32, u32> {
 }
 
 pub fn sys_enter_fchownat(ctx: TracePointContext) -> u32 {
-    match try_sys_enter_fchownat(ctx) {
-        Ok(ret) => ret,
-        Err(ret) => ret,
-    }
+    into_ret(try_sys_enter_fchownat(ctx))
 }
 
 fn try_sys_enter_fchownat(ctx: TracePointContext) -> Result<u32, u32> {

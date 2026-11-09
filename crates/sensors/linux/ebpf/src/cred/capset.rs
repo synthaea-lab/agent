@@ -9,7 +9,7 @@ use aya_ebpf::{
 use aya_log_ebpf::warn;
 use sensor_linux_wire::{CapSetEvent, TASK_COMM_LEN};
 
-use crate::fill_lineage;
+use crate::{fill_lineage, into_ret};
 
 /// Ring buffer shared with userspace for `capset` events.
 #[map]
@@ -32,10 +32,7 @@ const CAPSET_HDRP_PTR_OFFSET: usize = 12;
 const CAPSET_DATA_PTR_OFFSET: usize = 16;
 
 pub fn sys_enter_capset(ctx: TracePointContext) -> u32 {
-    match try_sys_enter_capset(ctx) {
-        Ok(ret) => ret,
-        Err(ret) => ret,
-    }
+    into_ret(try_sys_enter_capset(ctx))
 }
 
 /// `struct __user_cap_header_struct { __u32 version; int pid; }` — `version`

@@ -9,7 +9,7 @@ use aya_ebpf::{
 use aya_log_ebpf::warn;
 use sensor_linux_wire::{PtraceEvent, TASK_COMM_LEN};
 
-use crate::fill_lineage;
+use crate::{fill_lineage, into_ret};
 
 /// Ring buffer shared with userspace for `ptrace` events (issue #265).
 #[map]
@@ -42,10 +42,7 @@ const PTRACE_ADDR_OFFSET: usize = 24;
 const PTRACE_DATA_OFFSET: usize = 28;
 
 pub fn sys_enter_ptrace(ctx: TracePointContext) -> u32 {
-    match try_sys_enter_ptrace(ctx) {
-        Ok(ret) => ret,
-        Err(ret) => ret,
-    }
+    into_ret(try_sys_enter_ptrace(ctx))
 }
 
 fn try_sys_enter_ptrace(ctx: TracePointContext) -> Result<u32, u32> {

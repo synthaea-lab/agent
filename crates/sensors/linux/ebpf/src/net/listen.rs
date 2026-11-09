@@ -10,7 +10,7 @@ use aya_log_ebpf::warn;
 use sensor_linux_wire::{SocketListenEvent, TASK_COMM_LEN};
 
 use super::bind::{BIND_ADDR_MAP, BindAddrKey};
-use crate::fill_lineage;
+use crate::{fill_lineage, into_ret};
 
 /// Ring buffer shared with userspace for `listen` events.
 #[map]
@@ -34,10 +34,7 @@ const LISTEN_FD_OFFSET: usize = 12;
 const LISTEN_BACKLOG_OFFSET: usize = 16;
 
 pub fn sys_enter_listen(ctx: TracePointContext) -> u32 {
-    match try_sys_enter_listen(ctx) {
-        Ok(ret) => ret,
-        Err(ret) => ret,
-    }
+    into_ret(try_sys_enter_listen(ctx))
 }
 
 /// `listen(2)` carries no address of its own — correlates against [`BIND_ADDR_MAP`]
