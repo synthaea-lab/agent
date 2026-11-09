@@ -21,15 +21,15 @@ hardening step can be undone by an administrator through the documented commands
 
 | Attack | Defense | Where |
 | --- | --- | --- |
-| Kill the agent | watchdog respawns it | [`supervise.rs`](../watchdog/src/supervise.rs) |
-| Kill the watchdog | service manager respawns it; the agent dies with it | [`service/`](../watchdog/src/service/mod.rs), [`die_with_parent`](../watchdog/src/supervise.rs) |
-| Freeze or wedge the agent | progress heartbeat stalls, watchdog kills and restarts it | [`heartbeat.rs`](../agent/src/heartbeat.rs), [`HeartbeatMonitor`](../watchdog/src/supervise.rs) |
-| Detach or stop one sensor | sensor-silence alert (T1562) | [`tamper::heartbeat`](../crates/tamper/src/heartbeat.rs), [`silence.rs`](../agent/src/silence.rs) |
-| Swap the binary on disk | watchdog refuses to launch it; periodic manifest check alerts (T1601) | [`BinaryPin`](../watchdog/src/tamper.rs), [`integrity.rs`](../agent/src/integrity.rs) |
-| Edit or disable the service definition | drift report (Linux) | [`drift_report`](../watchdog/src/service/linux.rs) |
-| Write, delete or rename the agent's own files | protected-resource alert (T1562) | [`protected.rs`](../agent/src/protected.rs) |
-| Send `SIGTERM`/`SIGHUP`/`SIGQUIT` | sender recorded before exit (T1562) | [`kill_loudness.rs`](../agent/src/kill_loudness.rs) |
-| Broken release after an update | probation, rollback and ban | [`probation.rs`](../watchdog/src/probation.rs), [`recovery.rs`](../watchdog/src/recovery.rs) |
+| Kill the agent | watchdog respawns it | [`supervise.rs`](../apps/watchdog/src/supervise.rs) |
+| Kill the watchdog | service manager respawns it; the agent dies with it | [`service/`](../apps/watchdog/src/service/mod.rs), [`die_with_parent`](../apps/watchdog/src/supervise.rs) |
+| Freeze or wedge the agent | progress heartbeat stalls, watchdog kills and restarts it | [`heartbeat.rs`](../apps/agent/src/heartbeat.rs), [`HeartbeatMonitor`](../apps/watchdog/src/supervise.rs) |
+| Detach or stop one sensor | sensor-silence alert (T1562) | [`tamper::heartbeat`](../crates/tamper/src/heartbeat.rs), [`silence.rs`](../apps/agent/src/silence.rs) |
+| Swap the binary on disk | watchdog refuses to launch it; periodic manifest check alerts (T1601) | [`BinaryPin`](../apps/watchdog/src/tamper.rs), [`integrity.rs`](../apps/agent/src/integrity.rs) |
+| Edit or disable the service definition | drift report (Linux) | [`drift_report`](../apps/watchdog/src/service/linux.rs) |
+| Write, delete or rename the agent's own files | protected-resource alert (T1562) | [`protected.rs`](../apps/agent/src/protected.rs) |
+| Send `SIGTERM`/`SIGHUP`/`SIGQUIT` | sender recorded before exit (T1562) | [`kill_loudness.rs`](../apps/agent/src/kill_loudness.rs) |
+| Broken release after an update | probation, rollback and ban | [`probation.rs`](../apps/watchdog/src/probation.rs), [`recovery.rs`](../apps/watchdog/src/recovery.rs) |
 
 ## Two layers of kill resistance
 
@@ -49,36 +49,36 @@ as the `synthaea` user with an ambient capability set
 ([`synthaea-agent.service`](../packaging/linux/systemd/synthaea-agent.service)).
 `watchdog install` uses that packaged unit when present and otherwise generates a
 development unit (also `Restart=always`), or an OpenRC script under
-`supervise-daemon` ([`service/linux.rs`](../watchdog/src/service/linux.rs)). On
+`supervise-daemon` ([`service/linux.rs`](../apps/watchdog/src/service/linux.rs)). On
 Windows the watchdog is an SCM service with an `sc failure` restart policy and a
-hardened service ACL ([`service/windows.rs`](../watchdog/src/service/windows.rs));
+hardened service ACL ([`service/windows.rs`](../apps/watchdog/src/service/windows.rs));
 on macOS a launchd daemon with `KeepAlive`
-([`service/macos.rs`](../watchdog/src/service/macos.rs)). Stopping for good goes
+([`service/macos.rs`](../apps/watchdog/src/service/macos.rs)). Stopping for good goes
 through the service manager. On Unix a stop arrives as `SIGTERM`; the watchdog kills
 the agent and exits.
 
 **Layer 1: the watchdog's supervision loop**
-([`supervise_loop`](../watchdog/src/supervise.rs)) spawns `agent run --alerts <path>`
+([`supervise_loop`](../apps/watchdog/src/supervise.rs)) spawns `agent run --alerts <path>`
 with its working directory set to the agent's folder (a Windows service would
 otherwise start in System32), watches it every 500 ms, and respawns it on exit.
 
-- **Crash-loop backoff** ([`Backoff`](../watchdog/src/supervise.rs)). An exit after
+- **Crash-loop backoff** ([`Backoff`](../apps/watchdog/src/supervise.rs)). An exit after
   less than 10 s is a fast crash: the delay doubles from `--restart-delay` (default
   5 s) up to 300 s. An exit after a longer run resets the delay to the floor, so a
   one-off crash does not inherit a stale long delay. Spawn failures, refused binaries
   and hung agents feed the same backoff. The service manager keeps its own fixed
   cadence for the watchdog; the two layers do not compound.
 - **The agent dies with the watchdog** on Linux
-  ([`die_with_parent`](../watchdog/src/supervise.rs)): `PR_SET_PDEATHSIG(SIGKILL)` in
+  ([`die_with_parent`](../apps/watchdog/src/supervise.rs)): `PR_SET_PDEATHSIG(SIGKILL)` in
   the child before `exec`, then a `getppid()` check that aborts the spawn if the
   watchdog already died between `fork` and `prctl`. Without it a killed watchdog
   leaves an unsupervised agent reparented to pid 1; systemd's cgroup sweep hides
   this, OpenRC by default does not.
 - **Counters for the fleet.** Each spawn passes how many times this watchdog has
   started the agent and how many self-protection events it has reported, through two
-  environment variables ([`agent_command`](../watchdog/src/supervise.rs), names in
+  environment variables ([`agent_command`](../apps/watchdog/src/supervise.rs), names in
   [`config::identity`](../crates/config/src/identity.rs)). The agent reads them
-  ([`host_counters.rs`](../agent/src/host_counters.rs)) and reports them in its
+  ([`host_counters.rs`](../apps/agent/src/host_counters.rs)) and reports them in its
   health beacon. Both restart from zero when the watchdog restarts.
 
 ## Liveness and hang detection
@@ -87,14 +87,14 @@ A process can be alive and still collect nothing: deadlocked, wedged on a poison
 lock, its capture thread dead while the main thread parks. A plain "is it running"
 check misses all of these.
 
-- **Writer.** [`DetectionSink`](../agent/src/sink/mod.rs) increments a progress counter
+- **Writer.** [`DetectionSink`](../apps/agent/src/sink/mod.rs) increments a progress counter
   once `on_event` has fully processed an event. A thread in
-  [`heartbeat.rs`](../agent/src/heartbeat.rs) writes it to a file next to the alert
+  [`heartbeat.rs`](../apps/agent/src/heartbeat.rs) writes it to a file next to the alert
   log every 2 s (`WRITE_INTERVAL`). The path transform
-  ([`heartbeat_path_for`](../agent/src/heartbeat.rs)) is duplicated in
-  [`watchdog::paths::heartbeat_path_for`](../watchdog/src/paths.rs), because the
+  ([`heartbeat_path_for`](../apps/agent/src/heartbeat.rs)) is duplicated in
+  [`watchdog::paths::heartbeat_path_for`](../apps/watchdog/src/paths.rs), because the
   watchdog cannot depend on the agent binary; the two must stay identical.
-- **Reader.** [`HeartbeatMonitor`](../watchdog/src/supervise.rs) reads the file every
+- **Reader.** [`HeartbeatMonitor`](../apps/watchdog/src/supervise.rs) reads the file every
   `--heartbeat-interval-secs` (default 5 s), counted in 500 ms poll ticks so the state
   machine needs no clock and is unit-tested with hand-fed readings. After
   `--heartbeat-miss-limit` (default 6) consecutive reads with no advance, the watchdog
@@ -118,7 +118,7 @@ the same observable, telemetry stops, and
   `AtomicU64` it pulses with one relaxed increment per event (or per batch with
   `pulse_n`). Sensor crates may not depend on `tamper`, so a sensor exposes a plain
   counter and the binary wraps it with `SensorHeartbeat::from_counter`. On the main
-  Linux path, [`PulsingSink`](../agent/src/silence.rs) pulses before forwarding each
+  Linux path, [`PulsingSink`](../apps/agent/src/silence.rs) pulses before forwarding each
   event to the sink.
 - A [`SilenceMonitor`](../crates/tamper/src/heartbeat.rs) holds a deadline per sensor.
   [`SilenceMonitor::poll`](../crates/tamper/src/heartbeat.rs) reports a
@@ -126,14 +126,14 @@ the same observable, telemetry stops, and
   counter static past its deadline, and re-arms when it advances. A sensor that never
   pulses is caught one deadline after registration. A sensor switched off on purpose
   is unregistered first, so it is not reported.
-- [`silence::spawn_monitor`](../agent/src/silence.rs) polls every 10 s
+- [`silence::spawn_monitor`](../apps/agent/src/silence.rs) polls every 10 s
   (`POLL_INTERVAL`) on its own thread and emits each verdict as a `T1562` alert through
   `DetectionSink::emit_tamper`, which also counts it for the health beacon. The same
   monitor feeds per-sensor health to the beacon
-  ([`SilenceHealthSource`](../agent/src/silence.rs)).
+  ([`SilenceHealthSource`](../apps/agent/src/silence.rs)).
 - A source that is down for a reason the agent knows (a socket that failed to open)
   is reported as degraded through the beacon via
-  [`SourceStatus`](../agent/src/silence.rs), not as tampering.
+  [`SourceStatus`](../apps/agent/src/silence.rs), not as tampering.
 
 **Determinism.** A healthy sensor on an idle host is indistinguishable from a
 blinded one unless it can generate its own traffic. Where a sensor has a canary (a
@@ -150,8 +150,8 @@ where it has none it is generous:
 | Windows event log channels | 60 s | |
 | Windows socket poller | 3 poll intervals | the poll itself |
 
-Deadlines are constants in [`commands/linux.rs`](../agent/src/commands/linux.rs) and
-[`commands/windows.rs`](../agent/src/commands/windows.rs). Without a canary, an
+Deadlines are constants in [`commands/linux.rs`](../apps/agent/src/commands/linux.rs) and
+[`commands/windows.rs`](../apps/agent/src/commands/windows.rs). Without a canary, an
 eBPF detach on a truly idle host is caught only as a 120 s stall. The monitor runs on
 an agent thread: a suspend of the whole agent freezes it too, and that case is caught
 by the watchdog's hang detection instead. macOS wires no silence monitoring yet
@@ -161,7 +161,7 @@ by the watchdog's hang detection instead. macOS wires no silence monitoring yet
 
 Two independent checks, at two privilege points.
 
-**Watchdog binary pin** ([`BinaryPin`](../watchdog/src/tamper.rs), all platforms).
+**Watchdog binary pin** ([`BinaryPin`](../apps/watchdog/src/tamper.rs), all platforms).
 At start the watchdog hashes the agent binary. Before every spawn it re-hashes it;
 a mismatch writes a `SELF-PROTECTION` line and the binary is **not launched** (the
 loop backs off and retries, so a restored binary starts again). If pinning fails at
@@ -170,23 +170,23 @@ refusing to supervise.
 
 **Service definition drift** (Linux). The watchdog snapshots the installed unit or
 OpenRC script and its enablement at start
-([`snapshot_definition`](../watchdog/src/service/linux.rs)) and, before each spawn,
-reports each difference ([`drift_report`](../watchdog/src/service/linux.rs)) as a
+([`snapshot_definition`](../apps/watchdog/src/service/linux.rs)) and, before each spawn,
+reports each difference ([`drift_report`](../apps/watchdog/src/service/linux.rs)) as a
 `SELF-PROTECTION` line.
 
-**Install-surface hardening** ([`watchdog::tamper`](../watchdog/src/tamper.rs)).
-At `install` time on Unix ([`resolve_paths` in `service/mod.rs`](../watchdog/src/service/mod.rs)),
+**Install-surface hardening** ([`watchdog::tamper`](../apps/watchdog/src/tamper.rs)).
+At `install` time on Unix ([`resolve_paths` in `service/mod.rs`](../apps/watchdog/src/service/mod.rs)),
 `refuse_world_writable_dir` refuses an agent or watchdog binary whose directory is
 world-writable, because anyone who can write there can drop a replacement right after
 the pin check. `harden_permissions` and `harden_ownership` set modes and root ownership on
 what `install` writes. On Windows, `install` applies a service SDDL in which only
 `LocalSystem` may stop, pause or delete the service; administrators keep `WRITE_DAC`
 so `watchdog uninstall` can reset it first
-([`HARDENED_SERVICE_SDDL`](../watchdog/src/service/windows.rs)). This is friction
+([`HARDENED_SERVICE_SDDL`](../apps/watchdog/src/service/windows.rs)). This is friction
 against a hand-typed `sc stop`, not a boundary.
 
 **Agent manifest check** ([`tamper::integrity`](../crates/tamper/src/integrity.rs),
-wired by [`agent/src/integrity.rs`](../agent/src/integrity.rs), Linux).
+wired by [`apps/agent/src/integrity.rs`](../apps/agent/src/integrity.rs), Linux).
 Every 300 s (`CHECK_INTERVAL`) a thread reads the active release's signed manifest
 from the updater layout, verifies its signature, and hashes every listed file
 ([`Manifest::verify`](../crates/tamper/src/integrity.rs)). Each
@@ -199,7 +199,7 @@ from the updater layout, verifies its signature, and hashes every listed file
 - The manifest is the root of trust; its authenticity is the updater's signature
   check. A build without a provisioned release key cannot verify any manifest, and
   that case is not reported as tampering
-  ([`signature_failure_is_tamper`](../agent/src/integrity.rs)).
+  ([`signature_failure_is_tamper`](../apps/agent/src/integrity.rs)).
 - Before the first promoted release (package-installed bootstrap binaries) there is no
   manifest and nothing is checked.
 - The cadence is coarse on purpose: it is real I/O, and an on-disk swap is not a race
@@ -207,15 +207,15 @@ from the updater layout, verifies its signature, and hashes every listed file
 
 ## Protected resources
 
-[`ProtectedResourceGuard`](../agent/src/protected.rs) wraps the main Linux sink and
+[`ProtectedResourceGuard`](../apps/agent/src/protected.rs) wraps the main Linux sink and
 watches the live event stream for another process touching the agent's own files:
 
 - a `FileOpen` with write intent, a `FileDelete`, or a `FileRename` with either side
   on a protected path, by any pid other than the agent's own, raises a `T1562` alert;
-- protected paths ([`protected_paths`](../agent/src/protected.rs)) are the agent
+- protected paths ([`protected_paths`](../apps/agent/src/protected.rs)) are the agent
   executable, the resolved config file, and the alert, events and heartbeat files it
   was started with, all made absolute first, because matching is a path-component
-  suffix comparison ([`matches_protected`](../agent/src/protected.rs)) that tolerates
+  suffix comparison ([`matches_protected`](../apps/agent/src/protected.rs)) that tolerates
   the eBPF sensor's dirfd-relative fragments without matching `myagent` against
   `agent`.
 
@@ -227,7 +227,7 @@ this list; the watchdog's own checks above cover them. These alerts go through
 
 ## Kill loudness
 
-[`kill_loudness.rs`](../agent/src/kill_loudness.rs), Linux: before the agent dies
+[`kill_loudness.rs`](../apps/agent/src/kill_loudness.rs), Linux: before the agent dies
 from a catchable termination signal, it records who sent it.
 
 1. `block_termination_signals` blocks `SIGTERM`, `SIGHUP` and `SIGQUIT` on the main
@@ -254,7 +254,7 @@ pure helpers are.
 
 On Linux, where versioned self-update exists:
 
-- **Probation** ([`probation.rs`](../watchdog/src/probation.rs)). A watchdog started
+- **Probation** ([`probation.rs`](../apps/watchdog/src/probation.rs)). A watchdog started
   from a freshly promoted release (it identifies its release from its own executable
   path, never from `current`) requires the agent's heartbeat to advance within
   `PROBATION_DEADLINE` (120 s). Progress observed at the deadline counts as life. If
@@ -263,7 +263,7 @@ On Linux, where versioned self-update exists:
   exits so the service manager restarts it from the rolled-back `current`. A rollback
   that itself fails is reported and the watchdog stays on the running release rather
   than loop. A watchdog started from `bootstrap/` has no probation: it is the floor.
-- **Pre-start recovery** ([`recovery.rs`](../watchdog/src/recovery.rs)). The packaged
+- **Pre-start recovery** ([`recovery.rs`](../apps/watchdog/src/recovery.rs)). The packaged
   unit's `ExecStartPre` runs `bootstrap/watchdog recover`, which execs
   `current/watchdog --help`; if that fails, `current` is rolled back and the release
   banned before systemd tries to start it.
@@ -300,7 +300,7 @@ amplifier. Tracked in [#29](https://github.com/synthaea-lab/agent/issues/29).
 
 | Technique | Source | Meaning |
 | --- | --- | --- |
-| `SELF-PROTECTION` | watchdog ([`report_self_protection_event`](../watchdog/src/supervise.rs)) | binary pin mismatch, definition drift, probation rollback or its failure |
+| `SELF-PROTECTION` | watchdog ([`report_self_protection_event`](../apps/watchdog/src/supervise.rs)) | binary pin mismatch, definition drift, probation rollback or its failure |
 | `T1562` | agent | sensor silent, protected resource touched, termination signal received |
 | `T1601` | agent | an installed artifact no longer matches the signed manifest |
 
@@ -325,12 +325,12 @@ are compile-time constants.
 
 - Backoff, hang detection, spawn counters, `SELF-PROTECTION` line shape, the agent
   dying with a `SIGKILL`ed watchdog, probation rollback and ban: tests in
-  [`supervise.rs`](../watchdog/src/supervise.rs) and
-  [`probation.rs`](../watchdog/src/probation.rs).
-- Pin, world-writable refusal, permission hardening: [`watchdog/src/tamper.rs`](../watchdog/src/tamper.rs).
-- Service SDDL: [`service/windows.rs`](../watchdog/src/service/windows.rs).
+  [`supervise.rs`](../apps/watchdog/src/supervise.rs) and
+  [`probation.rs`](../apps/watchdog/src/probation.rs).
+- Pin, world-writable refusal, permission hardening: [`apps/watchdog/src/tamper.rs`](../apps/watchdog/src/tamper.rs).
+- Service SDDL: [`service/windows.rs`](../apps/watchdog/src/service/windows.rs).
 - Silence monitor episodes, re-arming, unregister: [`tamper/src/heartbeat.rs`](../crates/tamper/src/heartbeat.rs);
-  silence to alert: [`agent/src/silence.rs`](../agent/src/silence.rs).
+  silence to alert: [`apps/agent/src/silence.rs`](../apps/agent/src/silence.rs).
 - Manifest verification: [`tamper/src/integrity.rs`](../crates/tamper/src/integrity.rs) and
-  [`agent/src/integrity.rs`](../agent/src/integrity.rs).
-- Protected resources (write, delete, rename, relative config path): [`protected.rs`](../agent/src/protected.rs).
+  [`apps/agent/src/integrity.rs`](../apps/agent/src/integrity.rs).
+- Protected resources (write, delete, rename, relative config path): [`protected.rs`](../apps/agent/src/protected.rs).

@@ -144,20 +144,20 @@ oldest.
 
 ### How the agent uses it
 
-[`upload::start`](../agent/src/upload.rs) opens two spools, both as siblings of
+[`upload::start`](../apps/agent/src/upload.rs) opens two spools, both as siblings of
 the `--alerts` file:
 
 | Directory | Segment size | Content | Why |
 |---|---|---|---|
-| `spool/` | 1024 records | redacted events, pushed by the enrichment worker in [`sink/mod.rs`](../agent/src/sink/mod.rs) | batching |
+| `spool/` | 1024 records | redacted events, pushed by the enrichment worker in [`sink/mod.rs`](../apps/agent/src/sink/mod.rs) | batching |
 | `detection-spool/` | 1 record | redacted detections | a detection the server refuses for good is skipped alone, without the valid detections beside it |
 
 Each spool is opened with `storage.spool_max_mb` as its cap
-([`spool_cap_bytes`](../agent/src/upload.rs)), so the worst case on disk is
+([`spool_cap_bytes`](../apps/agent/src/upload.rs)), so the worst case on disk is
 **twice** that value. Each spool sits behind an `Arc<Mutex<EventSpool>>` shared
 between its producer and its upload thread. The health beacon reports the sum of
 both spools as `spool_bytes` and `spool_dropped`
-([`SpoolHealth`](../agent/src/upload.rs)).
+([`SpoolHealth`](../apps/agent/src/upload.rs)).
 
 Retry limits belong to transport, not to the spool. The spool exports
 [`MAX_DRAIN_ATTEMPTS`](../crates/store/src/spool.rs) (5) as a suggestion.
@@ -188,7 +188,7 @@ survival across reopen, byte-cap shedding with counted loss, torn tail lines,
 two-phase redelivery after a crash, idempotent re-drain, poison-segment skip,
 in-flight protection from the cap, in-flight bytes in stats, one-record
 segments, and `ack_counting_dropped` accounting. The agent-side wiring is tested
-in [`agent/src/upload.rs`](../agent/src/upload.rs).
+in [`apps/agent/src/upload.rs`](../apps/agent/src/upload.rs).
 
 ## Cost notes
 

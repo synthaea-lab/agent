@@ -37,10 +37,10 @@ Only listeners are reported. Connections are the ETW stream's job, and a poll ec
 
 ## How the agent uses it
 
-There is no `Sensor` implementation. In [`agent/src/commands/windows.rs`](../../../agent/src/commands/windows.rs):
+There is no `Sensor` implementation. In [`apps/agent/src/commands/windows.rs`](../../../apps/agent/src/commands/windows.rs):
 
-1. [`seeded_rule_state`](../../../agent/src/commands/windows.rs) takes one `snapshot_for_drift` at startup and seeds the LISTENER-DRIFT baseline with `(address, port, protocol)`. A snapshot failure leaves the baseline empty and is logged.
-2. [`spawn_socket_poller`](../../../agent/src/commands/windows.rs) runs `listen_port_events_for_drift` every 10 s and forwards each entry. A successful snapshot pulses the `windows-sockets` heartbeat (30 s deadline), even when it holds no listeners. A failed one is logged and does not pulse.
+1. [`seeded_rule_state`](../../../apps/agent/src/commands/windows.rs) takes one `snapshot_for_drift` at startup and seeds the LISTENER-DRIFT baseline with `(address, port, protocol)`. A snapshot failure leaves the baseline empty and is logged.
+2. [`spawn_socket_poller`](../../../apps/agent/src/commands/windows.rs) runs `listen_port_events_for_drift` every 10 s and forwards each entry. A successful snapshot pulses the `windows-sockets` heartbeat (30 s deadline), even when it holds no listeners. A failed one is logged and does not pulse.
 
 ## Errors
 

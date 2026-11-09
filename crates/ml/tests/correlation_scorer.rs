@@ -1,8 +1,8 @@
 //! Inference parity seam for T2: `ml::CorrelationScorer` (Rust feature extraction
 //! from an `EventBus`, then `ort`) must reproduce the scores the training-side
 //! runtime produces (Python feature extraction through onnxruntime), pinned by
-//! `ml/tests/fixtures/correlation_scorer_golden.jsonl` and its
-//! `gen_correlation_scorer_fixture.py` generator.
+//! `crates/ml/tests/fixtures/correlation_scorer_golden.jsonl` and its
+//! `ml/tests/fixtures/generators/gen_correlation_scorer_golden.py` generator.
 //!
 //! The counterpart of `scorer.rs` for the correlation model: `features_golden`
 //! pins the vector, this pins the score the shipped runtime computes from a window

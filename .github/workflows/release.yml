@@ -81,12 +81,12 @@ jobs:
           VERSION: ${{ steps.tag.outputs.version }}
         run: |
           set -euo pipefail
-          cargo_version="$(sed -n 's/^version = "\(.*\)"/\1/p' agent/Cargo.toml | head -n1)"
+          cargo_version="$(sed -n 's/^version = "\(.*\)"/\1/p' apps/agent/Cargo.toml | head -n1)"
           apk_version="$(sed -n 's/^pkgver=//p' packaging/linux/alpine/APKBUILD)"
           core="${VERSION%%-*}"
           for v in "$cargo_version" "$apk_version"; do
             if [ "$v" != "$core" ]; then
-              echo "::warning::tag version $core differs from a package version ($v): agent/Cargo.toml=$cargo_version, APKBUILD=$apk_version"
+              echo "::warning::tag version $core differs from a package version ($v): apps/agent/Cargo.toml=$cargo_version, APKBUILD=$apk_version"
             fi
           done
 

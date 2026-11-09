@@ -2,7 +2,7 @@
 """Keep every tracked shell script with a shebang executable in git.
 
 Our docs and scripts run them by path (`./tools/gauntlet.sh`,
-`"$REPO_ROOT/toolchain/ort-static-link-flags.sh"`). A script committed
+`"$REPO_ROOT/packaging/toolchain/ort-static-link-flags.sh"`). A script committed
 as mode 100644 fails there with `Permission denied`, and inside `eval "$(...)"`
 that is silent: the substitution is empty, `eval` returns 0, and the caller
 carries on without whatever the script was meant to produce. That is how #647's

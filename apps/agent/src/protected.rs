@@ -11,7 +11,7 @@
 //! operator-edited, not updater-managed), plus the alerts/events/heartbeat files it
 //! was launched with. It does **not** cover the watchdog binary or the systemd
 //! unit/OpenRC install surface — those live in `watchdog`'s own path resolution
-//! (`watchdog/src/service/linux.rs`), and naming them here would mean either guessing
+//! (`apps/watchdog/src/service/linux.rs`), and naming them here would mean either guessing
 //! the packaging layout or a cross-binary dependency, neither of which this pass takes
 //! on; `watchdog::tamper` (#103) already covers that surface from the install/supervise
 //! side.

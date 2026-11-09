@@ -1,7 +1,7 @@
 //! Attribution parity seam, Rust side: the fixture under `tests/fixtures/` pins this
 //! crate's forest parsing + attribution walk to the Python reference
 //! (`ml/tests/attribution_reference.py`). Regenerate via
-//! `ml/tests/fixtures/gen_attribution_fixture.py` only on a deliberate semantic
+//! `ml/tests/fixtures/generators/gen_attribution_golden.py` only on a deliberate semantic
 //! change — never to make a red test green.
 
 use ml::{Forest, top_attributions};

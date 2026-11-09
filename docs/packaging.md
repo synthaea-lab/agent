@@ -53,7 +53,7 @@ unprivileged service user owns `current` and could otherwise repoint it to get r
   (`/run/synthaea`, `/var/log/synthaea`, `/var/lib/synthaea`, `/sys/fs/bpf/synthaea`);
 - `ExecStartPre` recreates a missing `current -> bootstrap` and `versions/`, then runs
   `bootstrap/watchdog recover --base-dir /var/lib/synthaea`, which rolls back a release whose
-  watchdog cannot execute ([`recovery.rs`](../watchdog/src/recovery.rs));
+  watchdog cannot execute ([`recovery.rs`](../apps/watchdog/src/recovery.rs));
 - `ExecStart` is `current/watchdog run --agent-bin current/agent --alerts /var/log/synthaea/alerts.ndjson`;
   the watchdog supervises the agent and runs release probation;
 - `Restart=always`; capabilities granted as an ambient set (`CAP_BPF`, `CAP_PERFMON`,
@@ -68,14 +68,14 @@ watchdog's die-with-parent protection.
 ### Static `.deb`
 
 [`build-deb.sh`](../packaging/linux/build-deb.sh) must run on an x86_64 Alpine (musl) host
-provisioned by [`alpine-toolchain.sh`](../toolchain/alpine-toolchain.sh). The output is fully static,
+provisioned by [`alpine-toolchain.sh`](../packaging/toolchain/alpine-toolchain.sh). The output is fully static,
 so one `.deb` runs on any glibc Debian/Ubuntu without inheriting the build host's glibc or libstdc++.
 The script:
 
 1. pins `cargo-deb` to 3.8.0 and reinstalls any other version: the `#DEBHELPER#` snippet injected
    into `postinst` is cargo-deb's own template and changes between releases;
 2. builds ONNX Runtime from source unless `ORT_LIB_LOCATION` points at a musl static build, and
-   derives the extra link flags with [`ort-static-link-flags.sh`](../toolchain/ort-static-link-flags.sh)
+   derives the extra link flags with [`ort-static-link-flags.sh`](../packaging/toolchain/ort-static-link-flags.sh)
    (failing loudly if it produces none);
 3. runs the `ml` tests and builds `agent`, `watchdog`, `cli` for `x86_64-unknown-linux-musl` with
    `--no-default-features` and `+crt-static`;
@@ -173,7 +173,7 @@ flowchart LR
 
 - The four packaging workflows are reused through `workflow_call` with `upload-artifact: true`, so
   the release builds exactly what guards `main`.
-- `meta` warns (does not fail) when the tag differs from the version in `agent/Cargo.toml` or
+- `meta` warns (does not fail) when the tag differs from the version in `apps/agent/Cargo.toml` or
   `APKBUILD`; package file names carry the package version, bare binaries carry the tag.
 - `publish` re-scans every binary it is about to publish (extracted from the `.deb`, `.apk` and
   macOS tarball, plus the `.exe`), so a mix-up between jobs cannot ship the test key.
@@ -188,13 +188,13 @@ flowchart LR
 
 | Script | Purpose |
 | --- | --- |
-| [`linux-toolchain.sh`](../toolchain/linux-toolchain.sh), [`arch-toolchain.sh`](../toolchain/arch-toolchain.sh), [`alpine-toolchain.sh`](../toolchain/alpine-toolchain.sh) | Provision a build/test machine (apt, dnf, pacman, apk): Rust, the eBPF nightly with `rust-src`, `bpf-linker`, and lab packages. Idempotent. If the `bpf-linker` download fails, the machine is replay-only. |
-| [`windows-toolchain.ps1`](../toolchain/windows-toolchain.ps1) | Same for Windows build machines. |
-| [`build-onnxruntime-static.sh`](../toolchain/build-onnxruntime-static.sh), [`.ps1`](../toolchain/build-onnxruntime-static.ps1) | Build ONNX Runtime 1.30.0 from source as static libraries (Linux glibc/musl, macOS, Windows MSVC). |
-| [`ort-static-link-flags.sh`](../toolchain/ort-static-link-flags.sh), [`.ps1`](../toolchain/ort-static-link-flags.ps1) | Emit the link flags `ort-sys` omits: it walks the build output for every static library actually produced (abseil, `utf8_range`, model package...) rather than maintaining a list. |
-| [`onnxruntime-static-build.md`](../toolchain/onnxruntime-static-build.md), [`onnxruntime-static-build-macos.md`](../toolchain/onnxruntime-static-build-macos.md) | Step-by-step guides and measurements. |
+| [`linux-toolchain.sh`](../packaging/toolchain/linux-toolchain.sh), [`arch-toolchain.sh`](../packaging/toolchain/arch-toolchain.sh), [`alpine-toolchain.sh`](../packaging/toolchain/alpine-toolchain.sh) | Provision a build/test machine (apt, dnf, pacman, apk): Rust, the eBPF nightly with `rust-src`, `bpf-linker`, and lab packages. Idempotent. If the `bpf-linker` download fails, the machine is replay-only. |
+| [`windows-toolchain.ps1`](../packaging/toolchain/windows-toolchain.ps1) | Same for Windows build machines. |
+| [`build-onnxruntime-static.sh`](../packaging/toolchain/build-onnxruntime-static.sh), [`.ps1`](../packaging/toolchain/build-onnxruntime-static.ps1) | Build ONNX Runtime 1.30.0 from source as static libraries (Linux glibc/musl, macOS, Windows MSVC). |
+| [`ort-static-link-flags.sh`](../packaging/toolchain/ort-static-link-flags.sh), [`.ps1`](../packaging/toolchain/ort-static-link-flags.ps1) | Emit the link flags `ort-sys` omits: it walks the build output for every static library actually produced (abseil, `utf8_range`, model package...) rather than maintaining a list. |
+| [`onnxruntime-static-build.md`](../packaging/toolchain/onnxruntime-static-build.md), [`onnxruntime-static-build-macos.md`](../packaging/toolchain/onnxruntime-static-build-macos.md) | Step-by-step guides and measurements. |
 
-The eBPF probe toolchain is pinned separately in [`ebpf-toolchain.txt`](../ebpf-toolchain.txt); the
+The eBPF probe toolchain is pinned separately in [`packaging/toolchain/ebpf-toolchain.txt`](../packaging/toolchain/ebpf-toolchain.txt); the
 `bpf-linker` version and its SHA-256 are pinned in CI's `linux-ebpf` job and must match the
 provisioning scripts.
 

@@ -140,7 +140,7 @@ One test deserves a special mention: the **Python/Rust feature-parity golden tes
 `ml/tests/fixtures/features_golden.jsonl`). Feature extraction exists twice — training in Python,
 inference in Rust — and any divergence silently invalidates the shipped models. If you change
 `ml/synthaea_ml/features/cmdline.py` or the Rust mirror, keep them in lockstep, regenerate the
-golden file (`python ml/tests/fixtures/gen_features_golden.py`), and retrain. See the generator's
+golden file (`python ml/tests/fixtures/generators/gen_features_golden.py`), and retrain. See the generator's
 docstring.
 
 Locally, before pushing:
@@ -164,7 +164,7 @@ between two copies of the same logic silently produces wrong verdicts.
   Rust (inference) must say so in a comment on *both* sides, and be locked by a shared test
   (golden file or mirrored test suites). See "Quality gates" above.
 - **One module, one responsibility.** A file that accumulates a second engine, a second layer,
-  or a second platform gets split (`agent/src/{commands,sink}.rs`,
+  or a second platform gets split (`apps/agent/src/{commands,sink}.rs`,
   `crates/correlator/src/{event,bus,rules,behavior,bayes,engine}.rs`). Platform `cfg`s live in
   one designated module per crate, not scattered.
 - **Comments say *why*, and carry their evidence.** The best comments in this repo cite the lab

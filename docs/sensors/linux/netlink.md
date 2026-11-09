@@ -6,7 +6,7 @@ where eBPF cannot and, next to eBPF, gives state the event stream does not: what
 now, and how many bytes each TCP flow carried.
 
 The crate has no `Sensor` implementation. It exposes one-shot queries that return `schema` events;
-the agent decides the cadence ([`spawn_netlink_poller`](../../../agent/src/commands/linux.rs)).
+the agent decides the cadence ([`spawn_netlink_poller`](../../../apps/agent/src/commands/linux.rs)).
 
 | Family | Client | Output | Privilege (observed) |
 | --- | --- | --- | --- |
@@ -16,7 +16,7 @@ the agent decides the cadence ([`spawn_netlink_poller`](../../../agent/src/comma
 
 ## The poller
 
-Every 10 s ([`NETLINK_POLL_INTERVAL`](../../../agent/src/commands/linux.rs)) the agent calls
+Every 10 s ([`NETLINK_POLL_INTERVAL`](../../../apps/agent/src/commands/linux.rs)) the agent calls
 `listen_port_events` and `conntrack_flow_events` and forwards the events. The interval leaves room
 for the beacon rule, which needs three distinct flows inside a 60 s window. A successful poll pulses
 the `linux-netlink` heartbeat whatever its event count; a failure is logged once per failure streak,
@@ -89,6 +89,6 @@ signal). Nothing in the agent consumes it yet, and it has no schema mapping.
 Every decoder reads bytes off a socket, so it must never panic. They use checked slicing only and
 return `None`/`Err` on malformed input. [`tests/robustness.rs`](../../../crates/sensors/linux/netlink/tests/robustness.rs)
 feeds deterministic pseudo-random corpora to `DiagMsg::parse`, `ProcEvent::parse` and
-`ConntrackFlow::parse`; [`netlink_parse`](../../../fuzz/fuzz_targets/netlink_parse.rs) fuzzes all
+`ConntrackFlow::parse`; [`netlink_parse`](../../../tests/fuzz/fuzz_targets/netlink_parse.rs) fuzzes all
 three. Several unit tests decode real captures byte for byte (for example `REAL_LISTEN_SOCKET_HEX`
 in `wire.rs`).

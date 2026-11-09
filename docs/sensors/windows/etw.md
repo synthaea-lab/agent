@@ -130,7 +130,7 @@ The error message is built by [`silent_session_diagnosis`](../../../crates/senso
 - **Our own loss counters** (`EventsLost`, `RealTimeBuffersLost`, `LogBuffersLost`) from `QueryAllTracesW` ([`describe_session_losses`](../../../crates/sensors/windows/etw/src/normalize.rs)).
 - **Foreign sessions that enable our providers**, from [`provider_enablements`](../../../crates/sensors/windows/etw/src/etw_sessions.rs), at most three named ([`describe_foreign_sessions`](../../../crates/sensors/windows/etw/src/normalize.rs)). A real-time session with no buffer written is flagged: a real-time session that nobody consumes stalls real-time delivery for every consumer on the host, which has been observed to blind this sensor.
 
-The agent then restarts nothing by itself: the run returns the error, [`hold_after_primary`](../../../agent/src/commands/windows.rs) keeps the supplementary sensors alive, and the `windows-etw` heartbeat raises the silence alert.
+The agent then restarts nothing by itself: the run returns the error, [`hold_after_primary`](../../../apps/agent/src/commands/windows.rs) keeps the supplementary sensors alive, and the `windows-etw` heartbeat raises the silence alert.
 
 ## Failure modes
 

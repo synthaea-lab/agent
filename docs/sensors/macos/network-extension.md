@@ -66,7 +66,7 @@ Newline-delimited JSON ([`wire.rs`](../../../crates/sensors/macos/network-extens
 
 ## Agent wiring
 
-[`spawn_network_extension_receiver`](../../../agent/src/commands/macos.rs) binds the socket and runs the accept loop on an `ne-receiver` thread. A bind failure (directory missing, not root) is logged and the agent continues without flow and DNS telemetry. Without an installed extension nothing ever connects, which is the normal state today.
+[`spawn_network_extension_receiver`](../../../apps/agent/src/commands/macos.rs) binds the socket and runs the accept loop on an `ne-receiver` thread. A bind failure (directory missing, not root) is logged and the agent continues without flow and DNS telemetry. Without an installed extension nothing ever connects, which is the normal state today.
 
 ## Known gaps
 

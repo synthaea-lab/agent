@@ -11,10 +11,10 @@
 [workspace]
 resolver = "2"
 members = [
-    "agent",
-    "watchdog",
-    "cli",
-    "release-tool",
+    "apps/agent",
+    "apps/watchdog",
+    "apps/cli",
+    "tools/release",
     "crates/schema",
     "crates/redact",
     "crates/policy",
@@ -61,17 +61,17 @@ members = [
 ]
 # The fuzz crate is fully excluded (not even a non-default member): it needs
 # nightly + libFuzzer instrumentation and is run explicitly —
-#   cargo +nightly fuzz run audit_parse
-# from the repo root (see fuzz/Cargo.toml).
-exclude = ["fuzz"]
+#   cargo +nightly fuzz run --fuzz-dir tests/fuzz audit_parse
+# from the repo root (see tests/fuzz/Cargo.toml).
+exclude = ["tests/fuzz"]
 # The eBPF probe crate is a member (aya-build resolves it by package id in the
 # workspace) but not a default member: it targets bpfel-unknown-none and only builds
 # via sensor-linux's build.rs with the eBPF toolchain present. Plain cargo commands
 # skip it; CI passes --workspace --exclude sensor-linux-ebpf.
 default-members = [
-    "agent",
-    "watchdog",
-    "cli",
+    "apps/agent",
+    "apps/watchdog",
+    "apps/cli",
     "crates/schema",
     "crates/policy",
     "crates/config",

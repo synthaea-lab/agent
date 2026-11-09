@@ -28,7 +28,7 @@ flowchart LR
     EV -->|SigmaAlert| SINK[DetectionSink]
 ```
 
-1. **Load.** [`load_sigma_rules`](../../agent/src/sink/mod.rs) in the agent calls
+1. **Load.** [`load_sigma_rules`](../../apps/agent/src/sink/mod.rs) in the agent calls
    `SigmaEngine::load_dir_for(<content_root>/rules/sigma, Platform::host())`. A rule that fails
    to parse or validate is skipped with a warning naming the file and the reason. The rest of
    the set loads. Only an unreadable directory is an error (`Load::Failed`, and the previous
@@ -43,7 +43,7 @@ Sigma sees the **raw** command line, before redaction. Only the alert text and t
 event are redacted. A rule therefore matches what actually ran, and a credential in the
 command line never reaches the alert log
 (`sigma_sees_raw_exec_but_alert_and_event_outputs_are_redacted` in
-[`sink/tests.rs`](../../agent/src/sink/tests.rs)).
+[`sink/tests.rs`](../../apps/agent/src/sink/tests.rs)).
 
 ## Which rules a host loads
 

@@ -11,7 +11,7 @@ RPMBUILD_DIR="$REPO_ROOT/target/rpmbuild"
 mkdir -p "$RPMBUILD_DIR"/{BUILD,RPMS,SOURCES,SPECS,SRPMS}
 
 # Extract version
-VERSION=$(grep -m1 '^version' agent/Cargo.toml | cut -d'"' -f2)
+VERSION=$(grep -m1 '^version' apps/agent/Cargo.toml | cut -d'"' -f2)
 echo "Version: $VERSION"
 
 # Build binaries
@@ -26,7 +26,7 @@ echo "Creating source tarball..."
 tar czf "$RPMBUILD_DIR/SOURCES/synthaea-agent-$VERSION.tar.gz" \
   --transform "s,^,synthaea-agent-$VERSION/," \
   --exclude-vcs --exclude target \
-  agent/ watchdog/ cli/ release-tool/ crates/ Cargo.* rust-toolchain.toml ebpf-toolchain.txt LICENSE README.md \
+  apps/ crates/ tools/release/ Cargo.* rust-toolchain.toml packaging/toolchain/ebpf-toolchain.txt LICENSE README.md \
   packaging/linux/systemd/
 
 # Copy spec file

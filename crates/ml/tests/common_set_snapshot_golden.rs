@@ -1,7 +1,7 @@
 //! Cross-language golden test for the common-set snapshot wire format (ADR-0020, #76).
 //!
 //! Consumes `ml/tests/fixtures/common_set_snapshot_golden.json`, written by
-//! `ml/tests/fixtures/gen_common_set_snapshot_golden.py` from the spec in
+//! `ml/tests/fixtures/generators/gen_common_set_snapshot_golden.py` from the spec in
 //! `docs/detection/common-set-snapshot-format.md`. The TypeScript writer
 //! (`server/tests/unit/common-set-snapshot.test.ts`) must produce these exact bytes; this reader
 //! must parse them and answer membership the same way.

@@ -8,11 +8,11 @@ quarantine, escalate) is on [Response](response.md).
 
 ## Where correlation sits in the pipeline
 
-Every normalized event reaches [`DetectionSink::on_event`](../agent/src/sink/mod.rs) on
+Every normalized event reaches [`DetectionSink::on_event`](../apps/agent/src/sink/mod.rs) on
 the sensor's capture thread. The first thing it does is call
-[`DetectionSink::correlate`](../agent/src/sink/mod.rs); the stateless and stateful rules,
+[`DetectionSink::correlate`](../apps/agent/src/sink/mod.rs); the stateless and stateful rules,
 Sigma, IOC matching and the canary checks run afterwards. Every finding from every
-engine then goes through one funnel, [`record_detection`](../agent/src/sink/mod.rs), which
+engine then goes through one funnel, [`record_detection`](../apps/agent/src/sink/mod.rs), which
 writes the alert log and folds the finding into the fused verdict.
 
 ```mermaid
@@ -38,7 +38,7 @@ Two outputs of the correlator matter downstream:
   within the window".
 - **The `BAYES` alert**: raised once when an entity's belief crosses the threshold.
   It is the only alert that can make a process eligible for an automated kill
-  ([`crosses_kill_gate`](../agent/src/sink/mod.rs)).
+  ([`crosses_kill_gate`](../apps/agent/src/sink/mod.rs)).
 
 ## The event bus: the correlator's short-term memory
 
@@ -173,7 +173,7 @@ sequenceDiagram
   stamped in the future cannot expire its own grace period. When the stream is idle,
   the sink's `correlator-tick` thread calls
   [`CorrelationEngine::advance_time`](../crates/correlator/src/engine.rs) every second
-  ([`DetectionSink::start_correlator_ticker`](../agent/src/sink/mod.rs)). The thread holds
+  ([`DetectionSink::start_correlator_ticker`](../apps/agent/src/sink/mod.rs)). The thread holds
   only a `Weak` reference to the sink and releases the correlator lock before writing
   alerts.
 - **Bounds.** At most 256 pending shells (`MAX_PENDING_WEB_SHELLS`; past that a shell
@@ -265,7 +265,7 @@ feature sum, which would count the same evidence twice:
 - **Fleet rarity.** When the enrichment worker learns an exec's hash and the fleet's
   common-set snapshot says the image is not common, it calls
   [`CorrelationEngine::apply_rarity_evidence`](../crates/correlator/src/engine.rs)
-  ([`apply_rarity_evidence` caller in the sink](../agent/src/sink/mod.rs)). Each call adds
+  ([`apply_rarity_evidence` caller in the sink](../apps/agent/src/sink/mod.rs)). Each call adds
   `RARITY_LLR` (0.35) within a total allowance of `RARITY_MAX_TOTAL_LLR` (1.0) that
   decays with the belief ([`apply_rarity_llr`](../crates/correlator/src/bayes.rs)).
   Together with the prior this keeps rarity alone about 7 log-odds under the
@@ -327,18 +327,18 @@ services are not shielded
 [`VerdictEngine`](../crates/verdict/src/lib.rs) turns "N engines each raising a hand"
 into one verdict per entity. The sink owns one behind `Arc<Mutex<_>>`, constructed
 with a 30 s dedup window (`VERDICT_DEDUP_WINDOW_NS` in
-[`sink/mod.rs`](../agent/src/sink/mod.rs)).
+[`sink/mod.rs`](../apps/agent/src/sink/mod.rs)).
 
 - **Key.** [`EntityKey`](../crates/verdict/src/lib.rs) is `(ppid, comm)` plus the
-  parent incarnation, built by [`entity_key`](../agent/src/sink/mod.rs) from the event's
+  parent incarnation, built by [`entity_key`](../apps/agent/src/sink/mod.rs) from the event's
   metadata: the correlator's join key, so a verdict and a belief describe the same
   entity. Same stamp rule as everywhere else: a recycled parent pid drops the old
   state.
 - **Inputs.** Real [`Detection`](../crates/schema/src/detection.rs) values: rule,
   Sigma, IOC and correlator findings from `record_detection`, YARA file matches keyed
   to the writing process through the scan context
-  ([`fuse_yara_match`](../agent/src/sink/mod.rs)), and memory-scan matches
-  ([`report_memory_matches`](../agent/src/sink/mod.rs)). Each finding is redacted before
+  ([`fuse_yara_match`](../apps/agent/src/sink/mod.rs)), and memory-scan matches
+  ([`report_memory_matches`](../apps/agent/src/sink/mod.rs)). Each finding is redacted before
   it enters the verdict, the alert log and the detection spool.
 - **Composition.** Severity is the max over everything recorded for the entity; score
   is the max over sources that carried one (no weighted blend until there is
@@ -355,7 +355,7 @@ with a 30 s dedup window (`VERDICT_DEDUP_WINDOW_NS` in
   finding, absorbed or not.
 - **Suppression.** An operator can mark `(entity, technique)` with `cli suppress
   <ppid> <comm> <technique>` (IPC to
-  [`DetectionSink::suppress_verdict`](../agent/src/sink/mod.rs)); matching findings are
+  [`DetectionSink::suppress_verdict`](../apps/agent/src/sink/mod.rs)); matching findings are
   dropped from fusion, and so from escalation, but still logged. Marks made from the
   CLI carry no parent stamp and so cover every incarnation; marks have no expiry, are
   bounded by [`MAX_SUPPRESSIONS`](../crates/verdict/src/lib.rs) (1024, `Full` past
@@ -421,7 +421,7 @@ runs on. What differs is the telemetry:
 There are no runtime knobs for the correlator: the window, thresholds, LLR table,
 exclusion lists and caps are compile-time constants listed above. What changes
 behavior at runtime is content: the ML model (`<state_dir>/ml/registry/...`, loaded by
-[`DetectionSink`](../agent/src/sink/mod.rs); without it the hand-calibrated features still
+[`DetectionSink`](../apps/agent/src/sink/mod.rs); without it the hand-calibrated features still
 work) and the common-set snapshot (`<content_root>/snapshots/common-set.bin`).
 
 ## Testing
@@ -437,6 +437,6 @@ work) and the common-set snapshot (`<content_root>/snapshots/common-set.bin`).
 - Fusion, dedup window, suppression, incarnations, evidence bound: unit tests in
   [`verdict/src/lib.rs`](../crates/verdict/src/lib.rs).
 - End to end through the sink (escalation, the kill gate reading only `BAYES`, siblings):
-  tests in [`agent/src/sink/tests.rs`](../agent/src/sink/tests.rs), for example
+  tests in [`apps/agent/src/sink/tests.rs`](../apps/agent/src/sink/tests.rs), for example
   `a_siblings_weak_alert_never_triggers_kill_from_anothers_bayes_crossing` and
   `a_critical_sigma_hit_never_triggers_a_kill`.

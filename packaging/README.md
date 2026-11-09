@@ -45,7 +45,7 @@ never creates a tag itself.
 | — | `release.yml` | `SHA256SUMS` (+ `SHA256SUMS.asc`, `synthaea-release-key.asc` when signed) | covers every file above |
 
 Not produced yet: the `.rpm` (`linux/build-rpm.sh` has no CI job), the MSI and the macOS `.pkg`.
-Package file names carry the version from `agent/Cargo.toml` / `APKBUILD`, not the tag; the
+Package file names carry the version from `apps/agent/Cargo.toml` / `APKBUILD`, not the tag; the
 workflow warns when the two differ.
 
 **Test key (ADR-0027).** The release job runs `tools/check-no-test-key.sh` on the tagged tree

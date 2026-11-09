@@ -103,7 +103,7 @@ flowchart LR
 - **Stop.** After the stop flag is set, events delivered before the handles close are discarded.
 - **Gaps.** There is no bookmark, so events written while the agent is down, or between startup and registration, are not delivered. There is no liveness signal either (see below).
 
-The agent always selects `Polling` today ([`eventlog_config`](../../../agent/src/commands/windows.rs)); `Subscribe` is not reachable from configuration yet.
+The agent always selects `Polling` today ([`eventlog_config`](../../../apps/agent/src/commands/windows.rs)); `Subscribe` is not reachable from configuration yet.
 
 ## Liveness
 
@@ -117,7 +117,7 @@ Under `Subscribe` the list is empty: a push subscription has no tick, so a count
 
 ## Configuration
 
-[`EventLogConfig`](../../../crates/sensors/windows/eventlog/src/sensor.rs) is this crate's own type, because sensor crates cannot depend on `policy`. The agent converts `policy::EventLogPolicy` into it in [`eventlog_config`](../../../agent/src/commands/windows.rs). A disabled target is never queried.
+[`EventLogConfig`](../../../crates/sensors/windows/eventlog/src/sensor.rs) is this crate's own type, because sensor crates cannot depend on `policy`. The agent converts `policy::EventLogPolicy` into it in [`eventlog_config`](../../../apps/agent/src/commands/windows.rs). A disabled target is never queried.
 
 | Field | Default | Set by the agent from |
 | --- | --- | --- |

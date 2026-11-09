@@ -4,7 +4,7 @@ Fileless payloads (a `memfd` executed in place, an injected region) leave nothin
 scan. [`sensor-linux-procmem`](../../../crates/sensors/linux/procmem/src/lib.rs) is the mechanism
 the YARA memory scan uses to look at a running process: list its mappings and read bytes from them.
 It holds no policy. Which regions to read, how much and when is the `yara` crate's memory module;
-the agent adapts the two in [`memscan.rs`](../../../agent/src/memscan.rs).
+the agent adapts the two in [`memscan.rs`](../../../apps/agent/src/memscan.rs).
 
 ## API
 

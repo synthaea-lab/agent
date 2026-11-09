@@ -1,7 +1,7 @@
 //! Inference parity seam: `CmdlineScorer` (Rust feature extraction through `ort`) must
 //! reproduce the scores the training-side runtime produces (Python feature extraction
-//! through onnxruntime), pinned by `ml/tests/fixtures/scorer_golden.json` and its
-//! `gen_scorer_fixture.py` generator.
+//! through onnxruntime), pinned by `crates/ml/tests/fixtures/scorer_golden.json` and its
+//! `ml/tests/fixtures/generators/gen_scorer_golden.py` generator.
 //!
 //! This closes the loop the feature and attribution seams leave open: `features_golden`
 //! pins the vector, `attribution_golden` pins the explanation, and this pins the score

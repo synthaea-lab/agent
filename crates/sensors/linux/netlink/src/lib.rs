@@ -114,7 +114,7 @@
 // The pure codec/normalize modules compile on every OS so their unit tests run
 // anywhere, but their only callers are the linux-gated socket modules below —
 // off-Linux, the lib target legitimately has unused items (same idiom as
-// `agent/src/health.rs`). The lint stays live on Linux, where dead code is real.
+// `apps/agent/src/health.rs`). The lint stays live on Linux, where dead code is real.
 mod conntrack_attrs;
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 mod normalize;

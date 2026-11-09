@@ -21,7 +21,7 @@
 //! [`diff_packages`] is the pure comparison between two snapshots. Turning a
 //! [`PackageChange`] into a real `schema::Event`/alert, persisting the snapshot
 //! between runs, and the periodic timer are the agent binary's job
-//! (`agent/src/inventory.rs`) — this crate is a LEAF (`tools/check-deps.py`) and
+//! (`apps/agent/src/inventory.rs`) — this crate is a LEAF (`tools/check-deps.py`) and
 //! stays free of `schema`'s event/detection types, same posture as `tamper`.
 //!
 //! Services, autoruns, listening ports and users are not built yet; tracked by #87.

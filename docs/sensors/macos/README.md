@@ -15,7 +15,7 @@ Apple's structures are large, version-gated unions (`es_message_t`, `socket_fdin
 
 ## How the agent runs them
 
-[`run_macos_sensors`](../../../agent/src/commands/macos.rs) wires the four sources into one shared sink (behind the command-line credential redactor):
+[`run_macos_sensors`](../../../apps/agent/src/commands/macos.rs) wires the four sources into one shared sink (behind the command-line credential redactor):
 
 ```mermaid
 flowchart LR
@@ -29,7 +29,7 @@ flowchart LR
 - EndpointSecurity is the primary sensor and runs on the calling thread; its error ends the run.
 - The unified-log tail, the socket poller and the NE receiver are supplementary. Each failure to start is logged and never fatal.
 - Ctrl-C stops the ES client, stops the socket poller and kills the `log stream` child (which ends the tail thread).
-- At startup, [`seeded_rule_state`](../../../agent/src/commands/macos.rs) seeds the rule state with the running processes (`ps`) and the LISTENER-DRIFT baseline from one socket snapshot.
+- At startup, [`seeded_rule_state`](../../../apps/agent/src/commands/macos.rs) seeds the rule state with the running processes (`ps`) and the LISTENER-DRIFT baseline from one socket snapshot.
 
 ## Differences from Windows and Linux
 

@@ -3,34 +3,34 @@ name: Linux static .apk portability
 on:
   pull_request:
     paths:
-      - "agent/**"
-      - "watchdog/**"
+      - "apps/agent/**"
+      - "apps/watchdog/**"
       - "crates/ml/**"
       - "crates/sensors/linux/**"
       - "crates/updater/**"
       - "packaging/linux/**"
-      - "toolchain/**"
+      - "packaging/toolchain/**"
       - "Cargo.toml"
       - "Cargo.lock"
       - ".cargo/config.toml"
       - "rust-toolchain.toml"
-      - "ebpf-toolchain.txt"
+      - "packaging/toolchain/ebpf-toolchain.txt"
       - ".github/workflows/linux-apk-portability.yml"
   push:
     branches: [main]
     paths:
-      - "agent/**"
-      - "watchdog/**"
+      - "apps/agent/**"
+      - "apps/watchdog/**"
       - "crates/ml/**"
       - "crates/sensors/linux/**"
       - "crates/updater/**"
       - "packaging/linux/**"
-      - "toolchain/**"
+      - "packaging/toolchain/**"
       - "Cargo.toml"
       - "Cargo.lock"
       - ".cargo/config.toml"
       - "rust-toolchain.toml"
-      - "ebpf-toolchain.txt"
+      - "packaging/toolchain/ebpf-toolchain.txt"
       - ".github/workflows/linux-apk-portability.yml"
   workflow_dispatch:
   workflow_call:
@@ -100,7 +100,7 @@ jobs:
                 export HOME=/home/builder
                 export SYNTHAEA_SRC=/work
                 cd /work
-                bash ./toolchain/alpine-toolchain.sh
+                bash ./packaging/toolchain/alpine-toolchain.sh
                 abuild-keygen -a -i -n
 
                 # Built once, outside both abuild runs below: the APKBUILD
@@ -108,7 +108,7 @@ jobs:
                 # unset, and the two runs (install build, then the bumped-
                 # pkgrel rebuild for the upgrade check) have no reason to
                 # pay for it twice.
-                bash ./toolchain/build-onnxruntime-static.sh
+                bash ./packaging/toolchain/build-onnxruntime-static.sh
                 export ORT_LIB_LOCATION=/work/onnxruntime/build/Linux/Release
                 export CARGO_TARGET_DIR=/work/target
 

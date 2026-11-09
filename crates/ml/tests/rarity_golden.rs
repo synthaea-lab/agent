@@ -1,7 +1,7 @@
 //! Python/Rust golden parity test for the rarity feature (ADR-0020, #640).
 //!
 //! Consumes `ml/tests/fixtures/rarity_golden.jsonl`, written by
-//! `ml/tests/fixtures/gen_rarity_golden.py` from `rarity.py`. The Python counterpart is
+//! `ml/tests/fixtures/generators/gen_rarity_golden.py` from `rarity.py`. The Python counterpart is
 //! `ml/tests/test_rarity_golden.py`.
 //!
 //! If this breaks, `ml::features::rarity::extract_features` has drifted from the Python

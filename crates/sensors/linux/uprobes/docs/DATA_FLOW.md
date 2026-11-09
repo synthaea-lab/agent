@@ -65,7 +65,7 @@ session cookies). Understanding the complete data flow is critical for:
 ┌─────────────────────────────────────────────────────────────────────────────┐
 │ Detection Pipeline (agent)                                                  │
 │  ┌───────────────────────────────────────────────────────────────────────┐  │
-│  │ DetectionSink (agent/src/sink.rs)                                     │  │
+│  │ DetectionSink (apps/agent/src/sink.rs)                                     │  │
 │  │  - Rules evaluation (crates/rules)                                    │  │
 │  │  - Sigma matching (crates/sigma)                                      │  │
 │  │  - Correlation (crates/correlator)                                    │  │
@@ -225,7 +225,7 @@ session cookies). Understanding the complete data flow is critical for:
 
 ### Stage 4: Detection Pipeline (Agent)
 
-**Where:** `agent/src/sink.rs`, `crates/rules`, `crates/sigma`, `crates/correlator`, `crates/ml`
+**Where:** `apps/agent/src/sink.rs`, `crates/rules`, `crates/sigma`, `crates/correlator`, `crates/ml`
 
 **What happens:**
 - `DetectionSink` receives `Event::TlsCapture` / `Event::ReadlineInput`

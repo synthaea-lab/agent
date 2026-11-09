@@ -25,7 +25,7 @@ if [ ! -r /etc/alpine-release ] || [ ! -e /lib/ld-musl-x86_64.so.1 ]; then
 fi
 command -v dpkg-deb >/dev/null || fail "install dpkg-deb (on Alpine: apk add dpkg)"
 command -v readelf >/dev/null || fail "install readelf (on Alpine: apk add binutils)"
-command -v bpf-linker >/dev/null || fail "install bpf-linker with toolchain/alpine-toolchain.sh"
+command -v bpf-linker >/dev/null || fail "install bpf-linker with packaging/toolchain/alpine-toolchain.sh"
 
 # cargo-deb only packages; build the exact musl artifacts ourselves so Cargo
 # cannot re-enable ml's default download-binaries feature.

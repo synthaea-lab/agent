@@ -55,7 +55,7 @@ sequenceDiagram
 
 ### Trigger
 
-[`DetectionSink::detect_file_open`](../../agent/src/sink/mod.rs) queues a scan for every
+[`DetectionSink::detect_file_open`](../../apps/agent/src/sink/mod.rs) queues a scan for every
 `FileOpen` whose flags include `O_WRONLY | O_RDWR | O_CREAT` (`0o103`). The request carries a
 [`ScanContext`](../../crates/yara/src/queue.rs): the writer's `(ppid, comm)`, the parent's
 incarnation, the event time and the requester's uid/gid. A match is attributed to that
@@ -99,7 +99,7 @@ a warning is logged. On Windows there is no uid, and every path is scanned.
 
 ### What a match does
 
-The callback built in [`start_yara`](../../agent/src/sink/mod.rs) does three things:
+The callback built in [`start_yara`](../../apps/agent/src/sink/mod.rs) does three things:
 
 1. **Fuses** each match into the writer's verdict entity (`fuse_yara_match`), keyed by the
    rule's technique. A native rule or Sigma finding of the same technique on that entity
@@ -121,7 +121,7 @@ same rules over them.
 
 A scan is requested only by a detection about that process. Today that is the memfd-exec
 rule: any `rules::Alert` with technique `T1620` makes
-[`DetectionSink::record_rule_alerts`](../../agent/src/sink/mod.rs) call `request_memory_scan`.
+[`DetectionSink::record_rule_alerts`](../../apps/agent/src/sink/mod.rs) call `request_memory_scan`.
 Scanning every process would cost too much, and the gain over a targeted scan is small.
 
 ### Policy and mechanism are split
@@ -129,9 +129,9 @@ Scanning every process would cost too much, and the gain over a targeted scan is
 The crate holds the policy: what to read, how much and how often
 ([`memory.rs`](../../crates/yara/src/memory.rs)). The platform holds the mechanism behind the
 [`MemorySource`](../../crates/yara/src/memory.rs) trait. On Linux that is
-[`ProcMemSource`](../../agent/src/memscan.rs), which reads `/proc/<pid>/maps` and
+[`ProcMemSource`](../../apps/agent/src/memscan.rs), which reads `/proc/<pid>/maps` and
 `/proc/<pid>/mem` through `sensor-linux-procmem`. No other platform has a source yet, so
-[`start_memscan`](../../agent/src/sink/mod.rs) returns `Load::Absent` there.
+[`start_memscan`](../../apps/agent/src/sink/mod.rs) returns `Load::Absent` there.
 
 ### What is read
 
@@ -176,7 +176,7 @@ capability overrides it.
 
 ### What a memory match does
 
-[`report_memory_matches`](../../agent/src/sink/mod.rs) fuses each matching rule into the scanned
+[`report_memory_matches`](../../apps/agent/src/sink/mod.rs) fuses each matching rule into the scanned
 process's entity (the same path as a file match) and records a `YARA-MEM` line with the region
 counts. It quarantines nothing: there is no file to move.
 
@@ -201,4 +201,4 @@ counts. It quarantines nothing: there is no file to move.
   sibling repo compiles and fires on its crafted sample.
 - Sink tests: `a_yara_match_with_quarantine_disabled_leaves_the_payload_and_says_observe_only`,
   `a_yara_match_with_quarantine_enabled_moves_the_payload_and_audits_it`, and the T1620 →
-  memory-scan path in [`sink/tests.rs`](../../agent/src/sink/tests.rs).
+  memory-scan path in [`sink/tests.rs`](../../apps/agent/src/sink/tests.rs).

@@ -9,7 +9,7 @@ accepted, security reports) are in [`CONTRIBUTING.md`](../CONTRIBUTING.md).
 | Pin | File | Used for |
 | --- | --- | --- |
 | Rust 1.99.1 with `rustfmt`, `clippy` | [`rust-toolchain.toml`](../rust-toolchain.toml) | everything; rustup picks it up in the repository |
-| a dated nightly | [`ebpf-toolchain.txt`](../ebpf-toolchain.txt) | compiling the Linux eBPF probes (with `rust-src`) |
+| a dated nightly | [`packaging/toolchain/ebpf-toolchain.txt`](../packaging/toolchain/ebpf-toolchain.txt) | compiling the Linux eBPF probes (with `rust-src`) |
 | nightly `rustfmt` | none | [`rustfmt.toml`](../rustfmt.toml) uses unstable options that stable `rustfmt` silently ignores |
 
 Bump a toolchain in its own commit: a bump hidden in a feature change makes breakage hard to bisect.
@@ -26,8 +26,8 @@ cargo build -p agent --release
   `bpfel-unknown-none` and is built by `sensor-linux`'s build script when the eBPF toolchain and
   `bpf-linker` are present. Without them the probes are skipped and the Linux sensor builds without
   them. CI and local commands pass `--workspace --exclude sensor-linux-ebpf`.
-- `fuzz/` is excluded from the workspace; it needs nightly and libFuzzer
-  (see [`fuzz/README.md`](../fuzz/README.md)).
+- `tests/fuzz/` is excluded from the workspace; it needs nightly and libFuzzer
+  (see [`tests/fuzz/README.md`](../tests/fuzz/README.md)).
 - `agent`'s default features are `dynamic-onnx` (download a prebuilt ONNX Runtime) and `test-key`
   (the public updater test keys, plus the `--allow-test-key` flags). Packaged builds disable both
   defaults; see [Packaging](packaging.md#test-key-exclusion). The prebuilt runtime needs a recent
@@ -86,7 +86,7 @@ failure.
 
 ### PKCS#11 signing test
 
-`release-tool`'s token test ([`pkcs11_softhsm.rs`](../release-tool/tests/pkcs11_softhsm.rs)) needs a
+`release-tool`'s token test ([`pkcs11_softhsm.rs`](../tools/release/tests/pkcs11_softhsm.rs)) needs a
 SoftHSM module and skips without one. Run it with [`tools/test-pkcs11.sh`](../tools/test-pkcs11.sh),
 which finds the module (or uses `RELEASE_TOOL_SOFTHSM_MODULE`), creates a throwaway token directory,
 and makes a skip fatal.

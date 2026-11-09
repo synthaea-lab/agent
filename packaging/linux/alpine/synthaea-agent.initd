@@ -97,7 +97,7 @@ start_pre() {
 	# /var/lib/synthaea, is synthaea-owned and has no sticky bit). A
 	# compromised agent could otherwise plant its own "watchdog" there and
 	# get root code execution on the next restart. The recover probe itself
-	# also executes agent-controlled code (watchdog/src/recovery.rs runs
+	# also executes agent-controlled code (apps/watchdog/src/recovery.rs runs
 	# the candidate release's own `watchdog --help`), so it needs the same
 	# unprivileged context the systemd unit gets for free from its unit-wide
 	# User=synthaea. "-s /bin/sh": the synthaea user's shell is /sbin/nologin.

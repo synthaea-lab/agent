@@ -15,7 +15,7 @@ cannot attach the agent logs why and runs without it.
 
 | Hook | Attached by | Produces | Status |
 | --- | --- | --- | --- |
-| `file_open` | the agent, in a second copy of the object ([`attach_lsm_hooks`](../../../agent/src/commands/linux.rs)) | a per-CPU hit counter | observation only |
+| `file_open` | the agent, in a second copy of the object ([`attach_lsm_hooks`](../../../apps/agent/src/commands/linux.rs)) | a per-CPU hit counter | observation only |
 | `inode_setattr` | `LinuxSensor`, in its own object ([`attach_inode_setattr`](../../../crates/sensors/linux/userspace/src/ebpf.rs)) | `FileSetTimeEvent` | built |
 
 ## Detecting support
@@ -33,7 +33,7 @@ allows the open. [`file_open_hit_count`](../../../crates/sensors/linux/lsm/src/a
 counter. It reads no `struct file` field and emits no `FileOpenEvent`: an LSM-sourced open and the
 tracepoint-sourced one would double-count the same open until a deduplication rule exists. Its
 purpose today is to prove the hook fires, including for `io_uring` opens, which
-[`lsm_io_uring_evasion.rs`](../../../agent/tests/lsm_io_uring_evasion.rs) checks on a real
+[`lsm_io_uring_evasion.rs`](../../../apps/agent/tests/lsm_io_uring_evasion.rs) checks on a real
 BPF-LSM kernel with `fio --ioengine=io_uring`.
 
 ### Deferring to an earlier deny
@@ -84,7 +84,7 @@ passes for an absolute path. A file on a mount other than `/` lacks its mount pr
 ## Testing
 
 - [`attach.rs`](../../../crates/sensors/linux/lsm/src/attach.rs) unit test (an unknown hook name is
-  rejected) and the live [`lsm_io_uring_evasion.rs`](../../../agent/tests/lsm_io_uring_evasion.rs)
+  rejected) and the live [`lsm_io_uring_evasion.rs`](../../../apps/agent/tests/lsm_io_uring_evasion.rs)
   for `file_open`. The live test needs root, a BPF-LSM kernel and `fio`, and skips itself otherwise.
 - BTF parser tests in [`btf.rs`](../../../crates/sensors/linux/userspace/src/btf.rs): a hook with
   another signature is disabled, offsets through an anonymous union, missing structs refused, and

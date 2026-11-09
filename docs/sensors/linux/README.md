@@ -46,7 +46,7 @@ or the rules lives in the agent.
 
 ## How the agent composes them
 
-[`cmd_run`](../../../agent/src/commands/linux.rs) builds the pipeline, then:
+[`cmd_run`](../../../apps/agent/src/commands/linux.rs) builds the pipeline, then:
 
 1. `select_sensor` runs `can_use_ebpf`: root or `CAP_BPF`+`CAP_PERFMON` (or `CAP_SYS_ADMIN`),
    `/sys/kernel/btf/vmlinux` present, the embedded object loads, and the first raw tracepoint
@@ -134,7 +134,7 @@ normal on a quiet site).
   arm64 build in CI yet ([#62](https://github.com/synthaea-lab/agent/issues/62)).
 - **cgroup v2** is assumed for container attribution.
 - `agent status` runs the same checks as `can_use_ebpf` and loads every raw tracepoint program
-  through the verifier without attaching it ([`cmd_status`](../../../agent/src/commands/linux.rs)).
+  through the verifier without attaching it ([`cmd_status`](../../../apps/agent/src/commands/linux.rs)).
 
 ## Known gaps at a glance
 

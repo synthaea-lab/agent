@@ -34,7 +34,7 @@ Every dispatcher returns `Vec<Alert>` (or nothing, for the record-only methods).
 [`Alert`](../../crates/rules/src/lib.rs) carries a `&'static str` technique, a `Severity` set
 where the alert is built, and a human message. The sink turns each one into a
 `DetectionSource::Rule { rule_id: technique }` detection
-([`DetectionSink::record_rule_alerts`](../../agent/src/sink/mod.rs)).
+([`DetectionSink::record_rule_alerts`](../../apps/agent/src/sink/mod.rs)).
 
 Two techniques get extra handling there:
 
@@ -216,7 +216,7 @@ The verdict describes the file at the image path when the worker opens it. A dro
 Windows can rename itself and put a signed binary at its old path before the worker gets
 there. To catch that, the sensor records the image's file identity at exec
 (`ExecEvent::image_file_id`). The worker compares it with the identity of the file it verified
-(`image_confirmed` in [`enrich_queue.rs`](../../agent/src/enrich_queue.rs)), and on a mismatch
+(`image_confirmed` in [`enrich_queue.rs`](../../apps/agent/src/enrich_queue.rs)), and on a mismatch
 the alert resolves as not verified. Identity is captured on Windows only, and only as early as
 the ETW callback. The window between process start and that callback is still open
 ([#46](https://github.com/synthaea-lab/agent/issues/46)).
@@ -256,6 +256,6 @@ verification and window calibration are tracked in
   pins the positive case, its benign lookalikes (one per exclusion) and the window edges.
 - [`rdp.rs`](../../crates/rules/src/rdp.rs) and [`sudo.rs`](../../crates/rules/src/sudo.rs)
   carry proptest suites for the failure-then-success joins.
-- Sink-level tests in [`agent/src/sink/tests.rs`](../../agent/src/sink/tests.rs) check that each event type
+- Sink-level tests in [`apps/agent/src/sink/tests.rs`](../../apps/agent/src/sink/tests.rs) check that each event type
   reaches its rule through the real dispatcher, for example
   `set_time_event_reaches_the_timestomp_rule_through_the_real_sink`.

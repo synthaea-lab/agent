@@ -23,7 +23,7 @@
 //! one `HttpSummary` per source per window.
 //!
 //! **Status:** everything here is pure and tested; nothing writes or sends an event, the
-//! agent does (`agent/src/log_sources.rs`). The credential redaction of an event's
+//! agent does (`apps/agent/src/log_sources.rs`). The credential redaction of an event's
 //! evidence value is not here either: ADR-0018 puts it at the agent's sink boundary
 //! (`log_sources::deliver`), so the evidence leaves this crate cut but raw.
 

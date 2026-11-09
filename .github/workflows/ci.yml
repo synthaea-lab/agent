@@ -214,15 +214,15 @@ jobs:
   # The `test` runner has no bpf-linker, so there build.rs skips the probes: the
   # eBPF crate itself never compiles, and clippy only sees the probe-less variant
   # of sensor-linux (#448: code that was dead only in that variant). This job
-  # installs the same toolchain as toolchain/linux-toolchain.sh (the nightly
-  # pinned in ebpf-toolchain.txt + rust-src for aya-build, prebuilt bpf-linker at
+  # installs the same toolchain as packaging/toolchain/linux-toolchain.sh (the nightly
+  # pinned in packaging/toolchain/ebpf-toolchain.txt + rust-src for aya-build, prebuilt bpf-linker at
   # the same pin) and fails if the
   # probes did not get embedded. No `cargo test` here: loading them needs a
   # privileged kernel, which needs a dedicated test VM.
   linux-ebpf:
     runs-on: ubuntu-latest
     env:
-      # Keep both in sync with toolchain/linux-toolchain.sh. The hash is the
+      # Keep both in sync with packaging/toolchain/linux-toolchain.sh. The hash is the
       # x86_64 musl tarball's: a replaced release asset must fail here, not run.
       BPF_LINKER_VERSION: v0.11.1
       BPF_LINKER_SHA256: e058a6aecc9e65fa4c977b298a8e4b738424d7629769fd352eed409fb57e16e8
@@ -235,7 +235,7 @@ jobs:
           toolchain: stable
           components: clippy
       - name: pinned nightly + rust-src (aya-build compiles the probes with it)
-        run: rustup toolchain install "$(tr -d '[:space:]' < ebpf-toolchain.txt)" --profile minimal --component rust-src
+        run: rustup toolchain install "$(tr -d '[:space:]' < packaging/toolchain/ebpf-toolchain.txt)" --profile minimal --component rust-src
       - name: bpf-linker (prebuilt, musl-static, bundled LLVM, SHA-256 pinned)
         run: |
           curl -fsSL --retry 3 --retry-all-errors -o "$RUNNER_TEMP/bpf-linker.tar.zst" \
@@ -248,7 +248,7 @@ jobs:
         with:
           # Never share a cache with the probe-less `test` job: a restored build
           # script output from there would skip the probes (see the stale-build
-          # note in toolchain/linux-toolchain.sh).
+          # note in packaging/toolchain/linux-toolchain.sh).
           key: ebpf-embedded
       - name: clippy (embedded probes)
         run: cargo clippy -p sensor-linux -p sensor-linux-uprobes -p agent --all-targets -- -D warnings

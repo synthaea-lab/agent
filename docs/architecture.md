@@ -8,10 +8,10 @@ The workspace builds four binaries. Only `agent` and `watchdog` run on an endpoi
 
 | Binary | Entry point | Role |
 | --- | --- | --- |
-| `agent` | [`try_main`](../agent/src/main.rs) | Hosts the detection pipeline (`agent run`) and the one-shot maintenance commands: `status`, `capture-events`, `capture-baseline`, `check-content-manifest`, `apply-content-manifest`, `apply-release`, `apply-key-rotation`, `quarantine list/restore`. |
-| `watchdog` | [`run_cli`](../watchdog/src/main.rs) | The process the service manager starts. It spawns the agent, restarts it with crash-loop backoff, kills it when its progress heartbeat stalls, pins the agent binary hash, and runs post-update probation and rollback. |
-| `cli` | [`main`](../cli/src/main.rs) | Talks to a running agent over the local IPC endpoint (`status`, `health`, `detections`, `policy`, `suppress`, `unsuppress`). Also inspects and writes the local config (`config init/check/path`). It holds no privileges of its own. |
-| `release-tool` | [`main`](../release-tool/src/main.rs) | Offline tool that builds and signs release, content and key-rotation manifests. Signs with a PKCS#11 token in production, or with a key file / the public test key in labs. |
+| `agent` | [`try_main`](../apps/agent/src/main.rs) | Hosts the detection pipeline (`agent run`) and the one-shot maintenance commands: `status`, `capture-events`, `capture-baseline`, `check-content-manifest`, `apply-content-manifest`, `apply-release`, `apply-key-rotation`, `quarantine list/restore`. |
+| `watchdog` | [`run_cli`](../apps/watchdog/src/main.rs) | The process the service manager starts. It spawns the agent, restarts it with crash-loop backoff, kills it when its progress heartbeat stalls, pins the agent binary hash, and runs post-update probation and rollback. |
+| `cli` | [`main`](../apps/cli/src/main.rs) | Talks to a running agent over the local IPC endpoint (`status`, `health`, `detections`, `policy`, `suppress`, `unsuppress`). Also inspects and writes the local config (`config init/check/path`). It holds no privileges of its own. |
+| `release-tool` | [`main`](../tools/release/src/main.rs) | Offline tool that builds and signs release, content and key-rotation manifests. Signs with a PKCS#11 token in production, or with a key file / the public test key in labs. |
 
 All three endpoint binaries load the same TOML configuration first, through [`config::load`](../crates/config/src/load.rs). The path comes from `--config`, then the `SYNTHAEA_CONFIG` environment variable, then the OS default ([`config::discover`](../crates/config/src/discovery.rs)). If the file is missing or invalid, the binary stops with an error that lists every path it tried. Nothing falls back to built-in defaults. A mis-installed watchdog that kept respawning an agent unable to find its own config would only waste restarts.
 
@@ -27,15 +27,15 @@ flowchart LR
   WD -->|polls| HB
 ```
 
-The service manager supervises the watchdog, never the agent. The watchdog's supervision loop ([`supervise_loop`](../watchdog/src/supervise.rs)) supervises the agent:
+The service manager supervises the watchdog, never the agent. The watchdog's supervision loop ([`supervise_loop`](../apps/watchdog/src/supervise.rs)) supervises the agent:
 
-- **Crash-loop backoff** ([`Backoff`](../watchdog/src/supervise.rs)). An exit within 10 s of spawn counts as a fast crash. Each fast crash doubles the delay, starting from `--restart-delay` (5 s by default) and capped at 300 s. An exit after a longer run resets the delay to that floor. A failed spawn and a refused (tampered) binary feed the same backoff.
-- **Progress liveness** ([`HeartbeatMonitor`](../watchdog/src/supervise.rs)). The agent's [`heartbeat`](../agent/src/heartbeat.rs) thread writes the pipeline's progress counter to a file next to the alerts file. That counter only advances after `DetectionSink::on_event` finishes an event. After `--heartbeat-miss-limit` (6) checks in a row with no advance, at `--heartbeat-interval-secs` (5 s) each, the watchdog kills the agent and restarts it through the backoff. A missing or unreadable file is never counted as a miss. Both crates compute the heartbeat path separately ([`heartbeat_path_for`](../agent/src/heartbeat.rs) and [`heartbeat_path_for`](../watchdog/src/paths.rs)) because the watchdog cannot depend on the agent binary. The two functions must stay in sync.
-- **Binary pinning.** The watchdog hashes the agent binary once at startup ([`BinaryPin`](../watchdog/src/tamper.rs)) and checks the hash again before every spawn. On Linux it also compares the installed service definition against a snapshot taken at startup.
-- **Probation** ([`Probation`](../watchdog/src/probation.rs)). After `apply-release` promotes a new version, the watchdog must see the heartbeat advance within `PROBATION_DEADLINE` (120 s). Otherwise it rolls `current` back to the previous version and bans the failed one.
-- **Parent-death signal (Linux)** ([`die_with_parent`](../watchdog/src/supervise.rs)). The agent child gets `PR_SET_PDEATHSIG=SIGKILL`, so killing the watchdog cannot leave behind an unsupervised agent that has been reparented to PID 1.
+- **Crash-loop backoff** ([`Backoff`](../apps/watchdog/src/supervise.rs)). An exit within 10 s of spawn counts as a fast crash. Each fast crash doubles the delay, starting from `--restart-delay` (5 s by default) and capped at 300 s. An exit after a longer run resets the delay to that floor. A failed spawn and a refused (tampered) binary feed the same backoff.
+- **Progress liveness** ([`HeartbeatMonitor`](../apps/watchdog/src/supervise.rs)). The agent's [`heartbeat`](../apps/agent/src/heartbeat.rs) thread writes the pipeline's progress counter to a file next to the alerts file. That counter only advances after `DetectionSink::on_event` finishes an event. After `--heartbeat-miss-limit` (6) checks in a row with no advance, at `--heartbeat-interval-secs` (5 s) each, the watchdog kills the agent and restarts it through the backoff. A missing or unreadable file is never counted as a miss. Both crates compute the heartbeat path separately ([`heartbeat_path_for`](../apps/agent/src/heartbeat.rs) and [`heartbeat_path_for`](../apps/watchdog/src/paths.rs)) because the watchdog cannot depend on the agent binary. The two functions must stay in sync.
+- **Binary pinning.** The watchdog hashes the agent binary once at startup ([`BinaryPin`](../apps/watchdog/src/tamper.rs)) and checks the hash again before every spawn. On Linux it also compares the installed service definition against a snapshot taken at startup.
+- **Probation** ([`Probation`](../apps/watchdog/src/probation.rs)). After `apply-release` promotes a new version, the watchdog must see the heartbeat advance within `PROBATION_DEADLINE` (120 s). Otherwise it rolls `current` back to the previous version and bans the failed one.
+- **Parent-death signal (Linux)** ([`die_with_parent`](../apps/watchdog/src/supervise.rs)). The agent child gets `PR_SET_PDEATHSIG=SIGKILL`, so killing the watchdog cannot leave behind an unsupervised agent that has been reparented to PID 1.
 
-The watchdog tells the agent how often it was restarted and how many self-protection events it saw, through two environment variables. The agent reads them in [`WatchdogReport::from_env`](../agent/src/host_counters.rs) and reports them in the health beacon.
+The watchdog tells the agent how often it was restarted and how many self-protection events it saw, through two environment variables. The agent reads them in [`WatchdogReport::from_env`](../apps/agent/src/host_counters.rs) and reports them in the health beacon.
 
 ## Crate map
 
@@ -80,40 +80,40 @@ The rules:
 
 Some consequences show up in the agent's code:
 
-- **The binary bridges types that two crates may not share.** [`upload.rs`](../agent/src/upload.rs) adapts `store::EventSpool` to `transport::EventDrain`. [`content.rs`](../agent/src/content.rs) composes `updater` verification with `transport` downloads. [`eventlog_config`](../agent/src/commands/windows.rs) maps `policy::EventLogPolicy` to `sensor-windows-eventlog`'s own config type field by field.
-- **The binary injects OS calls.** `response::kill_process` takes the actual kill as a closure. On Linux that closure is [`terminate_process`](../agent/src/commands/linux.rs), which sends `SIGKILL`.
+- **The binary bridges types that two crates may not share.** [`upload.rs`](../apps/agent/src/upload.rs) adapts `store::EventSpool` to `transport::EventDrain`. [`content.rs`](../apps/agent/src/content.rs) composes `updater` verification with `transport` downloads. [`eventlog_config`](../apps/agent/src/commands/windows.rs) maps `policy::EventLogPolicy` to `sensor-windows-eventlog`'s own config type field by field.
+- **The binary injects OS calls.** `response::kill_process` takes the actual kill as a closure. On Linux that closure is [`terminate_process`](../apps/agent/src/commands/linux.rs), which sends `SIGKILL`.
 
 ## Where platform code lives
 
-All `cfg(target_os)` dispatch in the agent sits in [`agent/src/commands/`](../agent/src/commands/mod.rs):
+All `cfg(target_os)` dispatch in the agent sits in [`apps/agent/src/commands/`](../apps/agent/src/commands/mod.rs):
 
 | Module | Contents |
 | --- | --- |
-| [`commands/mod.rs`](../agent/src/commands/mod.rs) | `RunOptions` (all `run` flags and config sections, bundled), and the re-export of the current platform's `cmd_status` / `cmd_run` / `cmd_capture_events` / `cmd_capture_baseline`. On an unsupported OS these compile but fail at runtime. |
-| [`commands/common.rs`](../agent/src/commands/common.rs) | The platform-independent part of `run`: [`wire_run_pipeline`](../agent/src/commands/common.rs) (transport, detection sink, correlator ticker, banner, heartbeat, IPC), [`apply_detection`](../agent/src/commands/common.rs) (local time zone and odd-hour calibration), [`plant_canaries`](../agent/src/commands/common.rs), and [`health_collector`](../agent/src/commands/common.rs). |
-| [`commands/linux.rs`](../agent/src/commands/linux.rs) | eBPF preflight, sensor selection (eBPF or the audit fallback), and every Linux worker thread. |
-| [`commands/windows.rs`](../agent/src/commands/windows.rs) | ETW plus the Event Log, socket-table and minifilter sources. |
-| [`commands/macos.rs`](../agent/src/commands/macos.rs) | EndpointSecurity plus the unified log, socket-table and NetworkExtension sources. |
+| [`commands/mod.rs`](../apps/agent/src/commands/mod.rs) | `RunOptions` (all `run` flags and config sections, bundled), and the re-export of the current platform's `cmd_status` / `cmd_run` / `cmd_capture_events` / `cmd_capture_baseline`. On an unsupported OS these compile but fail at runtime. |
+| [`commands/common.rs`](../apps/agent/src/commands/common.rs) | The platform-independent part of `run`: [`wire_run_pipeline`](../apps/agent/src/commands/common.rs) (transport, detection sink, correlator ticker, banner, heartbeat, IPC), [`apply_detection`](../apps/agent/src/commands/common.rs) (local time zone and odd-hour calibration), [`plant_canaries`](../apps/agent/src/commands/common.rs), and [`health_collector`](../apps/agent/src/commands/common.rs). |
+| [`commands/linux.rs`](../apps/agent/src/commands/linux.rs) | eBPF preflight, sensor selection (eBPF or the audit fallback), and every Linux worker thread. |
+| [`commands/windows.rs`](../apps/agent/src/commands/windows.rs) | ETW plus the Event Log, socket-table and minifilter sources. |
+| [`commands/macos.rs`](../apps/agent/src/commands/macos.rs) | EndpointSecurity plus the unified log, socket-table and NetworkExtension sources. |
 
-The detection sink ([`sink/mod.rs`](../agent/src/sink/mod.rs)) has no platform dispatch of its own. A few agent modules are compiled only on Linux because the mechanism exists only there: `integrity`, `inventory`, `kill_loudness`, `journal_cursor`, `log_sources`, `memscan`, `captures`. See the `mod` declarations in [`main.rs`](../agent/src/main.rs).
+The detection sink ([`sink/mod.rs`](../apps/agent/src/sink/mod.rs)) has no platform dispatch of its own. A few agent modules are compiled only on Linux because the mechanism exists only there: `integrity`, `inventory`, `kill_loudness`, `journal_cursor`, `log_sources`, `memscan`, `captures`. See the `mod` declarations in [`main.rs`](../apps/agent/src/main.rs).
 
 ## Agent modules at a glance
 
 | Module | Responsibility |
 | --- | --- |
-| [`sink`](../agent/src/sink/mod.rs) | `DetectionSink`, the `EventSink` that runs every engine, records findings and drives response. Also `BaselineSink` for ML baseline capture. |
-| [`enrich_queue`](../agent/src/enrich_queue.rs) | Bounded worker that moves hashing, signature checks, raw-event logging and spool appends off the capture thread. |
-| [`alerts`](../agent/src/alerts.rs) | `AlertLog`, the single alert funnel: `alerts.ndjson`, stderr, and the 256-entry in-memory buffer that `cli detections` reads. |
-| [`upload`](../agent/src/upload.rs) | The event spool and detection spool, plus their upload threads. Resolves which control plane `run` talks to. |
-| [`silence`](../agent/src/silence.rs) | Per-sensor heartbeats, the silence-monitor thread, and `PulsingSink`. |
-| [`health`](../agent/src/health.rs) | Health-beacon collector, sent every 30 s by default. |
-| [`heartbeat`](../agent/src/heartbeat.rs) | Progress-counter file for the watchdog. |
-| [`ipc_handler`](../agent/src/ipc_handler.rs) | IPC server thread answering `cli` requests and content reloads. |
-| [`shutdown`](../agent/src/shutdown.rs) | `ShutdownPlan`, a bounded join of the registered workers. |
-| [`kill_loudness`](../agent/src/kill_loudness.rs) | Attributes SIGTERM/SIGHUP/SIGQUIT to their sender before exiting (Linux). |
-| [`redact`](../agent/src/redact.rs) | `RedactingSink` and `redact_event`, which redact data at the point where events leave the process. |
-| [`content`](../agent/src/content.rs), [`release`](../agent/src/release.rs), [`rotation`](../agent/src/rotation.rs), [`trust`](../agent/src/trust.rs) | Signed content, release and key-rotation commands. |
-| [`protected`](../agent/src/protected.rs), [`integrity`](../agent/src/integrity.rs), [`inventory`](../agent/src/inventory.rs) | Linux self-protection and inventory monitors. |
+| [`sink`](../apps/agent/src/sink/mod.rs) | `DetectionSink`, the `EventSink` that runs every engine, records findings and drives response. Also `BaselineSink` for ML baseline capture. |
+| [`enrich_queue`](../apps/agent/src/enrich_queue.rs) | Bounded worker that moves hashing, signature checks, raw-event logging and spool appends off the capture thread. |
+| [`alerts`](../apps/agent/src/alerts.rs) | `AlertLog`, the single alert funnel: `alerts.ndjson`, stderr, and the 256-entry in-memory buffer that `cli detections` reads. |
+| [`upload`](../apps/agent/src/upload.rs) | The event spool and detection spool, plus their upload threads. Resolves which control plane `run` talks to. |
+| [`silence`](../apps/agent/src/silence.rs) | Per-sensor heartbeats, the silence-monitor thread, and `PulsingSink`. |
+| [`health`](../apps/agent/src/health.rs) | Health-beacon collector, sent every 30 s by default. |
+| [`heartbeat`](../apps/agent/src/heartbeat.rs) | Progress-counter file for the watchdog. |
+| [`ipc_handler`](../apps/agent/src/ipc_handler.rs) | IPC server thread answering `cli` requests and content reloads. |
+| [`shutdown`](../apps/agent/src/shutdown.rs) | `ShutdownPlan`, a bounded join of the registered workers. |
+| [`kill_loudness`](../apps/agent/src/kill_loudness.rs) | Attributes SIGTERM/SIGHUP/SIGQUIT to their sender before exiting (Linux). |
+| [`redact`](../apps/agent/src/redact.rs) | `RedactingSink` and `redact_event`, which redact data at the point where events leave the process. |
+| [`content`](../apps/agent/src/content.rs), [`release`](../apps/agent/src/release.rs), [`rotation`](../apps/agent/src/rotation.rs), [`trust`](../apps/agent/src/trust.rs) | Signed content, release and key-rotation commands. |
+| [`protected`](../apps/agent/src/protected.rs), [`integrity`](../apps/agent/src/integrity.rs), [`inventory`](../apps/agent/src/inventory.rs) | Linux self-protection and inventory monitors. |
 
 ## Known gaps
 

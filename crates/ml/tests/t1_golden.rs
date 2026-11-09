@@ -2,7 +2,7 @@
 //!
 //! Consumes `ml/tests/fixtures/t1_events.jsonl` (the agent's wire format) and
 //! `ml/tests/fixtures/t1_golden.jsonl` (`{pid, process_generation, features[17]}` per
-//! incarnation), both written by `ml/tests/fixtures/gen_t1_parity.py`. The Python
+//! incarnation), both written by `ml/tests/fixtures/generators/gen_t1_golden.py`. The Python
 //! counterpart is `ml/tests/test_t1_parity.py`.
 //!
 //! A break here means `ml::features::t1` (or one of the three blocks it assembles, or the

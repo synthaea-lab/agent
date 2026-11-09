@@ -6,16 +6,16 @@ edition = "2024"
 
 # Excluded from the workspace like sensor-linux-ebpf: cargo-fuzz needs nightly,
 # libFuzzer instrumentation, and its own profile settings — run it explicitly
-# with `cargo +nightly fuzz run <target>` from this directory's parent.
+# with `cargo +nightly fuzz run --fuzz-dir tests/fuzz <target>` from the repo root.
 [package.metadata]
 cargo-fuzz = true
 
 [dependencies]
 libfuzzer-sys = "0.4"
-sensor-linux-audit = { path = "../crates/sensors/linux/audit" }
-sensor-linux-logs = { path = "../crates/sensors/linux/logs" }
-sensor-linux-netlink = { path = "../crates/sensors/linux/netlink" }
-sensor-linux-wire = { path = "../crates/sensors/linux/wire" }
+sensor-linux-audit = { path = "../../crates/sensors/linux/audit" }
+sensor-linux-logs = { path = "../../crates/sensors/linux/logs" }
+sensor-linux-netlink = { path = "../../crates/sensors/linux/netlink" }
+sensor-linux-wire = { path = "../../crates/sensors/linux/wire" }
 
 [[bin]]
 name = "audit_parse"

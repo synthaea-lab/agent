@@ -14,7 +14,7 @@
 //! mix, a missing stamp keeps the pid-only behavior.
 //!
 //! A parity seam like the other extractors: `ml/tests/fixtures/t1_golden.jsonl` is
-//! produced by Python (`gen_t1_parity.py`) and checked from both sides. A T1 model
+//! produced by Python (`gen_t1_golden.py`) and checked from both sides. A T1 model
 //! trained on the Python vectors only scores consistently here if they match.
 
 use correlator::EventBus;

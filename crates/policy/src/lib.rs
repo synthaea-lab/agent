@@ -24,7 +24,7 @@
 //!
 //! Wiring `PolicyPayload.sensors.windows_eventlog` into the sensor's own
 //! `EventLogConfig` (replacing the `EventLogPolicy` glue in
-//! `agent/src/commands/windows.rs`) is a follow-up per ADR-0010
+//! `apps/agent/src/commands/windows.rs`) is a follow-up per ADR-0010
 //! §Consequences.
 
 pub mod canonical;
@@ -340,7 +340,7 @@ pub fn parent_exclusion_applies(comm: &str, parent_comm: Option<&str>) -> bool {
 /// on `schema` (`tools/check-deps.py`), so this type cannot be read by the
 /// sensor directly: the `agent` binary (unrestricted deps) reads it here and
 /// converts it into the sensor's own `EventLogConfig` at construction time
-/// (`agent/src/commands/windows.rs`; ADR-0006).
+/// (`apps/agent/src/commands/windows.rs`; ADR-0006).
 ///
 /// The first struct this crate has ever held (previously pure functions
 /// only) — deliberately without a `serde` derive: there is no policy-loading

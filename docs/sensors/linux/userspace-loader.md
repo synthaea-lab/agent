@@ -27,8 +27,8 @@ into `OUT_DIR` and sets the `ebpf_embedded` cfg. It is skipped on non-Linux targ
 `bpf-linker` is not on `PATH`; the crate then builds without probes and
 [`load_ebpf`](../../../crates/sensors/linux/userspace/src/ebpf.rs) returns an error explaining how to
 provision the toolchain. The probe toolchain is the nightly pinned in
-[`ebpf-toolchain.txt`](../../../ebpf-toolchain.txt) (override with `SYNTHAEA_EBPF_TOOLCHAIN`);
-[`toolchain/linux-toolchain.sh`](../../../toolchain/linux-toolchain.sh) installs it with a matching
+[`packaging/toolchain/ebpf-toolchain.txt`](../../../packaging/toolchain/ebpf-toolchain.txt) (override with `SYNTHAEA_EBPF_TOOLCHAIN`);
+[`packaging/toolchain/linux-toolchain.sh`](../../../packaging/toolchain/linux-toolchain.sh) installs it with a matching
 `bpf-linker`. An unpinned nightly breaks as soon as its LLVM major moves past the linker's.
 `sensor-linux-uprobes` has an identical `build.rs` and embeds its own copy of the same object.
 
@@ -134,7 +134,7 @@ platform-independent; its unit tests run on every CI leg. Invariants it enforces
   bits, so without the mask an unprivileged process could set the synthetic `schema::FLAG_*` bits
   other sensors use to mark persistence facts on a `FileOpenEvent`, and raise those alerts at will.
   A compile-time block asserts every synthetic flag lies outside the mask; a new `FLAG_*` must be
-  added there. The end-to-end check is [`probe_open_synthetic_bits.rs`](../../../agent/tests/probe_open_synthetic_bits.rs).
+  added there. The end-to-end check is [`probe_open_synthetic_bits.rs`](../../../apps/agent/tests/probe_open_synthetic_bits.rs).
 - **argv is bounded** to `schema::ARGV_CAPTURE_BUDGET` (32 KiB) in `exec`, the one place every exec
   passes; a cut sets `cmdline_truncated` and makes `argv_omitted_bytes` unknown.
 - **The image path is the kernel's** `bprm->filename`, never `argv[0]`.

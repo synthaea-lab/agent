@@ -49,8 +49,8 @@ see `CLAUDE.md`.
 | `device-control` | Removable-media telemetry + policy-gated control (USB first) | skeleton | new development (https://github.com/synthaea-lab/agent/issues/30) |
 | `inventory` | Diffed asset inventory: packages, services, autoruns, ports | skeleton | new development (issue #87) |
 
-The binaries live outside this folder: `agent/` (the pipeline host), `watchdog/`, and
-`cli/` (admin tool, an `ipc` client).
+The binaries live outside this folder: `apps/agent/` (the pipeline host), `apps/watchdog/`, and
+`apps/cli/` (admin tool, an `ipc` client).
 
 ## Adding a crate
 

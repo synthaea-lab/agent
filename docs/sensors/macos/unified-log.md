@@ -8,7 +8,7 @@
 | TCC decisions | subsystem `com.apple.TCC`, `AUTHREQ_CTX` + `AUTHREQ_RESULT` pair | `schema::TccDecisionEvent` |
 | Gatekeeper verdicts | process `syspolicyd`, `GK evaluateScanResult` | `schema::GatekeeperVerdictEvent` |
 
-It has no `Sensor` implementation. The agent runs it as a supplementary tail beside the ES sensor ([`spawn_unifiedlog_tail`](../../../agent/src/commands/macos.rs)), like the Linux journal tail.
+It has no `Sensor` implementation. The agent runs it as a supplementary tail beside the ES sensor ([`spawn_unifiedlog_tail`](../../../apps/agent/src/commands/macos.rs)), like the Linux journal tail.
 
 ## Why `log stream` and not `OSLogStore`
 
