@@ -4,6 +4,12 @@
 
 use std::collections::HashMap;
 
+/// The last component of a Windows path: an image's process name.
+#[cfg(any(windows, test))]
+pub(crate) fn basename(path: &str) -> String {
+    path.rsplit('\\').next().unwrap_or(path).to_string()
+}
+
 /// Windows FILETIME (100ns intervals since 1601-01-01) → Unix epoch nanoseconds.
 #[must_use]
 pub fn filetime_to_ns(ft: i64) -> u64 {
@@ -410,6 +416,13 @@ mod tests {
     use super::*;
 
     const PREFIX: &str = "wtrace-";
+
+    #[test]
+    fn basename_is_the_last_backslash_component() {
+        assert_eq!(basename(r"C:\Windows\System32\cmd.exe"), "cmd.exe");
+        assert_eq!(basename("cmd.exe"), "cmd.exe");
+        assert_eq!(basename(r"C:\dir\"), "");
+    }
 
     #[test]
     fn ntlm_pids_and_accounts_parse_like_the_lab_events() {

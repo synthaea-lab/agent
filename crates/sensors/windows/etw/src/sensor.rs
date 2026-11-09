@@ -405,12 +405,8 @@ impl SharedState {
                 resolved
             }
         };
-        Some(basename(&path))
+        Some(normalize::basename(&path))
     }
-}
-
-pub(crate) fn basename(path: &str) -> String {
-    path.rsplit('\\').next().unwrap_or(path).to_string()
 }
 
 /// Starts the `Zone.Identifier` read-back worker (#439). It exits by itself
@@ -454,7 +450,7 @@ fn spawn_silo_resolver(
 /// of it); see [`silo::match_containers`] for why the image is checked.
 fn probe_silo(pid: u32, image: &str) -> Option<u32> {
     let live = winapi::resolve_pid_live(pid)?;
-    if !basename(&live).eq_ignore_ascii_case(&basename(image)) {
+    if !normalize::basename(&live).eq_ignore_ascii_case(&normalize::basename(image)) {
         return None;
     }
     winapi::read_server_silo_id(pid)
