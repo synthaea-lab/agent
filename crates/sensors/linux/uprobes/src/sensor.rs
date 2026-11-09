@@ -7,7 +7,6 @@
 use std::{
     collections::{HashMap, HashSet},
     sync::{Arc, Mutex},
-    time::{Duration, Instant},
 };
 
 use aya::{
@@ -22,6 +21,7 @@ use tokio::sync::Notify;
 use tracing::{debug, info, warn};
 
 use crate::{
+    budget::SlidingBudget,
     config::{TlsConfig, UprobesConfig},
     normalize,
     symbol_resolver::{self, SymbolInfo},
@@ -34,134 +34,6 @@ fn err(msg: String) -> SensorError {
 /// See `sensor_linux_wire::boot_epoch_offset_ns` — computed once at startup.
 fn boot_epoch_offset_ns() -> u64 {
     sensor_linux_wire::boot_epoch_offset_ns()
-}
-
-/// Per-process budget tracking for TLS capture (sliding window).
-struct TlsBudgetTracker {
-    /// Budget: bytes per process per second.
-    bytes_per_sec: u32,
-    /// Sliding window: `(pid, timestamp, bytes_captured)`.
-    windows: HashMap<u32, Vec<(Instant, u32)>>,
-    /// Cleanup interval (remove old entries every N checks).
-    cleanup_counter: u32,
-}
-
-impl TlsBudgetTracker {
-    fn new(bytes_per_sec: u32) -> Self {
-        Self {
-            bytes_per_sec,
-            windows: HashMap::new(),
-            cleanup_counter: 0,
-        }
-    }
-
-    /// Check if pid can capture `bytes` without exceeding budget.
-    /// Returns true if allowed, false if budget exceeded.
-    fn check_and_record(&mut self, pid: u32, bytes: u32) -> bool {
-        let now = Instant::now();
-        let window = Duration::from_secs(1);
-
-        let entries = self.windows.entry(pid).or_default();
-        entries.retain(|(ts, _)| now.duration_since(*ts) < window);
-        let bytes_in_window: u32 = entries.iter().map(|(_, b)| b).sum();
-
-        if bytes_in_window + bytes > self.bytes_per_sec {
-            return false;
-        }
-
-        entries.push((now, bytes));
-
-        self.cleanup_counter += 1;
-        if self.cleanup_counter >= 100 {
-            self.cleanup_counter = 0;
-            self.windows.retain(|_, entries| !entries.is_empty());
-        }
-
-        true
-    }
-}
-
-/// Per-process budget tracking for readline capture (sliding window).
-struct ReadlineBudgetTracker {
-    /// Budget: commands per process per second.
-    commands_per_sec: u32,
-    /// Sliding window: (pid, timestamps).
-    windows: HashMap<u32, Vec<Instant>>,
-    /// Cleanup interval.
-    cleanup_counter: u32,
-}
-
-impl ReadlineBudgetTracker {
-    fn new(commands_per_sec: u32) -> Self {
-        Self {
-            commands_per_sec,
-            windows: HashMap::new(),
-            cleanup_counter: 0,
-        }
-    }
-
-    /// Check if pid can capture one more command without exceeding budget.
-    fn check_and_record(&mut self, pid: u32) -> bool {
-        let now = Instant::now();
-        let window = Duration::from_secs(1);
-
-        let entries = self.windows.entry(pid).or_default();
-        entries.retain(|ts| now.duration_since(*ts) < window);
-
-        if entries.len() >= self.commands_per_sec as usize {
-            return false;
-        }
-
-        entries.push(now);
-
-        self.cleanup_counter += 1;
-        if self.cleanup_counter >= 100 {
-            self.cleanup_counter = 0;
-            self.windows.retain(|_, entries| !entries.is_empty());
-        }
-
-        true
-    }
-}
-
-/// Per-process budget tracking for DNS capture (sliding window). Same shape as
-/// [`ReadlineBudgetTracker`] — one query "unit" per event, not bytes.
-struct DnsBudgetTracker {
-    queries_per_sec: u32,
-    windows: HashMap<u32, Vec<Instant>>,
-    cleanup_counter: u32,
-}
-
-impl DnsBudgetTracker {
-    fn new(queries_per_sec: u32) -> Self {
-        Self {
-            queries_per_sec,
-            windows: HashMap::new(),
-            cleanup_counter: 0,
-        }
-    }
-
-    fn check_and_record(&mut self, pid: u32) -> bool {
-        let now = Instant::now();
-        let window = Duration::from_secs(1);
-
-        let entries = self.windows.entry(pid).or_default();
-        entries.retain(|ts| now.duration_since(*ts) < window);
-
-        if entries.len() >= self.queries_per_sec as usize {
-            return false;
-        }
-
-        entries.push(now);
-
-        self.cleanup_counter += 1;
-        if self.cleanup_counter >= 100 {
-            self.cleanup_counter = 0;
-            self.windows.retain(|_, entries| !entries.is_empty());
-        }
-
-        true
-    }
 }
 
 /// Loads the embedded eBPF object from the main sensor-linux-ebpf crate.
@@ -314,8 +186,7 @@ macro_rules! drain_tls {
                     }
                 }
 
-                // Budget enforcement: check if pid hasn't exceeded bytes/sec budget
-                if !$budget.check_and_record(event.meta.pid, event.bytes_len) {
+                if !$budget.try_spend(event.meta.pid, event.bytes_len) {
                     debug!(
                         pid = event.meta.pid,
                         bytes = event.bytes_len,
@@ -366,8 +237,7 @@ macro_rules! drain_readline {
                     }
                 }
 
-                // Budget enforcement: check if pid hasn't exceeded commands/sec budget
-                if !$budget.check_and_record(event.meta.pid) {
+                if !$budget.try_spend(event.meta.pid, 1) {
                     debug!(
                         pid = event.meta.pid,
                         "sensor-linux-uprobes: readline dropped (budget)"
@@ -412,7 +282,7 @@ macro_rules! drain_dns {
                     }
                 }
 
-                if !$budget.check_and_record(event.meta.pid) {
+                if !$budget.try_spend(event.meta.pid, 1) {
                     debug!(
                         pid = event.meta.pid,
                         "sensor-linux-uprobes: DNS query dropped (budget)"
@@ -627,11 +497,10 @@ impl UprobesSensor {
         let mut ebpf = load_ebpf()?;
         let offset = boot_epoch_offset_ns();
 
-        // Initialize budget trackers
-        let mut tls_budget = TlsBudgetTracker::new(self.config.tls.bytes_per_process_per_sec);
+        let mut tls_budget = SlidingBudget::per_second(self.config.tls.bytes_per_process_per_sec);
         let mut readline_budget =
-            ReadlineBudgetTracker::new(self.config.readline.commands_per_process_per_sec);
-        let mut dns_budget = DnsBudgetTracker::new(self.config.dns.queries_per_process_per_sec);
+            SlidingBudget::per_second(self.config.readline.commands_per_process_per_sec);
+        let mut dns_budget = SlidingBudget::per_second(self.config.dns.queries_per_process_per_sec);
         let mut tls_dropped = 0u64;
         let mut readline_dropped = 0u64;
         let mut dns_dropped = 0u64;
