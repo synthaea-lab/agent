@@ -263,3 +263,12 @@ jobs:
             fi
             ls -la "$obj"
           done
+      # The loader finds every probe and map by name, and nothing in CI loads them: a rename
+      # or a program moved to another section must fail here, not on a kernel (AS-003).
+      - name: probe and map names unchanged
+        run: |
+          for crate in sensor-linux sensor-linux-uprobes; do
+            obj=$(find target/debug/build -regextype posix-extended \
+              -regex ".*/build/${crate}-[0-9a-f]{16}/out/sensor-linux-ebpf" -type f -print -quit)
+            python3 tools/check-ebpf-symbols.py "$obj" crates/sensors/linux/ebpf/symbols.txt
+          done
