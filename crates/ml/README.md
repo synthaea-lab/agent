@@ -1,167 +1,64 @@
-# ML Crate
+# ml
 
-On-device ML inference using ONNX Runtime with feature extraction from event streams.
+On-device machine learning for the agent: feature extraction from `schema` events and
+Isolation Forest scoring through ONNX Runtime ([`ort`](https://crates.io/crates/ort)).
+The models are trained, calibrated and exported by
+[synthaea-lab/ml](https://github.com/synthaea-lab/ml) and loaded from disk at start-up; a
+missing or invalid model leaves the agent running without ML evidence.
 
-## ONNX Runtime Linking
+| Tier | Scorer | Scores | Used by the agent |
+| --- | --- | --- | --- |
+| T0 | `CmdlineScorer` | one command line | not yet |
+| T1 | `BehaviorScorer` | one process incarnation | not yet |
+| T2 | `CorrelationScorer` | one process's correlator window, as evidence for the correlator's belief | yes, when a model is present |
 
-Per **ADR-0002 decision #2**, onnxruntime is statically linked into the agent binary for production:
-- Single-binary deployment (no runtime .so/.dll dependencies)
-- Updater integrity guarantees
-- Root/SYSTEM execution security posture
+Each score can carry a per-feature attribution. Tiers, features, attribution and the
+degraded modes are documented in [docs/detection/ml.md](../../docs/detection/ml.md).
 
-### Development Builds (Dynamic Linking - Default)
+## Feature parity
 
-By default, the ml crate uses the `dynamic-onnx` feature which downloads prebuilt ONNX Runtime libraries:
+Every feature extractor under [`src/features`](src/features.rs) mirrors a Python definition in
+the training pipeline. A model scores correctly only if both sides build the same vector for
+the same input, so each extractor is pinned by a golden fixture that both repositories test
+against. Change a feature on both sides in step, and retrain the model.
 
-```bash
-# Standard dev workflow - downloads onnxruntime automatically
-cargo build -p ml
-cargo test -p ml
-cargo test --workspace --exclude sensor-linux-ebpf
-```
+## ONNX Runtime linking
 
-This allows fast iteration without manual onnxruntime builds. The `dynamic-onnx` feature is **enabled by default** for dev convenience.
+The default `dynamic-onnx` feature downloads a prebuilt ONNX Runtime, which keeps
+development builds fast. Packaged builds use `--no-default-features` and link ONNX Runtime
+1.30.0 statically, so the agent ships as one binary with no shared library to load.
 
-### Production Builds (Static Linking - Required)
+Static build on Linux or macOS:
 
-**Issue:** #110 tracks full integration. Current status: **Manual setup required**
-
-#### Quick Start
-
-```bash
-# 1. Build onnxruntime from source
+```sh
 ./packaging/toolchain/build-onnxruntime-static.sh
-
-# 2. Set environment variable
-export ORT_LIB_LOCATION="$PWD/onnxruntime/build/Linux/Release"
-
-# 3. Generate static link flags
+export ORT_LIB_LOCATION="$PWD/onnxruntime/build/Linux/Release"   # on macOS: build/MacOS/Release
 eval "$(./packaging/toolchain/ort-static-link-flags.sh)"
-
-# 4. Build with static linking (disables dynamic-onnx default feature)
-cargo build -p ml --release --no-default-features
 cargo test -p ml --release --no-default-features
-
-# 5. Verify no runtime dependencies
-ldd target/release/deps/ml-* | grep -i onnx  # Should return nothing
 ```
 
-**Note:** The `--no-default-features` flag disables the `dynamic-onnx` feature, forcing static linking.
-
-#### Windows (MSVC)
+Static build on Windows (MSVC), from PowerShell:
 
 ```powershell
-.\toolchain\build-onnxruntime-static.ps1
+.\packaging\toolchain\build-onnxruntime-static.ps1
 $env:ORT_LIB_LOCATION = "$PWD\onnxruntime\build\Windows\Release\Release"
-.\toolchain\ort-static-link-flags.ps1 | Invoke-Expression
+.\packaging\toolchain\ort-static-link-flags.ps1 | Invoke-Expression
 cargo test -j 1 -p ml --release --no-default-features
-python tools\check-pe-imports.py target\release\deps\ml-*.exe   # no onnxruntime/directml/d3d12
 ```
 
-The source build is CPU only, so unlike the prebuilt download the binary does not import
-`directml.dll` or `d3d12.dll`. Prerequisites, timings and the Windows-specific pitfalls
-(`re2`, `shell32`, memory while linking) are in `packaging/toolchain/onnxruntime-static-build.md`.
-
-#### Detailed Documentation
-
-See `packaging/toolchain/onnxruntime-static-build.md` for:
-- Prerequisites and platform support
-- Detailed build steps
-- Known issues and workarounds
-- CI integration options (TODO)
-
-#### Platform Support
-
-- ✅ **Linux (Ubuntu 24.04+)**: Fully tested, production-ready
-- ⏳ **Windows**: Not yet implemented (issue #110)
-- ✅ **macOS (Apple Silicon and Intel)**: validated on hosted runners (issue #338, PR #788): onnxruntime from source, `cargo test -p ml` and the agent linked statically, no `libonnxruntime.dylib`; see `packaging/toolchain/onnxruntime-static-build-macos.md`
-
-## Features
-
-### Inference
-
-- ONNX model loading and inference
-- Feature vector extraction from event streams
-- Correlation scoring
-- Capture scoring (process tree analysis)
-
-### Event Integration
-
-- Consumes events from `schema::Event`
-- Integrates with `correlator` for event windowing
-- Produces scored detections
+Prerequisites, build times and platform notes are in
+[onnxruntime-static-build.md](../../packaging/toolchain/onnxruntime-static-build.md) and
+[onnxruntime-static-build-macos.md](../../packaging/toolchain/onnxruntime-static-build-macos.md).
 
 ## Testing
 
-```bash
-# Run all ml tests
+```sh
 cargo test -p ml
-
-# Run specific test suites
-cargo test -p ml --test correlation_scorer  # End-to-end correlation scoring
-cargo test -p ml --test capture_parity      # Python parity validation
 ```
 
-### Test Coverage
-
-- **Unit tests**: Feature extraction, vector building
-- **Integration tests**: End-to-end inference with real ONNX models
-- **Parity tests**: Validates Rust feature extraction matches Python training pipeline
-
-## Development
-
-### Adding New Features
-
-1. Define feature in both:
-   - Rust: `src/features.rs`
-   - Python: `ml/features.py` (training pipeline)
-
-2. Add parity test case to maintain feature consistency
-
-3. Update test fixtures if schema changes
-
-### Model Updates
-
-Models are located in `tests/fixtures/`:
-- `correlation_scorer.onnx` - Correlation detection model
-- `capture_scorer.onnx` - Process tree analysis model
-
-Regenerate models when:
-- Feature definitions change
-- Training data updates
-- Model architecture changes
-
-Coordinate with ML workstream for model regeneration.
-
-## Dependencies
-
-- `ort`: ONNX Runtime bindings (statically linked per ADR-0002)
-- `schema`: Event type definitions
-- `correlator`: Event windowing and aggregation
-- `thiserror`: Error handling
-
-## Known Issues
-
-### Static Linking Not Automated (Issue #110)
-
-**Status:** Manual setup required (see Static Linking section above)
-
-**Root causes:**
-1. `ort-sys` v2.0.0-rc.13 has incomplete static library list for onnxruntime 1.30.0 (~78 missing abseil libraries)
-2. `re2` library is orphaned CMake target in static-only builds (Ubuntu/glibc)
-
-**Workarounds:** Automated via `build-onnxruntime-static.sh` and `ort-static-link-flags.sh`
-
-**Upstream:** Consider filing issues with:
-- pykeio/ort: Incomplete library list in `ort-sys/build/static_link/mod.rs`
-- microsoft/onnxruntime: `re2` CMake dependency not expressed in build graph
-
-### Binary Size Impact
-
-**TODO:** Measure and document binary size delta (ADR-0002 §3)
-
-## References
-
-- Issue #110: ML crate static linking tracking
-- ADR-0002: ML runtime decisions (static linking requirement)
-- `packaging/toolchain/onnxruntime-static-build.md`: Detailed static build guide
+The integration tests score the fixture models in [`tests/fixtures/`](tests/fixtures) and
+compare features, scores and attributions with golden files produced by the Python pipeline.
+The fixture models are trained on synthetic data: they prove that Rust and Python agree, not
+how well a model detects. Some golden tests read fixtures from a checkout of
+[synthaea-lab/ml](https://github.com/synthaea-lab/ml) next to this repository and skip
+without it.

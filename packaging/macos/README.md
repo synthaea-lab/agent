@@ -1,95 +1,64 @@
 # packaging/macos
 
-How the macOS agent becomes installable and approved: the app bundle that
-hosts the system extensions, the entitlements each piece needs, and the
-activation/approval flow. Written with issue #33 (the NetworkExtension
-sensor's extension) and #32 (the EndpointSecurity entitlement) — the .pkg
-build scripts land when the walking-skeleton lab run needs them, same
-sequencing as `packaging/windows`.
+The design for installing the macOS agent: the app bundle that hosts the network system
+extension, the entitlements each part needs, and the approval flow. There is no `.pkg` build
+yet; releases carry the bare agent binary, which is not notarized.
 
-## Why an app bundle at all
+## Why an app bundle
 
-Apple only activates a **system extension** from inside a signed app bundle
-in `/Applications` (`OSSystemExtensionRequest`); a bare daemon cannot host
-one. The macOS agent therefore ships as:
+macOS activates a system extension only from a signed app bundle in `/Applications`
+(`OSSystemExtensionRequest`); a bare daemon cannot host one. The agent therefore ships as an
+app bundle for the network extension and a launchd daemon for the agent. The planned layout:
 
-```
-Synthaea.app/
-  Contents/MacOS/Synthaea                    ← thin activation/status UI
+```text
+/Applications/Synthaea.app/
+  Contents/MacOS/Synthaea                       activation and status UI
   Contents/Library/SystemExtensions/
-    dev.synthaea.agent.network.systemextension   ← NEFilterDataProvider +
-                                                   NEDNSProxyProvider
-                                                   (crates/sensors/macos/
-                                                    network-extension/extension)
-  Contents/Resources/ ...
-/usr/local/synthaea/agent                    ← the Rust agent daemon (launchd)
+    dev.synthaea.agent.network.systemextension  NEFilterDataProvider and NEDNSProxyProvider
+/usr/local/synthaea/agent                       the agent daemon
 /Library/LaunchDaemons/dev.synthaea.agent.plist
 ```
 
-The ES sensor (`sensor-macos`) does **not** need a system extension — an
-entitled daemon binary is enough (`docs/sensors/macos.md`), so the agent
-stays a plain launchd daemon.
+The EndpointSecurity sensor needs no system extension: an entitled daemon is enough, so the
+agent stays a plain launchd daemon. The extension's sources are in
+[`crates/sensors/macos/network-extension/extension`](../../crates/sensors/macos/network-extension/extension/README.md).
 
 ## Entitlements
 
-| Piece | Entitlements |
+| Part | Entitlements |
 | --- | --- |
-| agent daemon | `com.apple.developer.endpoint-security.client` (Apple-granted, restricted), app group |
-| host app | `com.apple.developer.system-extension.install`, app group |
-| network extension | `com.apple.developer.networking.networkextension` with `content-filter-provider` + `dns-proxy` (restricted — same Apple request form as ES), app group |
+| Agent daemon | `com.apple.developer.endpoint-security.client` (restricted, granted by Apple), app group |
+| Host app | `com.apple.developer.system-extension.install`, app group |
+| Network extension | `com.apple.developer.networking.networkextension` with `content-filter-provider` and `dns-proxy` (restricted), app group |
 
-All three share one **app group** (`group.dev.synthaea.agent`): the network
-extension's sandbox only reaches its own group container, and that is where
-the agent's Unix socket for the extension↔agent event pipe lives
-(`crates/sensors/macos/network-extension`, `receiver.rs` — the agent
-listens, the extension reconnects, since the OS starts/stops the extension
-on its own schedule).
+All three share the app group `group.dev.synthaea.agent`. The extension's sandbox reaches
+only its group container, which is where the agent's Unix socket for the extension's events
+lives. The agent listens and the extension reconnects, because macOS starts and stops the
+extension on its own schedule.
 
-## Activation & approval flow
+The restricted entitlements must be granted by Apple before a build can use them. Until
+then, no provisioning profile authorizes them, and a SIP-enabled host kills a binary that
+claims them at exec.
 
-1. The installer places `Synthaea.app` and the daemon, loads the launchd
-   plist.
-2. The app calls `OSSystemExtensionRequest.activationRequest` for the
-   network extension.
-3. macOS prompts the user (System Settings → General → Login Items &
-   Extensions) unless an MDM profile pre-approves:
-   - `com.apple.system-extension-policy` (allowed team/bundle ids), and
-   - `com.apple.webcontent-filter` + `com.apple.dnsProxy` payloads so the
-     content filter and DNS proxy attach without per-user consent.
-4. Separately, TCC Full Disk Access for the daemon (ES requirement) — user
-   grant or `com.apple.TCC.configuration-profile-policy` via MDM.
-5. `systemextensionsctl list` shows the activated extension;
-   `systemextensionsctl reset` is the lab-machine escape hatch.
+## Activation and approval
 
-Fleet reality: without MDM, three user prompts (extension, filter, FDA);
-with MDM, zero. The installer must treat "approved" as asynchronous state,
-not an install-time postcondition.
+1. The installer places `Synthaea.app` and the daemon, and loads the launchd plist.
+2. The app requests activation of the network extension
+   (`OSSystemExtensionRequest.activationRequest`).
+3. macOS asks the user to approve it in System Settings, under General, Login Items &
+   Extensions, unless an MDM profile pre-approves it with:
+   - `com.apple.system-extension-policy` for the allowed team and bundle IDs, and
+   - `com.apple.webcontent-filter` and `com.apple.dnsProxy` payloads, so the content filter
+     and DNS proxy attach without per-user consent.
+4. The daemon needs Full Disk Access for EndpointSecurity, granted by the user or by a
+   `com.apple.TCC.configuration-profile-policy` payload.
+5. `systemextensionsctl list` shows the activated extension.
 
-## Dev loop (lab machine)
+Without MDM a user sees three prompts (extension, filter, Full Disk Access); with MDM, none.
+The installer treats approval as state that arrives later, not as an install-time result.
 
-- `systemextensionsctl developer on` lets a non-`/Applications` build
-  activate extensions without notarization (SIP-relaxed lab machines only,
-  same caveat as the ES dev-signing path in `docs/sensors/macos.md`).
-- The extension builds from
-  `crates/sensors/macos/network-extension/extension/` (Xcode target or
-  `swiftc`; CI type-checks the sources with `swiftc -typecheck` so SDK
-  drift is caught without an Xcode project).
-- The DNS proxy's upstream resolver comes from the provider configuration
-  (`NEDNSProxyManager`) — the scaffold's hardcoded default is replaced by
-  the managed value when the manager wiring lands.
+## Development
 
-## Status
-
-Scaffold + this document (issues #32/#33). Real `.pkg` build scripts,
-signing/notarization pipeline, and the beacon-scenario lab validation are
-the follow-up — they need the Developer ID + restricted entitlements, an
-organizational step, not a code one. **The Endpoint Security entitlement
-request was submitted to Apple on 2026-09-22** (via
-<https://developer.apple.com/system-extensions/>, describing the
-open-source EDR use case); the Network Extension content-filter/dns-proxy
-request is a separate form on the same page and is still to file. Until a
-grant lands, no provisioning profile on any machine can authorize the
-restricted entitlements — verified live: amfid SIGKILLs an ad-hoc-entitled
-binary at exec (error -424), before TCC, on a SIP-enabled host (see the
-dev-signing section of `docs/sensors/macos.md` for the lab-relaxation
-alternative).
+On a test Mac with SIP relaxed, `systemextensionsctl developer on` lets a build outside
+`/Applications` activate extensions without notarization, and `systemextensionsctl reset`
+removes them. The extension builds from its sources with Xcode or `swiftc`.

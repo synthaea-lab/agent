@@ -1,8 +1,7 @@
 # Contributing to Synthaea
 
-Synthaea has a working Linux implementation (validated live in the lab — see `crates/`,
-`agent/`, and the sibling repos) while much of the wider system is still **design-phase** — the
-foundations are still cheap to argue about.
+Synthaea is alpha software. The Linux agent runs end to end, while much of the wider system is
+still being designed, so the foundations are still cheap to argue about.
 
 **One of the most valuable contributions is still a well-argued objection to a design
 decision.** If you think the schema design is wrong, the metamorphism claims are
@@ -98,14 +97,14 @@ Superseding an ADR means writing a new one that references the old — we don't 
 
 Documentation PRs are welcome immediately. Particularly wanted:
 
-- **Correctness of platform claims.** The telemetry-source inventory and the per-platform coverage
-  matrices
-  ([`crates/sensors/`](crates/sensors/README.md)) make specific assertions about Windows kernel
-  callbacks, BPF-LSM availability, and EndpointSecurity events. If one is wrong or out of date,
-  that's a high-value fix — the roadmap depends on it.
-- **Prior art we've mischaracterized.** The comparison table in the README makes claims about
-  other projects. If we've been unfair to OSQuery, Velociraptor, Wazuh, or Falco, correct us. We'd
-  rather be accurate than flattering to ourselves.
+- **Correctness of platform claims.** The sensor guides for
+  [Linux](docs/sensors/linux/README.md), [Windows](docs/sensors/windows/README.md) and
+  [macOS](docs/sensors/macos/README.md) make specific assertions about kernel facilities, ETW
+  providers, BPF-LSM availability and EndpointSecurity events. If one is wrong or out of date,
+  that's a high-value fix.
+- **Prior art we've mischaracterized.** If the documentation is unfair to osquery, Velociraptor,
+  Wazuh, Falco or any other project, correct us. We'd rather be accurate than flattering to
+  ourselves.
 - **Threat-model gaps.** Especially where the honest limitations matter more than the
   capability lists.
 
@@ -121,34 +120,24 @@ so FP governance is strict.
 
 ---
 
-## Quality gates (enforced by CI)
+## Quality gates
 
-CI ([`.github/workflows/ci.yml`](.github/workflows/ci.yml)) runs on every push and PR to `main`.
-A PR must pass all of it:
+[docs/development.md](docs/development.md#ci-gates) lists every check a pull request must
+pass: formatting with nightly `rustfmt`, the dependency-direction check, `cargo-deny`, clippy
+with `-D warnings`, and the tests on Linux, Windows and macOS, plus the detection-content
+suites. Run the same checks on one machine before pushing:
 
-- **`cargo fmt --check`** on every crate (config in [`rustfmt.toml`](rustfmt.toml); the generated
-  `vmlinux*.rs` bindings are exempt).
-- **`cargo clippy -- -D warnings`** on the platform-agnostic crates. Warnings are errors — either
-  fix them or carry a narrowly scoped `#[allow]` with a comment saying why.
-- **`cargo test`** across the workspace on all three OSes (platform sensors compile to stubs on
-  foreign targets; the eBPF probes build and validate on lab machines).
-- **`ruff check` + `ruff format --check` + `pytest`** on `ml/` (config in
-  [`ml/pyproject.toml`](ml/pyproject.toml)).
-
-One test deserves a special mention: the **Python/Rust feature-parity golden test**
-(`ml/tests/test_features_golden.py` and the `crates/ml` golden feature test, both reading
-`ml/tests/fixtures/features_golden.jsonl`). Feature extraction exists twice — training in Python,
-inference in Rust — and any divergence silently invalidates the shipped models. If you change
-`ml/synthaea_ml/features/cmdline.py` or the Rust mirror, keep them in lockstep, regenerate the
-golden file (`python ml/tests/fixtures/generators/gen_features_golden.py`), and retrain. See the generator's
-docstring.
-
-Locally, before pushing:
-
-```bash
-cargo fmt && cargo clippy --workspace --exclude sensor-linux-ebpf --all-targets -- -D warnings   && cargo test --workspace --exclude sensor-linux-ebpf && python3 tools/check-deps.py
-ruff check ml && pytest ml/tests
+```sh
+tools/gauntlet.sh          # everything
+tools/gauntlet.sh --fast   # skip the cross-target and documentation passes
 ```
+
+One contract deserves a special mention: **feature parity between Python and Rust.**
+Feature extraction exists twice, for training in
+[synthaea-lab/ml](https://github.com/synthaea-lab/ml) and for inference in `crates/ml`, and
+any divergence silently invalidates the shipped models. Both sides test against the same
+golden fixtures. If you change a feature on one side, change the other in the same step,
+regenerate the fixtures and retrain; see [crates/ml](crates/ml/README.md#feature-parity).
 
 ## Clean code
 
