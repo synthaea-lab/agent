@@ -1,7 +1,7 @@
 //! `process_vm_readv(2)` and `process_vm_writev(2)` calls (issue #265).
 
 use aya_ebpf::{
-    helpers::{bpf_get_current_comm, bpf_get_current_pid_tgid, bpf_probe_read_user},
+    helpers::{bpf_get_current_comm, bpf_get_current_pid_tgid},
     macros::map,
     maps::{PerCpuArray, RingBuf},
     programs::TracePointContext,
@@ -9,7 +9,10 @@ use aya_ebpf::{
 use aya_log_ebpf::warn;
 use sensor_linux_wire::{ProcessVmReadEvent, ProcessVmWriteEvent};
 
-use crate::{fill_event_meta, into_ret};
+use crate::{
+    arch::{SyscallRecord, ULONG_SIZE, arg_offset, read_user_ulong},
+    fill_event_meta, into_ret,
+};
 
 /// Ring buffer shared with userspace for `process_vm_readv` events (issue #265).
 #[map]
@@ -33,23 +36,14 @@ static PROCESS_VM_WRITE_SCRATCH: PerCpuArray<ProcessVmWriteEvent> =
 /// (kernel 6.6.9-arch1-1, `x86_64`) via
 /// `/sys/kernel/tracing/events/syscalls/sys_enter_process_vm_readv/format` (and
 /// `..._writev/format`, identical layout).
-#[cfg(any(bpf_target_arch = "x86_64", bpf_target_arch = "aarch64"))]
-const PROCESS_VM_PID_OFFSET: usize = 16;
-#[cfg(any(bpf_target_arch = "x86_64", bpf_target_arch = "aarch64"))]
-const PROCESS_VM_LIOVCNT_OFFSET: usize = 32;
-#[cfg(any(bpf_target_arch = "x86_64", bpf_target_arch = "aarch64"))]
-const PROCESS_VM_REMOTE_IOV_OFFSET: usize = 40;
-#[cfg(any(bpf_target_arch = "x86_64", bpf_target_arch = "aarch64"))]
-const PROCESS_VM_RIOVCNT_OFFSET: usize = 48;
-/// i686: inferred, not independently verified (see `sys_enter_open`'s i686 note).
-#[cfg(bpf_target_arch = "x86")]
-const PROCESS_VM_PID_OFFSET: usize = 16;
-#[cfg(bpf_target_arch = "x86")]
-const PROCESS_VM_LIOVCNT_OFFSET: usize = 24;
-#[cfg(bpf_target_arch = "x86")]
-const PROCESS_VM_REMOTE_IOV_OFFSET: usize = 28;
-#[cfg(bpf_target_arch = "x86")]
-const PROCESS_VM_RIOVCNT_OFFSET: usize = 32;
+///
+/// i686: derived from the record layout like every other syscall here, not read from an i686
+/// kernel. The first hand-written i686 values started at 16 and read every argument one slot
+/// late (#218).
+const PROCESS_VM_PID_OFFSET: usize = arg_offset(0);
+const PROCESS_VM_LIOVCNT_OFFSET: usize = arg_offset(2);
+const PROCESS_VM_REMOTE_IOV_OFFSET: usize = arg_offset(3);
+const PROCESS_VM_RIOVCNT_OFFSET: usize = arg_offset(4);
 
 /// Reads `iovec[0].iov_len` from a user-space `struct iovec *`. On `x86_64/aarch64`
 /// `iov_base` (a pointer, unread here) occupies the first 8 bytes and `iov_len`
@@ -63,14 +57,8 @@ fn read_first_iovec_len(iov_ptr: u64, count: u64) -> u64 {
     if iov_ptr == 0 || count == 0 {
         return 0;
     }
-    #[cfg(any(bpf_target_arch = "x86_64", bpf_target_arch = "aarch64"))]
-    {
-        unsafe { bpf_probe_read_user((iov_ptr + 8) as *const u64) }.unwrap_or(0)
-    }
-    #[cfg(bpf_target_arch = "x86")]
-    {
-        unsafe { bpf_probe_read_user((iov_ptr + 4) as *const u32) }.unwrap_or(0) as u64
-    }
+    // `iov_len` follows `iov_base`, a pointer: one `unsigned long` into the struct.
+    unsafe { read_user_ulong(iov_ptr + ULONG_SIZE) }.unwrap_or(0)
 }
 
 pub fn sys_enter_process_vm_readv(ctx: TracePointContext) -> u32 {
@@ -78,37 +66,21 @@ pub fn sys_enter_process_vm_readv(ctx: TracePointContext) -> u32 {
 }
 
 fn try_sys_enter_process_vm_readv(ctx: TracePointContext) -> Result<u32, u32> {
-    #[cfg(any(bpf_target_arch = "x86_64", bpf_target_arch = "aarch64"))]
-    let target_pid: u64 = unsafe { ctx.read_at(PROCESS_VM_PID_OFFSET).map_err(|_| 1u32)? };
-    #[cfg(bpf_target_arch = "x86")]
     let target_pid: u64 = unsafe {
-        ctx.read_at::<u32>(PROCESS_VM_PID_OFFSET)
-            .map_err(|_| 1u32)? as u64
-    };
-    #[cfg(any(bpf_target_arch = "x86_64", bpf_target_arch = "aarch64"))]
-    let local_iov_count: u64 = unsafe { ctx.read_at(PROCESS_VM_LIOVCNT_OFFSET).map_err(|_| 1u32)? };
-    #[cfg(bpf_target_arch = "x86")]
-    let local_iov_count: u64 = unsafe {
-        ctx.read_at::<u32>(PROCESS_VM_LIOVCNT_OFFSET)
-            .map_err(|_| 1u32)? as u64
-    };
-    #[cfg(any(bpf_target_arch = "x86_64", bpf_target_arch = "aarch64"))]
-    let remote_iov_ptr: u64 = unsafe {
-        ctx.read_at(PROCESS_VM_REMOTE_IOV_OFFSET)
+        ctx.read_ulong_arg(PROCESS_VM_PID_OFFSET)
             .map_err(|_| 1u32)?
     };
-    #[cfg(bpf_target_arch = "x86")]
-    let remote_iov_ptr: u64 = unsafe {
-        ctx.read_at::<u32>(PROCESS_VM_REMOTE_IOV_OFFSET)
-            .map_err(|_| 1u32)? as u64
+    let local_iov_count: u64 = unsafe {
+        ctx.read_ulong_arg(PROCESS_VM_LIOVCNT_OFFSET)
+            .map_err(|_| 1u32)?
     };
-    #[cfg(any(bpf_target_arch = "x86_64", bpf_target_arch = "aarch64"))]
-    let remote_iov_count: u64 =
-        unsafe { ctx.read_at(PROCESS_VM_RIOVCNT_OFFSET).map_err(|_| 1u32)? };
-    #[cfg(bpf_target_arch = "x86")]
+    let remote_iov_ptr: u64 = unsafe {
+        ctx.read_ulong_arg(PROCESS_VM_REMOTE_IOV_OFFSET)
+            .map_err(|_| 1u32)?
+    };
     let remote_iov_count: u64 = unsafe {
-        ctx.read_at::<u32>(PROCESS_VM_RIOVCNT_OFFSET)
-            .map_err(|_| 1u32)? as u64
+        ctx.read_ulong_arg(PROCESS_VM_RIOVCNT_OFFSET)
+            .map_err(|_| 1u32)?
     };
     let remote_iov_len = read_first_iovec_len(remote_iov_ptr, remote_iov_count);
 
@@ -148,37 +120,21 @@ pub fn sys_enter_process_vm_writev(ctx: TracePointContext) -> u32 {
 }
 
 fn try_sys_enter_process_vm_writev(ctx: TracePointContext) -> Result<u32, u32> {
-    #[cfg(any(bpf_target_arch = "x86_64", bpf_target_arch = "aarch64"))]
-    let target_pid: u64 = unsafe { ctx.read_at(PROCESS_VM_PID_OFFSET).map_err(|_| 1u32)? };
-    #[cfg(bpf_target_arch = "x86")]
     let target_pid: u64 = unsafe {
-        ctx.read_at::<u32>(PROCESS_VM_PID_OFFSET)
-            .map_err(|_| 1u32)? as u64
-    };
-    #[cfg(any(bpf_target_arch = "x86_64", bpf_target_arch = "aarch64"))]
-    let local_iov_count: u64 = unsafe { ctx.read_at(PROCESS_VM_LIOVCNT_OFFSET).map_err(|_| 1u32)? };
-    #[cfg(bpf_target_arch = "x86")]
-    let local_iov_count: u64 = unsafe {
-        ctx.read_at::<u32>(PROCESS_VM_LIOVCNT_OFFSET)
-            .map_err(|_| 1u32)? as u64
-    };
-    #[cfg(any(bpf_target_arch = "x86_64", bpf_target_arch = "aarch64"))]
-    let remote_iov_ptr: u64 = unsafe {
-        ctx.read_at(PROCESS_VM_REMOTE_IOV_OFFSET)
+        ctx.read_ulong_arg(PROCESS_VM_PID_OFFSET)
             .map_err(|_| 1u32)?
     };
-    #[cfg(bpf_target_arch = "x86")]
-    let remote_iov_ptr: u64 = unsafe {
-        ctx.read_at::<u32>(PROCESS_VM_REMOTE_IOV_OFFSET)
-            .map_err(|_| 1u32)? as u64
+    let local_iov_count: u64 = unsafe {
+        ctx.read_ulong_arg(PROCESS_VM_LIOVCNT_OFFSET)
+            .map_err(|_| 1u32)?
     };
-    #[cfg(any(bpf_target_arch = "x86_64", bpf_target_arch = "aarch64"))]
-    let remote_iov_count: u64 =
-        unsafe { ctx.read_at(PROCESS_VM_RIOVCNT_OFFSET).map_err(|_| 1u32)? };
-    #[cfg(bpf_target_arch = "x86")]
+    let remote_iov_ptr: u64 = unsafe {
+        ctx.read_ulong_arg(PROCESS_VM_REMOTE_IOV_OFFSET)
+            .map_err(|_| 1u32)?
+    };
     let remote_iov_count: u64 = unsafe {
-        ctx.read_at::<u32>(PROCESS_VM_RIOVCNT_OFFSET)
-            .map_err(|_| 1u32)? as u64
+        ctx.read_ulong_arg(PROCESS_VM_RIOVCNT_OFFSET)
+            .map_err(|_| 1u32)?
     };
     let remote_iov_len = read_first_iovec_len(remote_iov_ptr, remote_iov_count);
 

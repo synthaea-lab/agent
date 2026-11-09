@@ -20,7 +20,7 @@ use sensor_linux_wire::{
 
 use crate::{
     PROC_LINEAGE,
-    arch::{SysEnterRecord, SysExitRecord},
+    arch::{SysEnterRecord, SysExitRecord, read_kernel_ulong, to_clong, to_ulong_args},
     cred::{
         capset::sys_enter_capset,
         identity::{
@@ -405,15 +405,9 @@ pub fn raw_sys_enter(ctx: RawTracePointContext) -> u32 {
             core::mem::size_of::<SysEnterRecord>(),
         );
     }
-    #[cfg(any(bpf_target_arch = "x86_64", bpf_target_arch = "aarch64"))]
     unsafe {
-        (*record).id = syscall_id;
-        (*record).args = args;
-    }
-    #[cfg(bpf_target_arch = "x86")]
-    unsafe {
-        (*record).id = syscall_id as i32;
-        (*record).args = args.map(|arg| arg as u32);
+        (*record).id = to_clong(syscall_id);
+        (*record).args = to_ulong_args(args);
     }
 
     let trace_ctx = TracePointContext::new(record.cast());
@@ -520,15 +514,9 @@ pub fn raw_dns_udp_enter(ctx: RawTracePointContext) -> u32 {
             core::mem::size_of::<SysEnterRecord>(),
         );
     }
-    #[cfg(any(bpf_target_arch = "x86_64", bpf_target_arch = "aarch64"))]
     unsafe {
-        (*record).id = syscall_id;
-        (*record).args = args;
-    }
-    #[cfg(bpf_target_arch = "x86")]
-    unsafe {
-        (*record).id = syscall_id as i32;
-        (*record).args = args.map(|arg| arg as u32);
+        (*record).id = to_clong(syscall_id);
+        (*record).args = to_ulong_args(args);
     }
 
     let trace_ctx = TracePointContext::new(record.cast());
@@ -568,13 +556,8 @@ pub fn raw_sys_exit(ctx: RawTracePointContext) -> u32 {
             core::mem::size_of::<SysExitRecord>(),
         );
     }
-    #[cfg(any(bpf_target_arch = "x86_64", bpf_target_arch = "aarch64"))]
     unsafe {
-        (*record).ret = return_value;
-    }
-    #[cfg(bpf_target_arch = "x86")]
-    unsafe {
-        (*record).ret = return_value as i32;
+        (*record).ret = to_clong(return_value);
     }
 
     let trace_ctx = TracePointContext::new(record.cast());
@@ -594,34 +577,14 @@ pub fn raw_sys_exit(ctx: RawTracePointContext) -> u32 {
 #[inline(always)]
 fn read_syscall_args(regs: *const u8) -> Option<[u64; 6]> {
     let offsets = SYSCALL_ARG_OFFSETS.load();
-    #[cfg(any(bpf_target_arch = "x86_64", bpf_target_arch = "aarch64"))]
-    {
-        Some([
-            unsafe { bpf_probe_read_kernel(regs.add(offsets[0] as usize).cast::<u64>()) }.ok()?,
-            unsafe { bpf_probe_read_kernel(regs.add(offsets[1] as usize).cast::<u64>()) }.ok()?,
-            unsafe { bpf_probe_read_kernel(regs.add(offsets[2] as usize).cast::<u64>()) }.ok()?,
-            unsafe { bpf_probe_read_kernel(regs.add(offsets[3] as usize).cast::<u64>()) }.ok()?,
-            unsafe { bpf_probe_read_kernel(regs.add(offsets[4] as usize).cast::<u64>()) }.ok()?,
-            unsafe { bpf_probe_read_kernel(regs.add(offsets[5] as usize).cast::<u64>()) }.ok()?,
-        ])
-    }
-    #[cfg(bpf_target_arch = "x86")]
-    {
-        Some([
-            unsafe { bpf_probe_read_kernel(regs.add(offsets[0] as usize).cast::<u32>()) }.ok()?
-                as u64,
-            unsafe { bpf_probe_read_kernel(regs.add(offsets[1] as usize).cast::<u32>()) }.ok()?
-                as u64,
-            unsafe { bpf_probe_read_kernel(regs.add(offsets[2] as usize).cast::<u32>()) }.ok()?
-                as u64,
-            unsafe { bpf_probe_read_kernel(regs.add(offsets[3] as usize).cast::<u32>()) }.ok()?
-                as u64,
-            unsafe { bpf_probe_read_kernel(regs.add(offsets[4] as usize).cast::<u32>()) }.ok()?
-                as u64,
-            unsafe { bpf_probe_read_kernel(regs.add(offsets[5] as usize).cast::<u32>()) }.ok()?
-                as u64,
-        ])
-    }
+    Some([
+        unsafe { read_kernel_ulong(regs.add(offsets[0] as usize)) }?,
+        unsafe { read_kernel_ulong(regs.add(offsets[1] as usize)) }?,
+        unsafe { read_kernel_ulong(regs.add(offsets[2] as usize)) }?,
+        unsafe { read_kernel_ulong(regs.add(offsets[3] as usize)) }?,
+        unsafe { read_kernel_ulong(regs.add(offsets[4] as usize)) }?,
+        unsafe { read_kernel_ulong(regs.add(offsets[5] as usize)) }?,
+    ])
 }
 
 fn read_syscall_nr(regs: *const u8) -> Option<u32> {

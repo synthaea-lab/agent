@@ -15,8 +15,8 @@ use aya_log_ebpf::warn;
 use sensor_linux_wire::UdpRecvEvent;
 
 use crate::{
-    AF_INET, AF_INET6, SYS_EXIT_RET_OFFSET,
-    arch::{SyscallRecord, arg_offset},
+    AF_INET, AF_INET6,
+    arch::{SYS_EXIT_RET_OFFSET, SyscallRecord, arg_offset},
     fill_event_meta, into_ret,
 };
 

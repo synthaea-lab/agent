@@ -9,7 +9,10 @@ use aya_ebpf::{
 use aya_log_ebpf::warn;
 use sensor_linux_wire::KernelModuleEvent;
 
-use crate::{fill_event_meta, into_ret};
+use crate::{
+    arch::{SyscallRecord, arg_offset},
+    fill_event_meta, into_ret,
+};
 
 /// Ring buffer shared with userspace for `init_module`/`finit_module`/
 /// `delete_module` events.
@@ -28,35 +31,23 @@ const KERNEL_MODULE_ACTION_UNLOAD: u8 = 2;
 /// `uargs`), assumed standard layout (16-byte header + 8 bytes/arg on
 /// `x86_64/aarch64`) — re-verify against `/format` on any newly supported kernel,
 /// same posture as every other offset const in this file.
-#[cfg(any(bpf_target_arch = "x86_64", bpf_target_arch = "aarch64"))]
-const INIT_MODULE_LEN_OFFSET: usize = 24;
+///
 /// i686: inferred, not independently verified (see `sys_enter_open`'s i686 note).
-#[cfg(bpf_target_arch = "x86")]
-const INIT_MODULE_LEN_OFFSET: usize = 16;
+const INIT_MODULE_LEN_OFFSET: usize = arg_offset(1);
 
 /// Offsets of the `syscalls:sys_enter_finit_module` tracepoint (`fd`, `uargs`,
 /// `flags`), assumed standard layout — see `INIT_MODULE_LEN_OFFSET`'s note.
-#[cfg(any(bpf_target_arch = "x86_64", bpf_target_arch = "aarch64"))]
-const FINIT_MODULE_FD_OFFSET: usize = 16;
-#[cfg(any(bpf_target_arch = "x86_64", bpf_target_arch = "aarch64"))]
-const FINIT_MODULE_FLAGS_OFFSET: usize = 32;
+///
 /// i686: inferred, not independently verified.
-#[cfg(bpf_target_arch = "x86")]
-const FINIT_MODULE_FD_OFFSET: usize = 12;
-#[cfg(bpf_target_arch = "x86")]
-const FINIT_MODULE_FLAGS_OFFSET: usize = 20;
+const FINIT_MODULE_FD_OFFSET: usize = arg_offset(0);
+const FINIT_MODULE_FLAGS_OFFSET: usize = arg_offset(2);
 
 /// Offsets of the `syscalls:sys_enter_delete_module` tracepoint (`name`,
 /// `flags`), assumed standard layout — see `INIT_MODULE_LEN_OFFSET`'s note.
-#[cfg(any(bpf_target_arch = "x86_64", bpf_target_arch = "aarch64"))]
-const DELETE_MODULE_NAME_PTR_OFFSET: usize = 16;
-#[cfg(any(bpf_target_arch = "x86_64", bpf_target_arch = "aarch64"))]
-const DELETE_MODULE_FLAGS_OFFSET: usize = 24;
+///
 /// i686: inferred, not independently verified.
-#[cfg(bpf_target_arch = "x86")]
-const DELETE_MODULE_NAME_PTR_OFFSET: usize = 12;
-#[cfg(bpf_target_arch = "x86")]
-const DELETE_MODULE_FLAGS_OFFSET: usize = 16;
+const DELETE_MODULE_NAME_PTR_OFFSET: usize = arg_offset(0);
+const DELETE_MODULE_FLAGS_OFFSET: usize = arg_offset(1);
 
 /// Shared by the three probes below: fills `EventMeta` and the action-specific
 /// fields into `KERNEL_MODULE_SCRATCH`, then emits. Mirrors `emit_mount_event`'s
@@ -113,12 +104,9 @@ pub fn sys_enter_init_module(ctx: TracePointContext) -> u32 {
 }
 
 fn try_sys_enter_init_module(ctx: TracePointContext) -> Result<u32, u32> {
-    #[cfg(any(bpf_target_arch = "x86_64", bpf_target_arch = "aarch64"))]
-    let len: u64 = unsafe { ctx.read_at(INIT_MODULE_LEN_OFFSET).map_err(|_| 1u32)? };
-    #[cfg(bpf_target_arch = "x86")]
     let len: u64 = unsafe {
-        ctx.read_at::<u32>(INIT_MODULE_LEN_OFFSET)
-            .map_err(|_| 1u32)? as u64
+        ctx.read_ulong_arg(INIT_MODULE_LEN_OFFSET)
+            .map_err(|_| 1u32)?
     };
 
     // `init_module(2)`'s module image lives inside `umod` — the raw memory blob
@@ -132,20 +120,14 @@ pub fn sys_enter_finit_module(ctx: TracePointContext) -> u32 {
 }
 
 fn try_sys_enter_finit_module(ctx: TracePointContext) -> Result<u32, u32> {
-    #[cfg(any(bpf_target_arch = "x86_64", bpf_target_arch = "aarch64"))]
-    let fd: u64 = unsafe { ctx.read_at(FINIT_MODULE_FD_OFFSET).map_err(|_| 1u32)? };
-    #[cfg(bpf_target_arch = "x86")]
     let fd: u64 = unsafe {
-        ctx.read_at::<u32>(FINIT_MODULE_FD_OFFSET)
-            .map_err(|_| 1u32)? as u64
+        ctx.read_ulong_arg(FINIT_MODULE_FD_OFFSET)
+            .map_err(|_| 1u32)?
     };
 
-    #[cfg(any(bpf_target_arch = "x86_64", bpf_target_arch = "aarch64"))]
-    let flags: u64 = unsafe { ctx.read_at(FINIT_MODULE_FLAGS_OFFSET).map_err(|_| 1u32)? };
-    #[cfg(bpf_target_arch = "x86")]
     let flags: u64 = unsafe {
-        ctx.read_at::<u32>(FINIT_MODULE_FLAGS_OFFSET)
-            .map_err(|_| 1u32)? as u64
+        ctx.read_ulong_arg(FINIT_MODULE_FLAGS_OFFSET)
+            .map_err(|_| 1u32)?
     };
 
     emit_kernel_module_event(
@@ -163,23 +145,14 @@ pub fn sys_enter_delete_module(ctx: TracePointContext) -> u32 {
 }
 
 fn try_sys_enter_delete_module(ctx: TracePointContext) -> Result<u32, u32> {
-    #[cfg(any(bpf_target_arch = "x86_64", bpf_target_arch = "aarch64"))]
     let name_ptr: u64 = unsafe {
-        ctx.read_at(DELETE_MODULE_NAME_PTR_OFFSET)
+        ctx.read_ulong_arg(DELETE_MODULE_NAME_PTR_OFFSET)
             .map_err(|_| 1u32)?
     };
-    #[cfg(bpf_target_arch = "x86")]
-    let name_ptr: u64 = unsafe {
-        ctx.read_at::<u32>(DELETE_MODULE_NAME_PTR_OFFSET)
-            .map_err(|_| 1u32)? as u64
-    };
 
-    #[cfg(any(bpf_target_arch = "x86_64", bpf_target_arch = "aarch64"))]
-    let flags: u64 = unsafe { ctx.read_at(DELETE_MODULE_FLAGS_OFFSET).map_err(|_| 1u32)? };
-    #[cfg(bpf_target_arch = "x86")]
     let flags: u64 = unsafe {
-        ctx.read_at::<u32>(DELETE_MODULE_FLAGS_OFFSET)
-            .map_err(|_| 1u32)? as u64
+        ctx.read_ulong_arg(DELETE_MODULE_FLAGS_OFFSET)
+            .map_err(|_| 1u32)?
     };
 
     emit_kernel_module_event(

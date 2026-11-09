@@ -60,6 +60,63 @@ const _: () = assert!(arg_offset(0) == 16 && arg_offset(1) == 24 && SYS_EXIT_RET
 #[cfg(bpf_target_arch = "x86")]
 const _: () = assert!(arg_offset(0) == 12 && arg_offset(1) == 16 && SYS_EXIT_RET_OFFSET == 12);
 
+/// The six syscall arguments as the record stores them (narrowed to 4 bytes on i686).
+#[cfg(any(bpf_target_arch = "x86_64", bpf_target_arch = "aarch64"))]
+#[inline(always)]
+pub(crate) fn to_ulong_args(args: [u64; 6]) -> [CULong; 6] {
+    args
+}
+/// The six syscall arguments as the record stores them (narrowed to 4 bytes on i686).
+#[cfg(bpf_target_arch = "x86")]
+#[inline(always)]
+pub(crate) fn to_ulong_args(args: [u64; 6]) -> [CULong; 6] {
+    args.map(|arg| arg as u32)
+}
+
+/// A syscall number or return value as the record stores it (narrowed to 4 bytes on i686).
+#[cfg(any(bpf_target_arch = "x86_64", bpf_target_arch = "aarch64"))]
+#[inline(always)]
+pub(crate) fn to_clong(value: i64) -> CLong {
+    value
+}
+/// A syscall number or return value as the record stores it (narrowed to 4 bytes on i686).
+#[cfg(bpf_target_arch = "x86")]
+#[inline(always)]
+pub(crate) fn to_clong(value: i64) -> CLong {
+    value as i32
+}
+
+/// Reads an `unsigned long` (a `pt_regs` slot) from kernel memory, zero-extended.
+///
+/// # Safety
+/// As `bpf_probe_read_kernel`: the helper handles a bad address and returns an error.
+#[inline(always)]
+#[allow(
+    clippy::useless_conversion,
+    reason = "the identity on 64-bit targets, a widening on i686"
+)]
+pub(crate) unsafe fn read_kernel_ulong(addr: *const u8) -> Option<u64> {
+    unsafe { aya_ebpf::helpers::bpf_probe_read_kernel(addr.cast::<CULong>()) }
+        .ok()
+        .map(u64::from)
+}
+
+/// Size of an `unsigned long` (a pointer, a `size_t`) in user memory: 8, or 4 on i686.
+pub(crate) const ULONG_SIZE: u64 = core::mem::size_of::<CULong>() as u64;
+
+/// Reads an `unsigned long` (a `size_t`, a pointer) from user memory at `addr`, zero-extended.
+///
+/// # Safety
+/// As `bpf_probe_read_user`: the helper handles a bad address and returns an error.
+#[inline(always)]
+#[allow(
+    clippy::useless_conversion,
+    reason = "the identity on 64-bit targets, a widening on i686"
+)]
+pub(crate) unsafe fn read_user_ulong(addr: u64) -> Result<u64, i32> {
+    unsafe { aya_ebpf::helpers::bpf_probe_read_user(addr as *const CULong) }.map(u64::from)
+}
+
 /// Reads a [`SysEnterRecord`] / [`SysExitRecord`] field by offset, widened the same way on every
 /// target, so a handler needs no `#[cfg]` around its argument reads.
 pub(crate) trait SyscallRecord {
