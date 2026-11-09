@@ -328,7 +328,7 @@ pub(crate) const IN_PLACE_EDIT_COMMS: &[&str] = &["sed"];
 /// same letters) appended after a message filename's `:2,` info marker
 /// (#459 part 1): `check_mass_rename_pattern`'s other known false positive,
 /// "mark all read" on a large folder renaming every message's flags in one
-/// IMAP pid. See [`crate::state::is_maildir_flag_change`]'s doc for why this
+/// IMAP pid. See `impact_state::is_maildir_flag_change`'s doc for why this
 /// one is deliberately not also comm-gated.
 pub(crate) const MAILDIR_FLAG_LETTERS: &[u8] = b"DFPRST";
 

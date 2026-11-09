@@ -21,31 +21,25 @@ use crate::{
     Alert,
     credfiles::{self, CredFile},
     exclusions::{
-        AGENT_CHILD_EXCLUSIONS, APK_STAGING_FILE_PREFIX, AUTH_FAILURE_THRESHOLD,
-        AUTH_FAILURE_WINDOW_NS, BITS_EXEC_WINDOW_NS, BURST_WRITE_BYTES_THRESHOLD,
-        COMPRESSION_DRIVER_COMMS, COMPRESSION_SUFFIXES, COMPRESSOR_COMMS,
-        CREATE_UNLINK_HISTORY_PER_PID, CREATE_UNLINK_PAIR_WINDOW_NS, CREATE_UNLINK_PID_CAP,
-        CREDENTIAL_READ_ALERT_WINDOW_NS, DOWNLOAD_EXEC_WINDOW_NS, DOWNLOADER_COMMS,
-        IN_PLACE_EDIT_COMMS, LOLBIN_LEGIT_PARENTS, LOLBINS, MAIL_CLIENT_QUARANTINE_AGENTS,
-        MAILDIR_FLAG_LETTERS, MEMFD_EXEC_WINDOW_NS, PACKAGE_MANAGER_COMMS,
-        PACKAGE_MANAGER_TEMP_RENAME_SUFFIXES, POLICY_DENIAL_ALERT_CAP, POLICY_DENIAL_SUBJECT_CAP,
-        QUARANTINE_EXEC_WINDOW_NS, RANSOMWARE_EXCLUDED_PATH_PREFIXES, RANSOMWARE_LOOP_CHILD_MAX,
-        RANSOMWARE_RENAME_THRESHOLD, RANSOMWARE_RENAME_WINDOW_NS, SELF_SPAWN_EXCLUSIONS,
-        SELF_SPAWN_PARENT_EXCLUSIONS, SELF_SPAWN_SCRIPT_HOSTS, SELF_SPAWN_THRESHOLD,
-        SELF_SPAWN_TRUSTED_THRESHOLD, SELF_SPAWN_WINDOW_NS, SELINUX_POLICY_TOOL_COMMS,
-        SERVICE_COMM_PREFIXES, SERVICE_COMMS, SHELL_COMMS, STAGING_PID_CAP, STAGING_READ_DIRS,
-        STAGING_READ_FILES, STAGING_WINDOW_NS, STAGING_WRITE_FILES, SUSPECT_CHILDREN_WIN,
-        SUSPECT_PARENTS_WIN, TASK_REGISTRATION_DEDUP_WINDOW_NS, TOUCHED_FILES_PER_PID,
-        TOUCHED_FILES_PID_CAP,
+        AGENT_CHILD_EXCLUSIONS, AUTH_FAILURE_THRESHOLD, AUTH_FAILURE_WINDOW_NS,
+        BITS_EXEC_WINDOW_NS, CREDENTIAL_READ_ALERT_WINDOW_NS, DOWNLOAD_EXEC_WINDOW_NS,
+        DOWNLOADER_COMMS, LOLBIN_LEGIT_PARENTS, LOLBINS, MAIL_CLIENT_QUARANTINE_AGENTS,
+        MEMFD_EXEC_WINDOW_NS, POLICY_DENIAL_ALERT_CAP, POLICY_DENIAL_SUBJECT_CAP,
+        QUARANTINE_EXEC_WINDOW_NS, SELF_SPAWN_EXCLUSIONS, SELF_SPAWN_PARENT_EXCLUSIONS,
+        SELF_SPAWN_SCRIPT_HOSTS, SELF_SPAWN_THRESHOLD, SELF_SPAWN_TRUSTED_THRESHOLD,
+        SELF_SPAWN_WINDOW_NS, SERVICE_COMM_PREFIXES, SERVICE_COMMS, SHELL_COMMS, STAGING_PID_CAP,
+        STAGING_READ_DIRS, STAGING_READ_FILES, STAGING_WINDOW_NS, STAGING_WRITE_FILES,
+        SUSPECT_CHILDREN_WIN, SUSPECT_PARENTS_WIN, TASK_REGISTRATION_DEDUP_WINDOW_NS,
     },
     has_write_intent,
+    impact_state::ImpactState,
     logon::{LogonBaseline, Observation},
     lsass::{self, LSASS_ACCESS_ALERT_WINDOW_NS, LSASS_THREAD_ALERT_WINDOW_NS},
     network_state::NetworkState,
     rdp::RdpSuccessAfterFailures,
     session::SessionHijack,
     signature_gate::SignatureGatedAlert,
-    sliding::{SlidingCounter, SlidingDistinct, SlidingSum},
+    sliding::{SlidingCounter, SlidingDistinct},
     staging::{self, StagingDir, StagingReads},
     sudo::SudoSuccessAfterFailures,
 };
@@ -239,9 +233,9 @@ pub struct RuleState {
     recent_motw_removals: BoundedMap<String, MotwRemoval>,
     /// (ppid, comm) → sliding counter for SELF-SPAWN (T1059 Windows). LRU-bounded.
     self_spawn: BoundedMap<(u32, String), SlidingCounter>,
-    /// Linux timestomp alerts already raised, per process incarnation `(pid, generation)`
-    /// (#1036): one alert per window per process, see [`Self::on_file_set_time`].
-    set_time_alerted: BoundedMap<(u32, u64), SetTimeWindow>,
+    /// RANSOMWARE-RENAME, write-new-then-unlink, write-volume T1486, the timestomp dedup and
+    /// the damage manifest: see [`ImpactState`].
+    impact: ImpactState,
     /// BEACON, SCAN-SPREAD/-VERTICAL, EGRESS-VOLUME/-DOMAIN and ARCHIVE-EXFIL: see
     /// [`NetworkState`].
     network: NetworkState,
@@ -368,52 +362,9 @@ pub struct RuleState {
     /// (creator pid, process generation) → the last alert, for LSASS-REMOTE-THREAD (T1055,
     /// <https://github.com/synthaea-lab/agent/issues/45>): one alert per injector per window. LRU-bounded like every other counter.
     lsass_threads: BoundedMap<(u32, Option<u64>), SlidingCounter>,
-    /// pid → sliding counter for RANSOMWARE-RENAME (T1486, issue #262): renames by
-    /// this pid where `new_path` is `old_path` plus an appended suffix. LRU-bounded:
-    /// a hostile process renaming under many different pids (unusual, but not
-    /// impossible) must not grow this without limit either.
-    ransomware_rename: BoundedMap<u32, SlidingCounter>,
     /// Distinct LDAP searches per process for the enumeration-sweep rule
     /// (T1087.002, #364).
     ldap_burst: crate::ldap::LdapBurst,
-    /// ppid → the same counter, for the shell-loop shape (`for f in *; do mv "$f"
-    /// "$f.locked"; done`, `find … -exec mv {} {}.x \;`): each rename runs in its own
-    /// short-lived `mv` pid, so the per-pid counter never climbs, but every child
-    /// shares the loop's shell as `ppid`. Real Linux ransomware ships this way, so the
-    /// per-pid counter alone would miss it (issue #262 review, old-dov). LRU-bounded.
-    /// `ppid <= 1` (unknown/init) is never keyed here — see `check_mass_rename_pattern`.
-    ransomware_rename_by_ppid: BoundedMap<u32, SlidingCounter>,
-    /// pid → (timestamp, path) of the recent write-intent creations (`O_CREAT`) seen
-    /// for it, newest last: the "new file" half of the write-new-then-unlink T1486
-    /// shape (#512 part B). `FileWriteEvent` carries only an fd, so the correlation is
-    /// between this creation and a later `FileDeleteEvent`, both of which carry paths.
-    /// Bounded by [`CREATE_UNLINK_PID_CAP`] pids x [`CREATE_UNLINK_HISTORY_PER_PID`].
-    recent_creates: BoundedMap<u32, VecDeque<(u64, String)>>,
-    /// pid → (timestamp, path) of unlinks that found no creation to pair with yet.
-    /// The kernel always creates `X.suffix` before unlinking `X`, but userspace drains
-    /// the open and delete ring buffers independently, so the delete can be processed
-    /// first (the same ordering hazard as `pending_proc_fd_exec`, #503); the creation
-    /// then pairs with it on arrival. Same bounds as `recent_creates`.
-    pending_unlinks: BoundedMap<u32, VecDeque<(u64, String)>>,
-    /// pid → the newest renames and deletions seen for it (oldest first): the damage
-    /// manifest of a ransomware detection (issue #82), read through [`Self::touched_files`].
-    /// Bounded by [`TOUCHED_FILES_PID_CAP`] pids x [`TOUCHED_FILES_PER_PID`] events.
-    touched_files: BoundedMap<u32, VecDeque<Event>>,
-    /// pid → sliding counter of write-new-then-unlink pairs (T1486, #512 part B).
-    ransomware_unlink: BoundedMap<u32, SlidingCounter>,
-    /// pid → sliding sum of `FileWriteEvent::bytes_requested` (issue #82): the
-    /// write-volume half of a second, independent T1486 corroboration signal —
-    /// heavy write volume alongside a rename burst, regardless of whether the
-    /// rename shape itself matched `check_mass_rename_pattern`'s prefix-preserving
-    /// pattern. LRU-bounded.
-    write_volume: BoundedMap<u32, SlidingSum>,
-    /// pid → sliding counter of renames, any shape — the rename half of the
-    /// write-volume corroboration signal above. Deliberately separate from
-    /// `ransomware_rename`: that counter only records prefix-preserving renames
-    /// (`check_mass_rename_pattern`'s shape), this one counts every rename, so a
-    /// pid that renames heavily without preserving the original name still
-    /// contributes here.
-    rename_count: BoundedMap<u32, SlidingCounter>,
     /// Task leaf name → last reported T1053.005 registration, so one registration
     /// seen on both Security 4698 and TaskScheduler/Operational 106 alerts once
     /// (#422). LRU-bounded like the counters.
@@ -461,30 +412,6 @@ struct PendingProcFdExec {
     timestamp_ns: u64,
 }
 
-/// One process incarnation's timestomp alert state (#1036): when it last alerted and how many
-/// requests the window has swallowed since, so the next alert can say how many there were.
-#[derive(Default)]
-struct SetTimeWindow {
-    last_alert_ns: Option<u64>,
-    folded: u32,
-}
-
-impl SetTimeWindow {
-    /// `Some(requests folded since the last alert)` when this request alerts, `None` when it is
-    /// folded into the alert of the window it falls in.
-    fn admit(&mut self, ts: u64, window_ns: u64) -> Option<u32> {
-        if self
-            .last_alert_ns
-            .is_some_and(|t| ts.saturating_sub(t) <= window_ns)
-        {
-            self.folded = self.folded.saturating_add(1);
-            return None;
-        }
-        self.last_alert_ns = Some(ts);
-        Some(std::mem::take(&mut self.folded))
-    }
-}
-
 /// Memfd creations remembered per pid (see `RuleState::recent_memfd_creates`). A real
 /// fileless-exec process creates one or two; a process making more than this inside
 /// the correlation window is not something a longer list would catch better.
@@ -494,8 +421,6 @@ const PID_COMM_CAP: usize = 65_536;
 /// Counter/write-history bounds — one logical entity per key, far fewer than pids.
 pub(crate) const COUNTER_CAP: usize = 16_384;
 const RECENT_WRITES_CAP: usize = 4_096;
-/// One Linux timestomp alert per process incarnation per this window (#1036).
-const SET_TIME_ALERT_WINDOW_NS: u64 = 60_000_000_000;
 
 impl Default for RuleState {
     fn default() -> Self {
@@ -518,7 +443,7 @@ impl RuleState {
             recent_bits_downloads: BoundedMap::new(RECENT_WRITES_CAP),
             recent_motw_removals: BoundedMap::new(RECENT_WRITES_CAP),
             self_spawn: BoundedMap::new(COUNTER_CAP),
-            set_time_alerted: BoundedMap::new(COUNTER_CAP),
+            impact: ImpactState::new(),
             ldap_burst: crate::ldap::LdapBurst::new(),
             network: NetworkState::new(),
             staging_reads: BoundedMap::new(STAGING_PID_CAP),
@@ -543,17 +468,9 @@ impl RuleState {
             odd_hours: crate::logon::OddHours::new(),
             rdp_success: RdpSuccessAfterFailures::new(),
             sudo_success: SudoSuccessAfterFailures::new(),
-            recent_creates: BoundedMap::new(CREATE_UNLINK_PID_CAP),
-            pending_unlinks: BoundedMap::new(CREATE_UNLINK_PID_CAP),
-            touched_files: BoundedMap::new(TOUCHED_FILES_PID_CAP),
-            ransomware_unlink: BoundedMap::new(COUNTER_CAP),
             credential_reads: BoundedMap::new(COUNTER_CAP),
             lsass_access: BoundedMap::new(COUNTER_CAP),
             lsass_threads: BoundedMap::new(COUNTER_CAP),
-            ransomware_rename: BoundedMap::new(COUNTER_CAP),
-            ransomware_rename_by_ppid: BoundedMap::new(COUNTER_CAP),
-            write_volume: BoundedMap::new(COUNTER_CAP),
-            rename_count: BoundedMap::new(COUNTER_CAP),
             task_registrations: BoundedMap::new(COUNTER_CAP),
             session_hijack: SessionHijack::new(),
             own_pid: None,
@@ -2237,7 +2154,7 @@ impl RuleState {
             |pid, generation| self.resolve_comm(pid, generation),
         ));
         alerts.extend(self.check_credential_file_read(event));
-        alerts.extend(self.record_create(event));
+        alerts.extend(self.impact.record_create(event, &self.pid_image_path));
         self.record_downloader_write(event);
         self.network.record_archive_open(event);
         alerts.extend(self.check_staging_dir(event));
@@ -2494,138 +2411,15 @@ impl RuleState {
         );
     }
 
-    /// T1486 — Data Encrypted for Impact. Ransomware's near-universal tell: a burst
-    /// of renames, each keeping the original filename intact and appending a new
-    /// suffix (`invoice.pdf` → `invoice.pdf.locked`), from the same pid, in a tight
-    /// window. Extension-agnostic by design — matching on "`old_path` is a strict
-    /// prefix of `new_path`" catches every real family's naming scheme (`.locked`,
-    /// `.encrypted`, `.WNCRY`, a random hex suffix, ...) without a list to keep
-    /// current against new strains, and without false-positiving on renames that
-    /// *don't* preserve the original name (a normal `mv a b` has no such relation).
-    ///
-    /// Deliberately keyed on rename shape alone, not `FileWriteEvent` volume: many
-    /// legitimate bulk operations (package installs, `tar` extraction, a compiler's
-    /// intermediate files) write many files quickly, but essentially none rename
-    /// hundreds of pre-existing files to append a shared new suffix in seconds —
-    /// see `RANSOMWARE_RENAME_THRESHOLD`'s doc for the calibration reasoning.
-    ///
-    /// Counted twice, so both real shapes reach the threshold (issue #262 review):
-    /// per-pid for a single encryptor binary, and per-ppid for the shell-loop shape
-    /// (`for f in *; do mv "$f" "$f.locked"; done`) where each rename is a separate
-    /// short-lived `mv` pid but every one shares the loop's shell as `ppid`. The
-    /// per-pid branch wins when it fires, so a single process yields one alert, not
-    /// two (its renames also land in the per-ppid counter, but that branch is only
-    /// consulted when the per-pid one did not fire this event).
-    ///
-    /// Known benign producers of this exact shape (#459 part 1 closes the first
-    /// two; the third stays open, see below):
-    /// - Log rotation (`app.log` → `app.log.1`): handled by [`is_rotation_suffix`]
-    ///   (a suffix with no letter never counts) — the one case a shape signal settles.
-    /// - In-place edit with a backup: `sed -i.bak` `rename(2)`s the
-    ///   original to `f.bak`/`f.orig` from one pid; 20+ files in one command
-    ///   (`sed -i.bak … *.conf`) used to trip this rule. [`is_in_place_edit_backup`]
-    ///   now excludes it, gated on `comm` + the pid's exec-time `image_path`
-    ///   (CLAUDE.md — name-keyed exclusions must be gated on evidence, cf.
-    ///   [`policy::name_exclusion_applies`]; excluding on `comm` alone would be
-    ///   spoofable, an encryptor can set `comm=sed` for free). Fails closed when
-    ///   no path is known, see `Self::is_in_place_edit_backup`.
-    /// - Maildir flag changes (`…:2,S` → `…:2,ST`): one IMAP pid, prefix-preserving,
-    ///   lettered suffix; "mark all read" on a large folder can exceed the
-    ///   threshold. [`is_maildir_flag_change`] now excludes it — structurally
-    ///   (the flag-letter alphabet), deliberately *not* also comm-gated; see
-    ///   that function's doc for why.
-    ///
-    /// Cross-directory moves (`~/docs/a.docx` → `~/.stash/a.docx.locked`, #512):
-    /// when the directories differ the full-path prefix test can never hold, so the
-    /// same appended-suffix relation is read off the file *names* instead
-    /// ([`appended_suffix`]). Same counters, same exclusions; the one new benign
-    /// producer that shape brings in is the Maildir delivery move
-    /// (`new/msg` → `cur/msg:2,S`), excluded by [`is_maildir_delivery`].
-    ///
-    /// Shapes this rule still cannot see at all (write-new-then-unlink) need a
-    /// separate open/delete correlation — still a follow-up, tracked in #512.
-    fn check_mass_rename_pattern(&mut self, event: &FileRenameEvent) -> Option<Alert> {
-        let suffix = appended_suffix(&event.old_path, &event.new_path)?;
-        if suffix.is_empty()
-            || is_rotation_suffix(suffix)
-            || self.is_in_place_edit_backup(event)
-            || is_maildir_flag_change(&event.old_path, suffix)
-            || is_maildir_delivery(&event.old_path, &event.new_path, suffix)
-        {
-            return None;
-        }
-        let ts = event.meta.timestamp_ns;
-
-        // Per-pid: a single encryptor process renaming its way through a tree.
-        let pid_entry = self
-            .ransomware_rename
-            .get_or_insert_with(event.meta.pid, SlidingCounter::default);
-        let pid_count = pid_entry.record(ts, RANSOMWARE_RENAME_WINDOW_NS);
-        if pid_count >= RANSOMWARE_RENAME_THRESHOLD
-            && pid_entry.try_alert(ts, RANSOMWARE_RENAME_WINDOW_NS)
-        {
-            return Some(Alert {
-                technique: "T1486",
-                severity: Severity::Critical,
-                message: format!(
-                    "pid={} comm={}: {pid_count} files renamed with an appended suffix in {}s \
-                     (e.g. {} → {}) — suspected ransomware encryption pass",
-                    event.meta.pid,
-                    event.meta.comm,
-                    RANSOMWARE_RENAME_WINDOW_NS / 1_000_000_000,
-                    event.old_path,
-                    event.new_path,
-                ),
-            });
-        }
-
-        // Per-ppid: a shell loop spawning one short-lived `mv` per file — the per-pid
-        // counter above never climbs, but the parent shell ties the burst together.
-        // Only pids that are themselves light renamers feed this counter, so a single
-        // busy process (already handled above) does not also drive the shared per-ppid
-        // counter to a second alert — see `RANSOMWARE_LOOP_CHILD_MAX`.
-        //
-        // ppid 0 ("unknown" — a `PROC_LINEAGE` miss on the sensor, never real pid 0)
-        // and ppid 1 (init — orphans and daemons reparent there) are shared buckets
-        // that would lump unrelated processes into a false "shell-loop" alert; a real
-        // loop's children have the loop's shell as parent, so skip both (#455 review).
-        if pid_count > RANSOMWARE_LOOP_CHILD_MAX || event.meta.ppid <= 1 {
-            return None;
-        }
-        let ppid_entry = self
-            .ransomware_rename_by_ppid
-            .get_or_insert_with(event.meta.ppid, SlidingCounter::default);
-        let ppid_count = ppid_entry.record(ts, RANSOMWARE_RENAME_WINDOW_NS);
-        if ppid_count >= RANSOMWARE_RENAME_THRESHOLD
-            && ppid_entry.try_alert(ts, RANSOMWARE_RENAME_WINDOW_NS)
-        {
-            return Some(Alert {
-                technique: "T1486",
-                severity: Severity::Critical,
-                message: format!(
-                    "ppid={}: {ppid_count} files renamed with an appended suffix by short-lived \
-                     children in {}s (e.g. {} → {}, comm={}) — suspected ransomware encryption \
-                     pass (shell-loop pattern)",
-                    event.meta.ppid,
-                    RANSOMWARE_RENAME_WINDOW_NS / 1_000_000_000,
-                    event.old_path,
-                    event.new_path,
-                    event.meta.comm,
-                ),
-            });
-        }
-        None
-    }
-
     /// To be called for every `FileDeleteEvent` in the stream: the unlink half of the
     /// write-new-then-unlink T1486 shape (#512 part B), see
-    /// [`Self::check_write_new_then_unlink`], and the mark-of-the-web removal
+    /// [`ImpactState::check_write_new_then_unlink`], and the mark-of-the-web removal
     /// consumed by [`Self::check_exec_after_motw_removal`].
     pub fn on_file_delete(&mut self, event: &FileDeleteEvent) -> Vec<Alert> {
         self.record_motw_removal(event);
-        self.record_touched(event.meta.pid, Event::FileDelete(event.clone()));
         let mut alerts: Vec<Alert> = self
-            .check_write_new_then_unlink(event)
+            .impact
+            .on_file_delete(event, &self.pid_image_path)
             .into_iter()
             .collect();
         self.note_t1486(&event.meta, &mut alerts);
@@ -2730,187 +2524,11 @@ impl RuleState {
         })
     }
 
-    /// T1486, the shape `check_mass_rename_pattern` cannot see because none of it is a
-    /// rename (#512 part B): the encryptor writes `file.docx.locked` as a **new** file and
-    /// only then unlinks `file.docx` (safer than an in-place rewrite: the original
-    /// survives until the copy is complete). Same appended-suffix relation
-    /// ([`appended_suffix`], so a cross-directory pair counts too), same lettered,
-    /// non-rotation, non-Maildir suffix filter, same threshold and window.
-    ///
-    /// The correlation is a write-intent `O_CREAT` open (`record_create`) and an unlink
-    /// of the file whose name the new one extends, by one pid within
-    /// [`CREATE_UNLINK_PAIR_WINDOW_NS`], in either arrival order (`pending_unlinks`).
-    /// It cannot use `FileWriteEvent`: that event carries an fd and no path.
-    ///
-    /// The benign producer measured live (Debian 13) is compression: `gzip`, `xz`,
-    /// `bzip2` and `zstd` each did 30 of these in 5 s over a `*.log` glob. They are
-    /// excluded by [`COMPRESSOR_COMMS`] gated on the pid running the trusted binary of
-    /// that name, failing closed ([`Self::runs_trusted_binary_named`]); a suffix
-    /// allowlist (`.gz`) alone would be free for an encryptor to copy. `logrotate` with
-    /// `compress` opens the `.gz` and unlinks the input itself (gzip only writes to an
-    /// inherited fd), so it is excluded as a compression *driver*
-    /// ([`Self::is_compression_driver`]): trusted binary named `logrotate` **and** a
-    /// compression extension, both required (found live by Jihair on Alpine, #527). A third
-    /// benign producer, `semodule -B`/`-DB` rebuilding the `SELinux` policy store, is excluded
-    /// the same way as the compressors ([`Self::is_selinux_policy_tool`]): no suffix
-    /// convention to also require (found live on Fedora, #1013). Nothing else measured
-    /// (`zip -m`, `rsync --remove-source-files`, `git gc`, atomic writers, `apt`)
-    /// exceeded 2. Restricted to Unix events: the Windows and macOS producers of this
-    /// shape (Explorer, `ditto`, installers) were not measured.
-    ///
-    /// **Not covered**: a shell loop with one process per step (`openssl enc -out $f.enc`
-    /// creates, a separate `rm $f` unlinks). Creation and unlink then belong to different
-    /// pids, so no pair forms (confirmed live on Debian 13); tying them through the
-    /// parent would also fold in ordinary `cp x x.bak; rm x` scripts, which was not
-    /// measured. The rename shape of that loop is covered by `check_mass_rename_pattern`.
-    ///
-    /// Like every pid-keyed table here it inherits #519: a recycled pid keeps a stale
-    /// history until it ages out of the window.
-    fn check_write_new_then_unlink(&mut self, event: &FileDeleteEvent) -> Option<Alert> {
-        if !matches!(event.meta.user, User::Unix { .. }) {
-            return None;
-        }
-        let pid = event.meta.pid;
-        let ts = event.meta.timestamp_ns;
-        let created = self.recent_creates.get_mut(&pid).and_then(|creates| {
-            let idx = creates.iter().rposition(|(created_ts, path)| {
-                pairs_create_and_unlink(*created_ts, path, ts, &event.path)
-            })?;
-            creates.remove(idx).map(|(_, path)| path)
-        });
-        let Some(created) = created else {
-            // No creation seen yet: it may still arrive after this unlink.
-            let pending = self.pending_unlinks.get_or_insert_with(pid, VecDeque::new);
-            if pending.len() >= CREATE_UNLINK_HISTORY_PER_PID {
-                pending.pop_front();
-            }
-            pending.push_back((ts, event.path.clone()));
-            return None;
-        };
-        self.count_create_unlink_pair(&event.meta, ts, &event.path, &created)
-    }
-
-    /// The creation half: remembers a write-intent `O_CREAT` open, or pairs it with an
-    /// unlink that arrived first. Unix events only, see
-    /// [`Self::check_write_new_then_unlink`].
-    fn record_create(&mut self, event: &FileOpenEvent) -> Option<Alert> {
-        if event.flags & O_CREAT == 0
-            || !has_write_intent(event.flags)
-            || !matches!(event.meta.user, User::Unix { .. })
-        {
-            return None;
-        }
-        let pid = event.meta.pid;
-        let created_ts = event.meta.timestamp_ns;
-        let unlinked = self.pending_unlinks.get_mut(&pid).and_then(|pending| {
-            let idx = pending.iter().position(|(unlink_ts, path)| {
-                pairs_create_and_unlink(created_ts, &event.path, *unlink_ts, path)
-            })?;
-            pending.remove(idx)
-        });
-        if let Some((unlink_ts, deleted)) = unlinked {
-            return self.count_create_unlink_pair(&event.meta, unlink_ts, &deleted, &event.path);
-        }
-        let creates = self.recent_creates.get_or_insert_with(pid, VecDeque::new);
-        if creates.len() >= CREATE_UNLINK_HISTORY_PER_PID {
-            creates.pop_front();
-        }
-        creates.push_back((created_ts, event.path.clone()));
-        None
-    }
-
-    /// Counts one matched write-new-then-unlink pair per pid, alerting at the
-    /// mass-rename threshold. `ts` is the later (unlink) time.
-    fn count_create_unlink_pair(
-        &mut self,
-        meta: &schema::EventMeta,
-        ts: u64,
-        deleted: &str,
-        created: &str,
-    ) -> Option<Alert> {
-        if self.is_compressor(meta)
-            || self.is_compression_driver(meta, deleted, created)
-            || self.is_selinux_policy_tool(meta)
-        {
-            return None;
-        }
-        let pid_entry = self
-            .ransomware_unlink
-            .get_or_insert_with(meta.pid, SlidingCounter::default);
-        let pid_count = pid_entry.record(ts, RANSOMWARE_RENAME_WINDOW_NS);
-        if pid_count >= RANSOMWARE_RENAME_THRESHOLD
-            && pid_entry.try_alert(ts, RANSOMWARE_RENAME_WINDOW_NS)
-        {
-            return Some(Alert {
-                technique: "T1486",
-                severity: Severity::Critical,
-                message: format!(
-                    "pid={} comm={}: {pid_count} files replaced by a new file with an appended \
-                     suffix and then unlinked in {}s (e.g. {deleted} → {created}) — suspected \
-                     ransomware encryption pass (write-new-then-unlink)",
-                    meta.pid,
-                    meta.comm,
-                    RANSOMWARE_RENAME_WINDOW_NS / 1_000_000_000,
-                ),
-            });
-        }
-        None
-    }
-
-    /// True when `comm` is a compression driver ([`COMPRESSION_DRIVER_COMMS`], i.e.
-    /// `logrotate`) that really runs the trusted binary of that name and the new file
-    /// only appends a compression extension to the old name.
-    fn is_compression_driver(
-        &self,
-        meta: &schema::EventMeta,
-        deleted: &str,
-        created: &str,
-    ) -> bool {
-        COMPRESSION_DRIVER_COMMS.contains(&meta.comm.as_str())
-            && appended_suffix(deleted, created)
-                .is_some_and(|suffix| COMPRESSION_SUFFIXES.contains(&suffix))
-            && self.runs_trusted_binary_named(meta)
-    }
-
-    /// True when `comm` is a compression tool ([`COMPRESSOR_COMMS`]) and the pid really
-    /// runs the trusted binary of that name: see [`Self::runs_trusted_binary_named`].
-    fn is_compressor(&self, meta: &schema::EventMeta) -> bool {
-        COMPRESSOR_COMMS.contains(&meta.comm.as_str()) && self.runs_trusted_binary_named(meta)
-    }
-
-    /// True when `comm` is a `SELinux` policy-store tool ([`SELINUX_POLICY_TOOL_COMMS`]) and
-    /// the pid really runs the trusted binary of that name (#1013): `semodule -B`'s
-    /// create-then-replace of every module in the targeted policy base set matches this
-    /// shape with no `comm`-independent suffix convention to additionally require, unlike
-    /// [`Self::is_compression_driver`].
-    fn is_selinux_policy_tool(&self, meta: &schema::EventMeta) -> bool {
-        SELINUX_POLICY_TOOL_COMMS.contains(&meta.comm.as_str())
-            && self.runs_trusted_binary_named(meta)
-    }
-
-    /// True when this pid's exec-time `image_path` is known, sits at a trusted system
-    /// path **and is a binary named `comm`**. Both halves matter: a trusted path alone
-    /// is not enough, because a process running the system `python3` can rename its own
-    /// `comm` to `gzip` with `prctl(PR_SET_NAME)` and would otherwise inherit the
-    /// exclusion; what an encryptor cannot fake is that the trusted binary it runs is
-    /// *called* `gzip`. Unknown is **not** trusted (fails closed): delete events carry no
-    /// rename-time `executable_path` to fall back on, and "no exec seen" (a forked child
-    /// that only set `comm`) is not evidence of `/usr/bin/gzip`.
-    fn runs_trusted_binary_named(&self, meta: &schema::EventMeta) -> bool {
-        PidFact::current(&self.pid_image_path, meta.pid, meta.process_generation).is_some_and(|p| {
-            !p.is_empty()
-                && policy::name_exclusion_applies(Some(p))
-                && written_file_is(p, &meta.comm)
-        })
-    }
-
     /// To be called for every `FileRenameEvent` in the stream (T1486, issue #262 +
     /// #82's write-volume corroboration).
     pub fn on_file_rename(&mut self, event: &FileRenameEvent) -> Vec<Alert> {
         self.record_motw_stream_rename(event);
-        self.record_touched(event.meta.pid, Event::FileRename(event.clone()));
-        let mut alerts: Vec<Alert> = self.check_mass_rename_pattern(event).into_iter().collect();
-        alerts.extend(self.check_burst_write_volume(event));
+        let mut alerts = self.impact.on_file_rename(event, &self.pid_image_path);
         self.note_t1486(&event.meta, &mut alerts);
         alerts
     }
@@ -2919,51 +2537,17 @@ impl RuleState {
     /// process on Linux (#1036): the `inode_setattr` hook reports every explicit time, and
     /// `tar x`, `cp -a`, `rsync -a` and `cpio` set one per file, so a 3000-file unpack raised
     /// about 1000 Low alerts in the lab (the rest were lost to the ring buffer). One alert per
-    /// process incarnation per [`SET_TIME_ALERT_WINDOW_NS`] says the same thing; every `touch -d`
-    /// of a stomping script is its own process and still alerts. Windows events carry no
+    /// process incarnation per
+    /// [`SET_TIME_ALERT_WINDOW_NS`](crate::impact_state::SET_TIME_ALERT_WINDOW_NS) says the
+    /// same thing; every `touch -d` of a stomping script is its own process and still alerts. Windows events carry no
     /// trustworthy process (the minifilter's `comm` is empty), so they pass through as before.
     pub fn on_file_set_time(&mut self, event: &schema::FileSetTimeEvent) -> Vec<Alert> {
-        let mut alerts = crate::evaluate_file_set_time(event);
+        let alerts = crate::evaluate_file_set_time(event);
         if alerts.is_empty() || !matches!(event.meta.user, schema::User::Unix { .. }) {
             return alerts;
         }
-        // A package manager unpacking an archive stamps every file with its stored mtime. The
-        // skip is keyed on the exec-time image, not on `comm` alone: `comm` is the basename of
-        // whatever was exec'd and any process can rewrite it (`prctl(PR_SET_NAME)`), so a copy of
-        // `touch` named `/tmp/rpm`, or `python3` renamed to `rpm`, would otherwise stomp silently
-        // (#1045 review). Fails closed: a package manager whose exec the sensor missed (started
-        // before the agent) alerts at Low until it exits.
-        if crate::stateless::is_package_manager_comm(&event.meta.comm)
-            && self.runs_trusted_binary_named(&event.meta)
-        {
-            return Vec::new();
-        }
-        let key = (event.meta.pid, event.meta.process_generation.unwrap_or(0));
-        let window = self
-            .set_time_alerted
-            .get_or_insert_with(key, SetTimeWindow::default);
-        match window.admit(event.meta.timestamp_ns, SET_TIME_ALERT_WINDOW_NS) {
-            None => alerts.clear(),
-            Some(folded) if folded > 0 => {
-                // The one alert per window hides how many requests there were: say so.
-                for alert in &mut alerts {
-                    alert.message.push_str(&format!(
-                        " ({folded} more request(s) from this process since its last alert were not reported)"
-                    ));
-                }
-            }
-            Some(_) => {}
-        }
-        alerts
-    }
-
-    /// Remembers a rename or deletion for `pid`, dropping the oldest past the per-pid bound.
-    fn record_touched(&mut self, pid: u32, event: Event) {
-        let history = self.touched_files.get_or_insert_with(pid, VecDeque::new);
-        if history.len() == TOUCHED_FILES_PER_PID {
-            history.pop_front();
-        }
-        history.push_back(event);
+        self.impact
+            .dedup_file_set_time(event, alerts, &self.pid_image_path)
     }
 
     /// The renames and deletions of the process incarnation `(pid, generation)` still
@@ -2972,19 +2556,7 @@ impl RuleState {
     /// life is not this process's damage); a missing stamp keeps the pid-only behavior.
     #[must_use]
     pub fn touched_files(&self, pid: u32, generation: Option<u64>) -> Vec<Event> {
-        self.touched_files
-            .peek(&pid)
-            .map(|history| {
-                history
-                    .iter()
-                    .filter(|e| match (e.meta().process_generation, generation) {
-                        (Some(a), Some(b)) => a == b,
-                        _ => true,
-                    })
-                    .cloned()
-                    .collect()
-            })
-            .unwrap_or_default()
+        self.impact.touched_files(pid, generation)
     }
 
     /// To be called for every `FileWriteEvent` in the stream. Does not produce
@@ -2992,80 +2564,7 @@ impl RuleState {
     /// `check_burst_write_volume` on the next `FileRenameEvent`.
     pub fn on_file_write(&mut self, event: &FileWriteEvent) {
         self.network.record_archive_write(event);
-        self.write_volume
-            .get_or_insert_with(event.meta.pid, SlidingSum::default)
-            .add(
-                event.meta.timestamp_ns,
-                event.bytes_requested,
-                RANSOMWARE_RENAME_WINDOW_NS,
-            );
-    }
-
-    /// Second, independent T1486 signal (issue #82): heavy write volume alongside
-    /// a rename burst, regardless of whether the rename shape matched
-    /// `check_mass_rename_pattern`'s prefix-preserving pattern — catches a
-    /// renamed-over-the-original-name encryptor shape that check's
-    /// suffix-appending model doesn't.
-    ///
-    /// Only ever runs on `FileRenameEvent` (dispatched from `on_file_rename`,
-    /// never on an unlink) — despite an earlier version of this doc's claim to
-    /// catch a "writes-new-then-unlinks" shape, no unlink telemetry feeds this
-    /// at all (review finding, #496). `bytes_written` comes from
-    /// `FileWriteEvent::bytes_requested`, which `sensor-linux-ebpf`'s
-    /// `sys_enter_write` hook records for every `write(2)` regardless of what
-    /// the fd refers to — a regular file, a socket, a pipe — so a chatty
-    /// network/IPC-heavy process's write volume counts the same as real disk
-    /// writes toward this total. Both caveats are honest gaps, not yet closed.
-    ///
-    /// Deliberately no name-keyed exclusion here: `FileRenameEvent`/`FileWriteEvent`
-    /// carry no executable path (same gap `check_mass_rename_pattern`'s doc
-    /// describes, tracked in #459), so a `comm`-only exclusion would be spoofable.
-    /// `RANSOMWARE_EXCLUDED_PATH_PREFIXES` is path-based, not name-based, and stays.
-    /// [`is_package_manager_temp_rename`] requires both the filename shape and
-    /// `comm` to match a known package manager (#496, hardened per #500
-    /// review): the shape alone — staging heavy writes under `foo.dpkg-new`
-    /// then renaming it onto `foo` — previously cleared both gates below and
-    /// false-positived T1486, but the shape by itself is just a naming
-    /// convention the renaming process controls; requiring `comm` too raises
-    /// the bar to also impersonating the specific package manager it belongs
-    /// to, not just picking a suffix.
-    fn check_burst_write_volume(&mut self, event: &FileRenameEvent) -> Option<Alert> {
-        if RANSOMWARE_EXCLUDED_PATH_PREFIXES
-            .iter()
-            .any(|prefix| event.new_path.starts_with(prefix))
-            || is_package_manager_temp_rename(&event.old_path, &event.new_path, &event.meta.comm)
-        {
-            return None;
-        }
-        let ts = event.meta.timestamp_ns;
-        // Independent field from `rename_count` below — read first so the
-        // `SlidingCounter` borrow can stay held through the `try_alert` call.
-        let bytes_written = self
-            .write_volume
-            .get_or_insert_with(event.meta.pid, SlidingSum::default)
-            .total(ts, RANSOMWARE_RENAME_WINDOW_NS);
-        let entry = self
-            .rename_count
-            .get_or_insert_with(event.meta.pid, SlidingCounter::default);
-        let rename_count = entry.record(ts, RANSOMWARE_RENAME_WINDOW_NS);
-        if rename_count >= RANSOMWARE_RENAME_THRESHOLD
-            && bytes_written >= BURST_WRITE_BYTES_THRESHOLD
-            && entry.try_alert(ts, RANSOMWARE_RENAME_WINDOW_NS)
-        {
-            return Some(Alert {
-                technique: "T1486",
-                severity: Severity::Critical,
-                message: format!(
-                    "pid={} comm={} wrote {}MB and renamed {rename_count}x in {}s — \
-                     suspected ransomware kill chain",
-                    event.meta.pid,
-                    event.meta.comm,
-                    bytes_written / (1024 * 1024),
-                    RANSOMWARE_RENAME_WINDOW_NS / 1_000_000_000,
-                ),
-            });
-        }
-        None
+        self.impact.record_write(event);
     }
 }
 
@@ -3095,14 +2594,6 @@ fn memfd_proc_fd_exec_alert(pid: u32, comm: &str, path: &str, fd: i32) -> Alert 
              this process created moments earlier — a payload that never touched disk",
         ),
     }
-}
-
-/// Suffixes logrotate and similar rotators append (`.1`, `-20260924`, `.1.2`, `~`
-/// backups): no ASCII letter at all. Ransomware markers carry letters (`.locked`,
-/// `.WNCRY`, `.id-<hex>.[mail]`); an all-digit random suffix is the one blind spot,
-/// accepted over alerting on every rotation run.
-fn is_rotation_suffix(suffix: &str) -> bool {
-    !suffix.bytes().any(|b| b.is_ascii_alphabetic())
 }
 
 fn is_all_digits(s: &str) -> bool {
@@ -3142,193 +2633,11 @@ fn proc_fd_number(path: &str, own_pid: u32) -> Option<i32> {
     fd.parse().ok()
 }
 
-/// True when `old_path` is `new_path` with one of
-/// [`PACKAGE_MANAGER_TEMP_RENAME_SUFFIXES`] appended *and* `comm` is one of
-/// [`PACKAGE_MANAGER_COMMS`] — the package-manager "stage under a temp name,
-/// then rename over the real one" shape `check_burst_write_volume` excludes
-/// (#496), corroborated by which process is doing it (#500 review) so the
-/// filename convention alone isn't a free pass. The path relationship is the
-/// reverse of [`is_rotation_suffix`]'s callers (`new_path` = `old_path` +
-/// suffix): here the suffix is on the *old* name.
-fn is_package_manager_temp_rename(old_path: &str, new_path: &str, comm: &str) -> bool {
-    PACKAGE_MANAGER_COMMS.contains(&comm)
-        && (old_path
-            .strip_prefix(new_path)
-            .is_some_and(|suffix| PACKAGE_MANAGER_TEMP_RENAME_SUFFIXES.contains(&suffix))
-            || is_apk_staging_rename(old_path, new_path))
-}
-
-/// True for apk-tools' real staging shape (#500 review, Jihair): `old_path`
-/// sits in the same directory as `new_path` (not derived from it by suffix —
-/// see [`APK_STAGING_FILE_PREFIX`]'s doc) and its basename is that prefix
-/// followed by a hex digest, e.g. `usr/bin/.apk.e9a41015…` ->
-/// `usr/bin/c89`. Splits on the last `/` rather than comparing absolute
-/// prefixes because apk's renames are relative to a directory fd
-/// (`renameat`), so there's no leading `/` to anchor on — `usr/bin/foo` and
-/// `bin/foo` must both work, and no separator at all means "current
-/// directory" for both sides equally.
-fn is_apk_staging_rename(old_path: &str, new_path: &str) -> bool {
-    let (old_dir, old_base) = old_path.rsplit_once('/').unwrap_or(("", old_path));
-    let (new_dir, _) = new_path.rsplit_once('/').unwrap_or(("", new_path));
-    old_dir == new_dir
-        && old_base
-            .strip_prefix(APK_STAGING_FILE_PREFIX)
-            .is_some_and(|hex| !hex.is_empty() && hex.bytes().all(|b| b.is_ascii_hexdigit()))
-}
-
-impl RuleState {
-    /// True for `check_mass_rename_pattern`'s in-place-edit-with-backup false
-    /// positive (#459 part 1): `comm` is a known in-place-edit tool
-    /// ([`IN_PLACE_EDIT_COMMS`]) and the binary behind the pid is at a trusted
-    /// path ([`policy::name_exclusion_applies`]).
-    ///
-    /// The path is the exec-time `image_path` from [`Self::pid_image_path`], not
-    /// `FileRenameEvent::executable_path`: the latter is a rename-time `/proc` read
-    /// that a short-lived process loses (#513 review), and "unknown" there is
-    /// something the process controls by exiting. Unlike the other name-keyed
-    /// exclusions (whose image paths the kernel hands us at exec time), an
-    /// unresolvable path here **fails closed**: a pid with no exec seen (it never
-    /// exec'd since the agent started — e.g. a forked child that only set `comm`)
-    /// is not evidence of `/usr/bin/sed`. `executable_path` is only a fallback for
-    /// that gap, never a way to override a known exec-time path.
-    fn is_in_place_edit_backup(&self, event: &FileRenameEvent) -> bool {
-        if !IN_PLACE_EDIT_COMMS.contains(&event.meta.comm.as_str()) {
-            return false;
-        }
-        let path = PidFact::current(
-            &self.pid_image_path,
-            event.meta.pid,
-            event.meta.process_generation,
-        )
-        .or(event.executable_path.as_deref());
-        // A trusted path is not enough on its own: the system `python3` can set its own
-        // `comm` to `sed` (`prctl(PR_SET_NAME)`) and would inherit the exclusion. What
-        // an encryptor cannot fake is that the trusted binary it runs is *called* `comm`.
-        matches!(
-            path,
-            Some(p) if !p.is_empty()
-                && policy::name_exclusion_applies(Some(p))
-                && written_file_is(p, &event.meta.comm)
-        )
-    }
-}
-
-/// The suffix a rename appends to a file's name, when that is what it does: the tail
-/// of `new_path` after `old_path` (same directory, `a.docx` → `a.docx.locked`), or,
-/// when the directories differ, the tail of `new_path`'s *file name* after
-/// `old_path`'s (`~/docs/a.docx` → `~/.stash/a.docx.locked`, #512). `None` when
-/// neither relation holds. Splits on `/` and `\\` alike: Windows sensors feed this
-/// rule too. Works on the raw path strings, so a relative pair (both relative to
-/// the same unresolved dirfd or cwd) compares consistently without resolving it.
-fn appended_suffix<'a>(old_path: &str, new_path: &'a str) -> Option<&'a str> {
-    if let Some(suffix) = new_path.strip_prefix(old_path) {
-        return Some(suffix);
-    }
-    let old_base = split_dir_base(old_path).1;
-    let new_base = split_dir_base(new_path).1;
-    // No `old_dir == new_dir` shortcut: with equal directories the literal prefix test
-    // above only fails when the separators differ (`dir/a` vs `dir\a.locked`), and the
-    // base-name comparison below is exactly what must still run then.
-    if old_base.is_empty() {
-        return None;
-    }
-    new_base.strip_prefix(old_base)
-}
-
-/// Whether creating `created` (at `created_ts`) and unlinking `deleted` (at `deleted_ts`)
-/// is one write-new-then-unlink: the new file's name extends the deleted one's by a
-/// lettered, non-rotation, non-Maildir suffix ([`appended_suffix`]), the kernel-time
-/// order is create-then-unlink, and they are within [`CREATE_UNLINK_PAIR_WINDOW_NS`].
-fn pairs_create_and_unlink(created_ts: u64, created: &str, deleted_ts: u64, deleted: &str) -> bool {
-    created_ts <= deleted_ts
-        && deleted_ts - created_ts <= CREATE_UNLINK_PAIR_WINDOW_NS
-        && appended_suffix(deleted, created).is_some_and(|suffix| {
-            !suffix.is_empty()
-                && !is_rotation_suffix(suffix)
-                && !is_maildir_delivery(deleted, created, suffix)
-        })
-}
-
-/// `path` split at its last separator into `(directory, file name)`; no separator
-/// means an empty directory part.
-fn split_dir_base(path: &str) -> (&str, &str) {
-    match path.rfind(['/', '\\']) {
-        Some(i) => (&path[..i], &path[i + 1..]),
-        None => ("", path),
-    }
-}
-
-/// True for a suffix that is exactly a Maildir info marker: `:2,` followed by
-/// zero or more flag letters. Delivering a message out of `new/` into `cur/` is a
-/// cross-directory rename that appends precisely this (`msg` → `msg:2,S`), and an
-/// IMAP server or `mbsync` does it for every message a client opens: 20+ in a
-/// few seconds on "mark all read" (#512). Structural like
-/// [`is_maildir_flag_change`], for the same reason: the alphabet is a tight shape
-/// and there is no small fixed set of `comm` values to gate on.
-fn is_maildir_info_suffix(suffix: &str) -> bool {
-    suffix.strip_prefix(":2,").is_some_and(is_maildir_flags)
-}
-
-/// True for a real Maildir delivery: a move from a `new` directory into the `cur`
-/// directory next to it, whose new name only appends a Maildir info suffix
-/// ([`is_maildir_info_suffix`]). The directory shape is part of the test, not just the
-/// suffix: `:2,` followed by lowercase keyword letters is a free, readable extension for
-/// an encryptor (`f.docx` → `f.docx:2,locked`), so the suffix alone must never exclude
-/// a rename (#526 review, found live on Alpine).
-fn is_maildir_delivery(old_path: &str, new_path: &str, suffix: &str) -> bool {
-    if !is_maildir_info_suffix(suffix) {
-        return false;
-    }
-    let (old_dir, _) = split_dir_base(old_path);
-    let (new_dir, _) = split_dir_base(new_path);
-    let (old_parent, old_leaf) = split_dir_base(old_dir);
-    let (new_parent, new_leaf) = split_dir_base(new_dir);
-    old_leaf == "new" && new_leaf == "cur" && old_parent == new_parent
-}
-
-/// True for what follows `:2,` in a Maildir info suffix: the standard flag letters
-/// ([`MAILDIR_FLAG_LETTERS`]) and then, optionally, Dovecot's IMAP keywords, which it
-/// stores as lowercase `a`-`z` after them (`:2,Sa`, `:2,RSab`; Thunderbird tags,
-/// `$Label1`, Junk/NonJunk). Delivering or tagging 20+ messages raised T1486 on the
-/// standard alphabet alone (#526 review, live on Alpine). The order keeps the shape
-/// tight: keywords never precede a standard flag.
-fn is_maildir_flags(flags: &str) -> bool {
-    let keywords = flags.trim_start_matches(|c: char| {
-        u8::try_from(c).is_ok_and(|b| MAILDIR_FLAG_LETTERS.contains(&b))
-    });
-    keywords.bytes().all(|b| b.is_ascii_lowercase())
-}
-
-/// True for `check_mass_rename_pattern`'s Maildir-flag-change false positive
-/// (#459 part 1): `old_path` already ends in the Maildir info/flags marker
-/// (`:2,` optionally followed by flag letters) and `suffix` — the tail
-/// `new_path` appends — is composed entirely of valid Maildir flag letters
-/// ([`MAILDIR_FLAG_LETTERS`]).
-///
-/// Deliberately **not** also gated on `comm`, unlike [`is_in_place_edit_backup`]
-/// and unlike issue #459's own suggestion: `sed` is one fixed,
-/// well-known binary, but "a mail server touching Maildir" has no small
-/// fixed `comm` set to enumerate without guessing (dovecot, courier,
-/// procmail, maildrop, notmuch, mbsync, offlineimap, mutt, ...) — inventing
-/// one would be exactly the uncalibrated-exclusion-list problem this crate's
-/// own module doc warns against. The flag-letter alphabet constraint is
-/// already a tight structural signal on its own, the same class of reasoning
-/// [`is_rotation_suffix`]'s all-digit check relies on.
-fn is_maildir_flag_change(old_path: &str, suffix: &str) -> bool {
-    if suffix.is_empty() || !is_maildir_flags(suffix) {
-        return false;
-    }
-    let Some(marker) = old_path.rfind(":2,") else {
-        return false;
-    };
-    is_maildir_flags(&old_path[marker + 3..])
-}
-
 /// Whether the file at `path` is the one a process named `comm` runs from. A
 /// Windows path (`C:\…`, `\\server\…`) is split on `\` and compared
 /// case-insensitively, as NTFS names files; the first cut split on `/` only, so
 /// the leaf of a Windows path was the whole path and never matched (#442).
-fn written_file_is(path: &str, comm: &str) -> bool {
+pub(crate) fn written_file_is(path: &str, comm: &str) -> bool {
     let windows = path.as_bytes().get(1) == Some(&b':') || path.starts_with(r"\\");
     if windows {
         path.rsplit('\\')
