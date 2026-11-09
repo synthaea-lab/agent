@@ -57,8 +57,9 @@ All handlers are in [`main.rs`](../../../crates/sensors/linux/ebpf/src/main.rs).
 - **`SSL_write`** (entry): copies the first `MAX_TLS_CAPTURE` (256) bytes of the plaintext buffer
   with one clamped read, before encryption.
 - **`SSL_read`**: the buffer is only filled when the call returns. The entry probe stashes
-  `(buf, num, lib)` in `SSL_READ_ARGS` keyed by `pid_tgid`; the uretprobe reads the buffer with the
-  return value as length.
+  `(buf, num, lib)` in `SSL_READ_ARGS` keyed by `pid_tgid`, as three `u64`s: a tuple with padding
+  is refused by the 5.15 and 6.1 verifiers (#204). The uretprobe reads the buffer with the return
+  value as length.
 - **`readline`** (return): reads the returned string, up to `MAX_READLINE_INPUT` (512) bytes.
 - **`getaddrinfo`**: the entry stashes the query-name pointer and the address of the caller's
   `res` pointer in `GETADDRINFO_ARGS`; the return probe reads the status and walks the `addrinfo`
