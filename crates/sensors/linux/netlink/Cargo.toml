@@ -11,6 +11,10 @@ workspace = true
 
 [dependencies]
 schema = { path = "../../../schema" }
+tracing = { workspace = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 libc = { version = "0.2", default-features = false }
+
+[dev-dependencies]
+schema = { path = "../../../schema", features = ["test-fixtures"] }

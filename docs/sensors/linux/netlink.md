@@ -5,8 +5,10 @@ netlink families with hand-written clients: no probe, no special kernel configur
 where eBPF cannot and, next to eBPF, gives state the event stream does not: what is listening right
 now, and how many bytes each TCP flow carried.
 
-The crate has no `Sensor` implementation. It exposes one-shot queries that return `schema` events;
-the agent decides the cadence ([`spawn_netlink_poller`](../../../apps/agent/src/commands/linux.rs)).
+The crate exposes one-shot queries that return `schema` events, and
+[`NetlinkPollSensor`](../../../crates/sensors/linux/netlink/src/poll.rs), the `Sensor` that polls
+them. The agent only runs that sensor on its own thread
+([`spawn_netlink_poller`](../../../apps/agent/src/commands/linux.rs)).
 
 | Family | Client | Output | Privilege (observed) |
 | --- | --- | --- | --- |
@@ -16,10 +18,11 @@ the agent decides the cadence ([`spawn_netlink_poller`](../../../apps/agent/src/
 
 ## The poller
 
-Every 10 s ([`NETLINK_POLL_INTERVAL`](../../../apps/agent/src/commands/linux.rs)) the agent calls
-`listen_port_events` and `conntrack_flow_events` and forwards the events. The interval leaves room
-for the beacon rule, which needs three distinct flows inside a 60 s window. A successful poll pulses
-the `linux-netlink` heartbeat whatever its event count; a failure is logged once per failure streak,
+Every 10 s ([`POLL_INTERVAL`](../../../crates/sensors/linux/netlink/src/poll.rs)) `NetlinkPollSensor`
+calls `listen_port_events` and `conntrack_flow_events` and forwards the events to its sink. The
+interval leaves room for the beacon rule, which needs three distinct flows inside a 60 s window. A
+successful query calls the sensor's `on_poll_ok` callback whatever its event count, and the agent
+pulses the `linux-netlink` heartbeat from it; a failure is logged once per failure streak,
 so an unprivileged agent does not log the same `EPERM` every 10 s.
 
 ## Listening sockets

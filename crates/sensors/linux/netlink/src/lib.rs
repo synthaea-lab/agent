@@ -119,6 +119,8 @@ mod conntrack_attrs;
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 mod normalize;
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+mod poll;
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 mod proc_events;
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 mod proc_join;
@@ -139,6 +141,9 @@ use std::net::SocketAddr;
 pub use conntrack_attrs::{ConntrackFlow, FlowCounters, FlowTuple, TcpState};
 #[cfg(target_os = "linux")]
 pub use conntrack_socket::dump as dump_conntrack;
+#[cfg(target_os = "linux")]
+pub use poll::NetlinkPollSensor;
+pub use poll::{POLL_INTERVAL, PollStopHandle};
 pub use proc_events::ProcEvent;
 #[cfg(target_os = "linux")]
 pub use proc_socket::ProcEventSubscription;

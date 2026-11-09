@@ -38,7 +38,7 @@ Every source produces `schema::Event` values and hands each one by value to `Eve
 - `EventSink::on_event(&self, Event)` takes `&self`, and implementations must be `Send + Sync`. A blanket `impl EventSink for Arc<T>` lets several producers share one sink. This is how the primary sensor and every poller thread feed the same `DetectionSink`.
 - `Event` is `#[non_exhaustive]`, so a new variant does not break existing sinks. `DetectionSink` matches the variants it understands and only logs the rest.
 
-Only the primary sensor implements `Sensor` (`LinuxSensor`/`AuditSensor`, `WindowsSensor`, `MacosSensor`, plus `EventLogSensor` and `UprobesSensor`). The other sources are poll or stream functions, and the platform module drives them on its own thread. The netlink poller, journal tail, socket pollers, unified-log tail and NE receiver all work this way.
+Only the primary sensor implements `Sensor` (`LinuxSensor`/`AuditSensor`, `WindowsSensor`, `MacosSensor`, plus `EventLogSensor`, `UprobesSensor` and the netlink poller's `NetlinkPollSensor`). The other sources are poll or stream functions, and the platform module drives them on its own thread. The journal tail, socket pollers, unified-log tail and NE receiver all work this way.
 
 ### 2. Wrappers in front of the sink
 
