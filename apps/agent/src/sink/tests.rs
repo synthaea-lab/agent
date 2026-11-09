@@ -356,7 +356,7 @@ fn amsi_rules_see_the_raw_buffer_but_alert_and_event_outputs_are_redacted() {
 #[test]
 fn redacted_detection_message_keeps_messages_with_an_empty_command_line_intact() {
     assert_eq!(
-        super::redact_detection_message("", "", "process comm=it's"),
+        super::recording::redact_detection_message("", "", "process comm=it's"),
         "process comm=it's"
     );
 }
@@ -1891,15 +1891,18 @@ fn emitted_finding_reaches_the_durable_detection_spool() {
     )
     .unwrap();
     let event = exec(7, "test", "/bin/test");
-    sink.record_and_emit(
-        &verdict::EntityKey::new(1, "test"),
-        "T1059",
-        "test finding",
-        schema::detection::DetectionSource::Rule {
-            rule_id: "T1059".into(),
+    sink.record(
+        super::Finding {
+            entity: &verdict::EntityKey::new(1, "test"),
+            technique: "T1059",
+            message: "test finding",
+            source: schema::detection::DetectionSource::Rule {
+                rule_id: "T1059".into(),
+            },
+            severity: schema::detection::Severity::Medium,
         },
-        schema::detection::Severity::Medium,
         &event,
+        Vec::new(),
     );
     assert!(
         sink.enrich_queue()
@@ -2218,15 +2221,18 @@ fn a_detection_that_is_not_ransomware_carries_only_its_triggering_event() {
     .unwrap();
     sink.on_event(rename_of(900, 0, ".bak"));
     let event = exec(7, "test", "/bin/test");
-    sink.record_and_emit(
-        &verdict::EntityKey::new(1, "test"),
-        "T1059",
-        "test finding",
-        schema::detection::DetectionSource::Rule {
-            rule_id: "T1059".into(),
+    sink.record(
+        super::Finding {
+            entity: &verdict::EntityKey::new(1, "test"),
+            technique: "T1059",
+            message: "test finding",
+            source: schema::detection::DetectionSource::Rule {
+                rule_id: "T1059".into(),
+            },
+            severity: schema::detection::Severity::Medium,
         },
-        schema::detection::Severity::Medium,
         &event,
+        Vec::new(),
     );
     assert!(
         sink.enrich_queue()
@@ -2451,15 +2457,18 @@ fn a_yara_match_and_a_rule_alert_on_the_same_entity_and_technique_are_one_verdic
         meta: meta.clone(),
         ..schema::fixtures::file_open()
     });
-    sink.record_and_emit(
-        &entity,
-        "T1105",
-        "downloader wrote then ran a binary",
-        schema::detection::DetectionSource::Rule {
-            rule_id: "T1105".into(),
+    sink.record(
+        super::Finding {
+            entity: &entity,
+            technique: "T1105",
+            message: "downloader wrote then ran a binary",
+            source: schema::detection::DetectionSource::Rule {
+                rule_id: "T1105".into(),
+            },
+            severity: schema::detection::Severity::Medium,
         },
-        schema::detection::Severity::Medium,
         &event,
+        Vec::new(),
     );
 
     let absorbed = super::fuse_yara_match(
@@ -2645,15 +2654,18 @@ fn a_suppressed_technique_leaves_the_verdict_but_stays_in_the_alert_log() {
         ..schema::fixtures::file_open()
     });
     let record = || {
-        sink.record_and_emit(
-            &entity,
-            "T1105",
-            "downloader wrote then ran a binary",
-            schema::detection::DetectionSource::Rule {
-                rule_id: "T1105".into(),
+        sink.record(
+            super::Finding {
+                entity: &entity,
+                technique: "T1105",
+                message: "downloader wrote then ran a binary",
+                source: schema::detection::DetectionSource::Rule {
+                    rule_id: "T1105".into(),
+                },
+                severity: schema::detection::Severity::Medium,
             },
-            schema::detection::Severity::Medium,
             &event,
+            Vec::new(),
         )
     };
 

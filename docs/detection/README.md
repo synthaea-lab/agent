@@ -76,7 +76,7 @@ These hold across the engines. When a rule's comment points here, this is the se
   message. Severity ranks and fuses findings. It never gates a destructive action on its own.
 - Sigma produces `SigmaAlert`, YARA produces `YaraMatch` and the IOC matcher produces
   `IocHit`. The sink turns each one into a `schema::detection::Detection` with a
-  `DetectionSource` that names the engine, and records it through `record_and_emit`. That
+  `DetectionSource` that names the engine, and records it through [`DetectionSink::record`](../../apps/agent/src/sink/recording.rs). That
   writes the alert log (the audit trail: every finding, duplicates included) and folds the
   finding into verdict fusion.
 - Every finding is keyed to the entity `(ppid, comm)`, plus the parent's incarnation when the
