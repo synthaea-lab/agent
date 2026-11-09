@@ -25,7 +25,7 @@ Rules every package follows:
 
 Pushing a tag `vX.Y.Z[-suffix]`, or running
 [`release.yml`](../.github/workflows/release.yml) by hand for an existing tag, builds every
-artifact with the same jobs that check packaging on `main` and publishes a GitHub release.
+artifact and publishes a GitHub release.
 A tag with a `-` suffix (`-beta.1`, `-rc.1`) is published as a pre-release. The workflow never
 creates a tag.
 
@@ -38,19 +38,6 @@ creates a tag.
 | all | `SHA256SUMS`, plus `SHA256SUMS.asc` and `synthaea-release-key.asc` when signed | covers every file above |
 
 Package file names carry the version from `apps/agent/Cargo.toml` and `APKBUILD`, not the
-tag; the workflow warns when they differ. Before publishing, it scans the tagged tree and
-every binary it is about to publish for the test key, and stops if it finds it.
-
-No artifact is code-signed yet, and the workflow never signs updater or content manifests:
-those keys stay offline on hardware tokens and are used with `release-tool` on the release
-manager's machine. The one signature the workflow can make is a detached GPG signature over
-`SHA256SUMS`, from these optional secrets of the `release` environment:
-
-| Secret | Content |
-| --- | --- |
-| `RELEASE_GPG_PRIVATE_KEY` | ASCII-armored private signing key (a subkey) |
-| `RELEASE_GPG_PASSPHRASE` | its passphrase, empty if it has none |
-
-Without `RELEASE_GPG_PRIVATE_KEY` the release is still published, with a warning in the run
-and an "UNSIGNED BUILD" banner at the top of its notes. Required reviewers on the `release`
-environment put a second person in front of every publish.
+tag. No artifact is code-signed yet; `SHA256SUMS` carries a detached GPG signature when the
+release is signed. The jobs, the test-key scan and the signing model are described in
+[docs/packaging.md](../docs/packaging.md#release-workflow).
