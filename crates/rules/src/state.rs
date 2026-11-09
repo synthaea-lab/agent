@@ -2,46 +2,40 @@
 //! per-window counters) and consults it on every event. Each rule stays a dedicated
 //! method, with its calibration constants next to it.
 
-use std::{
-    collections::{HashMap, VecDeque},
-    net::IpAddr,
-};
+use std::{collections::HashMap, net::IpAddr};
 
 use schema::{
-    AuthEvent, AuthKind, AuthOutcome, BitsJobEvent, BitsJobState, ConnectEvent, DnsQueryEvent,
-    Event, ExecEvent, FLAG_PERSISTENCE_TASK_ACTION_UNKNOWN, FileDeleteEvent, FileOpenEvent,
-    FileQuarantineEvent, FileRenameEvent, FileWriteEvent, ListenPortEvent, MemfdCreateEvent,
-    NetworkFlowEvent, O_CREAT, POLICY_MECHANISM_APPLOCKER, POLICY_MECHANISM_SELINUX,
-    POLICY_MECHANISM_WDAC, PolicyDenialEvent, SessionEvent, SessionState, UnitStopEvent, User,
-    detection::Severity,
+    AuthEvent, BitsJobEvent, BitsJobState, ConnectEvent, DnsQueryEvent, Event, ExecEvent,
+    FLAG_PERSISTENCE_TASK_ACTION_UNKNOWN, FileDeleteEvent, FileOpenEvent, FileQuarantineEvent,
+    FileRenameEvent, FileWriteEvent, ListenPortEvent, MemfdCreateEvent, NetworkFlowEvent, O_CREAT,
+    POLICY_MECHANISM_APPLOCKER, POLICY_MECHANISM_SELINUX, POLICY_MECHANISM_WDAC, PolicyDenialEvent,
+    SessionEvent, UnitStopEvent, User, detection::Severity,
 };
 use store::BoundedMap;
 
 use crate::{
     Alert,
+    auth_state::AuthState,
     credfiles::{self, CredFile},
     exclusions::{
-        AGENT_CHILD_EXCLUSIONS, AUTH_FAILURE_THRESHOLD, AUTH_FAILURE_WINDOW_NS,
-        BITS_EXEC_WINDOW_NS, CREDENTIAL_READ_ALERT_WINDOW_NS, DOWNLOAD_EXEC_WINDOW_NS,
-        DOWNLOADER_COMMS, LOLBIN_LEGIT_PARENTS, LOLBINS, MAIL_CLIENT_QUARANTINE_AGENTS,
-        MEMFD_EXEC_WINDOW_NS, POLICY_DENIAL_ALERT_CAP, POLICY_DENIAL_SUBJECT_CAP,
-        QUARANTINE_EXEC_WINDOW_NS, SELF_SPAWN_EXCLUSIONS, SELF_SPAWN_PARENT_EXCLUSIONS,
-        SELF_SPAWN_SCRIPT_HOSTS, SELF_SPAWN_THRESHOLD, SELF_SPAWN_TRUSTED_THRESHOLD,
-        SELF_SPAWN_WINDOW_NS, SERVICE_COMM_PREFIXES, SERVICE_COMMS, SHELL_COMMS, STAGING_PID_CAP,
-        STAGING_READ_DIRS, STAGING_READ_FILES, STAGING_WINDOW_NS, STAGING_WRITE_FILES,
-        SUSPECT_CHILDREN_WIN, SUSPECT_PARENTS_WIN, TASK_REGISTRATION_DEDUP_WINDOW_NS,
+        AGENT_CHILD_EXCLUSIONS, BITS_EXEC_WINDOW_NS, CREDENTIAL_READ_ALERT_WINDOW_NS,
+        DOWNLOAD_EXEC_WINDOW_NS, DOWNLOADER_COMMS, LOLBIN_LEGIT_PARENTS, LOLBINS,
+        MAIL_CLIENT_QUARANTINE_AGENTS, MEMFD_EXEC_WINDOW_NS, POLICY_DENIAL_ALERT_CAP,
+        POLICY_DENIAL_SUBJECT_CAP, QUARANTINE_EXEC_WINDOW_NS, SELF_SPAWN_EXCLUSIONS,
+        SELF_SPAWN_PARENT_EXCLUSIONS, SELF_SPAWN_SCRIPT_HOSTS, SELF_SPAWN_THRESHOLD,
+        SELF_SPAWN_TRUSTED_THRESHOLD, SELF_SPAWN_WINDOW_NS, SERVICE_COMM_PREFIXES, SERVICE_COMMS,
+        SHELL_COMMS, STAGING_PID_CAP, STAGING_READ_DIRS, STAGING_READ_FILES, STAGING_WINDOW_NS,
+        STAGING_WRITE_FILES, SUSPECT_CHILDREN_WIN, SUSPECT_PARENTS_WIN,
+        TASK_REGISTRATION_DEDUP_WINDOW_NS,
     },
     has_write_intent,
     impact_state::ImpactState,
-    logon::{LogonBaseline, Observation},
     lsass::{self, LSASS_ACCESS_ALERT_WINDOW_NS, LSASS_THREAD_ALERT_WINDOW_NS},
     network_state::NetworkState,
-    rdp::RdpSuccessAfterFailures,
-    session::SessionHijack,
+    privesc::IdentityRequests,
     signature_gate::SignatureGatedAlert,
     sliding::{SlidingCounter, SlidingDistinct},
     staging::{self, StagingDir, StagingReads},
-    sudo::SudoSuccessAfterFailures,
 };
 
 /// False only when both generation stamps exist and differ: the same rule as
@@ -60,13 +54,6 @@ struct RecentWrite {
 /// mark gets (<https://github.com/synthaea-lab/agent/issues/17>).
 const USER_EXECUTION_TECHNIQUE: &str = "T1204.002";
 const MAIL_ATTACHMENT_TECHNIQUE: &str = "T1566.001/T1204.002";
-
-/// One exec of a pid, for the as-of-time image lookup of SETUID-ROOT-REQUEST (#1041).
-struct ExecRecord {
-    timestamp_ns: u64,
-    generation: Option<u64>,
-    image: String,
-}
 
 /// A download-provenance mark, as [`RuleState::on_file_quarantine`] saw it.
 struct RecentQuarantine {
@@ -206,17 +193,9 @@ pub struct RuleState {
     /// `sed -i.bak`, or an encryptor that exits right after its renames) is already
     /// gone and it reads `None` (#513 review). LRU-bounded like `pid_comm`.
     pid_image_path: BoundedMap<u32, PidFact>,
-    /// pid → generation of the process that already raised SETUID-ROOT-REQUEST (T1548.001,
-    /// #1041): one alert per process, since a `PoC` calls `setuid`, `setresuid`, ... in a row.
-    /// LRU-bounded like `pid_comm`.
-    setuid_root_alerted: BoundedMap<u32, Option<u64>>,
-    /// pid → its latest execs (image, time, incarnation): SETUID-ROOT-REQUEST reads the image
-    /// a pid had *as of* an event's time, which `pid_image_path` (latest only) cannot give.
-    exec_history: BoundedMap<u32, Vec<ExecRecord>>,
-    /// Identity requests for uid 0 waiting for their process's exec to arrive (#1041).
-    pending_identity: VecDeque<schema::IdentityChangeEvent>,
-    /// The latest timestamp of any identity or exec event seen: the stream's clock.
-    identity_clock_ns: u64,
+    /// SETUID-ROOT-REQUEST's queued requests, stream clock and exec history: see
+    /// [`IdentityRequests`].
+    identity: IdentityRequests,
     /// path → info about the last write by a known downloader (T1105). LRU-bounded:
     /// downloader writes are rare, but a hostile loop must not grow agent memory.
     recent_writes: BoundedMap<String, RecentWrite>,
@@ -333,23 +312,9 @@ pub struct RuleState {
     /// `COUNTER_CAP` (never a full clear — only the evicted entries can re-alert) and a
     /// shape re-alerting is silent loss (CLAUDE.md: counted, observable shedding).
     policy_denial_evictions_reported: u64,
-    /// (target user, source) → sliding failure counter for T1110 (AUTH-BURST).
-    /// LRU-bounded like every other counter: a spray across many fabricated
-    /// usernames must not grow this without limit.
-    auth_failures: BoundedMap<(String, String), SlidingCounter>,
-    /// The accounts seen logging on, for FIRST-SEEN-LOGON (T1078, <https://github.com/synthaea-lab/agent/issues/17>). LRU-bounded.
-    logon_baseline: LogonBaseline,
-    /// ODD-HOUR-LOGON's clock and quiet period; off until [`Self::set_local_utc_offset_minutes`].
-    odd_hours: crate::logon::OddHours,
-    /// RDP authentication successes joined to the failures from the same address,
-    /// by event time (T1021.001, #285); see the `rdp` module.
-    rdp_success: RdpSuccessAfterFailures,
-    /// Local privilege-escalation successes (`sudo`/`su`) joined to the
-    /// authentication failures for the same account, by event time (#381,
-    /// T1548.003 for `sudo` / T1110.001 for `su`) — "same account" means the
-    /// same invoker uid for `sudo`, the same target name for `su`; see the
-    /// `sudo` module's own doc for why they differ.
-    sudo_success: SudoSuccessAfterFailures,
+    /// FIRST-SEEN-LOGON, ODD-HOUR-LOGON, the T1110 failure burst and the RDP, `sudo`/`su` and
+    /// session-reconnect joins: see [`AuthState`].
+    auth: AuthState,
     /// (pid, kind of credential file) → the last alert, for CREDENTIAL-READ (T1003.008,
     /// T1552, #377): one alert per window, not one per open. LRU-bounded like every other
     /// counter.
@@ -369,9 +334,6 @@ pub struct RuleState {
     /// seen on both Security 4698 and TaskScheduler/Operational 106 alerts once
     /// (#422). LRU-bounded like the counters.
     task_registrations: BoundedMap<String, ReportedTaskRegistration>,
-    /// Disconnected sessions and the client each was left from, for the
-    /// T1563.002 reconnect check (#285).
-    session_hijack: SessionHijack,
     /// The agent's own pid, for [`Self::check_self_spawn`]'s narrow exclusion of
     /// its own known children (issue #403). `None` until [`Self::seed_own_pid`] is
     /// called — `sensor-*` crates stay `schema`-only (`tools/check-deps.py`), so
@@ -417,7 +379,7 @@ struct PendingProcFdExec {
 /// the correlation window is not something a longer list would catch better.
 const MEMFD_CREATES_PER_PID: usize = 8;
 /// Same bound as the correlator's entity table: the realistic live-pid space.
-const PID_COMM_CAP: usize = 65_536;
+pub(crate) const PID_COMM_CAP: usize = 65_536;
 /// Counter/write-history bounds — one logical entity per key, far fewer than pids.
 pub(crate) const COUNTER_CAP: usize = 16_384;
 const RECENT_WRITES_CAP: usize = 4_096;
@@ -434,10 +396,7 @@ impl RuleState {
         Self {
             pid_comm: BoundedMap::new(PID_COMM_CAP),
             pid_image_path: BoundedMap::new(PID_COMM_CAP),
-            setuid_root_alerted: BoundedMap::new(PID_COMM_CAP),
-            exec_history: BoundedMap::new(PID_COMM_CAP),
-            pending_identity: VecDeque::new(),
-            identity_clock_ns: 0,
+            identity: IdentityRequests::new(),
             recent_writes: BoundedMap::new(RECENT_WRITES_CAP),
             recent_quarantines: BoundedMap::new(RECENT_WRITES_CAP),
             recent_bits_downloads: BoundedMap::new(RECENT_WRITES_CAP),
@@ -463,16 +422,11 @@ impl RuleState {
             policy_denial_budget_evictions_reported: 0,
             policy_denial_alerts_shed: 0,
             policy_denial_evictions_reported: 0,
-            auth_failures: BoundedMap::new(COUNTER_CAP),
-            logon_baseline: LogonBaseline::new(),
-            odd_hours: crate::logon::OddHours::new(),
-            rdp_success: RdpSuccessAfterFailures::new(),
-            sudo_success: SudoSuccessAfterFailures::new(),
+            auth: AuthState::new(),
             credential_reads: BoundedMap::new(COUNTER_CAP),
             lsass_access: BoundedMap::new(COUNTER_CAP),
             lsass_threads: BoundedMap::new(COUNTER_CAP),
             task_registrations: BoundedMap::new(COUNTER_CAP),
-            session_hijack: SessionHijack::new(),
             own_pid: None,
             ld_trust_extra: Vec::new(),
             recent_memfd_creates: BoundedMap::new(PID_COMM_CAP),
@@ -1251,41 +1205,8 @@ impl RuleState {
             event.meta.pid,
             PidFact::new(generation, event.image_path.clone()),
         );
-        self.record_exec_history(event);
+        self.identity.record_exec(event);
         alerts
-    }
-
-    /// Remembers this exec for [`Self::on_identity_change`], and moves the stream clock.
-    fn record_exec_history(&mut self, event: &ExecEvent) {
-        self.identity_clock_ns = self.identity_clock_ns.max(event.meta.timestamp_ns);
-        let history = self
-            .exec_history
-            .get_or_insert_with(event.meta.pid, Vec::new);
-        if history.len() >= crate::privesc::EXEC_HISTORY_PER_PID {
-            history.remove(0);
-        }
-        history.push(ExecRecord {
-            timestamp_ns: event.meta.timestamp_ns,
-            generation: event.meta.process_generation,
-            image: event.image_path.clone(),
-        });
-    }
-
-    /// The image `pid` (incarnation `generation`) had at `at_ns`: its latest exec at or before
-    /// that time. An exec of another incarnation of the pid does not count.
-    fn image_as_of(&self, pid: u32, generation: Option<u64>, at_ns: u64) -> Option<&str> {
-        self.exec_history
-            .peek(&pid)?
-            .iter()
-            .rev()
-            .find(|record| {
-                record.timestamp_ns <= at_ns
-                    && match (record.generation, generation) {
-                        (Some(recorded), Some(wanted)) => recorded == wanted,
-                        _ => true,
-                    }
-            })
-            .map(|record| record.image.as_str())
     }
 
     /// The exec findings that wait for the image's signature (#441): today
@@ -1531,74 +1452,12 @@ impl RuleState {
         self.ldap_burst.observe(event).into_iter().collect()
     }
 
-    /// To be called for every `AuthEvent` in the stream (issue #377, T1110):
-    /// counts failures per (target user, source) on a sliding window and
-    /// alerts once per window when the burst threshold is crossed. A success
-    /// deliberately doesn't reset the counter — a success right after a burst
-    /// is the *stronger* signal, not an all-clear. For a Windows RDP success
-    /// that signal is [`Self::rdp_success`] (T1021.001, joined from a separate
-    /// `SessionEvent`); for a local `sudo`/`su` success it is
-    /// [`Self::sudo_success`] (#381, T1548.003 for `sudo` / T1110.001 for `su`
-    /// — see `crate::sudo`'s module doc) below, joined from this same
-    /// `AuthEvent` stream. A local `sudo`/`su` failure also counts into the burst
-    /// counter below (key: target account, source `"local"`, `sudo` and `su` sharing
-    /// one key), so five wrong passwords in the window raise T1110 by themselves,
-    /// before and independently of any success (#838).
-    ///
-    /// A **successful** [`AuthKind::Logon`] also goes through FIRST-SEEN-LOGON
-    /// ([`Self::check_first_seen_logon`], T1078); it is the one rule on `main` that fires
-    /// on a successful logon.
+    /// To be called for every `AuthEvent` in the stream: FIRST-SEEN-LOGON and ODD-HOUR-LOGON
+    /// (T1078) on a successful logon, the failure burst (T1110), and the RDP (T1021.001) and
+    /// `sudo`/`su` (T1548.003 / T1110.001) failure-then-success joins; see
+    /// [`AuthState::on_auth`].
     pub fn on_auth(&mut self, event: &AuthEvent) -> Vec<Alert> {
-        let mut alerts: Vec<Alert> = self.check_first_seen_logon(event).into_iter().collect();
-        alerts.extend(self.check_odd_hour_logon(event));
-        alerts.extend(self.on_auth_failures_and_escalations(event));
-        alerts
-    }
-
-    /// FIRST-SEEN-LOGON (T1078, <https://github.com/synthaea-lab/agent/issues/17>) — a successful logon ([`AuthKind::Logon`], never a
-    /// failure, never `su`/`sudo`'s [`AuthKind::ExplicitCredentials`] or
-    /// [`AuthKind::PrivilegedSession`]) of an account that did not log on to this host during
-    /// the first [`LOGON_LEARNING_NS`](crate::exclusions::LOGON_LEARNING_NS) after the first
-    /// one the state saw. One alert per account: it is in the baseline afterwards. Low: a new
-    /// colleague, a new service account and a reinstalled host look the same, and nothing
-    /// here separates them.
-    ///
-    /// **This makes the control plane's identity join live** (`server/lib/fleet-case.ts`,
-    /// #62, #940): the join reads the event a detection stores, and until this rule no rule
-    /// on `main` fired on a successful logon. The limits of that join are this rule's: the
-    /// generic accounts are excluded (see `crate::logon`), `vagrant` deliberately is not,
-    /// and a `LogonFailure` never counts because its user name is chosen by whoever tries
-    /// it.
-    ///
-    /// The baseline is **in memory**: an agent restart, an update included, begins a new
-    /// learning window, and an account that logs on during the window is learned without an
-    /// alert, an intruder's included. Expected false positives: a domain controller or file
-    /// server, which sees every user's first logon; a new hire; a service account first
-    /// used after an install. Odd hours are [`Self::check_odd_hour_logon`], which needs the
-    /// host's UTC offset: the event carries a UTC timestamp and nothing else knows the local time.
-    fn check_first_seen_logon(&mut self, event: &AuthEvent) -> Option<Alert> {
-        if event.outcome != AuthOutcome::Success || event.kind != AuthKind::Logon {
-            return None;
-        }
-        match self.logon_baseline.observe(
-            &event.target_user,
-            event.target_user_sid.as_deref(),
-            event.meta.timestamp_ns,
-        ) {
-            Observation::FirstSeen => {}
-            Observation::Quiet | Observation::Known => return None,
-        }
-        let source = event
-            .source_address
-            .map_or_else(String::new, |address| format!(" from {address}"));
-        Some(Alert {
-            technique: "T1078",
-            severity: Severity::Low,
-            message: format!(
-                "first successful logon of account {}{source} on this host since the baseline began",
-                event.target_user,
-            ),
-        })
+        self.auth.on_auth(event)
     }
 
     /// Tells the rules the host's local time as minutes east of UTC (`120` for UTC+2,
@@ -1607,7 +1466,7 @@ impl RuleState {
     /// platform zone ([`Self::set_local_zone`]): a host that changes its offset with daylight
     /// saving is an hour out for half the year under this one.
     pub fn set_local_utc_offset_minutes(&mut self, minutes: i32) -> bool {
-        self.odd_hours.set_offset_minutes(minutes)
+        self.auth.odd_hours.set_offset_minutes(minutes)
     }
 
     /// Declares the local hours `[start, end)` in which a logon is ordinary for ODD-HOUR-LOGON
@@ -1615,7 +1474,7 @@ impl RuleState {
     /// keeps what it had, unless `start` is 0 to 23, `end` 1 to 24 and they differ. The default is
     /// [`WORK_HOURS_LOCAL`](crate::exclusions::WORK_HOURS_LOCAL).
     pub fn set_work_hours(&mut self, start: u32, end: u32) -> bool {
-        self.odd_hours.set_work_hours(start, end)
+        self.auth.odd_hours.set_work_hours(start, end)
     }
 
     /// Declares the accounts whose odd-hour logons are expected (<https://github.com/synthaea-lab/agent/issues/64>): on-call staff, a
@@ -1624,7 +1483,7 @@ impl RuleState {
     /// kept, a blank, over-long or malformed one is dropped, and the number kept is returned.
     /// Replaces the previous list; empty by default, so nothing is exempt until the operator says so.
     pub fn set_odd_hour_exempt_accounts(&mut self, accounts: &[String]) -> usize {
-        self.odd_hours.set_exempt_accounts(accounts)
+        self.auth.odd_hours.set_exempt_accounts(accounts)
     }
 
     /// Odd-hour logons the exempt list has suppressed since the agent started (<https://github.com/synthaea-lab/agent/issues/64>); read by the
@@ -1632,7 +1491,7 @@ impl RuleState {
     #[cfg(test)]
     #[must_use]
     pub(crate) fn odd_hour_exempt_skips(&self) -> u64 {
-        self.odd_hours.exempt_skips()
+        self.auth.odd_hours.exempt_skips()
     }
 
     /// Gives the rules the host's platform time zone (<https://github.com/synthaea-lab/agent/issues/15>): `zone` maps an instant (seconds
@@ -1641,130 +1500,7 @@ impl RuleState {
     /// on. A fixed offset from [`Self::set_local_utc_offset_minutes`] overrides it whichever is
     /// set first. False, and the rule keeps what it had, when `zone` has no answer for `now_secs`.
     pub fn set_local_zone(&mut self, zone: crate::LocalOffsetAt, now_secs: i64) -> bool {
-        self.odd_hours.set_zone(zone, now_secs)
-    }
-
-    /// ODD-HOUR-LOGON (T1078, <https://github.com/synthaea-lab/agent/issues/17>): a successful [`AuthKind::Logon`] of a non-generic
-    /// account whose host-local hour is outside the working hours: [`WORK_HOURS_LOCAL`](crate::exclusions::WORK_HOURS_LOCAL)
-    /// unless the operator declared another window ([`Self::set_work_hours`]).
-    /// Low, once per account per [`ODD_HOUR_QUIET_NS`](crate::exclusions::ODD_HOUR_QUIET_NS).
-    /// Same event gate and generic-account list as FIRST-SEEN-LOGON, so the two share the
-    /// identity join's limits; they are independent and a first logon at night raises both.
-    ///
-    /// **Off until the host's local time is known**: the platform's zone (the agent asks it at
-    /// startup, [`Self::set_local_zone`]) or the operator's fixed UTC offset (`[detection]` in
-    /// `agent.toml`, which overrides the zone). The event's timestamp is UTC and nothing else
-    /// in the agent knows the local time.
-    /// Expected false positives: on-call staff, night shifts, a host in use around the clock,
-    /// and on Windows the service and batch logons (4624) of a named account; the operator
-    /// answers them with a declared window ([`Self::set_work_hours`]) and an exempt list
-    /// ([`Self::set_odd_hour_exempt_accounts`]).
-    fn check_odd_hour_logon(&mut self, event: &AuthEvent) -> Option<Alert> {
-        if event.outcome != AuthOutcome::Success || event.kind != AuthKind::Logon {
-            return None;
-        }
-        let hour = self.odd_hours.observe(
-            &event.target_user,
-            event.target_user_sid.as_deref(),
-            event.meta.timestamp_ns,
-        )?;
-        let source = event
-            .source_address
-            .map_or_else(String::new, |address| format!(" from {address}"));
-        Some(Alert {
-            technique: "T1078",
-            severity: Severity::Low,
-            message: format!(
-                "successful logon of account {}{source} at {hour:02}:00 host-local time, outside the working hours",
-                event.target_user,
-            ),
-        })
-    }
-
-    /// The failure-burst and `sudo`/`su` joins of [`Self::on_auth`].
-    fn on_auth_failures_and_escalations(&mut self, event: &AuthEvent) -> Vec<Alert> {
-        let ts = event.meta.timestamp_ns;
-        if event.outcome == AuthOutcome::Success {
-            // Only a local (Unix) privilege-escalation success joins the sudo/su
-            // burst history — a Windows logon success is [`Self::rdp_success`]'s
-            // job, fed from the Terminal Services session event instead, not
-            // this one (see that field's doc). `PrivilegedSession`/
-            // `ExplicitCredentials` are only ever produced for `sudo`/`su`
-            // (`auth::to_auth_event`), so `event.meta.comm` is already one of
-            // the two here; the explicit match is defense in depth, not a new
-            // restriction. `sudo` joins on the trusted uid, not a name, and
-            // `su` still joins on the target `AuthEvent::target_user` names —
-            // see `crate::sudo`'s module doc for why they differ (review of
-            // #838, Sollykhan 2026-10-19, point 1).
-            let User::Unix { uid, .. } = event.meta.user else {
-                return Vec::new();
-            };
-            return if matches!(
-                event.kind,
-                AuthKind::PrivilegedSession | AuthKind::ExplicitCredentials
-            ) {
-                match event.meta.comm.as_str() {
-                    "sudo" => self.sudo_success.on_sudo_success(uid, ts),
-                    "su" => self.sudo_success.on_su_success(&event.target_user, ts),
-                    _ => Vec::new(),
-                }
-            } else {
-                Vec::new()
-            };
-        }
-        // "local" for console/service logons that legitimately carry no
-        // source address (see `AuthEvent::source_address`'s doc) — a distinct
-        // key, never a fabricated loopback.
-        let source = event
-            .source_address
-            .map_or_else(|| "local".to_string(), |a| a.to_string());
-        let key = (event.target_user.clone(), source.clone());
-        // A success can reach the rules before the last failures that precede
-        // it (two channels, two poll threads, for RDP's own join): this failure
-        // may complete it. Only failures from the Windows Security log feed that
-        // join: they carry a Windows identity and are stamped with the event's
-        // own time, like the 1149. Application-log failures (`[logs]` sources)
-        // are stamped when the line is read, so a restart replaying a backlog
-        // would make hours-old failures look current: other clock, not joined.
-        let mut alerts: Vec<Alert> = event
-            .source_address
-            .filter(|_| matches!(event.meta.user, User::Windows { .. }))
-            .map(|address| self.rdp_success.on_failure(address, ts))
-            .unwrap_or_default();
-        // The sudo/su join has no such cross-channel concern (one journal
-        // stream feeds both sides of it), but still joins by event time, not
-        // arrival order — see the `sudo` module's doc. Gated on `comm`, not
-        // just `User::Unix`: an sshd failure (`LogonFailure` from `SshFailed`)
-        // is also a Unix identity, and must never reach this join at all —
-        // unchanged by the point below. What changed (review of #838,
-        // Sollykhan 2026-10-19, point 1): once an event *does* pass this
-        // gate, `sudo`'s own side of the join now keys on the trusted uid
-        // below, not on anything parsed from the message; `su`'s still keys
-        // on the target name, which has its own, narrower residual exposure
-        // — see `crate::sudo`'s doc for why the two differ.
-        if let User::Unix { uid, .. } = event.meta.user {
-            match event.meta.comm.as_str() {
-                "sudo" => alerts.extend(self.sudo_success.on_sudo_failure(uid, ts)),
-                "su" => alerts.extend(self.sudo_success.on_su_failure(&event.target_user, ts)),
-                _ => {}
-            }
-        }
-        let entry = self
-            .auth_failures
-            .get_or_insert_with(key, SlidingCounter::default);
-        let count = entry.record(ts, AUTH_FAILURE_WINDOW_NS);
-        if count >= AUTH_FAILURE_THRESHOLD && entry.try_alert(ts, AUTH_FAILURE_WINDOW_NS) {
-            alerts.push(Alert {
-                technique: "T1110",
-                severity: Severity::Medium,
-                message: format!(
-                    "target={} source={source}: {count} failed authentications in {}s —                      brute-force/spray burst",
-                    event.target_user,
-                    AUTH_FAILURE_WINDOW_NS / 1_000_000_000,
-                ),
-            });
-        }
-        alerts
+        self.auth.odd_hours.set_zone(zone, now_secs)
     }
 
     /// To be called for every `SessionEvent` in the stream (Windows Terminal
@@ -1772,19 +1508,7 @@ impl RuleState {
     /// client, T1563.002 (see the `session` module), or a successful RDP listener
     /// authentication after failures from that source, T1021.001.
     pub fn on_session(&mut self, event: &SessionEvent) -> Vec<Alert> {
-        let mut alerts: Vec<Alert> = self.session_hijack.on_session(event).into_iter().collect();
-
-        if event.state != SessionState::Connect || event.console {
-            return alerts;
-        }
-        if let Some(address) = event.source_address {
-            alerts.extend(self.rdp_success.on_success(
-                address,
-                event.meta.timestamp_ns,
-                &event.target_user,
-            ));
-        }
-        alerts
+        self.auth.on_session(event)
     }
 
     /// To be called for every `IdentityChangeEvent` in the stream (Linux, issue #266):
@@ -1799,14 +1523,7 @@ impl RuleState {
         &mut self,
         event: &schema::IdentityChangeEvent,
     ) -> Vec<(schema::IdentityChangeEvent, Alert)> {
-        self.identity_clock_ns = self.identity_clock_ns.max(event.meta.timestamp_ns);
-        if crate::privesc::requests_root_as_non_root(event) {
-            if self.pending_identity.len() >= crate::privesc::IDENTITY_PENDING_CAP {
-                self.pending_identity.pop_front();
-            }
-            self.pending_identity.push_back(event.clone());
-        }
-        self.take_due_identity_alerts()
+        self.identity.on_identity_change(event)
     }
 
     /// UNEXPLAINED-UNIT-STOP (T1562.001, #1085), see [`crate::unitstop`]: the security-unit stops
@@ -1820,46 +1537,7 @@ impl RuleState {
 
     /// The queued identity requests whose wait is over, judged: see [`Self::on_identity_change`].
     pub fn take_due_identity_alerts(&mut self) -> Vec<(schema::IdentityChangeEvent, Alert)> {
-        let mut due = Vec::new();
-        while let Some(front) = self.pending_identity.front() {
-            if front
-                .meta
-                .timestamp_ns
-                .saturating_add(crate::privesc::IDENTITY_DEFER_NS)
-                > self.identity_clock_ns
-            {
-                break;
-            }
-            let Some(event) = self.pending_identity.pop_front() else {
-                break;
-            };
-            if let Some(alert) = self.judge_identity_request(&event) {
-                due.push((event, alert));
-            }
-        }
-        due
-    }
-
-    fn judge_identity_request(&mut self, event: &schema::IdentityChangeEvent) -> Option<Alert> {
-        let meta = &event.meta;
-        let at = meta.timestamp_ns;
-        let image = self
-            .image_as_of(meta.pid, meta.process_generation, at)
-            .or_else(|| self.image_as_of(meta.ppid, meta.parent_process_generation, at))?
-            .to_owned();
-        if image.is_empty() || crate::privesc::is_known_setuid_root_program(&image) {
-            return None;
-        }
-        if self
-            .setuid_root_alerted
-            .peek(&meta.pid)
-            .is_some_and(|recorded| *recorded == meta.process_generation)
-        {
-            return None;
-        }
-        self.setuid_root_alerted
-            .insert(meta.pid, meta.process_generation);
-        Some(crate::privesc::alert(event, &image))
+        self.identity.take_due()
     }
 
     /// To be called for every `MemfdCreateEvent` in the stream (Linux, issue

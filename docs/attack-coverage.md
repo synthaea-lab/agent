@@ -9,7 +9,7 @@ Generated from ATT&CK technique identifiers tagged in source (`crates/rules`, `c
 
 | Technique | Layer(s) | Source(s) |
 | --- | --- | --- |
-| T1078 | 3 | `rules:crates/rules/src/state.rs` |
+| T1078 | 3 | `rules:crates/rules/src/auth_state.rs` |
 | T1189 | 3 | `sigma:rules/sigma/linux/browser_spawned_shell.yml`, `sigma:rules/sigma/windows/browser_spawned_interpreter.yml` |
 | T1190 | 3 | `rules:crates/rules/src/stateless.rs`, `sigma:rules/sigma/macos/web_server_spawned_shell.yml`, `sigma:rules/sigma/windows/iis_worker_spawned_interpreter.yml`, `sigma:rules/sigma/windows/web_server_spawned_interpreter.yml` |
 | T1566.001 | 3 | `rules:crates/rules/src/state.rs` |
@@ -81,7 +81,7 @@ Generated from ATT&CK technique identifiers tagged in source (`crates/rules`, `c
 | T1003.004 | 3 | `sigma:rules/sigma/windows/registry_credential_hive_save.yml` |
 | T1003.008 | 3 | `rules:crates/rules/src/credfiles.rs`, `sigma:rules/sigma/linux/shadow_file_copy.yml`, `sigma:rules/sigma/linux/unshadow_live_password_databases.yml` |
 | T1056.002 | 3 | `rules:crates/rules/src/osascript.rs` |
-| T1110 | 3 | `rules:crates/rules/src/state.rs` |
+| T1110 | 3 | `rules:crates/rules/src/auth_state.rs` |
 | T1552 | 3 | `rules:crates/rules/src/ldap.rs` |
 | T1552.001 | 3 | `rules:crates/rules/src/credfiles.rs` |
 | T1552.004 | 3 | `rules:crates/rules/src/credfiles.rs` |

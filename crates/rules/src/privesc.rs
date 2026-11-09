@@ -48,9 +48,12 @@
 //! event; a queue overflow drops the oldest request; requests still queued at shutdown are not
 //! judged.
 
-use schema::{IdentityChangeEvent, IdentityChangeKind, User, detection::Severity};
+use std::collections::VecDeque;
 
-use crate::Alert;
+use schema::{ExecEvent, IdentityChangeEvent, IdentityChangeKind, User, detection::Severity};
+use store::BoundedMap;
+
+use crate::{Alert, state::PID_COMM_CAP};
 
 /// How long past a request the stream clock must be before it is judged, so the exec of its
 /// process has had time to arrive (5 s). Provisional: the exec latency under load was not
@@ -121,5 +124,128 @@ pub(crate) fn alert(event: &IdentityChangeEvent, image: &str) -> Alert {
             event.effective,
             event.saved,
         ),
+    }
+}
+
+/// One exec of a pid, for the as-of-time image lookup of SETUID-ROOT-REQUEST (#1041).
+struct ExecRecord {
+    timestamp_ns: u64,
+    generation: Option<u64>,
+    image: String,
+}
+
+/// The deferred SETUID-ROOT-REQUEST judgement: the queued requests, the stream clock that
+/// releases them, and the exec history their image is read from.
+pub(crate) struct IdentityRequests {
+    /// pid → generation of the process that already raised SETUID-ROOT-REQUEST (T1548.001,
+    /// #1041): one alert per process, since a `PoC` calls `setuid`, `setresuid`, ... in a row.
+    /// LRU-bounded like `RuleState`'s pid tables.
+    setuid_root_alerted: BoundedMap<u32, Option<u64>>,
+    /// pid → its latest execs (image, time, incarnation): SETUID-ROOT-REQUEST reads the image
+    /// a pid had *as of* an event's time, which `RuleState`'s `pid_image_path` (latest only)
+    /// cannot give.
+    exec_history: BoundedMap<u32, Vec<ExecRecord>>,
+    /// Identity requests for uid 0 waiting for their process's exec to arrive (#1041).
+    pending_identity: VecDeque<IdentityChangeEvent>,
+    /// The latest timestamp of any identity or exec event seen: the stream's clock.
+    identity_clock_ns: u64,
+}
+
+impl IdentityRequests {
+    pub(crate) fn new() -> Self {
+        Self {
+            setuid_root_alerted: BoundedMap::new(PID_COMM_CAP),
+            exec_history: BoundedMap::new(PID_COMM_CAP),
+            pending_identity: VecDeque::new(),
+            identity_clock_ns: 0,
+        }
+    }
+
+    /// Remembers this exec for [`Self::on_identity_change`], and moves the stream clock.
+    pub(crate) fn record_exec(&mut self, event: &ExecEvent) {
+        self.identity_clock_ns = self.identity_clock_ns.max(event.meta.timestamp_ns);
+        let history = self
+            .exec_history
+            .get_or_insert_with(event.meta.pid, Vec::new);
+        if history.len() >= EXEC_HISTORY_PER_PID {
+            history.remove(0);
+        }
+        history.push(ExecRecord {
+            timestamp_ns: event.meta.timestamp_ns,
+            generation: event.meta.process_generation,
+            image: event.image_path.clone(),
+        });
+    }
+
+    /// The image `pid` (incarnation `generation`) had at `at_ns`: its latest exec at or before
+    /// that time. An exec of another incarnation of the pid does not count.
+    fn image_as_of(&self, pid: u32, generation: Option<u64>, at_ns: u64) -> Option<&str> {
+        self.exec_history
+            .peek(&pid)?
+            .iter()
+            .rev()
+            .find(|record| {
+                record.timestamp_ns <= at_ns
+                    && match (record.generation, generation) {
+                        (Some(recorded), Some(wanted)) => recorded == wanted,
+                        _ => true,
+                    }
+            })
+            .map(|record| record.image.as_str())
+    }
+
+    /// Queues `event` when it asks for uid 0, moves the stream clock, and returns the requests
+    /// now due: see [`crate::RuleState::on_identity_change`].
+    pub(crate) fn on_identity_change(
+        &mut self,
+        event: &IdentityChangeEvent,
+    ) -> Vec<(IdentityChangeEvent, Alert)> {
+        self.identity_clock_ns = self.identity_clock_ns.max(event.meta.timestamp_ns);
+        if requests_root_as_non_root(event) {
+            if self.pending_identity.len() >= IDENTITY_PENDING_CAP {
+                self.pending_identity.pop_front();
+            }
+            self.pending_identity.push_back(event.clone());
+        }
+        self.take_due()
+    }
+
+    /// The queued identity requests whose wait is over, judged: see [`Self::on_identity_change`].
+    pub(crate) fn take_due(&mut self) -> Vec<(IdentityChangeEvent, Alert)> {
+        let mut due = Vec::new();
+        while let Some(front) = self.pending_identity.front() {
+            if front.meta.timestamp_ns.saturating_add(IDENTITY_DEFER_NS) > self.identity_clock_ns {
+                break;
+            }
+            let Some(event) = self.pending_identity.pop_front() else {
+                break;
+            };
+            if let Some(alert) = self.judge(&event) {
+                due.push((event, alert));
+            }
+        }
+        due
+    }
+
+    fn judge(&mut self, event: &IdentityChangeEvent) -> Option<Alert> {
+        let meta = &event.meta;
+        let at = meta.timestamp_ns;
+        let image = self
+            .image_as_of(meta.pid, meta.process_generation, at)
+            .or_else(|| self.image_as_of(meta.ppid, meta.parent_process_generation, at))?
+            .to_owned();
+        if image.is_empty() || is_known_setuid_root_program(&image) {
+            return None;
+        }
+        if self
+            .setuid_root_alerted
+            .peek(&meta.pid)
+            .is_some_and(|recorded| *recorded == meta.process_generation)
+        {
+            return None;
+        }
+        self.setuid_root_alerted
+            .insert(meta.pid, meta.process_generation);
+        Some(alert(event, &image))
     }
 }
