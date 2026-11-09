@@ -15,6 +15,7 @@ mod auth_state;
 mod credfiles;
 mod defender;
 mod download_state;
+mod drift_state;
 mod egressdomain;
 mod exclusions;
 mod failure_join;

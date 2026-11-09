@@ -119,7 +119,7 @@ Generated from ATT&CK technique identifiers tagged in source (`crates/rules`, `c
 | T1071 | 3, 6 | `correlator:crates/correlator/src/rules.rs`, `rules:crates/rules/src/network_state.rs`, `rules:crates/rules/src/stateless.rs`, `sigma:rules/sigma/linux/reverse_shell.yml` |
 | T1071.004 | 3, 6 | `correlator:crates/correlator/src/rules.rs`, `rules:crates/rules/src/stateless.rs` |
 | T1105 | 1, 3, 6 | `correlator:crates/correlator/src/rules.rs`, `rules:crates/rules/src/amsi.rs`, `rules:crates/rules/src/download_state.rs`, `yara:rules/yara/lab/synthaea_lab_payload.yar` |
-| T1571 | 3 | `rules:crates/rules/src/state.rs` |
+| T1571 | 3 | `rules:crates/rules/src/drift_state.rs` |
 
 ## Exfiltration
 
@@ -163,7 +163,7 @@ Generated from ATT&CK technique identifiers tagged in source (`crates/rules`, `c
 | T1558.004 | 3 | `rules:crates/rules/src/ldap.rs` |
 | T1560 | 3 | `rules:crates/rules/src/network_state.rs` |
 | T1560.001 | 3 | `sigma:rules/sigma/linux/passworded_home_archive.yml`, `sigma:rules/sigma/windows/passworded_user_data_archive.yml` |
-| T1562 | 3 | `rules:crates/rules/src/state.rs` |
+| T1562 | 3 | `rules:crates/rules/src/drift_state.rs` |
 | T1562.002 | 3 | `rules:crates/rules/src/stateless.rs` |
 | T1564.004 | 3 | `rules:crates/rules/src/stateless.rs` |
 
