@@ -109,19 +109,19 @@ what comes next in [docs/roadmap.md](docs/roadmap.md).
 | --- | --- |
 | `crates/` | The agent's Rust modules — full table in [crates/README.md](crates/README.md) |
 | `crates/sensors/` | Platform sensors by mechanism — [coverage matrices](crates/sensors/README.md) |
-| `agent/` · `watchdog/` · `cli/` | The agent binaries |
-| `ui/` | Endpoint tray/notifications (unprivileged ipc client) |
+| `apps/agent/` · `apps/watchdog/` · `apps/cli/` | The agent binaries |
 | `packaging/` | MSI · notarized pkg · deb/rpm/apk + service integration |
-| `toolchain/` | Build-machine toolchain scripts (eBPF, ONNX Runtime) |
+| `packaging/toolchain/` | Build-machine toolchain scripts (eBPF, ONNX Runtime) |
 | `docs/` | [Technical documentation](docs/README.md), capabilities, roadmap, generated [ATT&CK coverage matrix](docs/attack-coverage.md) |
-| `tools/` | check-deps and developer tooling |
+| `tests/fuzz/` | Coverage-guided parser fuzzing (cargo-fuzz, workspace-excluded) |
+| `tools/` | check-deps and developer tooling; `tools/release/` is the offline release signer |
 
 ## Building
 
 `cargo check` / `cargo test` build the default members on any OS (toolchain pinned).
 CI enforces fmt, dependency direction, cargo-deny, clippy `-D warnings`, and tests on
 Linux/Windows/macOS, plus the detection-content suites. The eBPF probes build on a
-Linux build machine provisioned with `toolchain/linux-toolchain.sh` (or the Alpine/Arch
+Linux build machine provisioned with `packaging/toolchain/linux-toolchain.sh` (or the Alpine/Arch
 variants).
 
 ### Sibling checkouts

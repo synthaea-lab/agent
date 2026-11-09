@@ -19,33 +19,33 @@ dynamic-onnx = ["ml/dynamic-onnx"]
 test-key = ["updater/test-key"]
 
 [dependencies]
-schema = { path = "../crates/schema" }
-redact = { path = "../crates/redact" }
-config = { path = "../crates/config" }
-policy = { path = "../crates/policy" }
-rules = { path = "../crates/rules" }
-correlator = { path = "../crates/correlator" }
-verdict = { path = "../crates/verdict" }
-ml = { path = "../crates/ml", default-features = false }
-sigma = { path = "../crates/sigma" }
-enrich = { path = "../crates/enrich" }
-intel = { path = "../crates/intel" }
-yara = { path = "../crates/yara" }
-deception = { path = "../crates/deception" }
-sinks = { path = "../crates/sinks" }
-tamper = { path = "../crates/tamper" }
-inventory = { path = "../crates/inventory" }
-response = { path = "../crates/response" }
-store = { path = "../crates/store" }
-transport = { path = "../crates/transport" }
+schema = { path = "../../crates/schema" }
+redact = { path = "../../crates/redact" }
+config = { path = "../../crates/config" }
+policy = { path = "../../crates/policy" }
+rules = { path = "../../crates/rules" }
+correlator = { path = "../../crates/correlator" }
+verdict = { path = "../../crates/verdict" }
+ml = { path = "../../crates/ml", default-features = false }
+sigma = { path = "../../crates/sigma" }
+enrich = { path = "../../crates/enrich" }
+intel = { path = "../../crates/intel" }
+yara = { path = "../../crates/yara" }
+deception = { path = "../../crates/deception" }
+sinks = { path = "../../crates/sinks" }
+tamper = { path = "../../crates/tamper" }
+inventory = { path = "../../crates/inventory" }
+response = { path = "../../crates/response" }
+store = { path = "../../crates/store" }
+transport = { path = "../../crates/transport" }
 # Content-manifest fetch/verify (ADR-0016, issue #30/#73): cross-platform, unlike
 # `updater::layout`'s Linux-only bootstrap/current/versions binary-update layout —
 # content distribution has no such constraint, so this sits in the main
 # dependency block, not the Linux-only one.
-updater = { path = "../crates/updater", default-features = false }
+updater = { path = "../../crates/updater", default-features = false }
 # Local control channel served to `cli` (issue #388). The agent is otherwise
 # thread-based: tokio only runs the IPC server, on its own dedicated thread.
-ipc = { path = "../crates/ipc" }
+ipc = { path = "../../crates/ipc" }
 tokio = { workspace = true }
 
 anyhow = "1"
@@ -65,34 +65,34 @@ libc = "0.2"
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_Time"] }
-sensor-windows = { path = "../crates/sensors/windows/etw" }
-sensor-windows-eventlog = { path = "../crates/sensors/windows/eventlog" }
-sensor-windows-minifilter = { path = "../crates/sensors/windows/minifilter" }
-sensor-windows-sockets = { path = "../crates/sensors/windows/sockets" }
+sensor-windows = { path = "../../crates/sensors/windows/etw" }
+sensor-windows-eventlog = { path = "../../crates/sensors/windows/eventlog" }
+sensor-windows-minifilter = { path = "../../crates/sensors/windows/minifilter" }
+sensor-windows-sockets = { path = "../../crates/sensors/windows/sockets" }
 ctrlc = "3"
 
 [target.'cfg(target_os = "macos")'.dependencies]
-sensor-macos = { path = "../crates/sensors/macos/endpoint-security" }
-sensor-macos-unifiedlog = { path = "../crates/sensors/macos/unifiedlog" }
-sensor-macos-network-extension = { path = "../crates/sensors/macos/network-extension" }
-sensor-macos-sockets = { path = "../crates/sensors/macos/sockets" }
+sensor-macos = { path = "../../crates/sensors/macos/endpoint-security" }
+sensor-macos-unifiedlog = { path = "../../crates/sensors/macos/unifiedlog" }
+sensor-macos-network-extension = { path = "../../crates/sensors/macos/network-extension" }
+sensor-macos-sockets = { path = "../../crates/sensors/macos/sockets" }
 ctrlc = "3"
 
 [target.'cfg(target_os = "linux")'.dependencies]
-sensor-linux = { path = "../crates/sensors/linux/userspace" }
-sensor-linux-audit = { path = "../crates/sensors/linux/audit" }
-sensor-linux-netlink = { path = "../crates/sensors/linux/netlink" }
-sensor-linux-journal = { path = "../crates/sensors/linux/journal" }
-sensor-linux-logs = { path = "../crates/sensors/linux/logs" }
-sensor-linux-procmem = { path = "../crates/sensors/linux/procmem" }
+sensor-linux = { path = "../../crates/sensors/linux/userspace" }
+sensor-linux-audit = { path = "../../crates/sensors/linux/audit" }
+sensor-linux-netlink = { path = "../../crates/sensors/linux/netlink" }
+sensor-linux-journal = { path = "../../crates/sensors/linux/journal" }
+sensor-linux-logs = { path = "../../crates/sensors/linux/logs" }
+sensor-linux-procmem = { path = "../../crates/sensors/linux/procmem" }
 # `is_filtered_path`: the canary placement check uses the sensor's own filter, so the two
 # cannot drift apart (#81).
-sensor-linux-wire = { path = "../crates/sensors/linux/wire" }
-sensor-linux-uprobes = { path = "../crates/sensors/linux/uprobes" }
+sensor-linux-wire = { path = "../../crates/sensors/linux/wire" }
+sensor-linux-uprobes = { path = "../../crates/sensors/linux/uprobes" }
 # Observation-only file_open hook (issue #91/#313): cmd_run attaches it
 # best-effort alongside the primary sensor. Inline blocking (-EPERM on a
 # verdict) still needs the verdict model from #131/#133 first.
-sensor-linux-lsm = { path = "../crates/sensors/linux/lsm" }
+sensor-linux-lsm = { path = "../../crates/sensors/linux/lsm" }
 # Named directly in `commands::linux::attach_lsm_hooks`'s return type (the
 # `Ebpf` object that must outlive the hook) — same version sensor-linux-lsm
 # itself uses.
@@ -100,10 +100,10 @@ aya = { version = "0.16", default-features = false }
 
 [dev-dependencies]
 # Cross-repo contract fixtures (sibling checkouts of the other public repos), skipped when absent.
-siblings = { path = "../crates/siblings" }
+siblings = { path = "../../crates/siblings" }
 tempfile = "3"
 proptest = "1"
 # Tests sign manifests with the public test key.
-updater = { path = "../crates/updater", features = ["test-key"] }
+updater = { path = "../../crates/updater", features = ["test-key"] }
 ring = "0.17"
-schema = { path = "../crates/schema", features = ["test-fixtures"] }
+schema = { path = "../../crates/schema", features = ["test-fixtures"] }

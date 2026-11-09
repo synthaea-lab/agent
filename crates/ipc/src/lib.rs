@@ -1,10 +1,11 @@
 //! # ipc
 //!
 //! The local control channel the agent exposes on the endpoint, consumed
-//! by the endpoint UI (`ui/`) and the CLI. Named pipe on Windows, Unix
-//! domain socket on Linux/macOS, with peer authentication (caller
-//! identity) and a versioned, read-mostly protocol: agent status, sensor
-//! health, recent detections, policy version.
+//! by the endpoint UI (planned:
+//! <https://github.com/synthaea-lab/agent/issues/106>) and the CLI. Named
+//! pipe on Windows, Unix domain socket on Linux/macOS, with peer
+//! authentication (caller identity) and a versioned, read-mostly protocol:
+//! agent status, sensor health, recent detections, policy version.
 //!
 //! ## Layout
 //!

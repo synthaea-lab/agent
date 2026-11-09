@@ -8,7 +8,7 @@ other tools read (the alert log, the optional raw event capture). This page expl
 
 The [`ipc`](../crates/ipc/src/lib.rs) crate implements a small request/response protocol over a Unix
 domain socket (Linux, macOS) or a named pipe (Windows). The agent hosts the server
-([`ipc_handler.rs`](../agent/src/ipc_handler.rs)); [`cli`](../cli/src/main.rs) and
+([`ipc_handler.rs`](../apps/agent/src/ipc_handler.rs)); [`cli`](../apps/cli/src/main.rs) and
 `agent apply-content-manifest` are clients.
 
 | Module | Responsibility |
@@ -94,7 +94,7 @@ reconnect: clients are short-lived.
 
 ## `cli`
 
-[`cli`](../cli/src/main.rs) holds no privileges of its own; it is a pure client of the IPC channel
+[`cli`](../apps/cli/src/main.rs) holds no privileges of its own; it is a pure client of the IPC channel
 (installed on Linux as `/usr/bin/synthaea-ctl`).
 
 | Command | Does |
@@ -128,7 +128,7 @@ neutral formats; vendor SIEM connectors belong to the control plane's export, no
 
 In `agent run` the raw event log is written by the enrichment worker, after redaction, never by a
 capture thread, and is off unless requested: it grows without bound and only labs and ML calibration
-need it ([`DetectionSink::new`](../agent/src/sink/mod.rs)).
+need it ([`DetectionSink::new`](../apps/agent/src/sink/mod.rs)).
 
 Syslog/CEF and OCSF/ECS mappings are planned additions to this crate.
 

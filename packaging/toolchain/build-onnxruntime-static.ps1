@@ -7,7 +7,7 @@
 .DESCRIPTION
     This script only builds onnxruntime. Run ort-static-link-flags.ps1 next to
     turn the result into RUSTFLAGS, then build the `ml` crate with
-    `--no-default-features` (see toolchain/onnxruntime-static-build.md).
+    `--no-default-features` (see packaging/toolchain/onnxruntime-static-build.md).
 
     The build is CPU-only on purpose: no DirectML, no CUDA. The prebuilt
     archive the `dynamic-onnx` dev feature downloads links DirectML, and the
@@ -43,7 +43,7 @@ param(
 
 $ErrorActionPreference = 'Stop'
 
-$RepoRoot = Resolve-Path (Join-Path $PSScriptRoot '..')
+$RepoRoot = Resolve-Path (Join-Path $PSScriptRoot '..\..')
 $OnnxDir = Join-Path $RepoRoot 'onnxruntime'
 $OnnxVersion = 'v1.30.0'
 

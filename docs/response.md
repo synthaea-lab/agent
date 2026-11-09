@@ -22,11 +22,11 @@ These hold for every action and explain most of the code's shape:
   result, not a separate code path, and the functions never return `Err`: a caller
   audits every outcome through one path.
 - **Every outcome is audited** into the alert log (`alerts.ndjson`) as a `RESPONSE-*`
-  line, through the sink's single alert funnel ([`AlertLog`](../agent/src/alerts.rs)).
+  line, through the sink's single alert funnel ([`AlertLog`](../apps/agent/src/alerts.rs)).
 - **The library is platform-neutral.** `response` depends only on `schema` and
   `policy`. The OS call that acts (the `SIGKILL`, the firewall) is injected by the
   agent binary, which already holds the per-platform code in
-  [`commands/`](../agent/src/commands/mod.rs).
+  [`commands/`](../apps/agent/src/commands/mod.rs).
 - **Undo goes the safe direction without a policy gate.** Restoring a quarantined file
   and lifting an isolation are never gated: refusing them would turn a policy mistake
   into a host nobody can recover.
@@ -52,17 +52,17 @@ flowchart TD
     EL --> AL
 ```
 
-The hooks live in [`ResponseHooks`](../agent/src/sink/mod.rs): the policy, the injected
+The hooks live in [`ResponseHooks`](../apps/agent/src/sink/mod.rs): the policy, the injected
 `terminate` closure and the quarantine directory. They sit in an
 `Arc<Mutex<Option<_>>>` rather than a constructor argument because the YARA worker's
-callback is created inside [`DetectionSink::new`](../agent/src/sink/mod.rs), before any
+callback is created inside [`DetectionSink::new`](../apps/agent/src/sink/mod.rs), before any
 caller can configure the sink; the shared cell lets both the capture thread and that
 callback read whatever was set later.
 
-[`DetectionSink::enable_response`](../agent/src/sink/mod.rs) fills the cell. Only the
-Linux `run` command calls it ([`commands/linux.rs`](../agent/src/commands/linux.rs)),
+[`DetectionSink::enable_response`](../apps/agent/src/sink/mod.rs) fills the cell. Only the
+Linux `run` command calls it ([`commands/linux.rs`](../apps/agent/src/commands/linux.rs)),
 from the `--enable-kill` and `--enable-quarantine` flags of `agent run`
-([`main.rs`](../agent/src/main.rs)). `isolate_enabled` is always `false` there. When
+([`main.rs`](../apps/agent/src/main.rs)). `isolate_enabled` is always `false` there. When
 the cell is empty, every kill and quarantine path returns before doing or logging
 anything: on Windows and macOS the flags are accepted and ignored, and no
 `RESPONSE-KILL`/`RESPONSE-QUARANTINE` line appears at all (pinned by
@@ -72,18 +72,18 @@ anything: on Windows and macOS the flags are accepted and ignored, and no
 
 ### What can trigger a kill
 
-Exactly two triggers reach [`DetectionSink::kill_for`](../agent/src/sink/mod.rs):
+Exactly two triggers reach [`DetectionSink::kill_for`](../apps/agent/src/sink/mod.rs):
 
 1. **A `BAYES` alert raised by this event.** In
-   [`emit_correlator_alerts`](../agent/src/sink/mod.rs), after every correlator alert has
+   [`emit_correlator_alerts`](../apps/agent/src/sink/mod.rs), after every correlator alert has
    been recorded, the pid of the last alert for which
-   [`crosses_kill_gate`](../agent/src/sink/mod.rs) is true (technique `BAYES`) is passed to
-   [`maybe_kill`](../agent/src/sink/mod.rs). The audit reason is "a high-confidence
+   [`crosses_kill_gate`](../apps/agent/src/sink/mod.rs) is true (technique `BAYES`) is passed to
+   [`maybe_kill`](../apps/agent/src/sink/mod.rs). The audit reason is "a high-confidence
    correlated verdict".
-2. **The ransomware reflex.** [`RansomwareJoin`](../agent/src/ransomware_join.rs)
+2. **The ransomware reflex.** [`RansomwareJoin`](../apps/agent/src/ransomware_join.rs)
    records, per process incarnation, the last ransomware burst rule (T1486) and the
    last canary touch. When both are fresh within 60 s of each other, in either order,
-   [`ransomware_reflex`](../agent/src/sink/mod.rs) kills that pid. Neither signal kills
+   [`ransomware_reflex`](../apps/agent/src/sink/mod.rs) kills that pid. Neither signal kills
    alone: a burst alone is a backup or an archiver; a canary touch alone is an indexer
    nobody listed. The join tracks at most 256 incarnations and counts evictions; a
    touch judged only after the canary hold expired does not trigger it.
@@ -95,18 +95,18 @@ earned, and none of them widens what the agent kills. `BAYES` also carries `Crit
 but that is incidental. Pinned by `a_critical_sigma_hit_never_triggers_a_kill`,
 `a_high_severity_built_in_alert_never_triggers_a_kill` and
 `a_siblings_weak_alert_never_triggers_kill_from_anothers_bayes_crossing` in
-[`sink/tests.rs`](../agent/src/sink/tests.rs).
+[`sink/tests.rs`](../apps/agent/src/sink/tests.rs).
 
 `BAYES` is raised only from the per-event path, never from the one-second
 `advance_time` tick, so the tick passes no shield and cannot reach the gate.
 
 ### Shields: refusing by what the process is
 
-[`DetectionSink::correlate`](../agent/src/sink/mod.rs) asks the correlator for
+[`DetectionSink::correlate`](../apps/agent/src/sink/mod.rs) asks the correlator for
 [`CorrelationEngine::kill_shield`](../crates/correlator/src/engine.rs) for the event's
 pid and incarnation, before releasing the correlator lock. If a shield is set,
 `kill_for` reports [`KillOutcome::Refused`](../crates/response/src/kill.rs) with a
-fixed reason ([`shield_refusal`](../agent/src/sink/mod.rs)) and never calls the policy or
+fixed reason ([`shield_refusal`](../apps/agent/src/sink/mod.rs)) and never calls the policy or
 `terminate`:
 
 | Shield | Refusal text names |
@@ -128,7 +128,7 @@ Pinned by `a_system_service_crossing_bayes_is_refused_not_killed`,
 `an_ssh_login_session_crossing_bayes_is_refused_not_killed`,
 `a_shell_inside_an_ssh_login_crossing_bayes_is_still_killed`,
 `observe_mode_reports_a_service_as_refused_not_as_would_be_killed` and their
-neighbours in [`sink/tests.rs`](../agent/src/sink/tests.rs).
+neighbours in [`sink/tests.rs`](../apps/agent/src/sink/tests.rs).
 
 ### `kill_process`: protected pids and the policy gate
 
@@ -143,7 +143,7 @@ neighbours in [`sink/tests.rs`](../agent/src/sink/tests.rs).
 2. **Policy.** `kill_enabled == false` returns `ObserveOnly` without calling
    `terminate`.
 3. **`terminate(pid)`.** On Linux this is
-   [`terminate_process`](../agent/src/commands/linux.rs): `libc::kill(pid, SIGKILL)`.
+   [`terminate_process`](../apps/agent/src/commands/linux.rs): `libc::kill(pid, SIGKILL)`.
    `SIGKILL`, not `SIGTERM`, so a process judged compromised cannot catch the signal
    to clean up, hide or persist. An error (already exited, `EPERM`) becomes
    `Failed { error }`.
@@ -171,13 +171,13 @@ The packaged unit grants `CAP_KILL`
 The YARA file worker scans files opened with write intent (budgeted, off the capture
 thread). On a match it writes one `YARA` line per rule, fuses the match into the
 writing process's verdict, escalates if warranted, then calls
-[`quarantine_matched_payload`](../agent/src/sink/tests.rs). Any matching rule triggers it;
+[`quarantine_matched_payload`](../apps/agent/src/sink/tests.rs). Any matching rule triggers it;
 the rule's severity is not consulted. A path already under the quarantine directory is
 skipped: writing a payload there is itself a file event the sensor sees, and
 re-quarantining it would overwrite its own origin record with the wrong path.
 
 The quarantine directory is `quarantine/` next to the alert log
-([`quarantine_dir_for`](../agent/src/quarantine_cmd.rs)), the one definition both
+([`quarantine_dir_for`](../apps/agent/src/quarantine_cmd.rs)), the one definition both
 `agent run` and `agent quarantine` use. Memory-scan matches never quarantine: there is
 no file to move.
 
@@ -246,7 +246,7 @@ payload stays in place.
 ### Restore and list
 
 `agent quarantine list|restore --alerts <same path as run>`
-([`quarantine_cmd.rs`](../agent/src/quarantine_cmd.rs)):
+([`quarantine_cmd.rs`](../apps/agent/src/quarantine_cmd.rs)):
 
 - [`list_quarantined`](../crates/response/src/quarantine.rs) prints digest and
   original path, skipping (with a warning) a malformed sidecar so one bad entry cannot
@@ -263,7 +263,7 @@ payload stays in place.
 
 ## Escalation
 
-[`escalate_if_warranted`](../agent/src/sink/mod.rs) runs whenever the verdict engine
+[`escalate_if_warranted`](../apps/agent/src/sink/mod.rs) runs whenever the verdict engine
 returns a new snapshot (a first sighting, a severity raise, or a recurrence after the
 dedup window, never an absorbed duplicate) and
 [`response::should_escalate`](../crates/response/src/escalate.rs) says its fused
@@ -335,10 +335,10 @@ The Windows enforcement primitive (WFP) is tracked in
 
 | Technique | Written by | Messages |
 | --- | --- | --- |
-| `RESPONSE-KILL` | [`kill_for`](../agent/src/sink/mod.rs) | `killed pid N on <reason>`, `pid N would have been killed on <reason> (observe-only)`, `failed to kill pid N on <reason>: <error>`, `refused to kill pid N on <reason>: <why>` |
-| `RESPONSE-QUARANTINE` | [`quarantine_matched_payload`](../agent/src/sink/tests.rs) | `quarantined <path> (<sha256>) to <dir> ...`, `... would have been quarantined ... (observe-only)`, `failed to quarantine <path> ...: <error>` |
-| `RESPONSE-UNQUARANTINE` | [`cmd_quarantine_restore`](../agent/src/quarantine_cmd.rs) | restored, or failed with the error |
-| `RESPONSE-ESCALATE` | [`escalate_if_warranted`](../agent/src/sink/mod.rs) | `escalated <ppid>:<comm> at <severity> severity across N source(s): <techniques>` |
+| `RESPONSE-KILL` | [`kill_for`](../apps/agent/src/sink/mod.rs) | `killed pid N on <reason>`, `pid N would have been killed on <reason> (observe-only)`, `failed to kill pid N on <reason>: <error>`, `refused to kill pid N on <reason>: <why>` |
+| `RESPONSE-QUARANTINE` | [`quarantine_matched_payload`](../apps/agent/src/sink/tests.rs) | `quarantined <path> (<sha256>) to <dir> ...`, `... would have been quarantined ... (observe-only)`, `failed to quarantine <path> ...: <error>` |
+| `RESPONSE-UNQUARANTINE` | [`cmd_quarantine_restore`](../apps/agent/src/quarantine_cmd.rs) | restored, or failed with the error |
+| `RESPONSE-ESCALATE` | [`escalate_if_warranted`](../apps/agent/src/sink/mod.rs) | `escalated <ppid>:<comm> at <severity> severity across N source(s): <techniques>` |
 
 `<reason>` is `a high-confidence correlated verdict` or
 `a corroborated ransomware signal (burst rule + canary touch)`.
@@ -375,5 +375,5 @@ event capture.
   (`a_burst_then_a_canary_touch_by_the_same_process_kills_it`,
   `a_burst_and_a_canary_touch_from_two_processes_kill_neither`),
   `a_beacon_with_a_dropped_payload_is_killed_and_quarantined_and_both_are_audited` and
-  the escalation tests, all in [`sink/tests.rs`](../agent/src/sink/tests.rs).
-- Restore command: tests in [`quarantine_cmd.rs`](../agent/src/quarantine_cmd.rs).
+  the escalation tests, all in [`sink/tests.rs`](../apps/agent/src/sink/tests.rs).
+- Restore command: tests in [`quarantine_cmd.rs`](../apps/agent/src/quarantine_cmd.rs).

@@ -1,6 +1,6 @@
 # Workspace member but NOT a default member: targets bpfel-unknown-none
 # and is compiled by the userspace crate's build.rs via aya-build (nightly rustc +
-# bpf-linker required — toolchain/linux-toolchain.sh installs them).
+# bpf-linker required — packaging/toolchain/linux-toolchain.sh installs them).
 [package]
 name = "sensor-linux-ebpf"
 version = "0.1.0"

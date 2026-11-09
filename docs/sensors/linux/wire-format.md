@@ -109,7 +109,7 @@ fixed part plus the announced lengths is `Truncated`. A refused record is droppe
 the drain (`EXEC_RECORDS_REFUSED`, the first and every thousandth logged), never read past its end.
 The parser has a deterministic test suite in
 [`tests/exec_record.rs`](../../../crates/sensors/linux/wire/tests/exec_record.rs) and a fuzz target,
-[`exec_record_parse`](../../../fuzz/fuzz_targets/exec_record_parse.rs).
+[`exec_record_parse`](../../../tests/fuzz/fuzz_targets/exec_record_parse.rs).
 
 How the windows become `argv` tokens is in [process context](process-context.md#argv).
 

@@ -16,7 +16,7 @@ synthaea-lab/agent), `server/` (synthaea-lab/server), `ml/` (synthaea-lab/ml),
 `rules/` (synthaea-lab/rules), and `scenarios/` (synthaea-lab/scenarios, the attack
 scenarios).
 This repo must never depend on anything outside those public repos. The ONNX Runtime
-and build-machine toolchain scripts live here under `toolchain/`.
+and build-machine toolchain scripts live here under `packaging/toolchain/`.
 
 - Cross-repo contract tests (golden fixtures in `server/tests/fixtures` and
   `ml/tests/fixtures`, the shipped content in `rules/`, the server's routes) read the
@@ -45,7 +45,7 @@ and build-machine toolchain scripts live here under `toolchain/`.
   depend on the base tier, each other, and `store` — **never on a sensor**.
 - Leaf crates (`response`, `transport`, `ipc`, `sinks`, `updater`, `config`, `store`,
   `conformance`) depend only on the base tier.
-- Only the binaries (`agent/`, `watchdog/`, `cli/`, and the offline `release-tool/`) may depend on everything.
+- Only the binaries (`apps/agent/`, `apps/watchdog/`, `apps/cli/`, and the offline `tools/release/`) may depend on everything.
 
 New crate? Add it to the rules in `tools/check-deps.py` in the same change.
 
@@ -113,7 +113,7 @@ New crate? Add it to the rules in `tools/check-deps.py` in the same change.
   is the one deliberate exception.
 - Byte parsers (anything consuming kernel-socket or attacker-influenced bytes) get
   a never-panic robustness suite in their crate's `tests/` and, where high-value, a
-  fuzz target in `fuzz/`.
+  fuzz target in `tests/fuzz/`.
 - Platform-gated code must be linted for its platform before pushing:
   `cargo clippy -p sensor-windows --target x86_64-pc-windows-msvc` (and the Linux
   equivalent) — host-only clippy misses it entirely.
@@ -138,8 +138,8 @@ New crate? Add it to the rules in `tools/check-deps.py` in the same change.
 - `python3 tools/check-deps.py` — dependency direction check.
 - `python3 tools/check-docs.py` — docs links, anchors, and tracking issues on capability rows; `python3 tools/gen-roadmap.py` regenerates `docs/roadmap.md` (needs `gh`).
 - `python3 tools/attack-coverage.py [--check]` — regenerate / verify `docs/attack-coverage.md` (needs the `rules/` sibling).
-- `cargo +nightly fuzz run audit_parse` / `netlink_parse` — coverage-guided parser
-  fuzzing (`fuzz/README.md`; workspace-excluded, needs `cargo-fuzz`).
+- `cargo +nightly fuzz run --fuzz-dir tests/fuzz audit_parse` / `netlink_parse` — coverage-guided parser
+  fuzzing (`tests/fuzz/README.md`; workspace-excluded, needs `cargo-fuzz`).
 
 ## Migration order (from `old/`)
 

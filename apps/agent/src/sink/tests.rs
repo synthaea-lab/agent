@@ -191,7 +191,7 @@ fn write_capable_volume_open_reaches_t1006_through_the_real_sink() {
 
 #[test]
 fn a_metadata_only_volume_open_does_not_enter_the_raw_volume_route() {
-    // `alerts.ndjson` (`AlertRecord` in `agent/src/alerts.rs`) carries only
+    // `alerts.ndjson` (`AlertRecord` in `apps/agent/src/alerts.rs`) carries only
     // timestamp/technique/message — no severity field — so this sink-level test
     // can only prove "produces no alert at all", not "produces Low rather than
     // Medium". That distinction is already proven directly against the rule:

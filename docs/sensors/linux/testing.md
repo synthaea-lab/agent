@@ -41,14 +41,14 @@ drain path kills the sensor.
 
 | Parser | Deterministic suite | Fuzz target |
 | --- | --- | --- |
-| `parse_exec_record` | [`wire/tests/exec_record.rs`](../../../crates/sensors/linux/wire/tests/exec_record.rs) | [`exec_record_parse`](../../../fuzz/fuzz_targets/exec_record_parse.rs) |
-| `parse_audit_message` | [`audit/tests/robustness.rs`](../../../crates/sensors/linux/audit/tests/robustness.rs) | [`audit_parse`](../../../fuzz/fuzz_targets/audit_parse.rs) |
-| `DiagMsg`, `ProcEvent`, `ConntrackFlow` | [`netlink/tests/robustness.rs`](../../../crates/sensors/linux/netlink/tests/robustness.rs) | [`netlink_parse`](../../../fuzz/fuzz_targets/netlink_parse.rs) |
-| access-log and MySQL parsers | unit tests | [`logs_parse`](../../../fuzz/fuzz_targets/logs_parse.rs) |
+| `parse_exec_record` | [`wire/tests/exec_record.rs`](../../../crates/sensors/linux/wire/tests/exec_record.rs) | [`exec_record_parse`](../../../tests/fuzz/fuzz_targets/exec_record_parse.rs) |
+| `parse_audit_message` | [`audit/tests/robustness.rs`](../../../crates/sensors/linux/audit/tests/robustness.rs) | [`audit_parse`](../../../tests/fuzz/fuzz_targets/audit_parse.rs) |
+| `DiagMsg`, `ProcEvent`, `ConntrackFlow` | [`netlink/tests/robustness.rs`](../../../crates/sensors/linux/netlink/tests/robustness.rs) | [`netlink_parse`](../../../tests/fuzz/fuzz_targets/netlink_parse.rs) |
+| access-log and MySQL parsers | unit tests | [`logs_parse`](../../../tests/fuzz/fuzz_targets/logs_parse.rs) |
 
 The deterministic suites use a seeded LCG, so they are reproducible without a fuzzer. The
 scheduled fuzz workflow currently runs `audit_parse` and `netlink_parse`; the other two targets run
-locally with `cargo +nightly fuzz run <target>` (see [`fuzz/README.md`](../../../fuzz/README.md)).
+locally with `cargo +nightly fuzz run --fuzz-dir tests/fuzz <target>` (see [`tests/fuzz/README.md`](../../../tests/fuzz/README.md)).
 
 ## 4. Live tests on a lab host
 
@@ -56,9 +56,9 @@ These need root and a real kernel:
 
 - `agent status`: loads the embedded object and every raw tracepoint program through the verifier
   without attaching; exits non-zero on any rejection. The first check on a new kernel.
-- [`agent/tests/lsm_io_uring_evasion.rs`](../../../agent/tests/lsm_io_uring_evasion.rs): the
+- [`apps/agent/tests/lsm_io_uring_evasion.rs`](../../../apps/agent/tests/lsm_io_uring_evasion.rs): the
   `file_open` hook fires for an `io_uring` write (needs BPF-LSM and `fio`).
-- [`agent/tests/probe_open_synthetic_bits.rs`](../../../agent/tests/probe_open_synthetic_bits.rs):
+- [`apps/agent/tests/probe_open_synthetic_bits.rs`](../../../apps/agent/tests/probe_open_synthetic_bits.rs):
   no synthetic `FLAG_*` bit survives normalization of a probe-shaped open (runs without root; lives
   in the agent because it needs the normalizer and the rules).
 - [`examples/accept_map_pressure.rs`](../../../crates/sensors/linux/userspace/examples/accept_map_pressure.rs)

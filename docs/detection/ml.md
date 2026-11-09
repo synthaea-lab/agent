@@ -136,7 +136,7 @@ yet. The T2 path uses `score` only.
 
 ### Loading and degraded mode
 
-At construction, [`DetectionSink::load_correlation_scorer`](../../agent/src/sink/mod.rs) looks for
+At construction, [`DetectionSink::load_correlation_scorer`](../../apps/agent/src/sink/mod.rs) looks for
 `correlation-iforest-{linux,windows,macos}/0.1.0/model.onnx` under
 `<state_dir>/ml/registry` (`model_root`), then under `ml/registry` relative to the working
 directory (for a source checkout). The `model_metadata.json` next to it is optional. On any
@@ -146,7 +146,7 @@ failure it logs `ML correlation scorer unavailable — agent works without ML` a
 
 ### Per event
 
-[`DetectionSink::correlate`](../../agent/src/sink/mod.rs) runs on the capture thread, inside the
+[`DetectionSink::correlate`](../../apps/agent/src/sink/mod.rs) runs on the capture thread, inside the
 correlator lock (inference takes microseconds):
 
 | `score()` result | Effect |
@@ -174,7 +174,7 @@ that data can be scored as soon as it does.
 The fleet's **common set** is the set of image hashes seen on at least K hosts of the tenant.
 The server publishes it as a Bloom filter snapshot, and the agent loads it from
 `<content_root>/snapshots/common-set.bin` (at most 64 MiB, `MAX_COMMON_SET_BYTES` in
-[`sink/mod.rs`](../../agent/src/sink/mod.rs)).
+[`sink/mod.rs`](../../apps/agent/src/sink/mod.rs)).
 
 - [`CommonSetSnapshot::parse`](../../crates/ml/src/features/common_set.rs) is strict and
   total. An unknown magic or version, an out-of-range size, or a length that is not exactly
@@ -185,7 +185,7 @@ The server publishes it as a Bloom filter snapshot, and the agent loads it from
   `CommonSet` (a membership test and the number of hosts covered) and a minimum coverage, and
   returns two numbers. `rarity_known` keeps "rare" separate from "no basis to say": a fleet
   that has just enrolled has an empty snapshot, and without this every binary would look rare.
-- In the agent, [`note_image_rarity`](../../agent/src/sink/mod.rs) runs on the enrichment worker
+- In the agent, [`note_image_rarity`](../../apps/agent/src/sink/mod.rs) runs on the enrichment worker
   (only it knows the hash). It uses the same extractor, so the agent and a future model cannot
   disagree about what is known. "Not in the common set" becomes capped evidence in the
   correlator (`apply_rarity_evidence`). The evidence is withheld when there is no snapshot,

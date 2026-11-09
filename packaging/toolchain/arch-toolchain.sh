@@ -57,12 +57,12 @@ if ! command -v "$HOME/.cargo/bin/cargo" >/dev/null 2>&1; then
 fi
 # shellcheck disable=SC1091
 source "$HOME/.cargo/env"
-# The probe toolchain is pinned in ebpf-toolchain.txt at the repo root (the one
+# The probe toolchain is pinned in packaging/toolchain/ebpf-toolchain.txt (the one
 # source for build.rs, CI and these scripts); fall back to plain nightly only
 # when the tree isn't mounted, with a warning.
-_ebpf_tc=$(tr -d '[:space:]' 2>/dev/null < "${SYNTHAEA_SRC:-/synthaea/agent}/ebpf-toolchain.txt" || true)
+_ebpf_tc=$(tr -d '[:space:]' 2>/dev/null < "${SYNTHAEA_SRC:-/synthaea/agent}/packaging/toolchain/ebpf-toolchain.txt" || true)
 if [ -z "${_ebpf_tc:-}" ]; then
-  echo "[warn] ${SYNTHAEA_SRC:-/synthaea/agent}/ebpf-toolchain.txt not found — installing plain nightly; build.rs will ask for the pinned one" >&2
+  echo "[warn] ${SYNTHAEA_SRC:-/synthaea/agent}/packaging/toolchain/ebpf-toolchain.txt not found — installing plain nightly; build.rs will ask for the pinned one" >&2
   _ebpf_tc=nightly
 fi
 rustup toolchain install "$_ebpf_tc" --component rust-src
@@ -147,7 +147,7 @@ echo "Known caveats not resolved by this script:"
 echo "  - ml/ (ONNX Runtime) is out of scope here, same as Alpine: not"
 echo "    currently a dependency of the agent binary, so this doesn't block"
 echo "    the walking-skeleton scenario. Static ONNX Runtime linking is"
-echo "    documented in toolchain/onnxruntime-static-build.md."
+echo "    documented in packaging/toolchain/onnxruntime-static-build.md."
 echo "  - This installs whatever kernel/LLVM/clang the rolling repos serve"
 echo "    today. Record the actual versions seen after a"
 echo "    run — pinning them here would defeat the point of this box."

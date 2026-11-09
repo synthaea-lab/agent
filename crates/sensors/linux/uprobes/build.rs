@@ -15,7 +15,7 @@ fn main() -> anyhow::Result<()> {
     if which::which("bpf-linker").is_err() {
         println!(
             "cargo:warning=bpf-linker not found - building sensor-linux-uprobes WITHOUT embedded \
-             eBPF probes (load_ebpf() will error at runtime); see toolchain/"
+             eBPF probes (load_ebpf() will error at runtime); see packaging/toolchain/"
         );
         return Ok(());
     }
@@ -35,13 +35,13 @@ fn main() -> anyhow::Result<()> {
 }
 
 /// The toolchain aya-build compiles the probes with, pinned in
-/// `ebpf-toolchain.txt` at the repo root: the one source for this build script,
+/// `packaging/toolchain/ebpf-toolchain.txt`: the one source for this build script,
 /// CI and lab provisioning. An unpinned `nightly` breaks the probe build as soon
 /// as its LLVM major moves past the one bpf-linker was cut against.
 /// `SYNTHAEA_EBPF_TOOLCHAIN` overrides it for a local experiment.
 fn ebpf_toolchain() -> anyhow::Result<String> {
-    const PINNED: &str = include_str!("../../../../ebpf-toolchain.txt");
-    println!("cargo:rerun-if-changed=../../../../ebpf-toolchain.txt");
+    const PINNED: &str = include_str!("../../../../packaging/toolchain/ebpf-toolchain.txt");
+    println!("cargo:rerun-if-changed=../../../../packaging/toolchain/ebpf-toolchain.txt");
     println!("cargo:rerun-if-env-changed=SYNTHAEA_EBPF_TOOLCHAIN");
     let toolchain =
         std::env::var("SYNTHAEA_EBPF_TOOLCHAIN").unwrap_or_else(|_| PINNED.trim().to_owned());
@@ -74,7 +74,7 @@ fn ebpf_toolchain() -> anyhow::Result<String> {
         .any(|line| line.starts_with("rust-src"));
     anyhow::ensure!(
         has_src,
-        "the eBPF probe toolchain {toolchain} (ebpf-toolchain.txt) is not installed with \
+        "the eBPF probe toolchain {toolchain} (packaging/toolchain/ebpf-toolchain.txt) is not installed with \
          rust-src; run: rustup toolchain install {toolchain} --profile minimal --component rust-src"
     );
     Ok(toolchain)

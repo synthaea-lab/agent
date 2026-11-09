@@ -23,7 +23,7 @@
 //!
 //! **Real-hardware validation, issue #91's first `Done when` item — DONE
 //! 2026-09-18** (Hyper-V lab, Arch `7.2.4-arch1-2`, `bpf` in the active `lsm=`
-//! list). `agent/tests/lsm_io_uring_evasion.rs` loads the eBPF object, attaches
+//! list). `apps/agent/tests/lsm_io_uring_evasion.rs` loads the eBPF object, attaches
 //! this hook, drives a real `fio --ioengine=io_uring` write, and asserts the hit
 //! counter increased — confirming the hook fires for an `io_uring`-submitted
 //! write, the case tracepoints structurally cannot see.

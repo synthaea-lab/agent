@@ -17,7 +17,7 @@ Hashing a file and verifying a signature read the file and run crypto. On a cach
 can take milliseconds, and misses come in clusters: a software rollout, first boot, an attacker
 unpacking many payloads. Doing that on the capture thread would let the kernel buffer fill and
 drop telemetry. So enrichment runs on a dedicated worker behind the
-[`EnrichQueue`](../../agent/src/enrich_queue.rs):
+[`EnrichQueue`](../../apps/agent/src/enrich_queue.rs):
 
 ```mermaid
 flowchart LR
@@ -51,7 +51,7 @@ because that path must not let a wedged process outlast the signal.
 **Known gap: Sigma runs before the PE strings exist.** Sigma evaluates an `Exec` on the
 capture thread, in `DetectionSink::detect_exec`. The PE strings are written into the
 `ExecEvent` later, by this worker (in
-[`enrich_queue.rs`](../../agent/src/enrich_queue.rs)), and no sensor fills them itself. So in
+[`enrich_queue.rs`](../../apps/agent/src/enrich_queue.rs)), and no sensor fills them itself. So in
 the running agent, a `windows/` Sigma rule that relies on `OriginalFileName`, `Company`,
 `Description` or `Product` sees the field as absent and does not match. The engine handles
 these fields correctly when they are present, and the unit and content tests use events that
@@ -138,6 +138,6 @@ directory from the open handle.
   mtime, size and identity change, the uncached path, the size budget, non-regular files.
 - [`pe_info.rs`](../../crates/enrich/src/pe_info.rs): empty result off Windows, parsing on
   Windows.
-- [`enrich_queue.rs`](../../agent/src/enrich_queue.rs): the worker fills the hash off the
+- [`enrich_queue.rs`](../../apps/agent/src/enrich_queue.rs): the worker fills the hash off the
   enqueue thread, a detection reaches its callback with its exec's hash, flush semantics, and
   `image_confirmed`.

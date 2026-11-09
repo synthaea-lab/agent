@@ -65,7 +65,7 @@ Timestamps come from the record header (seconds and milliseconds), not from the 
 ## The AVC reader
 
 The agent opens `AvcReader` only when eBPF is primary
-([`starts_avc_reader`](../../../agent/src/commands/linux.rs)); when `AuditSensor` is primary it
+([`starts_avc_reader`](../../../apps/agent/src/commands/linux.rs)); when `AuditSensor` is primary it
 already classifies AVC records, and a second reader would duplicate them. On a host with SELinux
 active, a failed open is reported as a degraded `linux-avc` source and retried; without SELinux it
 is skipped quietly. `AvcReader::drain` uses the same 256-record budget and the same unparsed
@@ -90,5 +90,5 @@ counter, and keeps only `PolicyDenial`.
 
 Unit tests for parse, classify and normalize; a deterministic never-panic suite
 ([`tests/robustness.rs`](../../../crates/sensors/linux/audit/tests/robustness.rs)) and a fuzz target
-([`audit_parse`](../../../fuzz/fuzz_targets/audit_parse.rs)) on the parser; `AvcReader` is tested
+([`audit_parse`](../../../tests/fuzz/fuzz_targets/audit_parse.rs)) on the parser; `AvcReader` is tested
 over a `socketpair`.

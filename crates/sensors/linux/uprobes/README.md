@@ -160,7 +160,7 @@ Uprobes are more expensive than tracepoints (~2-10x overhead). Mitigation:
 sudo ./target/release/agent status
 
 # Run with TLS capture enabled (code example needed)
-# See agent/src/commands/linux.rs for integration
+# See apps/agent/src/commands/linux.rs for integration
 ```
 
 ## Related Issues

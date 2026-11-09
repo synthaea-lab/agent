@@ -739,7 +739,7 @@ fn main() -> anyhow::Result<()> {
 **Implementation sketch:**
 
 ```rust
-// agent/src/main.rs
+// apps/agent/src/main.rs
 #[derive(Parser)]
 struct Cli {
     #[command(subcommand)]
@@ -965,7 +965,7 @@ impl From<LinuxUprobesConfig> for UprobesConfig {
 - ✅ YAML configuration design (for future implementation)
 
 **Next steps for full integration:**
-1. Implement CLI flags in `agent/src/main.rs`
+1. Implement CLI flags in `apps/agent/src/main.rs`
 2. Create `crates/config` for YAML configuration
 3. Wire `UprobesSensor` into agent run loop
 4. Add metrics/monitoring instrumentation

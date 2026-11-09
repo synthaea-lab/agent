@@ -20,7 +20,7 @@ separately; this section stops at the point where a finding leaves an engine.
 ## Data flow
 
 Every sensor hands events to one `EventSink`, the agent's
-[`DetectionSink`](../../agent/src/sink/mod.rs). `DetectionSink::on_event` runs synchronously on the
+[`DetectionSink`](../../apps/agent/src/sink/mod.rs). `DetectionSink::on_event` runs synchronously on the
 thread that delivered the event (on Linux, the thread that drains the eBPF ring buffer). Only
 in-memory work may run there. Anything that reads files or runs a crypto check goes behind a
 bounded queue.
@@ -47,7 +47,7 @@ flowchart LR
     ST & RS & SG & CAN & IOCN & GATE & IOCH & YW & MW --> V[verdict fusion + alert log]
 ```
 
-What `on_event` does, in order (see [`DetectionSink::on_event`](../../agent/src/sink/mod.rs)):
+What `on_event` does, in order (see [`DetectionSink::on_event`](../../apps/agent/src/sink/mod.rs)):
 
 1. **Correlate.** The event goes to the correlator. If an ML correlation scorer is loaded, it
    scores the pid's window and the score is added to the belief state
@@ -80,7 +80,7 @@ These hold across the engines. When a rule's comment points here, this is the se
   writes the alert log (the audit trail: every finding, duplicates included) and folds the
   finding into verdict fusion.
 - Every finding is keyed to the entity `(ppid, comm)`, plus the parent's incarnation when the
-  sensor stamps one ([`entity_key`](../../agent/src/sink/mod.rs)). Engines that work off the capture
+  sensor stamps one ([`entity_key`](../../apps/agent/src/sink/mod.rs)). Engines that work off the capture
   thread (YARA, memory scans) carry this identity with the request
   ([`yara::ScanContext`](../../crates/yara/src/queue.rs)). A late match then joins the same
   entity, stamped with the triggering event's time.
@@ -112,11 +112,11 @@ has a hard cap. Reaching the cap sheds work, and the shedding is counted, never 
 | Sliding counter timestamps | 256 per key ([sliding.rs](../../crates/rules/src/sliding.rs)) | oldest dropped |
 | YARA file queue | 512 requests ([queue.rs](../../crates/yara/src/queue.rs)) | dropped, `ScanStats::dropped` |
 | YARA memory queue | 16 requests, 6 scans/min, 5 min per process | dropped, counted by reason |
-| Enrichment queue | 4,096 events ([enrich_queue.rs](../../agent/src/enrich_queue.rs)) | event not enriched, gated finding raised unverified |
+| Enrichment queue | 4,096 events ([enrich_queue.rs](../../apps/agent/src/enrich_queue.rs)) | event not enriched, gated finding raised unverified |
 | Enrichment cache | 16,384 files ([lib.rs](../../crates/enrich/src/lib.rs)) | LRU |
 | IOC set | 64 MiB budget ([set.rs](../../crates/intel/src/set.rs)) | the whole set is refused |
-| IOC cooldown | 4,096 indicators ([ioc.rs](../../agent/src/ioc.rs)) | LRU |
-| Canary hold | 256 touches ([sink/mod.rs](../../agent/src/sink/mod.rs)) | judged at once, counted |
+| IOC cooldown | 4,096 indicators ([ioc.rs](../../apps/agent/src/ioc.rs)) | LRU |
+| Canary hold | 256 touches ([sink/mod.rs](../../apps/agent/src/sink/mod.rs)) | judged at once, counted |
 
 [`store::BoundedMap`](../../crates/store/src/bounded.rs) is the LRU used throughout. It is a
 `HashMap` with a use counter. Past the cap it evicts the least recently used eighth in one
@@ -134,7 +134,7 @@ Sigma rules, YARA rules, IOC feeds and the common-set snapshot are content under
 | Absent (directory or file missing) | engine unloaded, which is not an error |
 | Failed (content present but broken) | **previous engine kept**, error logged |
 
-[`DetectionSink::reload_content`](../../agent/src/sink/mod.rs) parses and compiles everything
+[`DetectionSink::reload_content`](../../apps/agent/src/sink/mod.rs) parses and compiles everything
 before it takes any lock, and holds each lock only for the swap. The capture thread takes the
 same locks for every exec and write-open, so loading under them would stall capture. The
 replaced engines are dropped after the locks are released, because dropping a `ScanQueue`
@@ -163,7 +163,7 @@ ML models are not reloaded. The correlation scorer is loaded once at constructio
   under [`crates/rules/src/tests/`](../../crates/rules/src/tests/mod.rs), and a few rules also
   have proptest suites ([`rdp.rs`](../../crates/rules/src/rdp.rs),
   [`sudo.rs`](../../crates/rules/src/sudo.rs)).
-- **Sink-level tests** in [`agent/src/sink/tests.rs`](../../agent/src/sink/tests.rs) drive real events
+- **Sink-level tests** in [`apps/agent/src/sink/tests.rs`](../../apps/agent/src/sink/tests.rs) drive real events
   through `DetectionSink::on_event` and assert on `alerts.ndjson`. They cover the routing,
   redaction, canary hold and cooldown, YARA quarantine and reload.
 - **Contract tests** against the sibling public repos (`rules`, `ml`, `server`) read their

@@ -57,7 +57,7 @@ This separation ensures that package managers (apt/dnf) and the updater never co
 ### Prerequisites
 
 **Static .deb:** build on an x86_64 Alpine/musl host with the toolchain provisioned by
-`toolchain/alpine-toolchain.sh`. The build creates ONNX Runtime from source and
+`packaging/toolchain/alpine-toolchain.sh`. The build creates ONNX Runtime from source and
 needs several gigabytes of disk and build time on first run. The resulting binaries are
 static musl executables, so one `.deb` runs on glibc-based Debian and Ubuntu versions
 without inheriting the build host's glibc or libstdc++ baseline.
@@ -73,7 +73,7 @@ curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 
 ### Build Debian Package
 
-On an x86_64 Alpine host with `toolchain/alpine-toolchain.sh` already run:
+On an x86_64 Alpine host with `packaging/toolchain/alpine-toolchain.sh` already run:
 
 ```bash
 ./packaging/linux/build-deb.sh

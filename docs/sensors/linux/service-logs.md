@@ -5,7 +5,7 @@ webshell answering requests, a database password guess.
 [`sensor-linux-logs`](../../../crates/sensors/linux/logs/src/lib.rs) parses the logs an operator
 declares and turns the few lines that matter into events. It is pure: parsers, a tailer, budgets
 and summaries, with no I/O beyond reading the file and no event delivery. The agent drives it
-([`log_sources.rs`](../../../agent/src/log_sources.rs)).
+([`log_sources.rs`](../../../apps/agent/src/log_sources.rs)).
 
 ## Configuration
 
@@ -93,5 +93,5 @@ There is no silence heartbeat for log sources: a quiet log is normal on a quiet 
 ## Testing
 
 Unit tests for every module, with log lines captured on real servers; the fuzz target
-[`logs_parse`](../../../fuzz/fuzz_targets/logs_parse.rs) runs both access formats and the MySQL
+[`logs_parse`](../../../tests/fuzz/fuzz_targets/logs_parse.rs) runs both access formats and the MySQL
 parser on arbitrary input.

@@ -18,7 +18,7 @@ The callback into Rust only collects records, so no user code runs inside the C 
 
 ## How the agent uses it
 
-[`seeded_rule_state`](../../../agent/src/commands/macos.rs) seeds the LISTENER-DRIFT baseline from one snapshot at startup (listeners only, protocol TCP). [`spawn_socket_poller`](../../../agent/src/commands/macos.rs) snapshots every 10 s and forwards the listener events. There is no heartbeat for this poller ([#34](https://github.com/synthaea-lab/agent/issues/34)).
+[`seeded_rule_state`](../../../apps/agent/src/commands/macos.rs) seeds the LISTENER-DRIFT baseline from one snapshot at startup (listeners only, protocol TCP). [`spawn_socket_poller`](../../../apps/agent/src/commands/macos.rs) snapshots every 10 s and forwards the listener events. There is no heartbeat for this poller ([#34](https://github.com/synthaea-lab/agent/issues/34)).
 
 ## Gaps
 

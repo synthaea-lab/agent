@@ -18,12 +18,12 @@ because a panic on the drain path kills the sensor.
 Needs nightly and `cargo-fuzz` (`cargo install cargo-fuzz`). From the repo root:
 
 ```bash
-cargo +nightly fuzz run audit_parse -- -max_total_time=300
-cargo +nightly fuzz run netlink_parse -- -max_total_time=300
+cargo +nightly fuzz run --fuzz-dir tests/fuzz audit_parse -- -max_total_time=300
+cargo +nightly fuzz run --fuzz-dir tests/fuzz netlink_parse -- -max_total_time=300
 ```
 
-A crash drops a reproducer under `fuzz/artifacts/<target>/`; minimize with
-`cargo +nightly fuzz tmin <target> <artifact>`, then pin the minimized input as
+A crash drops a reproducer under `tests/fuzz/artifacts/<target>/`; minimize with
+`cargo +nightly fuzz tmin --fuzz-dir tests/fuzz <target> <artifact>`, then pin the minimized input as
 a regression test in the owning crate's robustness suite (named after the
 behavior, per code-style.md) — the fuzz corpus itself stays untracked.
 

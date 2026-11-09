@@ -22,7 +22,7 @@ and the local JSONL outputs are covered in [Local interfaces](local-interfaces.m
 | [`fit_batches`](../crates/transport/src/event_limit.rs), [`fit_detection_to_limit`](../crates/transport/src/detection_upload.rs) | Keep every request body under the server's size limit by shortening, never by dropping. |
 | [`UploadLoop`](../crates/transport/src/upload.rs) | The blocking loop that drives either uploader, with backoff and a prompt, bounded stop. |
 | [`TransportError`](../crates/transport/src/error.rs) | Error taxonomy: which failures are retryable, which are pure connectivity. |
-| [`agent/src/upload.rs`](../agent/src/upload.rs) | Composition in the binary: opens the two spools, adapts them to the drain traits, spawns the upload threads. |
+| [`apps/agent/src/upload.rs`](../apps/agent/src/upload.rs) | Composition in the binary: opens the two spools, adapts them to the drain traits, spawns the upload threads. |
 | [`store::EventSpool`](../crates/store/src/spool.rs) | The durable segment spool both uploaders drain (owned by the `store` crate). |
 
 `transport` is a leaf crate: it depends only on `schema` and may not depend on `store`,
@@ -49,14 +49,14 @@ flowchart LR
 ```
 
 - Events are appended to the spool by the enrichment worker, never by a sensor's capture
-  thread, and only after [`redact_event`](../agent/src/redact.rs) has run on them (see the
-  worker closure in [`DetectionSink::new`](../agent/src/sink/mod.rs)). A spool write is file
+  thread, and only after [`redact_event`](../apps/agent/src/redact.rs) has run on them (see the
+  worker closure in [`DetectionSink::new`](../apps/agent/src/sink/mod.rs)). A spool write is file
   I/O, and file I/O must not stall capture.
 - Detections get a random UUIDv4 idempotency key at the moment they are spooled
-  ([`persist_detection`](../agent/src/upload.rs)). The key is stored in the same spool
+  ([`persist_detection`](../apps/agent/src/upload.rs)). The key is stored in the same spool
   record as the detection ([`QueuedDetection`](../crates/transport/src/detection_upload.rs)),
   so a retry after a crash reuses it.
-- [`upload::start`](../agent/src/upload.rs) builds three clients from one config: one
+- [`upload::start`](../apps/agent/src/upload.rs) builds three clients from one config: one
   consumed by the event uploader, one by the detection uploader, one shared (`Arc`) by the
   health beacon, the snapshot fetch loop and decoy registration.
 
@@ -110,11 +110,11 @@ built-in public roots apply.
   explicit message by `is_encrypted_pem`, because the parser's own error would not say why.
   `server.mtls_passphrase` is parsed by the configuration but not used by the transport.
 - **User-Agent.** The crate sets none by default; every client the agent builds starts from
-  [`transport_config_for`](../agent/src/upload.rs), which names the product and the agent
+  [`transport_config_for`](../apps/agent/src/upload.rs), which names the product and the agent
   version.
 
 Which certificate goes to which server is decided once, in
-[`resolve_run_target`](../agent/src/upload.rs):
+[`resolve_run_target`](../apps/agent/src/upload.rs):
 
 | Invocation | Server | Client certificate | CA |
 | --- | --- | --- | --- |
@@ -131,7 +131,7 @@ Both uploaders drain a [`store::EventSpool`](../crates/store/src/spool.rs): appe
 segments, rotated at 1024 records or 1 MiB, with a total byte cap enforced by deleting the
 oldest segment and counting the loss. The detection spool is opened with one record per
 segment ([`open_with_segment_records`](../crates/store/src/spool.rs) in
-[`upload::start`](../agent/src/upload.rs)), so a segment is exactly one detection.
+[`upload::start`](../apps/agent/src/upload.rs)), so a segment is exactly one detection.
 
 The drain traits encode a two-phase protocol:
 
@@ -153,7 +153,7 @@ Invariants that follow:
   whatever the next drain would have returned (`empty_drain_is_never_acked` in
   [`upload.rs`](../crates/transport/src/upload.rs)).
 - **Bounded disk.** `storage.spool_max_mb` caps *each* of the two spools, so the worst case
-  on disk is twice that value ([`spool_cap_bytes`](../agent/src/upload.rs)). Past the cap the
+  on disk is twice that value ([`spool_cap_bytes`](../apps/agent/src/upload.rs)). Past the cap the
   oldest segment is shed and counted; the capture path never blocks.
 
 ## Event upload
@@ -311,10 +311,10 @@ different bytes under the same key. The agent logs the original and sent sizes w
 ## Upload loop and shutdown
 
 [`UploadLoop::run`](../crates/transport/src/upload.rs) blocks on its own thread
-(`transport-upload` and `detection-upload`, spawned in [`upload::start`](../agent/src/upload.rs)):
+(`transport-upload` and `detection-upload`, spawned in [`upload::start`](../apps/agent/src/upload.rs)):
 
 - `Ok(0)`: sleep the poll interval (`UPLOAD_POLL_INTERVAL`, 5 s, in
-  [`agent/src/upload.rs`](../agent/src/upload.rs)). Uploads are latency-tolerant; detection
+  [`apps/agent/src/upload.rs`](../apps/agent/src/upload.rs)). Uploads are latency-tolerant; detection
   happens locally.
 - `Ok(n)`: immediately try the next segment.
 - `Err`: sleep [`backoff_duration`](../crates/transport/src/upload.rs).
@@ -355,7 +355,7 @@ carry only the status.
 | Control plane unreachable | Events and detections keep spooling up to the cap; uploads back off to 60 s; segments skipped only by the network budget (events) or never (detections). |
 | Spool full | Oldest segment shed and counted (`spool_dropped` in the health beacon); capture never blocks. |
 | Spool append fails (real I/O error) | Logged; the event stays local-only. |
-| Upload cannot be set up (unreadable or encrypted key, missing CA bundle, spool directory) | With `server.offline_fallback = true` (default) the agent keeps detecting, prints and emits an `UPLOAD-DISABLED` alert; with `false`, `run` fails. See [`start_or_disable`](../agent/src/upload.rs). |
+| Upload cannot be set up (unreadable or encrypted key, missing CA bundle, spool directory) | With `server.offline_fallback = true` (default) the agent keeps detecting, prints and emits an `UPLOAD-DISABLED` alert; with `false`, `run` fails. See [`start_or_disable`](../apps/agent/src/upload.rs). |
 | Certificate rotated or rejected | Event segments: an HTTP 4xx (such as a proxy's `400` for a client certificate that does not verify) skips the segment at once; a rejection during the TLS handshake counts against the network budget. Detection segments: stay spooled, backoff. |
 | Shutdown | Linux: final drain up to 3 s. Other platforms: the threads end with the process; the spool re-delivers. |
 
@@ -367,7 +367,7 @@ would roll back and ban an otherwise healthy release.
 ## Configuration
 
 From `agent.toml` ([`ServerConfig`, `StorageConfig`](../crates/config/src/schema.rs)) and
-`agent run` flags ([`agent/src/main.rs`](../agent/src/main.rs)):
+`agent run` flags ([`apps/agent/src/main.rs`](../apps/agent/src/main.rs)):
 
 | Knob | Default | Effect |
 | --- | --- | --- |
@@ -390,12 +390,12 @@ defaults (not exposed in `agent.toml`):
 | `request_timeout` | 30 s |
 | `max_drain_attempts` | 5 (mirrors `store::MAX_DRAIN_ATTEMPTS`; duplicated because the two leaf crates cannot import each other) |
 | `max_network_drain_attempts` | 20 |
-| `heartbeat_interval` | 30 s, **not wired**: the beacon cadence is [`health::BeaconInterval`](../agent/src/health.rs); kept so existing configurations are not refused |
+| `heartbeat_interval` | 30 s, **not wired**: the beacon cadence is [`health::BeaconInterval`](../apps/agent/src/health.rs); kept so existing configurations are not refused |
 
 ## Observability
 
 - Health beacon fields `spool_bytes` and `spool_dropped` sum both spools
-  ([`SpoolHealth`](../agent/src/upload.rs)). `spool_dropped` counts records shed at the cap,
+  ([`SpoolHealth`](../apps/agent/src/upload.rs)). `spool_dropped` counts records shed at the cap,
   skipped as poison, and refused individually by the server.
 - Warnings carry structured fields: `attempt`, `network_attempt`, `server_attempt`, `dropped`,
   `original_bytes`/`sent_bytes`, and the detection `key`.
@@ -410,7 +410,7 @@ The crate is platform-neutral and runs the same on Linux, Windows and macOS. Dif
 the binary's wiring:
 
 - The graceful-shutdown final drain is registered only on Linux
-  ([`TransportHandle::register_shutdown`](../agent/src/upload.rs)).
+  ([`TransportHandle::register_shutdown`](../apps/agent/src/upload.rs)).
 - The health beacon is sent on Linux and Windows; macOS does not send one yet.
 
 ## Testing
@@ -422,6 +422,6 @@ the binary's wiring:
 | [`tests/http_path.rs`](../crates/transport/tests/http_path.rs) | Real HTTP against canned in-process TCP servers: ack/skip/redelivery, both budgets, poison segments, idempotency keys, per-record refusals, oversize detections. |
 | [`tests/private_ca.rs`](../crates/transport/tests/private_ca.rs) | CA pinning accepts the pinned CA, refuses public-only and wrong pins, fails at construction on a bad bundle. |
 | Contract tests in [`client.rs`](../crates/transport/src/client.rs) | Heartbeat and decoy routes exist in the `server` sibling; wire shapes are pinned. |
-| Tests in [`agent/src/upload.rs`](../agent/src/upload.rs) | Target resolution, CA/certificate plumbing, offline fallback both ways. |
+| Tests in [`apps/agent/src/upload.rs`](../apps/agent/src/upload.rs) | Target resolution, CA/certificate plumbing, offline fallback both ways. |
 
 Run them with `cargo test -p transport` and `cargo test -p agent upload`.

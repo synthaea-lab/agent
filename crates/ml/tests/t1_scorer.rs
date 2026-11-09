@@ -2,7 +2,7 @@
 //! from an `EventBus`, then `ort`) must reproduce the score the training-side runtime
 //! computes (Python vector through onnxruntime), pinned by
 //! `crates/ml/tests/fixtures/t1_scorer_golden.jsonl` and its generator
-//! `ml/tests/fixtures/gen_t1_scorer_fixture.py`. The vector itself is pinned by
+//! `ml/tests/fixtures/generators/gen_t1_scorer_golden.py`. The vector itself is pinned by
 //! `t1_golden.rs`; this pins what the shipped runtime does with it, and the gates around
 //! the model: no exec, the conformal threshold, the out-of-distribution bounds.
 

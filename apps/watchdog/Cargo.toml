@@ -12,14 +12,14 @@ workspace = true
 [dependencies]
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
-config = { path = "../crates/config" }
+config = { path = "../../crates/config" }
 serde_json = { workspace = true }
 sha2 = "0.11"
 # Self-protection alerts are appended to the agent's alerts file in its own record shape.
-sinks = { path = "../crates/sinks" }
+sinks = { path = "../../crates/sinks" }
 # Post-promotion health gate (ADR-0015 Decision 6, issue #30): the watchdog rolls a
 # release that never proves itself back, via the updater's layout + ban list.
-updater = { path = "../crates/updater", default-features = false }
+updater = { path = "../../crates/updater", default-features = false }
 
 [target.'cfg(windows)'.dependencies]
 windows-service = "0.8"
@@ -39,10 +39,10 @@ name = "synthaea-agent"
 # Cargo's own workspace-inheritance machinery. Set explicitly (#675: `dpkg` warned
 # "missing 'Maintainer' field" without this).
 maintainer = "Synthaea Security <security@synthaea.io>"
-maintainer-scripts = "../packaging/linux/debian/maintainer-scripts"
+maintainer-scripts = "../../packaging/linux/debian/maintainer-scripts"
 
 # Assets: binaries use cargo-deb's target/release/ prefix, which it rewrites for
-# --target and workspaces; other paths are relative to watchdog/.
+# --target and workspaces; other paths are relative to apps/watchdog/.
 assets = [
     # Bootstrap binaries
     ["target/release/watchdog", "var/lib/synthaea/bootstrap/", "755"],
@@ -62,15 +62,15 @@ assets = [
     ["target/release/cli", "usr/bin/synthaea-ctl", "755"],
 
     # systemd integration
-    ["../packaging/linux/systemd/synthaea-agent.service", "usr/lib/systemd/system/", "644"],
-    ["../packaging/linux/systemd/synthaea.sysusers", "usr/lib/sysusers.d/synthaea.conf", "644"],
-    ["../packaging/linux/systemd/synthaea.tmpfiles", "usr/lib/tmpfiles.d/synthaea.conf", "644"],
+    ["../../packaging/linux/systemd/synthaea-agent.service", "usr/lib/systemd/system/", "644"],
+    ["../../packaging/linux/systemd/synthaea.sysusers", "usr/lib/sysusers.d/synthaea.conf", "644"],
+    ["../../packaging/linux/systemd/synthaea.tmpfiles", "usr/lib/tmpfiles.d/synthaea.conf", "644"],
 
     # Config (ADR-0013): the agent fails fast without a valid agent.toml, so the
     # package ships the same template `cli config init` writes, not a placeholder
     # (#675). Every control-plane field is a `# CHANGE ME` the operator must fill
     # in, but `offline_fallback = true` lets the agent start and run on it as-is.
-    ["../crates/config/data/default-agent.toml", "etc/synthaea/agent.toml", "644"],
+    ["../../crates/config/data/default-agent.toml", "etc/synthaea/agent.toml", "644"],
 ]
 
 [package.metadata.deb.systemd-units]

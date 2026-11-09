@@ -3,7 +3,7 @@
 Builds `SynthaeaAgent.msi`: installs `agent.exe` + `watchdog.exe` into
 `Program Files\Synthaea` and, on install, runs `watchdog.exe install` to
 register the `SynthaEDR` Windows service (the watchdog self-registers - see
-`watchdog/src/service/windows.rs` - this MSI does not duplicate that with
+`apps/watchdog/src/service/windows.rs` - this MSI does not duplicate that with
 WiX's own ServiceInstall/ServiceControl elements). On uninstall it runs
 `watchdog.exe uninstall`, then force-deletes everything left under
 `INSTALLFOLDER` via a `cmd.exe /c rd /s /q` custom action - including files
@@ -120,7 +120,7 @@ not cover:
 ## Known gaps (first pass, #37)
 
 - `rules/sigma` and `rules/yara` content directories are not included -
-  `agent.exe` runs fine without them (see `agent/src/sink.rs`'s
+  `agent.exe` runs fine without them (see `apps/agent/src/sink.rs`'s
   `content_dir` doc), so this is deferred until there is real content to
   ship, not because it is hard to add (one more `Directory`/`Component`
   pair mirroring `INSTALLFOLDER`).

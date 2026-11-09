@@ -2,7 +2,7 @@
 <!--
   Synthaea agent MSI (#37): installs agent.exe + watchdog.exe into Program Files
   and registers the watchdog as the "SynthaEDR" Windows service via its own
-  `install`/`uninstall` subcommands (see watchdog/src/service/windows.rs) rather
+  `install`/`uninstall` subcommands (see apps/watchdog/src/service/windows.rs) rather
   than WiX's native ServiceInstall/ServiceControl elements - the watchdog already
   self-registers (sc create + failure-action + start), persisting the
   agent-bin/alerts flags into the service's own binPath (#112), so
@@ -11,7 +11,7 @@
 
   WiX v3 (candle.exe/light.exe) chosen over v4/v5: a standalone toolset, no
   dotnet/NuGet needed to install it (this repo's dev machines already juggle
-  enough toolchains - see toolchain/windows-toolchain.ps1) or to build
+  enough toolchains - see packaging/toolchain/windows-toolchain.ps1) or to build
   with it.
 
   Build-tested (2026-09-18) end to end on a real Windows 11 machine: install,

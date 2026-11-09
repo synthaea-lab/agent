@@ -10,7 +10,7 @@ reads `journalctl -f -o json`, keeps an allowlist of records, and maps them to `
 [`spawn_follow`](../../../crates/sensors/linux/journal/src/tail.rs) runs `journalctl` rather than
 linking `libsystemd`: it gives cursor-based resume (`--after-cursor`), JSON the crate parses anyway,
 and no build-time dependency on `libsystemd-dev` on every build host and target. The cost is a
-child process; the agent owns it ([`spawn_journal_tail`](../../../agent/src/commands/linux.rs)).
+child process; the agent owns it ([`spawn_journal_tail`](../../../apps/agent/src/commands/linux.rs)).
 Restart on unexpected exit is not built.
 
 ## Data flow
@@ -94,7 +94,7 @@ line, and writes its own canary line every 30 s over journald's native socket
 stored and returned it through `journalctl -f`. It never matches the allowlist.
 
 The last cursor is persisted next to the alerts file by the agent
-([`journal_cursor.rs`](../../../agent/src/journal_cursor.rs)) and passed as `--after-cursor` on
+([`journal_cursor.rs`](../../../apps/agent/src/journal_cursor.rs)) and passed as `--after-cursor` on
 restart. The first start begins at "now".
 
 ## Limits

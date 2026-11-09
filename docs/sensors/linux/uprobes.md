@@ -14,13 +14,13 @@ The UDP/53 query capture is part of the primary eBPF sensor but is described her
 
 [`UprobesSensor`](../../../crates/sensors/linux/uprobes/src/sensor.rs) is a separate `Sensor` on its
 own thread, started by the agent's uprobes supervisor
-([`spawn_uprobes_supervisor`](../../../agent/src/commands/linux.rs)) only when at least one capture is
+([`spawn_uprobes_supervisor`](../../../apps/agent/src/commands/linux.rs)) only when at least one capture is
 on. It loads its own copy of the eBPF object (its [`build.rs`](../../../crates/sensors/linux/uprobes/build.rs)
 compiles the same `sensor-linux-ebpf` crate), attaches only the uprobe programs, and drains three
 rings: `TLS_CAPTURE_EVENTS`, `READLINE_EVENTS`, `DNS_QUERY_EVENTS` (256 KiB each).
 
 The capture set can be widened at run time by the agent
-([`CaptureSet`](../../../agent/src/captures.rs)); the sensor reads its configuration once, so a change
+([`CaptureSet`](../../../apps/agent/src/captures.rs)); the sensor reads its configuration once, so a change
 restarts the thread, with a capture gap while the object is reloaded.
 
 ```mermaid

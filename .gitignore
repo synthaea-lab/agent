@@ -15,7 +15,7 @@ __pycache__/
 !crates/ml/tests/fixtures/*.onnx
 !ml/registry/**/*.onnx
 
-# Source checkout and build tree of the static onnxruntime build (toolchain/build-onnxruntime-static.*)
+# Source checkout and build tree of the static onnxruntime build (packaging/toolchain/build-onnxruntime-static.*)
 /onnxruntime/
 
 # Vagrant (per-machine state, box images, generated SSH keys)

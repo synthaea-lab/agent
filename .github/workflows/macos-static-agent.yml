@@ -8,14 +8,14 @@ name: macOS static agent
 #
 # Written without a Mac, then run on a hosted Apple Silicon runner (macos-15, 2026-10-12): every
 # step passed on the first run. The measurements and what each assumption turned out to be are in
-# toolchain/onnxruntime-static-build-macos.md.
+# packaging/toolchain/onnxruntime-static-build-macos.md.
 on:
   pull_request:
     paths:
-      - "agent/Cargo.toml"
+      - "apps/agent/Cargo.toml"
       - "crates/ml/**"
-      - "toolchain/build-onnxruntime-static.sh"
-      - "toolchain/ort-static-link-flags.sh"
+      - "packaging/toolchain/build-onnxruntime-static.sh"
+      - "packaging/toolchain/ort-static-link-flags.sh"
       - "tools/check-macho-imports.py"
       - "Cargo.toml"
       - "Cargo.lock"
@@ -25,10 +25,10 @@ on:
   push:
     branches: [main]
     paths:
-      - "agent/Cargo.toml"
+      - "apps/agent/Cargo.toml"
       - "crates/ml/**"
-      - "toolchain/build-onnxruntime-static.sh"
-      - "toolchain/ort-static-link-flags.sh"
+      - "packaging/toolchain/build-onnxruntime-static.sh"
+      - "packaging/toolchain/ort-static-link-flags.sh"
       - "tools/check-macho-imports.py"
       - "Cargo.toml"
       - "Cargo.lock"
@@ -110,7 +110,7 @@ jobs:
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ort-static
-          key: ort-static-macos-${{ runner.arch }}-${{ matrix.os }}-${{ steps.xcode.outputs.id }}-dt${{ env.MACOSX_DEPLOYMENT_TARGET }}-${{ hashFiles('toolchain/build-onnxruntime-static.sh') }}
+          key: ort-static-macos-${{ runner.arch }}-${{ matrix.os }}-${{ steps.xcode.outputs.id }}-dt${{ env.MACOSX_DEPLOYMENT_TARGET }}-${{ hashFiles('packaging/toolchain/build-onnxruntime-static.sh') }}
 
       # onnxruntime's CMake downloads its dependencies (protobuf's protoc, cpuinfo, abseil, ...)
       # from GitHub while it configures, and a download that answers HTTP 504 stops the whole
@@ -120,7 +120,7 @@ jobs:
         if: steps.ort-cache.outputs.cache-hit != 'true'
         run: |
           for attempt in 1 2 3; do
-            if ./toolchain/build-onnxruntime-static.sh --jobs "$(sysctl -n hw.ncpu)"; then
+            if ./packaging/toolchain/build-onnxruntime-static.sh --jobs "$(sysctl -n hw.ncpu)"; then
               exit 0
             fi
             echo "onnxruntime build attempt $attempt failed" >&2
@@ -156,7 +156,7 @@ jobs:
         run: |
           set -euo pipefail
           export ORT_LIB_LOCATION="$PWD/ort-static/Release"
-          eval "$(./toolchain/ort-static-link-flags.sh)"
+          eval "$(./packaging/toolchain/ort-static-link-flags.sh)"
           echo "ORT_LIB_LOCATION=$ORT_LIB_LOCATION" >> "$GITHUB_ENV"
           echo "RUSTFLAGS=$RUSTFLAGS" >> "$GITHUB_ENV"
 

@@ -33,10 +33,10 @@ external scheduler runs them (a timer is tracked in
 
 The crate split mirrors the dependency rules: [`updater`](../crates/updater/src/lib.rs) is a leaf
 crate with verification, layout and state logic only, and cannot depend on `transport`. The
-fetch-verify-apply compositions live in the binary: [`release.rs`](../agent/src/release.rs),
-[`content.rs`](../agent/src/content.rs), [`rotation.rs`](../agent/src/rotation.rs),
-[`snapshot_fetch.rs`](../agent/src/snapshot_fetch.rs), with the post-promotion health gate in
-the watchdog ([`probation.rs`](../watchdog/src/probation.rs)).
+fetch-verify-apply compositions live in the binary: [`release.rs`](../apps/agent/src/release.rs),
+[`content.rs`](../apps/agent/src/content.rs), [`rotation.rs`](../apps/agent/src/rotation.rs),
+[`snapshot_fetch.rs`](../apps/agent/src/snapshot_fetch.rs), with the post-promotion health gate in
+the watchdog ([`probation.rs`](../apps/watchdog/src/probation.rs)).
 
 ## The trust set
 
@@ -66,11 +66,11 @@ key, which a rotation refuses to reproduce. The feature also links a marker stri
 (`SYNTHAEA-PUBLIC-TEST-KEY-SET-V1`) into the binary, which the packaging and release checks look
 for (see [Packaging](packaging.md#test-key-exclusion)).
 
-**Refusal before contact.** [`trust::ensure_key_trusted`](../agent/src/trust.rs) runs before any
+**Refusal before contact.** [`trust::ensure_key_trusted`](../apps/agent/src/trust.rs) runs before any
 network or disk work: a test-key build acts only with `--allow-test-key` (a flag that exists only
 in such a build), and a build with no key says that nothing can be verified instead of failing
 later at the signature. The keys in force are loaded fresh from the state directory for every
-command ([`trust::load`](../agent/src/trust.rs)), so a rotation applied by another process is in
+command ([`trust::load`](../apps/agent/src/trust.rs)), so a rotation applied by another process is in
 force at the next check.
 
 ## Manifest signing
@@ -100,7 +100,7 @@ A valid signature proves who signed a manifest, not that its paths are safe to w
 ## Binary self-update
 
 `agent apply-release --server URL [--cert --key] [--ca-cert] [--no-restart]` runs
-[`apply_release`](../agent/src/release.rs). It is Linux-only; elsewhere it returns an error.
+[`apply_release`](../apps/agent/src/release.rs). It is Linux-only; elsewhere it returns an error.
 
 ```mermaid
 sequenceDiagram
@@ -141,9 +141,9 @@ Points that are easy to miss:
   removed first, as a link if it is a symlink. An existing `vN` is complete by construction and is
   reused without downloading, but still re-verified.
 - **Size bound.** A release manifest has no signed per-entry size, so downloads are bounded by
-  the constant `MAX_RELEASE_ARTIFACT_BYTES` (256 MiB) in [`release.rs`](../agent/src/release.rs).
+  the constant `MAX_RELEASE_ARTIFACT_BYTES` (256 MiB) in [`release.rs`](../apps/agent/src/release.rs).
 - **SELinux.** Files written into `versions/vN/` inherit `var_lib_t`, which `init_t` may not
-  execute (the unit then dies with `203/EXEC`). [`restore_selinux_labels`](../agent/src/release.rs)
+  execute (the unit then dies with `203/EXEC`). [`restore_selinux_labels`](../apps/agent/src/release.rs)
   runs `restorecon -R` on the staged release. Under Enforcing, a missing or failing `restorecon`
   refuses the release and leaves `current` untouched; under Permissive it warns and promotes.
 - **Ownership.** `apply-release` usually runs as root, but the watchdog runs as the service user
@@ -181,7 +181,7 @@ key-rotations.json    applied key rotations (absent until the first rotation)
 ### Probation and rollback
 
 The watchdog is started from `current/watchdog`, so it knows its own release from its executable
-path ([`Probation::detect`](../watchdog/src/probation.rs)). A release is on probation when it runs
+path ([`Probation::detect`](../apps/watchdog/src/probation.rs)). A release is on probation when it runs
 from `versions/vN/`, has no `.healthy` marker, and is still what `current` points at. A run from
 `bootstrap/` is never on probation: bootstrap is the floor.
 
@@ -195,8 +195,8 @@ stateDiagram-v2
 ```
 
 - The proof is the progress-backed heartbeat file the agent writes, which advances only when an
-  event goes end to end through the pipeline ([`heartbeat.rs`](../agent/src/heartbeat.rs)), not a
-  process-alive check. The deadline, [`PROBATION_DEADLINE`](../watchdog/src/probation.rs), is
+  event goes end to end through the pipeline ([`heartbeat.rs`](../apps/agent/src/heartbeat.rs)), not a
+  process-alive check. The deadline, [`PROBATION_DEADLINE`](../apps/watchdog/src/probation.rs), is
   120 s, the same silence deadline every sensor gets; progress seen in the same poll as the
   deadline counts as life.
 - The rollback target ([`rollback_target`](../crates/updater/src/layout.rs)) is the newest
@@ -211,7 +211,7 @@ stateDiagram-v2
 - On success, `prove` writes `.healthy` and prunes releases older than the rollback target, so
   steady state keeps two release trees. A failed prune costs disk, not safety.
 - Before every service start, `ExecStartPre` runs the package's `bootstrap/watchdog recover`
-  ([`recovery.rs`](../watchdog/src/recovery.rs)): it probes `current/watchdog --help`, and if that
+  ([`recovery.rs`](../apps/watchdog/src/recovery.rs)): it probes `current/watchdog --help`, and if that
   release cannot even execute, rolls back and bans it the same way. Probation cannot catch a
   watchdog that never starts.
 
@@ -221,7 +221,7 @@ lives in a root-owned state directory. There is no un-ban command: remove the en
 
 **Integrity checks reuse the release manifest.** `persist_manifest` keeps the signed manifest in
 `versions/vN/manifest.json`; the periodic self-integrity check
-([`integrity.rs`](../agent/src/integrity.rs)) re-verifies its signature (against any key in the
+([`integrity.rs`](../apps/agent/src/integrity.rs)) re-verifies its signature (against any key in the
 release lineage, since a promoted release was signed by the key in force at the time) and re-hashes
 the files.
 
@@ -232,15 +232,15 @@ Content is versioned per ring, independently of binaries. Rings are `canary_0`, 
 comes from `--ring` or `updates.ring`, and with neither the command refuses rather than silently
 landing the agent in `prod`. Promotion between rings and automatic halts are server decisions.
 
-[`apply_content_manifest`](../agent/src/content.rs):
+[`apply_content_manifest`](../apps/agent/src/content.rs):
 
 1. Load the keys in force; build the client; `GET /api/content/manifest/{ring}`.
-2. [`plan_with_key`](../agent/src/content.rs) (pure, no I/O): schema version, signature against
+2. [`plan_with_key`](../apps/agent/src/content.rs) (pure, no I/O): schema version, signature against
    the `content` key, `ring` equals the requested ring (a valid signature does not prove it is the
    manifest *for this ring*), `release_version` newer than this ring's last applied release, entry
    paths safe. It returns which entries are missing or stale and which applied files the new
    release no longer lists.
-3. [`download_and_apply`](../agent/src/content.rs): each entry is fetched with
+3. [`download_and_apply`](../apps/agent/src/content.rs): each entry is fetched with
    `max_bytes = declared size`, after the declared size itself is checked against
    `MAX_CONTENT_ARTIFACT_BYTES` (100 MiB; otherwise a signed but huge `size` would drive the
    allocation), hash-checked, written atomically under the content directory, and recorded in the
@@ -251,7 +251,7 @@ landing the agent in `prod`. Promotion between rings and automatic halts are ser
    [Local interfaces](local-interfaces.md#local-control-channel)). If no agent is listening, the
    content is on disk and loads at next start; this is not an error.
 
-The local state ([`ContentState`](../agent/src/content.rs), default
+The local state ([`ContentState`](../apps/agent/src/content.rs), default
 `<state_dir>/content-state.json`) is unsigned: it is the agent's own record, the same trust boundary
 as the ban list. It is, however, the only thing between the agent and a replayed older manifest, so
 `--content-dir` and `--state` must resolve under `storage.state_dir`; the command refuses any other
@@ -264,14 +264,14 @@ prints that reason and exits with `EXIT_RING_HALTED` (75, `EX_TEMPFAIL`), distin
 **Withdrawing content.** The agent never applies a lower release number, so a server that rolls a
 ring back to an older release cannot take content off an agent that already applied the newer one;
 the command reports such an offer as older than the applied release, not as "up to date"
-([`describe_unchanged_offer`](../agent/src/content.rs)). Content is withdrawn by a **corrective
+([`describe_unchanged_offer`](../apps/agent/src/content.rs)). Content is withdrawn by a **corrective
 release**: a new, higher-numbered manifest that carries the earlier content, built with
-`release-tool roll-forward` ([`roll_forward.rs`](../release-tool/src/roll_forward.rs)). Agents
+`release-tool roll-forward` ([`roll_forward.rs`](../tools/release/src/roll_forward.rs)). Agents
 then fetch what differs and delete what is no longer listed.
 
 ## Common-set snapshot
 
-[`snapshot_fetch.rs`](../agent/src/snapshot_fetch.rs) runs a loop inside `agent run` that polls
+[`snapshot_fetch.rs`](../apps/agent/src/snapshot_fetch.rs) runs a loop inside `agent run` that polls
 `/api/snapshot/manifest` (every 6 h, jittered; `SYNTHAEA_SNAPSHOT_POLL_SECS` overrides it, clamped to
 at least 5 s), downloads the artifact only when `built_at` moved, verifies size and hash, writes
 `snapshots/common-set.bin` atomically and asks the sink to reload it.
@@ -289,7 +289,7 @@ at least 5 s), downloads the artifact only when `built_at` moved, verifies size 
 A [`KeyRotationManifest`](../crates/updater/src/rotation.rs) names a new `release` and/or `content`
 key and the key each one retires, and is signed only by `recovery`. `agent apply-key-rotation`
 fetches it from `/api/release/key-rotation` (404: nothing pending) or reads `--file`, verifies it and
-records it ([`rotation::apply`](../agent/src/rotation.rs)).
+records it ([`rotation::apply`](../apps/agent/src/rotation.rs)).
 
 [`KeyRotationManifest::verify`](../crates/updater/src/rotation.rs) checks, in order:
 
@@ -323,30 +323,30 @@ puts the embedded, retired keys back in force, which requires root on the state 
 
 ## Building and signing releases (`release-tool`)
 
-[`release-tool`](../release-tool/src/main.rs) is an offline binary: it runs on the release
+[`release-tool`](../tools/release/src/main.rs) is an offline binary: it runs on the release
 manager's machine, never on an endpoint or the control plane, and no CI job signs a manifest.
 
 | Command | Does |
 | --- | --- |
-| `manifest --release-version N --dir DIR` | Hash a directory into an unsigned release manifest ([`manifest_dir.rs`](../release-tool/src/manifest_dir.rs)). |
+| `manifest --release-version N --dir DIR` | Hash a directory into an unsigned release manifest ([`manifest_dir.rs`](../tools/release/src/manifest_dir.rs)). |
 | `roll-forward --from OLD --release-version N --released-at T [--current CUR]` | Build an unsigned corrective content release; with `--current`, report what it removes and which bytes must be put back in the artifact store. |
 | `rotation --release-version N --reason R --new-*-key --retire-*-key [--valid-for-days 7]` | Build an unsigned rotation manifest (at most 30 days). |
 | `sign --kind release\|content\|rotation (--key-file F \| --pkcs11 MOD ... \| --test-key \| --test-recovery-key) FILE` | Sign. |
 | `public-key (...)` | Print the hex public key to commit under `crates/updater/keys/`. |
 
-[`sign`](../release-tool/src/sign.rs) takes the manifest kind explicitly (guessing from content
+[`sign`](../tools/release/src/sign.rs) takes the manifest kind explicitly (guessing from content
 would let a wrong file be signed unnoticed), refuses a manifest the agent would reject whatever its
 signature (unsafe paths, unsupported schema), checks the produced signature against the signer's own
 public key, and reports whether this build's embedded key would accept it.
 
-Key sources ([`KeySource`](../release-tool/src/main.rs)):
+Key sources ([`KeySource`](../tools/release/src/main.rs)):
 
 - `--pkcs11 MODULE --pkcs11-token LABEL --pkcs11-key LABEL` is the production path
-  ([`pkcs11.rs`](../release-tool/src/pkcs11.rs)): the private key stays on the token (sensitive,
+  ([`pkcs11.rs`](../tools/release/src/pkcs11.rs)): the private key stays on the token (sensitive,
   not extractable), the tool sends the canonical bytes and receives a pure Ed25519 signature
   (`CKM_EDDSA`). Tokens are found by label, not slot number (slots renumber). The PIN comes from
   `RELEASE_TOOL_PKCS11_PIN` or `--pkcs11-pin-file`, never an argument (it would show in `ps`).
-- `--key-file` (64 hex characters, mode 0600, [`keyfile.rs`](../release-tool/src/keyfile.rs)) is
+- `--key-file` (64 hex characters, mode 0600, [`keyfile.rs`](../tools/release/src/keyfile.rs)) is
   for lab releases: a key readable from a file is not a production key.
 - `--test-key` / `--test-recovery-key` exist only in a `test-key` build and print a warning.
 
@@ -372,7 +372,7 @@ Key sources ([`KeySource`](../release-tool/src/main.rs)):
   `updater` contain `cfg(target_os)` code is scoped to this.
 - Content delivery, snapshot fetch and key rotation run on every OS. `apply-key-rotation` reads the
   installed release number from the layout on Linux only (`installed_release` in
-  [`rotation.rs`](../agent/src/rotation.rs)).
+  [`rotation.rs`](../apps/agent/src/rotation.rs)).
 
 ## Configuration
 
@@ -391,8 +391,8 @@ Key sources ([`KeySource`](../release-tool/src/main.rs)):
 | --- | --- |
 | [`updater` unit and integration tests](../crates/updater/src/lib.rs) | Sign/stage/verify/promote/rollback/ban end to end; anti-rollback; reported cleanup failure. |
 | [`tests/unprovisioned_build.rs`](../crates/updater/tests/unprovisioned_build.rs), [`tests/test_key_build.rs`](../crates/updater/tests/test_key_build.rs) | The packaged trust set fails closed; the test set is what test builds use (CI runs `cargo test -p updater --no-default-features`). |
-| Tests in [`agent/src/release.rs`](../agent/src/release.rs) | Against a local HTTP server: promotion, tampered artifact, mid-download failure, bad signature, escaping path, bans, rotations, SELinux cases, reuse of a staged release. |
-| Tests in [`watchdog/src/probation.rs`](../watchdog/src/probation.rs) and [`recovery.rs`](../watchdog/src/recovery.rs) | Probation detection, rollback targets, bans, pruning, stale watchdog. |
-| Tests in [`agent/src/content.rs`](../agent/src/content.rs) | Plan, hash mismatch, progress preservation, removal, halted rings. |
-| Tests in [`agent/src/rotation.rs`](../agent/src/rotation.rs) and [`trust_state.rs`](../crates/updater/src/trust_state.rs) | Rotation survives restart, replay and forgery refused, corrupt vs missing record. |
-| [`release-tool/tests/pkcs11_softhsm.rs`](../release-tool/tests/pkcs11_softhsm.rs) | Signing through a SoftHSM token, wrong token/PIN/key refused (run by `tools/test-pkcs11.sh` in CI). |
+| Tests in [`apps/agent/src/release.rs`](../apps/agent/src/release.rs) | Against a local HTTP server: promotion, tampered artifact, mid-download failure, bad signature, escaping path, bans, rotations, SELinux cases, reuse of a staged release. |
+| Tests in [`apps/watchdog/src/probation.rs`](../apps/watchdog/src/probation.rs) and [`recovery.rs`](../apps/watchdog/src/recovery.rs) | Probation detection, rollback targets, bans, pruning, stale watchdog. |
+| Tests in [`apps/agent/src/content.rs`](../apps/agent/src/content.rs) | Plan, hash mismatch, progress preservation, removal, halted rings. |
+| Tests in [`apps/agent/src/rotation.rs`](../apps/agent/src/rotation.rs) and [`trust_state.rs`](../crates/updater/src/trust_state.rs) | Rotation survives restart, replay and forgery refused, corrupt vs missing record. |
+| [`tools/release/tests/pkcs11_softhsm.rs`](../tools/release/tests/pkcs11_softhsm.rs) | Signing through a SoftHSM token, wrong token/PIN/key refused (run by `tools/test-pkcs11.sh` in CI). |
