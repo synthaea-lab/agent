@@ -120,7 +120,7 @@ jobs:
 
                 sed -i \"s/^pkgrel=0/pkgrel=1/\" APKBUILD
                 abuild -r
-                APK2=\$(find \$HOME/packages -name \"synthaea-agent-0.1.0-r1.apk\" -print -quit)
+                APK2=\$(find \$HOME/packages -name \"synthaea-agent-*-r1.apk\" -print -quit)
                 [ -n \"\$APK2\" ] || { echo \"no .apk produced by the upgrade rebuild (pkgrel bump did not take)\" >&2; exit 1; }
                 echo \"APK2=\$APK2\" >> /tmp/apk-paths
               "
@@ -159,7 +159,7 @@ jobs:
 
       - name: Run packaged agent on supported glibc userlands
         run: |
-          APK="$(find "$GITHUB_WORKSPACE" -maxdepth 6 -name 'synthaea-agent-0.1.0-r1.apk' -print -quit)"
+          APK="$(find "$GITHUB_WORKSPACE" -maxdepth 6 -name 'synthaea-agent-*-r1.apk' -print -quit)"
           [ -n "$APK" ] || { echo "could not find the upgraded .apk to extract" >&2; exit 1; }
           mkdir -p "$RUNNER_TEMP/synthaea-package"
           tar -xz -f "$APK" -C "$RUNNER_TEMP/synthaea-package"
