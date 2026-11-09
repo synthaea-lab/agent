@@ -185,7 +185,9 @@ Microsoft Store channel.
 
 Secrets used by `signing-policy`, the `sign-*` jobs, `publish` and the distribution jobs that
 declare `environment: release` can live in that environment (recommended: its reviewers then
-guard them) or at repository level. None is needed for an unsigned 0.0.x release.
+guard them) or at repository level. The release app's key is the exception: `release-please.yml`
+and the Homebrew job run outside the environment, so `RELEASE_APP_PRIVATE_KEY` must be a repository
+(or organization) secret. None is needed for an unsigned 0.0.x release.
 
 | Name | Kind | Used by | What it is |
 | --- | --- | --- | --- |
