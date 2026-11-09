@@ -29,6 +29,7 @@
     reason = "the recurring unsafe patterns are documented once in the crate-level Safety section (AS-029)"
 )]
 
+mod arch;
 mod cred;
 mod exec;
 mod file;
@@ -40,6 +41,7 @@ mod procmem;
 mod raw;
 mod uprobe;
 
+pub(crate) use arch::SYS_EXIT_RET_OFFSET;
 use aya_ebpf::{helpers::bpf_get_current_pid_tgid, macros::map, maps::HashMap};
 use sensor_linux_wire::{LineageEntry, TASK_COMM_LEN};
 
@@ -93,18 +95,6 @@ pub(crate) fn fill_event_meta(
         i += 1;
     }
 }
-
-/// Offset of `ret` in every `sys_exit_*` tracepoint (`x86_64/aarch64)`: 8-byte common
-/// header + `__syscall_nr`(4, +4 padding) + `ret`(8, signed). Verified on
-/// 2026-09-22 on Alpine (kernel 6.18.50-0-virt, `x86_64`) via
-/// `/sys/kernel/tracing/events/syscalls/sys_exit_accept{,4}/format` — identical for
-/// both.
-#[cfg(any(bpf_target_arch = "x86_64", bpf_target_arch = "aarch64"))]
-const SYS_EXIT_RET_OFFSET: usize = 16;
-/// i686: `ret` is a packed 4-byte `long`, not independently verified (see
-/// `sys_enter_open`'s i686 note for the same packed-layout reasoning).
-#[cfg(bpf_target_arch = "x86")]
-const SYS_EXIT_RET_OFFSET: usize = 12;
 
 /// `sa_family_t` values (linux/socket.h) for the two tracked families. Any other family
 /// (notably `AF_UNIX` = 1, very frequent — D-Bus, local sockets) is ignored: out of scope of
