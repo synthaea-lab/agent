@@ -4,9 +4,7 @@
 
 use core::ops::Deref;
 
-use schema::{ContainerContext, Event, sensor::EventSink};
-
-use crate::container::{CgroupIdCache, DockerInfoCache, container_context};
+use schema::{Event, sensor::EventSink};
 
 /// Items one drain takes before returning to `select!`: a ring read never yields, so an
 /// uncapped one starves every other ring (issue #326,
@@ -162,28 +160,6 @@ fn note_refused_exec_record(error: sensor_linux_wire::ExecRecordError, len: usiz
             refused = n,
             "sensor-linux: exec record refused"
         );
-    }
-}
-
-/// Container attribution for drained events (issues #80/#204): `meta.cgroup_id` resolved
-/// against cgroupfs (see `CgroupIdCache`), never `/proc`, plus the Docker details looked up
-/// in the background.
-pub(crate) struct ContainerResolver {
-    container_ids: CgroupIdCache,
-    docker_cache: DockerInfoCache,
-}
-
-impl ContainerResolver {
-    pub(crate) fn new() -> Self {
-        Self {
-            container_ids: CgroupIdCache::new(),
-            docker_cache: DockerInfoCache::default(),
-        }
-    }
-
-    /// The container `cgroup_id` belongs to, if any.
-    pub(crate) fn resolve(&mut self, cgroup_id: u64) -> Option<ContainerContext> {
-        container_context(cgroup_id, &mut self.container_ids, &self.docker_cache)
     }
 }
 

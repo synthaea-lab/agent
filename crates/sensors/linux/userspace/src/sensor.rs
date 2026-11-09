@@ -14,7 +14,8 @@ use tokio::sync::Notify;
 use tracing::warn;
 
 use crate::{
-    drain::{ContainerResolver, exec_record},
+    container::ContainerResolver,
+    drain::exec_record,
     ebpf::{
         DNS_UDP_PROGRAM, RAW_TRACEPOINTS, TamperSlot, attach_inode_setattr, attach_raw_tracepoint,
         clear_tamper_slot, err, load_ebpf_for_run, prime_proc_lineage, read_tamper_slot,

@@ -298,8 +298,9 @@ fn read_wire_event<T: Copy>(item: &[u8]) -> Option<T> {
 
 /// Upper bound on items one drain call takes from a ring buffer before returning
 /// control to `select!` — see `MAX_ITEMS_PER_DRAIN` in `sensor-linux`'s `drain.rs`
-/// (issue #326) for why an unbounded `while let Some(item) = rb.next()` loop can starve this sensor's
-/// other branch (and the reactor) indefinitely under sustained producer load.
+/// (issue #326) for why an unbounded `while let Some(item) = rb.next()` loop can
+/// starve this sensor's other branch (and the reactor) indefinitely under sustained
+/// producer load.
 const MAX_ITEMS_PER_DRAIN: usize = 256;
 
 /// Drains up to [`MAX_ITEMS_PER_DRAIN`] TLS capture events from the ring buffer and
