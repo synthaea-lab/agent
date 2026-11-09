@@ -28,7 +28,7 @@ const PR_CAPBSET_DROP: u64 = 24;
 const PR_SET_SECUREBITS: u64 = 28;
 
 /// Offsets of the `syscalls:sys_enter_prctl` tracepoint (`option`, `arg2`),
-/// assumed standard layout — see `INIT_MODULE_LEN_OFFSET`'s note in `main.rs`; verify
+/// assumed standard layout — see `INIT_MODULE_LEN_OFFSET`'s note in `kernel/module.rs`; verify
 /// against `/sys/kernel/tracing/events/syscalls/sys_enter_prctl/format`.
 #[cfg(any(bpf_target_arch = "x86_64", bpf_target_arch = "aarch64"))]
 const PRCTL_OPTION_OFFSET: usize = 16;
