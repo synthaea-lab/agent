@@ -133,9 +133,13 @@ pub fn local_path_for_join(raw: &str) -> String {
 
 /// What an EID 16403 record says about the file it adds.
 pub struct AddedFile {
+    /// The job GUID, braces included, as BITS writes it.
     pub job_id: String,
+    /// The job's display name, chosen by the client.
     pub job_title: String,
+    /// The remote URL of the added file (`RemoteName`).
     pub url: String,
+    /// Where BITS writes the file, already in [`local_path_for_join`] form.
     pub local_path: String,
 }
 
@@ -143,8 +147,11 @@ pub struct AddedFile {
 pub struct TransferFailure<'a> {
     /// The failing file's URL, when the record names one.
     pub url: Option<&'a str>,
+    /// When the service wrote the record, in Unix epoch nanoseconds.
     pub timestamp_ns: u64,
+    /// Bytes the job transferred so far; `None` when the record omits it.
     pub bytes_transferred: Option<u64>,
+    /// The raw failing HRESULT from the record's `hr` field, `0` when absent.
     pub hresult: u32,
 }
 
@@ -410,20 +417,6 @@ mod tests {
         )
     }
 
-    fn failure(
-        url: Option<&str>,
-        timestamp_ns: u64,
-        bytes_transferred: Option<u64>,
-        hresult: u32,
-    ) -> TransferFailure<'_> {
-        TransferFailure {
-            url,
-            timestamp_ns,
-            bytes_transferred,
-            hresult,
-        }
-    }
-
     #[test]
     fn url_host_strips_port_userinfo_and_path() {
         for (url, host) in [
@@ -523,8 +516,16 @@ mod tests {
         let mut jobs = BitsJobs::default();
         assert!(add(&mut jobs, JOB, UPDATE_URL).is_none());
         assert!(
-            jobs.transfer_error(JOB, &failure(None, 2, None, 0x8019_0194))
-                .is_none()
+            jobs.transfer_error(
+                JOB,
+                &TransferFailure {
+                    url: None,
+                    timestamp_ns: 2,
+                    bytes_transferred: None,
+                    hresult: 0x8019_0194,
+                }
+            )
+            .is_none()
         );
         assert!(jobs.completed(JOB, 3, None).is_empty());
         assert_eq!(jobs.filtered(), 1);
@@ -576,8 +577,16 @@ mod tests {
         assert!(jobs.completed(JOB, 1, None).is_empty());
         assert!(jobs.cancelled(JOB, &client(1, 1)).is_empty());
         assert!(
-            jobs.transfer_error(JOB, &failure(None, 1, None, 1))
-                .is_none()
+            jobs.transfer_error(
+                JOB,
+                &TransferFailure {
+                    url: None,
+                    timestamp_ns: 1,
+                    bytes_transferred: None,
+                    hresult: 1,
+                }
+            )
+            .is_none()
         );
     }
 
@@ -599,14 +608,30 @@ mod tests {
         add(&mut jobs, JOB, PAYLOAD_URL);
         add(&mut jobs, JOB, "https://example.test/second.exe");
         let failed = jobs
-            .transfer_error(JOB, &failure(Some(PAYLOAD_URL), 5, Some(1917), 0x8019_0194))
+            .transfer_error(
+                JOB,
+                &TransferFailure {
+                    url: Some(PAYLOAD_URL),
+                    timestamp_ns: 5,
+                    bytes_transferred: Some(1917),
+                    hresult: 0x8019_0194,
+                },
+            )
             .expect("forwarded");
         assert_eq!(failed.state, BitsJobState::TransferError);
         assert_eq!(failed.url, PAYLOAD_URL);
         assert_eq!(failed.hresult, Some(0x8019_0194));
         assert_eq!(failed.bytes_transferred, Some(1917));
         let unnamed = jobs
-            .transfer_error(JOB, &failure(None, 6, None, 1))
+            .transfer_error(
+                JOB,
+                &TransferFailure {
+                    url: None,
+                    timestamp_ns: 6,
+                    bytes_transferred: None,
+                    hresult: 1,
+                },
+            )
             .expect("forwarded");
         assert_eq!(
             unnamed.url, "https://example.test/second.exe",
