@@ -1,12 +1,9 @@
 //! The polling transport's read of a channel: `EvtQuery` + `EvtNext` + `EvtRender`, each
-//! event rendered to its XML as UTF-16 (#1126).
+//! event rendered to its XML as UTF-16.
 //!
-//! The poll loop used to run `wevtutil qe` and decode its stdout. With stdout redirected,
-//! `wevtutil` writes in the system ANSI code page, so a character that code page cannot hold
-//! (a Cyrillic or CJK account name on a Windows-1252 host) was already `?` before this crate
-//! saw a byte, and two accounts whose names differ only there became the same string. Reading
-//! the channel through the API gets the same XML the `Subscribe` transport renders, in UTF-16,
-//! with nothing to guess and no process spawned per poll.
+//! UTF-16 matters: `wevtutil`'s redirected stdout is in the ANSI code page, which turns a
+//! Cyrillic or CJK account name into `?`s. The API gives the same XML the `Subscribe`
+//! transport renders, with nothing to guess and no process spawned per poll.
 
 use windows_sys::Win32::{
     Foundation::{ERROR_NO_MORE_ITEMS, GetLastError},

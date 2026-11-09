@@ -1,19 +1,14 @@
-//! Mark-of-the-web (#365): the `Zone.Identifier` alternate data stream a
-//! browser, mail client or archiver writes next to a downloaded file — the
-//! Windows counterpart of macOS's `com.apple.quarantine` xattr, surfaced as the
-//! same `schema::FileQuarantineEvent`.
+//! Mark-of-the-web: the `Zone.Identifier` stream written next to a downloaded
+//! file, surfaced as `schema::FileQuarantineEvent` like macOS's quarantine
+//! xattr.
 //!
-//! Platform-independent on purpose: the stream content is attacker-controlled
-//! (anything can write an ADS), so the parser is unit-tested on every CI leg
-//! and has a never-panic suite in `tests/robustness.rs`. Only the ETW hook
-//! lives in the Windows-gated `providers`: it queues each write on
-//! [`MarkQueue`], and a worker ([`run_mark_reader`]) does the read-back, off the
-//! Kernel-File callback thread (#439).
+//! Portable because the stream content is attacker-controlled: the parser is
+//! unit-tested on every OS and has a never-panic suite in
+//! `tests/robustness.rs`. The ETW hook queues each write on [`MarkQueue`] and
+//! [`run_mark_reader`] reads it back off the Kernel-File callback thread.
 //!
-//! Lab-confirmed (2026-09-23, local Windows 11): Kernel-File reports a write to
-//! the stream as a create/write on `C:\…\file.exe:Zone.Identifier`, for both a
-//! `Set-Content -Stream` and a plain `CreateFileW` on `file:Zone.Identifier` —
-//! two or three records per write, hence [`QuarantineDedup`].
+//! Lab-confirmed (2026-09-23, Windows 11): one write to the stream yields two
+//! or three Kernel-File create/write records, hence [`QuarantineDedup`].
 
 use std::{
     collections::HashMap,
@@ -201,15 +196,12 @@ fn needs_escape(c: char) -> bool {
 /// marks only, one per stream write (a write produces two or three
 /// Kernel-File records).
 ///
-/// A mark is remembered only once it is reported, keyed by the (case-folded)
-/// host path *and* a digest of what the stream said. So a dropped local-zone
-/// write never shadows an internet re-download of the same path inside the
-/// window, and a read that raced the writer (empty stream) doesn't hide the
-/// complete read that follows — at worst a second event, never a lost one.
-/// The digest key is random per instance, so a stream's author cannot craft
-/// a collision that suppresses their next mark. Pruned on every call and
-/// hard-capped: past the cap a new path is reported without being remembered
-/// (again a possible duplicate, never a loss) and the skip is counted.
+/// A mark is remembered only once it is reported, keyed by the case-folded
+/// host path and a digest of the stream content, so neither a dropped
+/// local-zone write nor an empty read that raced the writer hides the mark
+/// that follows: at worst a duplicate, never a lost mark. The digest key is
+/// random per instance so a stream's author cannot craft a collision. Past the
+/// cap a new path is reported without being remembered, and counted.
 #[cfg_attr(not(windows), allow(dead_code))] // driven by the Windows-only provider
 pub(crate) struct QuarantineDedup {
     /// Case-folded host path → (last report, content digest).

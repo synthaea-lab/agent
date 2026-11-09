@@ -1,21 +1,9 @@
-//! Maps wire records ([`crate::wire::NeRecord`]) into `schema` events — all
-//! three shapes already exist, so this sensor adds **no** schema variants:
+//! Maps wire records ([`crate::wire::NeRecord`]) into existing `schema`
+//! events: `Flow` to [`schema::ConnectEvent`], `FlowStats` to
+//! [`schema::NetworkFlowEvent`] and `Dns` to [`schema::DnsQueryEvent`].
 //!
-//! - `Flow` → [`schema::ConnectEvent`] (the discrete fact the BEACON rule and
-//!   the correlator key on — `(comm, daddr, dport)`);
-//! - `FlowStats` → [`schema::NetworkFlowEvent`] (volume, the beacon feature a
-//!   point-in-time connect can't carry — same split as the Linux
-//!   conntrack source);
-//! - `Dns` → [`schema::DnsQueryEvent`] (the domain↔process join key), with
-//!   process attribution NE's DNS proxy gives that the Windows provider
-//!   documents wanting.
-//!
-//! Inbound flows are deliberately mapped to `ConnectEvent` too — the schema
-//! shape carries the remote peer either way, and an inbound connection to an
-//! unexpected local service is exactly the lateral-movement signal the
-//! coverage matrix promises ("inbound + outbound"). The direction currently
-//! rides in which port field is the remote one; a dedicated direction field
-//! is additive schema work if a rule ever needs it explicitly.
+//! Inbound flows become `ConnectEvent` too: the shape carries the remote peer
+//! either way, and no direction field is emitted.
 
 use schema::{ConnectEvent, DnsQueryEvent, Event, EventMeta, NetworkFlowEvent, User};
 

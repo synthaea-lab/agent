@@ -1,15 +1,14 @@
-//! The bounded pid → (image path, incarnation, server silo) cache behind
+//! The bounded pid -> (image path, incarnation, server silo) cache behind
 //! `SharedState::pids`.
 //!
-//! A local type rather than `store::BoundedMap`: sensor crates may depend only on
-//! `schema` (`tools/check-deps.py`). Same shape as `BoundedMap` — a `HashMap` plus
-//! a monotonic use counter, least-recently-used entries evicted in a batch of 1/8
-//! of the cap — plus the explicit `remove` a pid cache needs for PID recycling.
+//! A local copy of the `store::BoundedMap` shape (sensor crates may depend only
+//! on `schema`, `tools/check-deps.py`), plus the explicit `remove` a pid cache
+//! needs for PID recycling.
 
 use std::collections::HashMap;
 
-/// pid → full image path, process sequence number (#725) and server silo
-/// (<https://github.com/synthaea-lab/agent/issues/39>), never larger than its cap. Explicit [`Self::remove`] on
+/// pid → full image path, process sequence number and server silo, never
+/// larger than its cap. Explicit [`Self::remove`] on
 /// `ProcessEnd` is the correctness path (PID recycling); LRU eviction is only the
 /// backstop for when that removal never arrives, and is counted so the loss is
 /// observable rather than silent.

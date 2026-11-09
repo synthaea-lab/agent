@@ -1,11 +1,8 @@
-/* C shim for the libproc socket-table walk (issue #358).
+/* C shim for the libproc socket-table walk.
  *
- * Same reasoning as the EndpointSecurity shim: `socket_fdinfo` and friends
- * (<sys/proc_info.h>) are large, union-heavy structs — transcribing their
- * layout into #[repr(C)] Rust is silent-ABI-drift risk for zero gain. The
- * shim compiles against the SDK's own headers, walks the table in C, and
- * hands Rust one flat record per TCP socket. TCP state constants are mapped
- * to shim-owned values here (TCPS_* macros), never transcribed into Rust.
+ * socket_fdinfo (<sys/proc_info.h>) is a large union-heavy struct, so the
+ * walk stays in C against the SDK's headers and Rust gets one flat record per
+ * TCP socket. TCP states map to shim-owned values, never to TCPS_* in Rust.
  *
  * Records are only valid for the duration of the callback.
  */

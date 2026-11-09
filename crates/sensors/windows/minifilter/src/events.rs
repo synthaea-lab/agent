@@ -1,13 +1,10 @@
-//! Decoded driver messages to schema events (milestone 2c, #136).
+//! Decoded driver messages to schema events.
 //!
-//! The driver reports names in NT device form (`\Device\HarddiskVolume3\Users\…`). Rules match
-//! the drive-letter form the ETW sensor produces, so the same file must reach them under the
-//! same path whichever sensor saw it: [`VolumeMap`] does the ETW sensor's
-//! `normalize_nt_path` over the same `QueryDosDeviceW` table. Sensor crates cannot depend on
-//! each other (`tools/check-deps.py`), so the dozen lines are repeated here rather than shared;
-//! `a_device_path_gets_its_drive_letter` pins the same behaviour as the ETW tests.
-//!
-//! Platform-independent, like [`crate::wire`]: tested on every OS.
+//! The driver reports NT device paths; [`VolumeMap`] rewrites them to the drive-letter form the
+//! ETW sensor produces, over the same `QueryDosDeviceW` table, so rules see one path whichever
+//! sensor saw the file. Sensor crates cannot depend on each other (`tools/check-deps.py`), so
+//! those lines are repeated here; `a_device_path_gets_its_drive_letter` pins the same behaviour
+//! as the ETW tests. Portable, like [`crate::wire`].
 
 use schema::{
     Event, EventMeta, FileDeleteEvent, FileRenameEvent, FileSetTimeEvent, RawVolumeOpenEvent, User,
@@ -94,11 +91,9 @@ impl VolumeMap {
 /// path must not masquerade as a complete name in the rules; the receive loop counts it.
 ///
 /// The driver knows the pid and the thread, not the image, the parent or the user: `comm` is
-/// left empty, `ppid` 0 and `user` unknown. Nothing in the agent fills them in for these events
-/// today (the enrichment queue only handles exec images), so a rule on a minifilter event must
-/// key on `pid`, and cannot match on the process name or the account; resolving them from the
-/// process table is a follow-up. A pid above `u32::MAX` cannot come from Windows (pids are
-/// 32-bit in practice); it is clamped to 0, "unknown", rather than truncated to a real pid.
+/// left empty, `ppid` 0 and `user` unknown, and nothing downstream fills them in, so a rule on
+/// a minifilter event must key on `pid`. A pid above `u32::MAX` is clamped to 0, "unknown",
+/// rather than truncated to a real pid.
 #[must_use]
 pub fn to_event(message: &Message, volumes: &VolumeMap) -> Option<Event> {
     if message.body.has_truncated_path() {

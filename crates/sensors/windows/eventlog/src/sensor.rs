@@ -1,9 +1,7 @@
-//! Polling implementation (`EvtQuery`, `query.rs`) of the persistence detections plus the
-//! logon/session events (see the crate doc for why polling rather than
-//! `EvtSubscribe`/ETW). One independent poll thread per enabled
-//! [`PollTarget`] — the shared pipeline (cursor, query, normalize, count,
-//! sink) exists once; each target contributes only its query, parser, and
-//! normalization.
+//! The Windows-gated sensor: one poll thread per enabled [`PollTarget`] over `EvtQuery`
+//! (`query.rs`), or one `EvtSubscribe` subscription per target (`subscribe.rs`). The shared
+//! pipeline (cursor, query, normalize, count, sink) exists once; each target contributes its
+//! query, parser and normalization.
 
 use std::{
     fs::File,
@@ -38,41 +36,29 @@ use crate::{
     xml::{self, LogonEvent},
 };
 
-/// All channels are polled on the same cadence — persistence detection and
-/// logon-event normalization both have no sub-second stakes (the underlying
-/// Windows event already exists by the time a poll tick could see it), so one
-/// constant covers all three threads.
+/// The poll cadence of every target: none has sub-second stakes, since the event
+/// already exists by the time a tick could see it.
 const POLL_INTERVAL: Duration = Duration::from_secs(2);
 
-/// The audit subcategory events 4698 and 4702 depend on (lab, 2026-09-22: a 4702
-/// fired under the same enabled subcategory, no separate prerequisite), referenced
-/// by GUID rather than name: `auditpol` matches subcategory names against the OS's **localized**
-/// label, not the canonical English one — confirmed failing with Win32 error 87 on
-/// a French-language lab VM using the English name. The GUID is stable regardless
-/// of the OS language (Microsoft's documented approach for scripting `auditpol`).
+/// The audit subcategory events 4698 and 4702 depend on (lab, 2026-09-22: 4702 needs
+/// nothing more). Referenced by GUID because `auditpol` matches names against the
+/// localized label: the English name fails with Win32 error 87 on a French VM.
 const SCHEDULED_TASK_AUDIT_SUBCATEGORY_GUID: &str = "{0CCE9227-69AE-11D9-BED3-505054503030}";
 
-/// "Logon" audit subcategory (covers 4624, 4625, and 4648) — GUID form for the
-/// same locale-independence reason as
-/// [`SCHEDULED_TASK_AUDIT_SUBCATEGORY_GUID`]. Taken from Microsoft's published
-/// subcategory GUID list; **not yet re-confirmed against this project's own lab
-/// VM** the way the 4698 GUID was. Enabling it here is belt-and-suspenders, not
-/// the primary path: unlike "Other Object Access Events", "Logon" is part of
-/// Windows' out-of-the-box default audit policy, so a failure here should not
-/// be read as urgently as an `enable_scheduled_task_audit` failure would be.
+/// "Logon" audit subcategory (4624, 4625, 4648), by GUID as above. From Microsoft's
+/// published list, not lab-confirmed like the 4698 GUID. It is on in the default audit
+/// policy, so enabling it is belt-and-suspenders and a failure is less urgent than an
+/// `enable_scheduled_task_audit` one.
 const LOGON_AUDIT_SUBCATEGORY_GUID: &str = "{0CCE9215-69AE-11D9-BED3-505054503030}";
 
 /// "Special Logon" audit subcategory (covers 4672) — same caveats as
 /// [`LOGON_AUDIT_SUBCATEGORY_GUID`].
 const SPECIAL_LOGON_AUDIT_SUBCATEGORY_GUID: &str = "{0CCE921B-69AE-11D9-BED3-505054503030}";
 
-/// "User Account Management" audit subcategory (covers 4720/4722/4724/4738/...) —
-/// GUID form for the same locale-independence reason as the other GUIDs above.
-/// Published by Microsoft's subcategory GUID list; **not yet re-confirmed against
-/// this project's own lab VM** the way the 4698 GUID was. Unlike "Other Object
-/// Access Events" (needed for 4698), User Account Management is part of Windows'
-/// out-of-the-box default audit policy on both Client and Server SKUs — a failure
-/// to enable here is expected to be rare and non-blocking.
+/// "User Account Management" audit subcategory (4720 and the other account events), by
+/// GUID as above, from Microsoft's published list and not lab-confirmed. On in the
+/// default audit policy of Client and Server SKUs, so a failure to enable is rare and
+/// non-blocking.
 const USER_ACCOUNT_MGMT_AUDIT_SUBCATEGORY_GUID: &str = "{0CCE9235-69AE-11D9-BED3-505054503030}";
 
 /// The "Microsoft-Windows-Security-Auditing" provider that writes 4624/4625/
@@ -83,13 +69,9 @@ const LSASS_COMM: &str = "lsass.exe";
 
 // ── The shared poll pipeline ─────────────────────────────────────────────────
 //
-// Every target below is the same machine: remember the newest `EventRecordID`
-// already in the channel at startup — only events written *after* the sensor
-// starts are reported, matching the other sensors in this workspace (none of
-// them replay history) — then poll for anything newer, normalize each parsed
-// block into a `schema::Event`, count it, hand it to the sink. Only the
-// query, the parser, and the normalization differ per target, so those live
-// in a [`PollTarget`] and the machine exists once.
+// Every target is the same machine: remember the newest `EventRecordID` in the
+// channel at startup (no sensor replays history), then poll for anything newer,
+// normalize each parsed block, count it and hand it to the sink.
 
 /// One poll target: a channel + `EventID` filter, and how its raw XML blocks
 /// become normalized events. Reused as-is by the push-based `subscribe`
@@ -333,12 +315,9 @@ static SERVICE_INSTALLS: PollTarget = PollTarget {
 
 // ── Event 4698 — scheduled task creation (T1053.005) ─────────────────────────
 
-/// Audit enablement is still required even though reading is done via
-/// `wevtutil` rather than a live ETW subscription: without the subcategory
-/// active, Windows simply never writes the 4698 event, regardless of how it is
-/// read afterward. Unlike the logon/account subcategories, "Other Object
-/// Access Events" is NOT in Windows' default audit policy — this call is the
-/// primary enablement path, and its failure warning deserves urgency.
+/// Without this subcategory Windows never writes 4698/4702, however they are read.
+/// "Other Object Access Events" is not in the default audit policy, so this call is
+/// the primary enablement path and its failure warning deserves urgency.
 fn enable_scheduled_task_audit() {
     enable_audit_subcategory(
         "Other Object Access Events (events 4698/4702)",
@@ -573,12 +552,9 @@ static ACCOUNT_CREATIONS: PollTarget = PollTarget {
 
 // ── Events 8003/8004 — `AppLocker` EXE/DLL audit/block (Microsoft-Windows-AppLocker/EXE and DLL)
 //
-// `AppLocker`'s operational channel is **enabled by default** on modern Windows
-// SKUs that ship `AppLocker`: unlike 4698, no `auditpol` toggle is involved
-// (`AppLocker` is a policy-configured feature, not an audit subcategory). If the
-// channel is disabled by group policy on a given host, `wevtutil qe` simply
-// returns nothing and this poll thread stays idle — the failure mode is a
-// coverage gap, not a crash, and the start-up channel check logs it (#786).
+// `AppLocker`'s operational channel is on by default where `AppLocker` ships, with no
+// `auditpol` toggle. A channel disabled by group policy returns nothing: a coverage
+// gap the start-up channel check logs.
 
 /// `AppLocker` event id for "blocked" (enforce mode).
 const APPLOCKER_EVENT_BLOCKED: u32 = 8004;
@@ -1125,33 +1101,19 @@ static KERBEROS_DELEGATION_FAILURES: PollTarget = PollTarget {
     enabled: |c| c.kerberos_delegation_failures_enabled,
 };
 
-// ── Policy-configurable allowlist and volume counters (#94) ─────────────────
+// ── Policy-configurable allowlist and volume counters ────────────────────────
 //
-// `sensor-*` crates may depend only on `schema` (`tools/check-deps.py`), so
-// this sensor cannot read `policy::EventLogPolicy` itself — the agent binary
-// (unrestricted deps) reads that type and converts it into this crate's own
-// `EventLogConfig` when constructing the sensor (ADR-0006).
+// Sensor crates depend only on `schema` (`tools/check-deps.py`), so the agent
+// converts `policy::EventLogPolicy` into this crate's own `EventLogConfig`.
 
-/// Which transport the sensor uses to receive Event Log records from the OS
-/// (issue #322). Both transports produce identical normalized `Event`s
+/// Which transport delivers Event Log records. Both produce identical events
 /// through the same [`PollTarget`] parsers and update the same
-/// [`EventLogCounters`] — only the delivery mechanism differs.
+/// [`EventLogCounters`].
 ///
-/// - [`Polling`](EventLogTransport::Polling) — the default. One thread per
-///   enabled target runs an `EvtQuery` loop on `POLL_INTERVAL` cadence
-///   (`wevtutil qe` before #1126), filters by `EventRecordID > last_seen`,
-///   and parses each returned XML block. Adds up to `POLL_INTERVAL` of
-///   latency, in exchange for no callback registered with the OS — the safe
-///   fallback if a host's `EvtSubscribe` behavior is ever in doubt.
-///
-/// - [`Subscribe`](EventLogTransport::Subscribe) — one `EvtSubscribe` call
-///   per enabled target, callback delivery from the OS the moment an event
-///   lands in the channel. No polling latency.
-///
-/// The default is [`Polling`](EventLogTransport::Polling): opt-in for
-/// `Subscribe` at the config layer, so a deployment picks it host-by-host
-/// after validation rather than the whole fleet flipping on merge. Polling was the
-/// original transport (ADR-0004).
+/// [`Polling`](EventLogTransport::Polling) is the default: it adds up to
+/// `POLL_INTERVAL` of latency but registers no callback with the OS.
+/// [`Subscribe`](EventLogTransport::Subscribe) removes the latency and is opted
+/// into host by host.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EventLogTransport {
     /// Default `EvtQuery` poll loop, one thread per enabled target.
@@ -1162,24 +1124,18 @@ pub enum EventLogTransport {
 }
 
 impl Default for EventLogTransport {
-    /// [`Polling`](EventLogTransport::Polling), matching the pre-#322
-    /// behavior — the sensor's transport does not change on a mere upgrade;
-    /// it changes when an operator explicitly says so.
+    /// [`Polling`](EventLogTransport::Polling): the transport changes only when
+    /// an operator says so.
     fn default() -> Self {
         Self::Polling
     }
 }
 
 /// Which of this sensor's independently toggled targets are active, and which
-/// transport delivers them. A disabled target is never even queried — not
-/// filtered after the fact — so a host that, say, disables logon-event
-/// polling pays no query cost for it either.
+/// transport delivers them. A disabled target is never queried, so it costs nothing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct EventLogConfig {
-    /// Which OS-facing transport the sensor uses to receive channel events.
-    /// See [`EventLogTransport`] for the trade-offs; defaults to
-    /// [`Polling`](EventLogTransport::Polling) so a deployment does not
-    /// change delivery mechanism on a mere version bump.
+    /// Which transport delivers channel events; see [`EventLogTransport`].
     pub transport: EventLogTransport,
     /// Event 7045 (T1543.003 — service install persistence).
     pub service_installs_enabled: bool,
@@ -1189,36 +1145,35 @@ pub struct EventLogConfig {
     pub scheduled_tasks_enabled: bool,
     /// Event 4720 (T1136.001 — local account creation persistence).
     pub account_creations_enabled: bool,
-    /// Events 4624/4625/4648/4672 (logon/session, #94).
+    /// Events 4624/4625/4648/4672 (logon/session).
     pub logon_events_enabled: bool,
     /// Audit and enforced `AppLocker` decisions from EXE/DLL, MSI/Script,
     /// Packaged app-Execution, and Packaged app-Deployment, reported as
-    /// `PolicyDenialEvent` (#427).
+    /// `PolicyDenialEvent`.
     pub applocker_blocks_enabled: bool,
     /// Event 106 (T1053.005 — scheduled task registered via the
     /// `Microsoft-Windows-TaskScheduler/Operational` channel; complements the
     /// 4698 path where Task Scheduler history is enabled, which it is not by
-    /// default, #786).
+    /// default).
     pub task_scheduler_op_enabled: bool,
     /// Defender Operational: 1116/1117 verdicts and the 5001/5007/5010/5012
-    /// tamper traces, reported as `DefenderEvent` (#283).
+    /// tamper traces, reported as `DefenderEvent`.
     pub defender_enabled: bool,
     /// WDAC 3076/3077 on the `CodeIntegrity` Operational channel, reported as
-    /// `PolicyDenialEvent` with `POLICY_MECHANISM_WDAC` (#283).
+    /// `PolicyDenialEvent` with `POLICY_MECHANISM_WDAC`.
     pub wdac_enabled: bool,
     /// Terminal Services session lifecycle (`LocalSessionManager` 21/23/24/25)
     /// and RDP authentications (`RemoteConnectionManager` 1149), reported as
-    /// `SessionEvent` (#285). Console sessions included.
+    /// `SessionEvent`. Console sessions included.
     pub terminal_sessions_enabled: bool,
     /// Security 1102 and System 104, an event log cleared by any means,
-    /// reported as `LogClearedEvent` (#799). Both channels are always on.
+    /// reported as `LogClearedEvent`. Both channels are always on.
     pub log_clears_enabled: bool,
     /// Events 201/202 on `Microsoft-Windows-Kerberos/Operational` (unconstrained
     /// delegation and TGT session-key-export denials), reported as
-    /// `KerberosDelegationFailureEvent` (#364). That channel is off by default
-    /// on a clean install (checked, this crate does not enable it — same open
-    /// question as #786's point 1 for `TaskScheduler/Operational`); a disabled
-    /// channel is still reported via [`warn_about_disabled_channels`].
+    /// `KerberosDelegationFailureEvent`. That channel is off on a clean install
+    /// and this crate does not enable it; [`warn_about_disabled_channels`]
+    /// reports it.
     pub kerberos_delegation_failures_enabled: bool,
 }
 
@@ -1245,8 +1200,7 @@ static TARGETS: &[&PollTarget] = &[
 ];
 
 impl Default for EventLogConfig {
-    /// Every group enabled — this crate's behavior before `EventLogConfig`
-    /// existed.
+    /// Every group enabled.
     fn default() -> Self {
         Self {
             transport: EventLogTransport::default(),
@@ -1265,14 +1219,10 @@ impl Default for EventLogConfig {
     }
 }
 
-/// Per-group event counts, incremented once per event actually normalized and
-/// handed to the sink (not per raw XML block — a block skipped for
-/// missing/unusable fields is not "volume", it is noise this sensor already
-/// filtered out). Plain `Relaxed` atomics: independent monotonic counts, never
-/// used to synchronize anything else. A handle from
-/// [`EventLogSensor::counters`] can be read from any thread while `run` is
-/// updating it — e.g. a future diagnostics/health surface (none exists in
-/// this workspace yet; this type is what such a surface would read).
+/// Per-group event counts, incremented once per event normalized and handed to
+/// the sink (a skipped block is not volume). Independent `Relaxed` counters,
+/// readable from any thread through [`EventLogSensor::counters`] while `run`
+/// updates them.
 #[derive(Debug, Default)]
 pub struct EventLogCounters {
     pub service_installs: AtomicU64,
@@ -1290,12 +1240,12 @@ pub struct EventLogCounters {
     pub log_clears: AtomicU64,
     /// `Microsoft-Windows-Kerberos/Operational` 201 and 202 together.
     pub kerberos_delegation_failures: AtomicU64,
-    /// Channels found disabled at start-up for an enabled target (#786): each
+    /// Channels found disabled at start-up for an enabled target: each
     /// is polled or subscribed like any other but cannot deliver an event.
     pub disabled_channels: AtomicU64,
 }
 
-/// One warning per enabled target channel that is switched off (#786). A disabled
+/// One warning per enabled target channel that is switched off. A disabled
 /// channel answers a query with no events and no error, so without this the
 /// target looks like a quiet, healthy one and its liveness counter keeps moving.
 /// Checked once per channel (several targets share `Security`), at start-up only:
@@ -1326,8 +1276,8 @@ fn warn_about_disabled_channels(config: &EventLogConfig, counters: &EventLogCoun
 
 // ── The sensor ────────────────────────────────────────────────────────────────
 
-/// The Windows Event Log poller: spawns one `EvtQuery` poll loop per
-/// enabled target (see the crate doc) and implements `schema::sensor::Sensor`.
+/// The Windows Event Log sensor: one poll loop or subscription per enabled
+/// target, implementing `schema::sensor::Sensor`.
 pub struct EventLogSensor {
     stop: Arc<AtomicBool>,
     config: EventLogConfig,
@@ -1373,18 +1323,13 @@ impl EventLogSensor {
 
     /// One liveness counter per **enabled** poll target, named for a silence
     /// monitor (`windows-eventlog:<target>`). Each is incremented once per poll
-    /// tick that actually succeeded (the channel query did not fail), whether or not it
-    /// found events: a quiet channel stays live, a refused or broken one goes
-    /// dark. Per target rather than per sensor, because one shared counter would
-    /// let a healthy System poll mask a Security channel that stopped answering.
-    /// A disabled target is omitted — it never polls, so it must never be
-    /// watched for silence.
+    /// tick whose query succeeded, events or not: a quiet channel stays live, a
+    /// refused one goes dark. Per target so a healthy System poll cannot mask a
+    /// silent Security channel. A disabled target is omitted.
     ///
-    /// Empty under [`EventLogTransport::Subscribe`]: a push subscription has
-    /// no poll tick, so a counter would never move on a quiet channel and a
-    /// silence monitor would raise a false T1562 on a healthy target. Until
-    /// that transport has a liveness signal of its own, it is simply not
-    /// watched (issues #403, #423).
+    /// Empty under [`EventLogTransport::Subscribe`]: a push subscription has no
+    /// tick, so a counter would stay still on a quiet channel and raise a false
+    /// T1562 on a healthy target.
     #[must_use]
     pub fn liveness(&self) -> Vec<(&'static str, Arc<AtomicU64>)> {
         if self.config.transport == EventLogTransport::Subscribe {
@@ -1429,10 +1374,8 @@ impl Sensor for EventLogSensor {
         self.stop.store(false, Ordering::SeqCst);
         let sink: Arc<dyn EventSink> = Arc::from(sink);
 
-        // Audit-subcategory enablement is transport-independent: whether
-        // events land in the channel does not depend on whether we read them
-        // via `wevtutil` or `EvtSubscribe`. So we run each target's
-        // `enable_audit` (if any) once up front, regardless of transport.
+        // Audit enablement decides whether events are written at all, so it
+        // runs once up front whatever the transport.
         for target in TARGETS {
             if !(target.enabled)(&self.config) {
                 continue;
@@ -1443,10 +1386,7 @@ impl Sensor for EventLogSensor {
         }
         warn_about_disabled_channels(&self.config, &self.counters);
 
-        // Two kinds of "hold this alive while we run" objects, kept in
-        // separate vectors so their types stay concrete and their drops fire
-        // in the correct order on the way out (subscriptions before threads,
-        // via the natural reverse-declaration order of local drops).
+        // Declared before `subscriptions` so the subscriptions drop first.
         let mut poll_handles: Vec<std::thread::JoinHandle<()>> = Vec::new();
         #[cfg(windows)]
         let mut subscriptions: Vec<crate::subscribe::SubscriptionHandle> = Vec::new();
@@ -1475,11 +1415,8 @@ impl Sensor for EventLogSensor {
                             continue;
                         }
                         enabled += 1;
-                        // `subscribe` returns `None` on `EvtSubscribe`
-                        // failure (channel disabled, denied, invalid XPath).
-                        // The failure is logged inside `subscribe`; we
-                        // continue with the other targets — one channel
-                        // degraded is not a sensor-wide crash.
+                        // `None` (logged inside `subscribe`) degrades this
+                        // channel only.
                         if let Some(handle) = crate::subscribe::subscribe(
                             target,
                             Arc::clone(&sink),
@@ -1500,22 +1437,16 @@ impl Sensor for EventLogSensor {
             }
         }
 
-        // Same idle loop for both transports: the subscribe transport does
-        // its own delivery on OS-managed callback threads, we only wait for
-        // the stop signal here.
+        // Subscriptions deliver on OS callback threads; both transports just wait
+        // for stop here.
         while !self.stop.load(Ordering::SeqCst) {
             std::thread::sleep(Duration::from_millis(200));
         }
 
-        // Under `Polling`, threads exit on their own once `stop` is
-        // observed; join to reclaim them. Under `Subscribe`, the
-        // `subscriptions` vec is dropped when this function returns, which
-        // calls `EvtClose` on each handle (see `SubscriptionHandle::Drop`).
         for handle in poll_handles {
             let _ = handle.join();
         }
-        // `subscriptions` drops here (natural scope end), tearing down each
-        // `EvtSubscribe` before we return.
+        // `subscriptions` drops here, closing each `EvtSubscribe` handle.
         Ok(())
     }
 
@@ -1545,10 +1476,7 @@ mod config_tests {
 
     #[test]
     fn default_transport_is_polling() {
-        // Contract for #322: default MUST be Polling so a mere version bump
-        // does not silently change delivery mechanism on any host. Subscribe
-        // is opt-in at the config layer, exercised host-by-host after
-        // validation.
+        // An upgrade must not change the delivery mechanism of any host.
         assert_eq!(
             EventLogConfig::default().transport,
             EventLogTransport::Polling

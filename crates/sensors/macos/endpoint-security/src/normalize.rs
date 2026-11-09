@@ -1,23 +1,10 @@
 //! Normalization of raw `EndpointSecurity` records ([`crate::raw`]) into
-//! `schema` events — pure and cross-platform, so the mapping is unit-tested on
-//! any host (same split as `sensor-windows`' `normalize`).
+//! `schema` events, portable so the mapping is unit-tested on any host.
 //!
-//! ## Flag semantics
-//!
-//! `schema::FileOpenEvent::flags` is platform-native by contract; this sensor
-//! deliberately emits **POSIX `O_*` values** (macOS shares them with Linux for
-//! the bits `schema` defines), so `schema::has_write_intent` and every
-//! path+write rule work unchanged. The kernel's `fflag` (`FREAD`/`FWRITE`) is
-//! translated in [`open_fflag_to_flags`], never passed through raw.
-//!
-//! ## Signature at the source
-//!
-//! Unlike Windows (where enrichment computes Authenticode verdicts after the
-//! fact), `EndpointSecurity` hands the kernel's code-signing state to the
-//! sensor for free on every exec, so [`normalize`] fills
-//! `ExecEvent::signature` directly. This is the kernel's *dynamic validity*
-//! view (`CS_VALID`), not a full chain evaluation — good enough for "unsigned
-//! or invalidated binary ran", and enrichment may still refine it later.
+//! Open flags are emitted as POSIX `O_*` values (see [`open_fflag_to_flags`])
+//! so `schema::has_write_intent` and the path+write rules work unchanged.
+//! `ExecEvent::signature` comes from the kernel's code-signing flags: the
+//! dynamic `CS_VALID` view, not a chain evaluation.
 
 use std::net::IpAddr;
 

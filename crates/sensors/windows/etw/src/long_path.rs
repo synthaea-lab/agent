@@ -1,20 +1,12 @@
-//! 8.3 short-name expansion for sensor paths (#489).
+//! 8.3 short-name expansion for sensor paths.
 //!
-//! Kernel-File reports one file under both its short form
-//! (`C:\Users\JIHAIR~1\AppData\Local\Temp\x.exe`) and its long form, so every
-//! string comparison downstream (the `FileQuarantine` dedup, the T1105/T1204.002
-//! joins) saw two files where there is one — 946 events for 400 marks in the
-//! 2026-09-25 lab run. Expanding once here, before any event carries the path,
-//! gives consumers a single form.
-//!
-//! The expansion runs on the ETW callback thread, so it is shaped to stay cheap:
-//! only a local drive-letter path with a `~` in it is touched, the parent
-//! directory's expansion is cached (a host has few short-named directories),
-//! and only a `~` in the leaf itself costs an uncached lookup. UNC paths are
-//! never resolved: a lookup against a slow share would stall every Kernel-File
-//! event behind it (#439's lesson). A path that can't be resolved (already
-//! deleted, access denied) keeps its raw form — consumers must still tolerate
-//! a mismatch.
+//! Kernel-File reports one file under both its short (`JIHAIR~1`) and long
+//! names, so string joins downstream would see two files. Expansion runs on
+//! the ETW consumer thread and stays cheap: only local drive-letter paths with
+//! a `~` are touched and each parent directory's expansion is cached. UNC
+//! paths are never resolved, since a slow share would stall every Kernel-File
+//! event behind it. An unresolvable path keeps its raw form, so consumers must
+//! still tolerate a mismatch.
 
 use std::{collections::HashMap, sync::Mutex};
 

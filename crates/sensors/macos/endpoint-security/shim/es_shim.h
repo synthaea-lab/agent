@@ -1,16 +1,11 @@
-/* C shim between libEndpointSecurity and the Rust sensor (issue #32).
+/* C shim between libEndpointSecurity and the Rust sensor.
  *
- * Why a shim instead of Rust FFI against es_message_t: the message layout is
- * version-dependent (unions of ~100 event structs, fields gated on
- * `message version >= N`), and `es_new_client` takes an Objective-C block.
- * Transcribing that into #[repr(C)] Rust would be a silent-ABI-drift machine.
- * Here the shim is compiled against Apple's own headers on the build machine,
- * so every field access is checked by the C compiler, and Rust only ever sees
- * the flat, stable structs below.
+ * es_message_t is a version-gated union behind an Objective-C block API, so
+ * the shim is compiled against Apple's headers and hands Rust only the flat
+ * structs below; src/ffi.rs must mirror them field for field.
  *
- * String fields point into the es_message_t (or into scratch buffers owned by
- * the shim) and are ONLY valid for the duration of the callback — the Rust
- * side copies what it keeps before returning.
+ * String fields point into the es_message_t or into shim scratch buffers and
+ * are valid only for the duration of the callback: Rust copies what it keeps.
  */
 #ifndef SYNTHAEA_ES_SHIM_H
 #define SYNTHAEA_ES_SHIM_H

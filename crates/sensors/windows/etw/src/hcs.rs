@@ -1,11 +1,10 @@
-//! The Host Compute Service client behind container attribution (<https://github.com/synthaea-lab/agent/issues/39>): the
+//! The Host Compute Service client behind container attribution: the
 //! containers the service runs, and the processes in each.
 //!
-//! `computecore.dll` is loaded on first use, from System32 only, and first use
-//! only happens once a process was seen in a server silo. Linking it would make
-//! the agent fail to start on a build without it, and a host that never runs a
-//! container never needs it. When the DLL or the service is missing, every call
-//! answers an error and the silo keeps its provisional id.
+//! `computecore.dll` is loaded from System32 on first use, which only happens
+//! once a process was seen in a server silo: linking it would make the agent
+//! fail to start on a build without it. When the DLL or the service is
+//! missing, every call answers an error and the silo keeps its provisional id.
 
 use std::{ffi::c_void, sync::OnceLock};
 

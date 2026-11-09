@@ -17,14 +17,13 @@ pub struct ListenerEntry {
     pub process_name: Option<String>,
     pub local: SocketAddr,
     /// `IPPROTO_TCP` (6) or `IPPROTO_UDP` (17) — which IP Helper table this
-    /// entry came from (<https://github.com/synthaea-lab/agent/issues/40>).
+    /// entry came from.
     pub protocol: u8,
 }
 
 /// The default Windows dynamic (ephemeral) port range, 49152-65535, the same for
 /// UDP and TCP on IPv4 and IPv6 since Vista (`netsh int ipv4 show dynamicport udp`
-/// prints `start 49152, 16384 ports` on an untouched host; measured on the
-/// Windows 11 dev host of the <https://github.com/synthaea-lab/agent/issues/40> capture).
+/// prints `start 49152, 16384 ports` on an untouched Windows 11 host).
 ///
 /// Fixed rather than read from the host: no documented API returns the range,
 /// and getting it wrong only moves noise, never blindness. An administrator who
@@ -33,7 +32,7 @@ pub struct ListenerEntry {
 /// is dropped whatever the host's setting.
 pub const EPHEMERAL_UDP_PORTS: core::ops::RangeInclusive<u16> = 49152..=65535;
 
-/// Whether `entry` is a socket LISTENER-DRIFT should see (<https://github.com/synthaea-lab/agent/issues/40>).
+/// Whether `entry` is a socket LISTENER-DRIFT should see.
 ///
 /// Every TCP entry is: the TCP table is already filtered to listeners. A UDP
 /// entry is kept only when its port is outside [`EPHEMERAL_UDP_PORTS`].
@@ -43,7 +42,7 @@ pub const EPHEMERAL_UDP_PORTS: core::ops::RangeInclusive<u16> = 49152..=65535;
 /// bound on the next poll" does not separate them from a service. A service
 /// a client must find has a fixed port, and fixed ports sit below the range.
 ///
-/// The cost, stated in `docs/sensors/windows.md`: a UDP listener that binds
+/// The cost, stated in `docs/sensors/windows/sockets.md`: a UDP listener that binds
 /// a port in the ephemeral range on purpose is invisible to LISTENER-DRIFT. Its
 /// traffic still reaches the ETW network stream.
 #[must_use]

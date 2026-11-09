@@ -1,9 +1,8 @@
-// The extension side of the extension↔agent seam (issue #33): a reconnecting
+// The extension side of the extension-to-agent seam: a reconnecting
 // Unix-socket client writing the NDJSON wire records `src/wire.rs` defines.
-// WIRE_VERSION here must match that file — bump both together.
+// WIRE_VERSION here must match that file: bump both together.
 //
-// Built and packaged per packaging/macos (not by cargo); type-checked in CI
-// by `swiftc -typecheck` so drift against the SDK is caught on every change.
+// Built and packaged per packaging/macos, not by cargo.
 
 import Darwin
 import Foundation
@@ -83,9 +82,10 @@ final class EventPipe {
                 write(self.fd, raw.baseAddress, raw.count) == raw.count
             }
             if !ok {
-                // Agent restarted (or backpressure) — drop this record, and
-                // reconnect on the next one. The agent's stream counts skew;
-                // the extension must never buffer unboundedly.
+                // Short write: the agent went away. Drop this record and
+                // reconnect on the next one. The write itself blocks while the
+                // agent is not reading, and records queue on `queue` meanwhile
+                // with no bound.
                 close(self.fd)
                 self.fd = -1
             }

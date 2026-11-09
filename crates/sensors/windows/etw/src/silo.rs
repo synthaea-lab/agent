@@ -1,24 +1,9 @@
-//! Container attribution for process-isolated Windows containers (<https://github.com/synthaea-lab/agent/issues/39>): which
-//! server silo a process runs in, and which container that silo is.
-//!
-//! A process-isolated container shares the host kernel, so the ETW session
-//! already sees every process in it; what it lacks is the attribution. Three
-//! steps, each degrading to "unknown" (`container: None`) rather than failing:
-//!
-//! 1. **pid → `ServerSiloId`** at `ProcessStart` (`winapi::read_server_silo_id`,
-//!    `ProcessMembershipInformation`: Windows 11 22H2 / Server 2025 and later;
-//!    older builds answer "unsupported" and every process stays `None`). A
-//!    process already gone when its start is handled takes its parent's silo
-//!    ([`exec_silo`]): a child is created in its parent's silo and cannot leave
-//!    it. 0 is the host.
-//! 2. **silo → container id**, from the Host Compute Service on a background
-//!    thread ([`run_resolver`]): each container's process list is probed until
-//!    one of its processes is found in a silo ([`match_containers`]). Until that
-//!    answer arrives, the id is the provisional `silo:<n>` ([`provisional_id`]),
-//!    so the event still says "containerized" rather than claiming the host.
-//! 3. **teardown**: a Kernel-Process server-silo create or terminate record
-//!    forgets the silo's mapping ([`SiloDirectory::forget`]), since a silo id
-//!    can be reused by a later container.
+//! Container attribution for process-isolated Windows containers: which server
+//! silo a process runs in ([`exec_silo`]), which container that silo is
+//! ([`run_resolver`], [`match_containers`]; [`provisional_id`] until then) and
+//! when to forget it ([`SiloDirectory::forget`], silo ids are reused). Each
+//! step degrades to `container: None` rather than failing. See
+//! `docs/sensors/windows/etw-enrichment.md`.
 
 use std::{
     collections::{HashMap, HashSet, VecDeque},

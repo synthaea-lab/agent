@@ -1,14 +1,10 @@
-//! AMSI content (#282): turning EID 1101's binary buffer into text, and the
-//! volume gate in front of the sink.
+//! AMSI content: turning EID 1101's binary buffer into text, and the volume
+//! gate in front of the sink.
 //!
-//! AMSI rescans the same content constantly (a module imported by every
-//! `PowerShell` session, the profile script, Defender's own scans), and one
-//! busy script host can scan thousands of fragments a minute. The issue's
-//! requirement is to *see* everything new but not ship every rescan to the
-//! correlator, and #408 showed the real-time consumer must stay cheap. So:
-//! identical content (AMSI's own SHA-256) is reported once per
-//! [`DEDUP_WINDOW_NS`], and a process is capped at [`PER_PID_LIMIT`] events
-//! per [`PER_PID_WINDOW_NS`]. Both drops are counted, never silent.
+//! AMSI rescans the same content constantly, and the real-time consumer must
+//! stay cheap, so identical content (AMSI's own SHA-256) is reported once per
+//! [`DEDUP_WINDOW_NS`] and a process is capped at [`PER_PID_LIMIT`] events per
+//! [`PER_PID_WINDOW_NS`]. Both drops are counted.
 
 use std::collections::HashMap;
 

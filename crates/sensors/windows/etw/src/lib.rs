@@ -1,60 +1,11 @@
 //! # sensor-windows
 //!
-//! Windows user-mode sensor built on ETW (Kernel-Process, Kernel-Network,
-//! Kernel-File), migrated from the old iteration with the coverage-audit findings
-//! fixed at the source:
-//!
-//! - **F-1**: the command line is the REAL command line, read from the target's PEB
-//!   (`NtQueryInformationProcess` + `ReadProcessMemory`), never the image path.
-//! - **F-2**: the session name is randomized per start, but under a fixed
-//!   prefix the agent passes in (`EtwNames`, `wtrace-` today, #596) — every
-//!   session matching it is enumerated and stopped at
-//!   startup (issue #408 — catches every orphan left by any number of consecutive
-//!   unclean shutdowns, not just the most recent). That prefix is itself a
-//!   fingerprint: an attacker can enumerate our session exactly the way we do
-//!   (`logman query -ets | findstr wtrace-`), so the session is still stoppable.
-//!   The guarantee is that stopping it is *loud*, not that it's impossible: the
-//!   silence watchdog turns a stopped trace into a sensor error instead of quiet
-//!   blindness.
-//! - **F-3**: every event carries the process's user SID and integrity level
-//!   (`User::Windows`), resolved from the process token.
-//! - **F-4**: unbounded strings via the new schema — multi-KB encoded command lines
-//!   survive intact.
-//! - **F-5**: NT device paths normalize through a real `QueryDosDeviceW` volume map,
-//!   not a hardcoded `C:`, then 8.3 short components expand to their long names
-//!   (#489) so one file has one path.
-//! - **F-6** (partial): `CreateNewFile` (EID 30) joins `NameCreate` (EID 12), and
-//!   `DeletePath` (EID 26) is kept for one case, a `:Zone.Identifier` stream
-//!   deletion (#442); full delete/rename semantics land with the ransomware pack
-//!   (#82) / driver (<https://github.com/synthaea-lab/agent/issues/27>).
-//! - **F-7**: IPv6 connects (EID 58/26) are first-class, and a short dedup window
-//!   prevents Connect+Send double-counting.
-//!
-//! The provider expansion (registry, DNS, image load, AMSI, WMI — audit P2–P8) is
-//! #21; each provider arrives as its own module. Compiles to a stub off Windows.
-//!
-//! Download provenance (#365): a Kernel-File write to a `:Zone.Identifier`
-//! stream (mark-of-the-web) is read back and reported as
-//! `schema::FileQuarantineEvent`, the macOS quarantine-xattr sibling — see
-//! [`zone_identifier`].
-//! Deleting that stream (the mark removed, T1553.005) is reported as a
-//! `schema::FileDeleteEvent` of the stream path (#442).
-//!
-//! BITS jobs (#284): `Microsoft-Windows-Bits-Client` records, reported as
-//! `schema::BitsJobEvent` with the job's client process as the actor (BITS
-//! does the network I/O from its own service), Microsoft update jobs dropped
-//! — see [`bits`].
-//!
-//! Cross-process activity without a driver (<https://github.com/synthaea-lab/agent/issues/41>, ADR-0026 follow-up 6): a thread started in
-//! another process (Kernel-Process `ThreadStart`) as `schema::RemoteThreadEvent`, and a
-//! memory-reading open of LSASS (Kernel-Audit-API-Calls `PsOpenProcess`) as
-//! `schema::ProcessAccessEvent` — the native equivalents of Sysmon 8 and 10. The filters
-//! live in `cross_process`.
-//!
-//! Container attribution (<https://github.com/synthaea-lab/agent/issues/39>): a process in a process-isolated container
-//! (a server silo) carries `EventMeta::container`, its id named by the Host
-//! Compute Service — see `silo`. Hyper-V-isolated containers run their own
-//! kernel and are invisible to this sensor by design.
+//! Windows user-mode sensor built on one ETW real-time session over the
+//! kernel and user-mode providers in `providers`. Identity (the real command
+//! line from the PEB, user SID and integrity level, container) is attached and
+//! NT paths are normalized to one DOS form before an event leaves the crate.
+//! Compiles to a stub off Windows. See `docs/sensors/windows/etw.md` and
+//! `docs/sensors/windows/etw-enrichment.md`.
 
 #[cfg(any(windows, test))]
 mod amsi;

@@ -1,41 +1,13 @@
-//! Push-based transport for the Event Log sensor via `EvtSubscribe` (issue
-//! #322). The default remains `Polling` (`sensor.rs`), see `EventLogTransport`
-//! for the switch; this module is the alternative that removes the 2s poll
-//! cadence and the "did we miss a rotation" edge case — the OS delivers each
-//! matching event directly to a callback the moment it lands in the channel.
+//! Push transport for the Event Log sensor: one `EvtSubscribe` per enabled
+//! [`PollTarget`], opted into through `EventLogTransport`. Each callback renders
+//! the event with `EvtRender` (the same XML the polling read gets) and runs the
+//! target's own parser, counter and sink, so both transports emit identical
+//! events.
 //!
-//! ## Shape
-//!
-//! One `EvtSubscribe` call per enabled [`PollTarget`], each with:
-//! - the target's `channel` + `id_filter` wrapped into the `*[System[...]]`
-//!   `XPath` the polling code already builds
-//! - a per-target callback that renders the event to XML with `EvtRender`,
-//!   hands the XML to the same `target.parse_block` used by the polling code,
-//!   increments the same counter, and dispatches to the same sink — so
-//!   normalization, counters, and downstream consumers are identical between
-//!   the two transports (only the delivery mechanism differs)
-//!
-//! The callback runs on a Windows thread-pool thread the caller does not
-//! control, so the shared state must be `Send + Sync` — which the sensor's
-//! `Arc<dyn EventSink>` / `Arc<EventLogCounters>` / `Arc<AtomicBool>` already
-//! are.
-//!
-//! ## Lifetime
-//!
-//! [`subscribe`] returns a [`SubscriptionHandle`] that owns both the
-//! `EVT_HANDLE` and the `Box<CallbackContext>` the OS holds a raw pointer to.
-//! Dropping the handle closes the subscription (`EvtClose`) **before**
-//! reclaiming the boxed context, in that order — otherwise the OS could
-//! deliver one last callback into freed memory. See the `Drop` impl for the
-//! ordering commentary.
-//!
-//! ## No `EvtRender` rewrite of the parser layer
-//!
-//! `EvtRender` with `EvtRenderEventXml` returns the exact same UTF-16 XML shape
-//! `wevtutil qe /f:xml` produces (both wrap the underlying Event Log reader
-//! API). So `xml::parse_service_install_block` and its siblings are reused
-//! verbatim — the substring-based parsing that felt fragile under polling is
-//! the same substring-based parsing that works under push, unchanged.
+//! The callback runs on a Windows thread-pool thread, so its state is
+//! `Send + Sync`. [`SubscriptionHandle`] owns the `EVT_HANDLE` and the boxed
+//! context the OS points at, and closes the subscription before freeing the
+//! context (see its `Drop`).
 
 #![cfg(windows)]
 
@@ -65,9 +37,7 @@ use crate::{
 /// callback thread the OS invokes for every event it delivers. Passed to the
 /// OS as an opaque `*const c_void` and reconstructed inside the callback.
 ///
-/// The struct is deliberately `Send + Sync` by construction: every field is
-/// either `'static` or an `Arc`, matching the same shared-state pattern the
-/// ETW sensor's provider callbacks use.
+/// `Send + Sync` because every field is `'static` or an `Arc`.
 struct CallbackContext {
     target: &'static PollTarget,
     sink: Arc<dyn EventSink>,
@@ -76,10 +46,8 @@ struct CallbackContext {
 }
 
 /// The C-ABI callback invoked by the OS for every matching event on the
-/// channel. Returns `ERROR_SUCCESS` (0) to keep the subscription alive; any
-/// non-zero return code terminates the subscription — which we never want
-/// here, since a single malformed event should not stop the whole channel
-/// (matches the polling code's "unparseable block advances the cursor" stance).
+/// channel. Always returns `ERROR_SUCCESS`: any other code ends the
+/// subscription, and one malformed event must not stop the channel.
 ///
 /// # Safety
 ///
@@ -95,12 +63,8 @@ unsafe extern "system" fn subscribe_callback(
     user_context: *const c_void,
     event_handle: EVT_HANDLE,
 ) -> u32 {
-    // The API delivers two action codes: `Deliver` for a real event and
-    // `Error` for a subscription-level problem (channel gone, permissions
-    // lost). We only normalize on `Deliver`; an `Error` is logged and the
-    // subscription is left running — Windows will resume delivery on its own
-    // once the transient condition clears, and we would rather see silence in
-    // the metrics than crash the whole sensor on one hiccup.
+    // `Error` reports a subscription-level problem (channel gone, access
+    // lost): log it and keep the subscription, which resumes on its own.
     if action != EvtSubscribeActionDeliver {
         tracing::warn!(
             action = action,
@@ -114,11 +78,7 @@ unsafe extern "system" fn subscribe_callback(
     // `SubscriptionHandle` this callback's subscription is tied to.
     let ctx = unsafe { &*(user_context as *const CallbackContext) };
 
-    // Shutdown fast-path: once `stop` is signaled, the sensor's `run` loop
-    // will drop the `SubscriptionHandle` shortly (`EvtClose`), but between
-    // "stop was set" and "handle was dropped" the OS may still deliver a few
-    // more events. Discarding them here keeps the sink from receiving events
-    // for a sensor the caller has already asked to wind down.
+    // Events delivered between `stop` and `EvtClose` are dropped.
     if ctx.stop.load(Ordering::SeqCst) {
         return ERROR_SUCCESS;
     }

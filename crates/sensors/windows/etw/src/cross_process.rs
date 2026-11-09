@@ -1,12 +1,13 @@
-//! Cross-process telemetry from driver-free providers (<https://github.com/synthaea-lab/agent/issues/41>, ADR-0026 follow-up 6): a thread
-//! started in another process (Kernel-Process `ThreadStart`, the native Sysmon 8) and a
-//! memory-reading open of LSASS (Kernel-Audit-API-Calls `PsOpenProcess`, the native Sysmon 10).
+//! Cross-process telemetry from driver-free providers: a thread started in
+//! another process (Kernel-Process `ThreadStart`, the native Sysmon 8) and a
+//! memory-reading open of LSASS (Kernel-Audit-API-Calls `PsOpenProcess`, the
+//! native Sysmon 10). The decisions live here, apart from the ETW callbacks,
+//! so they are tested without a session.
 //!
-//! The decisions are here, apart from the ETW callbacks, so they can be tested without a
-//! session. The lab capture behind them (#715, Windows 11 build 26300, one host): 55 to 71
-//! thread starts per second, 22 % of them cross-process before the exclusions below and
-//! about 2 % (1 to 2 per second) after them; 280 to 330 process opens per second, about half
-//! of them with `PROCESS_VM_READ`, so the open filter keys on the target first.
+//! Lab rates (Windows 11 build 26300): 55 to 71 thread starts per second, 22 %
+//! cross-process before the exclusions below and about 2 % after them; 280 to
+//! 330 process opens per second, half with `PROCESS_VM_READ`, so the open
+//! filter keys on the target first.
 
 use std::{
     collections::HashMap,
@@ -52,11 +53,11 @@ struct Start {
 /// Tells the initial thread of a new process from a thread injected into it, whichever of
 /// `ProcessStart` and the initial `ThreadStart` the session delivers first.
 ///
-/// The first thread of a process is started by its creator, so it looks cross-process
-/// (#715: most of the raw 22 %). It is recognized by pairing:
+/// The first thread of a process is started by its creator, so it looks cross-process. It is
+/// recognized by pairing:
 /// - a `ProcessStart` is remembered for [`ORIGINS_WINDOW_NS`]; the first cross-process (or
 ///   kernel) thread of that pid inside the window is its initial thread, and every later
-///   one is remote, whatever the pid store remembers of the process;
+///   one is remote;
 /// - a thread whose owner has no remembered start and did not exist before the window
 ///   (`owner_predates`, asked of the caller: the pid store, then the process's creation
 ///   time) is taken as the initial thread of a process whose start is still in flight,
@@ -65,11 +66,9 @@ struct Start {
 /// - a process that existed before the trace, or before the window, never has an initial
 ///   thread to excuse, so every cross-process thread into it is remote.
 ///
-/// So the pid store's LRU eviction does not decide the classification on its own: an owner
-/// whose start was seen is judged on that start, and an owner the store lost is judged on
-/// its creation time. What is left (#1150 review): a process that started within the window,
-/// whose `ProcessStart` was lost or forgotten, and that is evicted from the pid store,
-/// excuses one injected thread. Both maps are bounded; what they forget is counted.
+/// Known blind spot: a process that started within the window, whose `ProcessStart` was
+/// lost and that the pid store evicted, excuses one injected thread. Both maps are bounded;
+/// what they forget is counted.
 #[derive(Debug, Default)]
 pub(crate) struct ThreadOrigins {
     /// pid → its `ProcessStart`, for the window.

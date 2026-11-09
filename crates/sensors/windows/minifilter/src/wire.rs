@@ -1,14 +1,12 @@
-//! Decoder for the messages `SynthaeaFilter` sends on its port (milestone 2c, #136).
+//! Decoder for the messages `SynthaeaFilter` sends on its port (protocol v5,
+//! `docs/sensors/windows/minifilter.md#wire-format-protocol-v5`): a fixed 108-byte
+//! little-endian header, then the paths in UTF-16LE, `old_path` then `new_path`, not
+//! NUL-terminated. The caller strips the `FILTER_MESSAGE_HEADER` first.
 //!
-//! The format is the one in `docs/architecture/minifilter-event-channel.md` (protocol v5): a
-//! fixed 108-byte little-endian header, then the paths in UTF-16LE, `old_path` then `new_path`, not
-//! NUL-terminated. This module sees only the payload: the `FILTER_MESSAGE_HEADER` that
-//! `FilterGetMessage` puts in front of it is stripped by the caller.
-//!
-//! ADR-0012 guardrail 7: the bytes come from the kernel, but they are still treated as hostile
-//! input. Every read is bounds-checked, every length is validated against the buffer before it
-//! is used, and nothing here can panic or allocate more than the message itself justifies.
-//! Platform-independent on purpose, so the decoder is tested and fuzzed on every OS.
+//! The bytes come from the kernel but are treated as hostile: every read is bounds-checked,
+//! every length validated against the buffer, and nothing here panics or allocates more than
+//! the message justifies. Portable, so the decoder is tested on every OS, including a
+//! `proptest` suite.
 
 /// Bytes before the paths.
 pub const HEADER_LEN: usize = 108;

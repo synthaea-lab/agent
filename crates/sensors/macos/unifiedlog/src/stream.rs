@@ -1,24 +1,11 @@
-//! Turns a stream of `log stream --style ndjson` lines into normalized schema
-//! events, and (on macOS) produces that stream by actually running
-//! `/usr/bin/log`.
+//! Turns `log stream --style ndjson` lines into schema events and, on macOS,
+//! runs `/usr/bin/log` to produce them.
 //!
-//! **Why a subprocess and not `OSLogStore` FFI:** the public `OSLogStore` API
-//! only supports positioned snapshots — live streaming goes through private
-//! `LoggingSupport.framework` interfaces that Apple neither documents nor
-//! keeps stable. `log stream` is the supported surface for exactly this, its
-//! NDJSON is line-oriented JSON we already parse for `record.rs`, and the
-//! predicate is enforced by the log daemon itself (records outside it are
-//! never even serialized into our pipe). Same trade-off and same shape as
-//! `sensor-linux-journal` spawning `journalctl`.
-//!
-//! **Firehose discipline** (issue #95): three gates, in order —
-//! 1. the daemon-side predicate ([`PREDICATE`]) allowlists three narrow
-//!    sources (sudo outcomes, tccd request decisions, syspolicyd Gatekeeper
-//!    verdicts);
-//! 2. [`crate::classify`] matches exact message shapes, dropping the
-//!    remainder of what the predicate lets through;
-//! 3. a sliding-window rate bound ([`MAX_EVENTS_PER_WINDOW`]) sheds — with a
-//!    counter, never silently — if a log storm ever defeats both.
+//! A subprocess rather than `OSLogStore`: the public API only reads
+//! positioned snapshots, live streaming is private framework territory.
+//! Three gates bound the volume, in order: the daemon-side [`PREDICATE`],
+//! the exact-shape [`crate::classify`], and a counted sliding-window shed
+//! ([`MAX_EVENTS_PER_WINDOW`]).
 
 use std::{collections::VecDeque, io::BufRead};
 

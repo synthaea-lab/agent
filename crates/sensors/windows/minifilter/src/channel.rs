@@ -1,16 +1,13 @@
-//! The receive loop: connect, read, decode, forward, reconnect (milestone 2c, #136; Windows).
+//! The receive loop (Windows): connect, read, decode, forward, reconnect.
 //!
-//! One thread runs [`run`] for the agent's lifetime. It connects to the driver, forwards each
-//! delete and rename to the sink as `FileDelete`/`FileRename`, calls `on_alive` for every
-//! message (heartbeats included, so a wedged driver or sender thread becomes a silence alert,
-//! #71), and keeps [`ChannelStats`] current. Loss that the driver's counters or a sequence
-//! gap reveal is logged at most once a minute ([`LOSS_REPORT_INTERVAL`]).
+//! One thread runs [`run`] for the agent's lifetime. It forwards each driver event to the sink,
+//! calls `on_alive` for every message (heartbeats included, so a wedged driver becomes a
+//! silence alert) and keeps [`ChannelStats`] current. Loss is logged at most once per
+//! [`LOSS_REPORT_INTERVAL`].
 //!
-//! When a connection cannot be made, or breaks, the loop waits and retries with a capped
-//! backoff (1 s doubling to 30 s). The backoff is reset only once a connection has delivered a
-//! message, so a driver that accepts the connection but fails every read is retried at the
-//! capped rate, never in a tight loop. While the driver is absent nothing is forwarded and
-//! `on_alive` is not called, which is exactly the silence the monitor is for.
+//! A failed or broken connection is retried with a backoff from 1 s doubling to 30 s, reset
+//! only once a connection has delivered a message, so a driver that accepts and then fails
+//! every read is never retried in a tight loop.
 
 use std::{
     sync::{
