@@ -12,6 +12,8 @@ runtime, enriches each record from `/proc` and cgroupfs, and hands a `schema::Ev
 | [`btf.rs`](../../../crates/sensors/linux/userspace/src/btf.rs) | Minimal BTF parser for structure offsets |
 | [`syscall.rs`](../../../crates/sensors/linux/userspace/src/syscall.rs) | Fill `SYSCALL_DISPATCH` from the host ABI |
 | [`sensor.rs`](../../../crates/sensors/linux/userspace/src/sensor.rs) | `LinuxSensor`, the drain loop |
+| [`rings.rs`](../../../crates/sensors/linux/userspace/src/rings.rs) | The ring buffer table, a ready ring to one drain |
+| [`drain.rs`](../../../crates/sensors/linux/userspace/src/drain.rs) | One drain: cap, self-exclusion, wire record reads; container attribution of drained events |
 | [`normalize.rs`](../../../crates/sensors/linux/userspace/src/normalize.rs) | Pure wire → schema mapping, tested on every OS |
 | [`proc.rs`](../../../crates/sensors/linux/userspace/src/proc.rs) | `/proc` parsing: cmdline, environ, stat |
 | [`container.rs`](../../../crates/sensors/linux/userspace/src/container.rs), [`docker.rs`](../../../crates/sensors/linux/userspace/src/docker.rs) | Container attribution |
@@ -81,12 +83,13 @@ loads programs through the verifier without attaching them.
 One `tokio::select!` waits on: Ctrl-C, `stop()`, two timers, and one `AsyncFd` per ring buffer.
 Readiness of a ring is the epoll edge on its fd.
 
-- [`drain!`](../../../crates/sensors/linux/userspace/src/sensor.rs) reads a fixed-size record
-  (length checked, then `read_unaligned`) and passes it to a per-type closure that enriches and
-  normalizes it. [`drain_bytes!`](../../../crates/sensors/linux/userspace/src/sensor.rs) does the
+- The rings live in one [`RingBuffers`](../../../crates/sensors/linux/userspace/src/rings.rs)
+  table. [`drain_wire`](../../../crates/sensors/linux/userspace/src/rings.rs) reads a fixed-size
+  record (length checked, then `read_unaligned`) and passes it to a per-type closure that enriches
+  and normalizes it. [`drain_ready`](../../../crates/sensors/linux/userspace/src/rings.rs) does the
   same for the variable-length exec record, which the closure parses with `parse_exec_record`.
 - **Fairness.** One drain call takes at most
-  [`MAX_ITEMS_PER_DRAIN`](../../../crates/sensors/linux/userspace/src/sensor.rs) (256) items. Reading
+  [`MAX_ITEMS_PER_DRAIN`](../../../crates/sensors/linux/userspace/src/drain.rs) (256) items. Reading
   a ring is a synchronous read of shared memory with no `.await`, so under a sustained producer an
   uncapped loop would never return to `select!` and every other ring would starve. When the cap is
   hit the readiness flag is left set, so the next iteration polls the same ring again right away;
@@ -97,7 +100,7 @@ Readiness of a ring is the epoll edge on its fd.
   ([in-kernel filters](ebpf-probes.md#in-kernel-filters)); this check covers the other events and
   the window before `SIGNAL_WATCH_PID` is written.
 - **Optional rings.** A ring whose program is not attached (the `inode_setattr` ring when the hook
-  failed) is `None`, and [`readable_or_pending`](../../../crates/sensors/linux/userspace/src/sensor.rs)
+  failed) is `None`, and [`readable_or_pending`](../../../crates/sensors/linux/userspace/src/rings.rs)
   never resolves for it.
 - **Timers.** Every 10 s the survived-`SIGKILL` sweep runs; every 5 s the security-tool watch list
   is rescanned and the kernel's tool-signal drop counter is read ([signals](signals.md)).

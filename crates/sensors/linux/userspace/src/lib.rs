@@ -23,11 +23,15 @@ mod container;
 #[cfg(target_os = "linux")]
 mod docker;
 #[cfg(target_os = "linux")]
+mod drain;
+#[cfg(target_os = "linux")]
 mod ebpf;
 #[cfg(target_os = "linux")]
 mod parent_image;
 #[cfg(target_os = "linux")]
 mod proc;
+#[cfg(target_os = "linux")]
+mod rings;
 #[cfg(target_os = "linux")]
 mod sensor;
 #[cfg(all(target_os = "linux", any(ebpf_embedded, test)))]

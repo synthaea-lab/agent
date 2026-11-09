@@ -248,7 +248,7 @@ Stated so a reader does not assume coverage:
 
 - A new syscall route needs: a handler in `main.rs`, a handler id in the `raw_sys_enter` match, an
   entry in both `DISPATCH_ENTRIES` tables, a ring buffer, a wire struct, a `WIRE_VERSION` bump, a
-  `normalize` function, and a `drain!` branch.
+  `normalize` function, a `RingBuffers` field and a `drain_wire` branch.
 - Verify on the oldest supported verifier (the lab matrix includes 5.14 and 5.15) with
   `agent status`, which loads every raw tracepoint program without attaching it.
 - Each per-handler `*_OFFSET` constant is an offset into the router's synthetic record. Keep the
