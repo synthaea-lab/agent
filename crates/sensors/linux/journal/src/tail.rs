@@ -15,7 +15,10 @@
 use std::{collections::VecDeque, io::BufRead};
 
 use crate::{
-    JournalError, JournalEvent, JournalRecord, classify, classify::pam_sss_reports_user_unknown,
+    JournalError, JournalEvent, JournalRecord,
+    bounded_lines::{BoundedLines, Line, MAX_LINE_BYTES},
+    classify,
+    classify::pam_sss_reports_user_unknown,
     parse_record,
 };
 
@@ -40,6 +43,15 @@ const RECENT_PAM_FAILURES_CAP: usize = 64;
 /// measurement from a real stacked host — nothing here has verified it against
 /// a real sssd-stacked `sudo`.
 const DOUBLE_LOG_DEDUP_WINDOW_US: u64 = 1_000_000;
+
+/// Whether the `count`th dropped oversize line is logged: the first, then every
+/// [`OVERSIZE_LOG_EVERY`]th, so a flood leaves a trace without becoming a flood of logs.
+fn should_report_oversize(count: u64) -> bool {
+    count == 1 || count.is_multiple_of(OVERSIZE_LOG_EVERY)
+}
+
+/// Spacing of the oversize-line warnings after the first one.
+const OVERSIZE_LOG_EVERY: u64 = 1000;
 
 /// Which PAM module logged a `PamAuthFailure` line — the signal
 /// [`ClassifiedJournal::is_duplicate_pam_failure`] keys on, since only a
@@ -79,7 +91,9 @@ fn pam_module(message: &str) -> Option<PamModule> {
 /// pending when the underlying stream ends is flushed rather than lost — the
 /// journal stopping right after it is not a refutation.
 pub struct ClassifiedJournal<R> {
-    lines: std::io::Lines<R>,
+    lines: BoundedLines<R>,
+    /// Lines over [`crate::bounded_lines::MAX_LINE_BYTES`], read to their end and dropped.
+    oversize_lines: u64,
     on_line: Option<Box<dyn FnMut() + Send>>,
     /// A record already read and parsed (while resolving `pending_sss_failure`)
     /// but not yet classified — consumed before reading a fresh line.
@@ -96,13 +110,26 @@ pub struct ClassifiedJournal<R> {
 
 impl<R: BufRead> ClassifiedJournal<R> {
     pub fn new(reader: R) -> Self {
+        Self::from_lines(BoundedLines::new(reader))
+    }
+
+    fn from_lines(lines: BoundedLines<R>) -> Self {
         Self {
-            lines: reader.lines(),
+            lines,
+            oversize_lines: 0,
             on_line: None,
             held_record: None,
             pending_sss_failure: None,
             recent_pam_failures: VecDeque::new(),
         }
+    }
+
+    /// How many lines were over the length cap, read to their end and dropped. A host where this
+    /// grows has a writer that floods the journal stream; the dropped lines are the
+    /// only records the tail lost for this reason.
+    #[must_use]
+    pub fn oversize_lines_dropped(&self) -> u64 {
+        self.oversize_lines
     }
 
     /// Calls `hook` once for every non-blank line read from the source, **before**
@@ -127,7 +154,22 @@ impl<R: BufRead> ClassifiedJournal<R> {
         }
         loop {
             let line = match self.lines.next()? {
-                Ok(line) => line,
+                Ok(Line::Text(line)) => line,
+                // Dropped unparsed, but it still proves `journalctl` is delivering.
+                Ok(Line::Oversize) => {
+                    self.oversize_lines += 1;
+                    if should_report_oversize(self.oversize_lines) {
+                        tracing::warn!(
+                            dropped = self.oversize_lines,
+                            max_bytes = MAX_LINE_BYTES,
+                            "journal tail: line over the size cap dropped"
+                        );
+                    }
+                    if let Some(hook) = self.on_line.as_mut() {
+                        hook();
+                    }
+                    continue;
+                }
                 Err(e) => return Some(Err(JournalError::Io(e))),
             };
             if line.trim().is_empty() {
@@ -412,6 +454,125 @@ mod tests {
         let input = r#"{"__CURSOR":"c1","__REALTIME_TIMESTAMP":"1","SYSLOG_IDENTIFIER":"kernel","MESSAGE":"eth0 up"}"#;
         let mut it = ClassifiedJournal::new(Cursor::new(input));
         assert!(it.next().is_none());
+    }
+
+    // --- line length cap (#189) ------------------------------------------------
+
+    const CAPPED_AT: usize = 256;
+
+    fn oversize_record() -> String {
+        format!(
+            r#"{{"__CURSOR":"big","__REALTIME_TIMESTAMP":"1","MESSAGE":"{}"}}"#,
+            "x".repeat(2 * CAPPED_AT)
+        )
+    }
+
+    fn capped_journal(input: String) -> ClassifiedJournal<Cursor<String>> {
+        ClassifiedJournal::from_lines(BoundedLines::with_cap(Cursor::new(input), CAPPED_AT))
+    }
+
+    /// Collects what `tracing` writes, so a test can read the warnings back.
+    #[derive(Clone, Default)]
+    struct Captured(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for Captured {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Captured {
+        type Writer = Self;
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    #[test]
+    fn the_first_oversize_line_logs_a_warning_without_its_content() {
+        let captured = Captured::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(captured.clone())
+            .with_ansi(false)
+            .finish();
+        let secret = "SECRETPAYLOAD";
+        let input = format!(
+            r#"{{"__CURSOR":"big","MESSAGE":"{secret}{}"}}"#,
+            "x".repeat(CAPPED_AT)
+        );
+
+        tracing::subscriber::with_default(subscriber, || {
+            let mut it = capped_journal(input);
+            assert!(it.next().is_none());
+        });
+
+        let out = String::from_utf8(captured.0.lock().unwrap().clone()).unwrap();
+        assert!(out.contains("line over the size cap dropped"), "{out}");
+        assert!(out.contains("dropped=1"), "{out}");
+        assert!(
+            !out.contains(secret),
+            "the payload must not be logged: {out}"
+        );
+    }
+
+    #[test]
+    fn oversize_warnings_are_rate_limited() {
+        assert!(should_report_oversize(1));
+        assert!(!should_report_oversize(2));
+        assert!(!should_report_oversize(999));
+        assert!(should_report_oversize(1000));
+        assert!(!should_report_oversize(1001));
+        assert!(should_report_oversize(2000));
+    }
+
+    #[test]
+    fn an_oversize_line_is_dropped_and_counted_and_the_next_record_is_still_read() {
+        let input = [
+            oversize_record(),
+            r#"{"__CURSOR":"c2","__REALTIME_TIMESTAMP":"2","_PID":"1","JOB_TYPE":"stop","JOB_RESULT":"done","UNIT":"x.service","MESSAGE":"Stopped x.service."}"#.to_owned(),
+        ]
+        .join("\n");
+
+        let mut it = capped_journal(input);
+        let (record, event) = it.next().unwrap().unwrap();
+        assert_eq!(record.cursor, "c2");
+        assert!(matches!(event, JournalEvent::UnitStopped { .. }));
+        assert!(it.next().is_none());
+        assert_eq!(it.oversize_lines_dropped(), 1);
+    }
+
+    #[test]
+    fn an_oversize_line_still_fires_the_line_hook() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+
+        let seen = Arc::new(AtomicUsize::new(0));
+        let hook_seen = seen.clone();
+        let mut it = capped_journal(oversize_record()).with_line_hook(move || {
+            hook_seen.fetch_add(1, Ordering::SeqCst);
+        });
+
+        assert!(it.next().is_none());
+        assert_eq!(
+            seen.load(Ordering::SeqCst),
+            1,
+            "delivery proof, not a record"
+        );
+    }
+
+    #[test]
+    fn a_stream_with_no_oversize_line_counts_none() {
+        let mut it = ClassifiedJournal::new(Cursor::new(
+            r#"{"__CURSOR":"c1","__REALTIME_TIMESTAMP":"1","SYSLOG_IDENTIFIER":"kernel","MESSAGE":"eth0 up"}"#,
+        ));
+        assert!(it.next().is_none());
+        assert_eq!(it.oversize_lines_dropped(), 0);
     }
 
     // --- pam_sss PAM_USER_UNKNOWN lookahead suppression (#881 review) ----------
