@@ -19,6 +19,8 @@
 //! view (`CS_VALID`), not a full chain evaluation — good enough for "unsigned
 //! or invalidated binary ran", and enrichment may still refine it later.
 
+use std::net::IpAddr;
+
 use schema::{
     AuthEvent, AuthKind, AuthOutcome, Event, EventMeta, ExecEvent, FileDeleteEvent, FileOpenEvent,
     FileQuarantineEvent, FileRenameEvent, MountEvent, SignalEvent, Signature, User,
@@ -147,6 +149,85 @@ fn exec(
     })
 }
 
+fn file_open(meta: &RawMeta, path: &str, flags: u32) -> Event {
+    Event::FileOpen(FileOpenEvent {
+        meta: event_meta(meta),
+        path: path.to_owned(),
+        flags,
+    })
+}
+
+fn rename(meta: &RawMeta, old_path: &str, new_path: &str) -> Event {
+    Event::FileRename(FileRenameEvent {
+        meta: event_meta(meta),
+        old_path: old_path.to_owned(),
+        new_path: new_path.to_owned(),
+        // Free on this platform (#459 part 1): ES hands the process's
+        // executable path in every message, unlike Linux's rename
+        // tracepoint which needs a /proc read at normalize time (see
+        // sensor-linux's exe_path_for_pid doc) — no race, no extra read.
+        executable_path: Some(meta.process_path.clone()),
+    })
+}
+
+fn unlink(meta: &RawMeta, path: &str) -> Event {
+    Event::FileDelete(FileDeleteEvent {
+        meta: event_meta(meta),
+        path: path.to_owned(),
+    })
+}
+
+/// A logon attempt: `success` picks both the outcome and the kind.
+fn logon(meta: &RawMeta, success: bool, username: &str, source_address: Option<IpAddr>) -> Event {
+    let (outcome, kind) = if success {
+        (AuthOutcome::Success, AuthKind::Logon)
+    } else {
+        (AuthOutcome::Failure, AuthKind::LogonFailure)
+    };
+    Event::Auth(AuthEvent {
+        meta: event_meta(meta),
+        outcome,
+        kind,
+        target_user: username.to_owned(),
+        target_user_sid: None,
+        source_address,
+        status_code: None,
+    })
+}
+
+fn file_quarantine(
+    meta: &RawMeta,
+    path: &str,
+    quarantine: Option<&str>,
+    wherefroms_plist: Option<&[u8]>,
+) -> Event {
+    let (origin_url, referrer_url) = wherefroms_plist.map_or((None, None), wherefroms_urls);
+    Event::FileQuarantine(FileQuarantineEvent {
+        meta: event_meta(meta),
+        path: path.to_owned(),
+        agent: quarantine.and_then(quarantine_agent),
+        origin_url,
+        referrer_url,
+    })
+}
+
+fn signal_to_es_client(
+    meta: &RawMeta,
+    signal: u32,
+    target_pid: u32,
+    target_path: Option<&str>,
+) -> Event {
+    Event::Signal(SignalEvent {
+        meta: event_meta(meta),
+        signal,
+        target_pid,
+        target_image_path: target_path.map(str::to_owned),
+        target_unit: None,
+        sender_unreliable: false,
+        signals_lost: 0,
+    })
+}
+
 /// Maps one raw ES record to its schema event.
 ///
 /// Total today (every [`RawEsEvent`] variant produces an event) but kept
@@ -154,7 +235,7 @@ fn exec(
 /// without a schema counterpart.
 #[must_use]
 pub fn normalize(raw: &RawEsEvent) -> Option<Event> {
-    match raw {
+    let event = match raw {
         RawEsEvent::Exec {
             meta,
             image_path,
@@ -165,125 +246,64 @@ pub fn normalize(raw: &RawEsEvent) -> Option<Event> {
             cs_flags,
             is_platform_binary: _,
             parent_path,
-        } => Some(exec(
+        } => exec(
             meta,
             image_path,
             argv,
             *argv_truncated,
             *cs_flags,
             parent_path.as_deref(),
-        )),
-        RawEsEvent::Open { meta, path, fflag } => Some(Event::FileOpen(FileOpenEvent {
-            meta: event_meta(meta),
-            path: path.clone(),
-            flags: open_fflag_to_flags(*fflag),
-        })),
-        RawEsEvent::Create { meta, path } => Some(Event::FileOpen(FileOpenEvent {
-            meta: event_meta(meta),
-            path: path.clone(),
-            // Creation is write intent by definition — same shape the kernel's
-            // own open(2) would report for O_CREAT|O_WRONLY.
-            flags: schema::O_CREAT | schema::O_WRONLY,
-        })),
+        ),
+        RawEsEvent::Open { meta, path, fflag } => {
+            file_open(meta, path, open_fflag_to_flags(*fflag))
+        }
+        // Creation is write intent by definition — same shape the kernel's
+        // own open(2) would report for O_CREAT|O_WRONLY.
+        RawEsEvent::Create { meta, path } => {
+            file_open(meta, path, schema::O_CREAT | schema::O_WRONLY)
+        }
         RawEsEvent::Rename {
             meta,
             old_path,
             new_path,
-        } => Some(Event::FileRename(FileRenameEvent {
-            meta: event_meta(meta),
-            old_path: old_path.clone(),
-            new_path: new_path.clone(),
-            // Free on this platform (#459 part 1): ES hands the process's
-            // executable path in every message, unlike Linux's rename
-            // tracepoint which needs a /proc read at normalize time (see
-            // sensor-linux's exe_path_for_pid doc) — no race, no extra read.
-            executable_path: Some(meta.process_path.clone()),
-        })),
-        RawEsEvent::Unlink { meta, path } => Some(Event::FileDelete(FileDeleteEvent {
-            meta: event_meta(meta),
-            path: path.clone(),
-        })),
-        RawEsEvent::MmapWriteShared { meta, path } => Some(Event::FileOpen(FileOpenEvent {
-            meta: event_meta(meta),
-            path: path.clone(),
-            // A writable shared mapping mutates the file exactly like opening
-            // it read-write — report it as that (the shim already dropped
-            // read-only/private mappings).
-            flags: schema::O_RDWR,
-        })),
+        } => rename(meta, old_path, new_path),
+        RawEsEvent::Unlink { meta, path } => unlink(meta, path),
+        // A writable shared mapping mutates the file exactly like opening it
+        // read-write — report it as that (the shim already dropped
+        // read-only/private mappings).
+        RawEsEvent::MmapWriteShared { meta, path } => file_open(meta, path, schema::O_RDWR),
         RawEsEvent::SshLogin {
             meta,
             success,
             username,
             source_address,
-        } => Some(Event::Auth(AuthEvent {
-            meta: event_meta(meta),
-            outcome: if *success {
-                AuthOutcome::Success
-            } else {
-                AuthOutcome::Failure
-            },
-            kind: if *success {
-                AuthKind::Logon
-            } else {
-                AuthKind::LogonFailure
-            },
-            target_user: username.clone(),
-            target_user_sid: None,
+        } => logon(
+            meta,
+            *success,
+            username,
             // sshd may report a hostname here; only a literal address is an
             // IpAddr — a non-parsing value is dropped, not fabricated.
-            source_address: source_address.as_deref().and_then(|s| s.parse().ok()),
-            status_code: None,
-        })),
+            source_address.as_deref().and_then(|s| s.parse().ok()),
+        ),
+        // Local console login — no source address, which is itself
+        // meaningful (see AuthEvent::source_address's doc).
         RawEsEvent::LoginLogin {
             meta,
             success,
             username,
-        } => Some(Event::Auth(AuthEvent {
-            meta: event_meta(meta),
-            outcome: if *success {
-                AuthOutcome::Success
-            } else {
-                AuthOutcome::Failure
-            },
-            kind: if *success {
-                AuthKind::Logon
-            } else {
-                AuthKind::LogonFailure
-            },
-            target_user: username.clone(),
-            target_user_sid: None,
-            // Local console login — no source address, which is itself
-            // meaningful (see AuthEvent::source_address's doc).
-            source_address: None,
-            status_code: None,
-        })),
-        RawEsEvent::LwSessionLogin { meta, username } => Some(Event::Auth(AuthEvent {
-            meta: event_meta(meta),
-            outcome: AuthOutcome::Success,
-            kind: AuthKind::Logon,
-            target_user: username.clone(),
-            target_user_sid: None,
-            source_address: None,
-            status_code: None,
-        })),
+        } => logon(meta, *success, username, None),
+        RawEsEvent::LwSessionLogin { meta, username } => logon(meta, true, username, None),
         RawEsEvent::QuarantineSet {
             meta,
             path,
             quarantine,
             wherefroms_plist,
-        } => {
-            let (origin_url, referrer_url) = wherefroms_plist
-                .as_deref()
-                .map_or((None, None), wherefroms_urls);
-            Some(Event::FileQuarantine(FileQuarantineEvent {
-                meta: event_meta(meta),
-                path: path.clone(),
-                agent: quarantine.as_deref().and_then(quarantine_agent),
-                origin_url,
-                referrer_url,
-            }))
-        }
+        } => file_quarantine(
+            meta,
+            path,
+            quarantine.as_deref(),
+            wherefroms_plist.as_deref(),
+        ),
         RawEsEvent::Mount {
             meta,
             mount_point,
@@ -291,37 +311,32 @@ pub fn normalize(raw: &RawEsEvent) -> Option<Event> {
             fs_type,
             readonly,
             mounted,
-        } => Some(Event::Mount(MountEvent {
+        } => Event::Mount(MountEvent {
             meta: event_meta(meta),
             mount_point: mount_point.clone(),
             source: source.clone(),
             fs_type: fs_type.clone(),
             readonly: *readonly,
             mounted: *mounted,
-        })),
+        }),
         RawEsEvent::SignalToEsClient {
             meta,
             signal,
             target_pid,
             target_path,
-        } => Some(Event::Signal(SignalEvent {
-            meta: event_meta(meta),
-            signal: *signal,
-            target_pid: *target_pid,
-            target_image_path: target_path.clone(),
-            target_unit: None,
-            sender_unreliable: false,
-            signals_lost: 0,
-        })),
+        } => signal_to_es_client(meta, *signal, *target_pid, target_path.as_deref()),
         RawEsEvent::XpcConnect {
             meta,
             service_name,
             domain_type,
-        } => Some(Event::XpcConnect(XpcConnectEvent {
+        } => Event::XpcConnect(XpcConnectEvent {
             meta: event_meta(meta),
             service_name: service_name.clone(),
             domain_type: *domain_type,
-        })),
+        }),
+        // The persistence payload when BTM resolved one (the executable the
+        // launchd plist points at), else the item URL — the artifact an
+        // analyst removes.
         RawEsEvent::BtmLaunchItemAdd {
             meta,
             item_type: _,
@@ -330,15 +345,13 @@ pub fn normalize(raw: &RawEsEvent) -> Option<Event> {
             item_url,
             app_url: _,
             executable_path,
-        } => Some(Event::FileOpen(FileOpenEvent {
-            meta: event_meta(meta),
-            // The persistence payload when BTM resolved one (the executable
-            // the launchd plist points at), else the item URL — the artifact
-            // an analyst removes.
-            path: executable_path.clone().unwrap_or_else(|| item_url.clone()),
-            flags: schema::FLAG_PERSISTENCE_BTM_ARTIFACT,
-        })),
-    }
+        } => file_open(
+            meta,
+            executable_path.as_deref().unwrap_or(item_url),
+            schema::FLAG_PERSISTENCE_BTM_ARTIFACT,
+        ),
+    };
+    Some(event)
 }
 
 #[cfg(test)]
@@ -694,5 +707,45 @@ mod tests {
             panic!("BTM add must normalize to Event::FileOpen");
         };
         assert_eq!(open.path, "file:///Applications/Evil.app");
+    }
+    #[test]
+    fn console_and_loginwindow_logins_map_without_source_address() {
+        let failed = RawEsEvent::LoginLogin {
+            meta: meta(),
+            success: false,
+            username: "root".to_string(),
+        };
+        let Some(Event::Auth(auth)) = normalize(&failed) else {
+            panic!("must map to Event::Auth");
+        };
+        assert_eq!(auth.outcome, schema::AuthOutcome::Failure);
+        assert_eq!(auth.kind, schema::AuthKind::LogonFailure);
+        assert_eq!(auth.target_user, "root");
+        assert_eq!(auth.source_address, None);
+
+        let ok = RawEsEvent::LoginLogin {
+            meta: meta(),
+            success: true,
+            username: "alice".to_string(),
+        };
+        let Some(Event::Auth(auth)) = normalize(&ok) else {
+            panic!("must map to Event::Auth");
+        };
+        assert_eq!(auth.outcome, schema::AuthOutcome::Success);
+        assert_eq!(auth.kind, schema::AuthKind::Logon);
+
+        let lw = RawEsEvent::LwSessionLogin {
+            meta: meta(),
+            username: "alice".to_string(),
+        };
+        let Some(Event::Auth(auth)) = normalize(&lw) else {
+            panic!("must map to Event::Auth");
+        };
+        assert_eq!(auth.outcome, schema::AuthOutcome::Success);
+        assert_eq!(auth.kind, schema::AuthKind::Logon);
+        assert_eq!(auth.target_user, "alice");
+        assert_eq!(auth.target_user_sid, None);
+        assert_eq!(auth.source_address, None);
+        assert_eq!(auth.status_code, None);
     }
 }
