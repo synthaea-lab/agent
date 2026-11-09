@@ -94,7 +94,7 @@ pub(crate) fn fill_event_meta(
     }
 }
 
-/// Offset of `ret` in every `sys_exit_*` tracepoint (`x86_64/aarch64)`: 8-byte common
+/// Offset of `ret` in every `sys_exit_*` tracepoint (`x86_64`/`aarch64`): 8-byte common
 /// header + `__syscall_nr`(4, +4 padding) + `ret`(8, signed). Verified on
 /// 2026-09-22 on Alpine (kernel 6.18.50-0-virt, `x86_64`) via
 /// `/sys/kernel/tracing/events/syscalls/sys_exit_accept{,4}/format` — identical for

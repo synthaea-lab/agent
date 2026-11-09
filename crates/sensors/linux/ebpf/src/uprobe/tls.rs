@@ -24,7 +24,7 @@ static TLS_CAPTURE_EVENTS: RingBuf = RingBuf::with_byte_size(256 * 1024, 0);
 static TLS_SCRATCH: PerCpuArray<TlsCaptureEvent> = PerCpuArray::with_max_entries(1, 0);
 
 /// Tracks `SSL_read` buffer pointers between entry and return: pid → (`buf_ptr`, num, `lib_type`).
-/// `SSL_read(SSL` *ssl, void *buf, int num) fills `buf` on success, so we need to
+/// `SSL_read(SSL *ssl, void *buf, int num)` fills `buf` on success, so we need to
 /// stash the arguments at entry and read the buffer at return (uretprobe).
 /// The `lib_type` (0=OpenSSL, 1=BoringSSL, 2=GnuTLS) is passed from entry to exit.
 #[map]
