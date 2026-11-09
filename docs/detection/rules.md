@@ -88,9 +88,11 @@ SETUID-ROOT-REQUEST's deferred judgement (`pending_identity`, `exec_history`,
 `setuid_root_alerted`) in `IdentityRequests` ([`privesc.rs`](../../crates/rules/src/privesc.rs)),
 the download-to-execution joins (`recent_writes`, `recent_quarantines`,
 `recent_bits_downloads`, `recent_motw_removals`) in
-[`DownloadState`](../../crates/rules/src/download_state.rs), and the T1620 memfd-exec
+[`DownloadState`](../../crates/rules/src/download_state.rs), the T1620 memfd-exec
 correlation (`recent_memfd_creates`, `pending_proc_fd_exec`) in
-[`MemfdState`](../../crates/rules/src/memfd_state.rs). The main families:
+[`MemfdState`](../../crates/rules/src/memfd_state.rs), and LISTENER-DRIFT and
+POLICY-DENIAL-DRIFT (`known_listeners`, `known_policy_denials`, `policy_denial_budgets`) in
+[`DriftState`](../../crates/rules/src/drift_state.rs). The main families:
 
 | Family | Fields (examples) | Key | Feeds |
 | --- | --- | --- | --- |
