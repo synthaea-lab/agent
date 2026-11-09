@@ -61,24 +61,16 @@ impl TlsBudgetTracker {
         let now = Instant::now();
         let window = Duration::from_secs(1);
 
-        // Get or create window for this pid
         let entries = self.windows.entry(pid).or_default();
-
-        // Remove entries older than 1 second
         entries.retain(|(ts, _)| now.duration_since(*ts) < window);
-
-        // Sum bytes in current window
         let bytes_in_window: u32 = entries.iter().map(|(_, b)| b).sum();
 
-        // Check budget
         if bytes_in_window + bytes > self.bytes_per_sec {
             return false;
         }
 
-        // Record this capture
         entries.push((now, bytes));
 
-        // Periodic cleanup of old PIDs (every 100 checks)
         self.cleanup_counter += 1;
         if self.cleanup_counter >= 100 {
             self.cleanup_counter = 0;
@@ -241,9 +233,6 @@ fn attach_uprobe(
         .try_into()
         .map_err(|e| err(format!("`{program_name}` is not a uprobe: {e}")))?;
 
-    // Load program only once per unique program name
-    // (critical fix: OpenSSL 3.x exports both SSL_write and SSL_write_ex,
-    // both must attach to the same "ssl_write_openssl" program instance)
     if !loaded_programs.contains(program_name) {
         program
             .load()
@@ -255,8 +244,6 @@ fn attach_uprobe(
         );
     }
 
-    // Attach uprobe: point = offset, target = library path, scope = all processes
-    // (can attach same program to multiple offsets)
     program
         .attach(
             [symbol.offset],
