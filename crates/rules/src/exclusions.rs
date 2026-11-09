@@ -73,7 +73,7 @@ pub(crate) const MEMFD_EXEC_WINDOW_NS: u64 = 5_000_000_000; // 5s
 pub(crate) const QUARANTINE_EXEC_WINDOW_NS: u64 = 600_000_000_000; // 10 min
 
 /// Quarantine agents that are a mail client, for the T1566.001 tag on the
-/// provenance join ([`crate::RuleState`]'s `check_quarantined_exec`, <https://github.com/synthaea-lab/agent/issues/17>).
+/// provenance join ([`crate::download_state::DownloadState::check_quarantined_exec`], <https://github.com/synthaea-lab/agent/issues/17>).
 /// Apple Mail is listed on its expected quarantine string, **not on a capture**:
 /// it is expected to record itself as `Mail` in the `com.apple.quarantine`
 /// agent field, but no `xattr -p com.apple.quarantine` of a saved attachment
