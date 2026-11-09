@@ -52,7 +52,7 @@ struct AcceptArgs {
 static ACCEPT_ARGS: LruHashMap<u64, AcceptArgs> = LruHashMap::with_max_entries(1024, 0);
 
 /// Offsets of the `syscalls:sys_enter_accept`/`sys_enter_accept4` tracepoints
-/// (`x86_64/aarch64)`: `fd`(16), `upeer_sockaddr`(24) — identical shape for both
+/// (`x86_64`/`aarch64`): `fd`(16), `upeer_sockaddr`(24) — identical shape for both
 /// (accept4's extra `flags` argument trails at 40, not needed here). Verified on
 /// 2026-09-22 on Alpine (kernel 6.18.50-0-virt, `x86_64`) via
 /// `/sys/kernel/tracing/events/syscalls/sys_enter_accept{,4}/format`.

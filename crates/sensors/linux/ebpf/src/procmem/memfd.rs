@@ -30,7 +30,7 @@ static MEMFD_CREATE_SCRATCH: PerCpuArray<MemfdCreateEvent> = PerCpuArray::with_m
 #[map]
 static MEMFD_ARGS: HashMap<u64, MemfdCreateEvent> = HashMap::with_max_entries(1024, 0);
 
-/// Offsets of the `syscalls:sys_enter_memfd_create` tracepoint (`x86_64/aarch64)`:
+/// Offsets of the `syscalls:sys_enter_memfd_create` tracepoint (`x86_64`/`aarch64`):
 /// `uname`(16), `flags`(24). Verified on 2026-09-22 on Arch (kernel
 /// 6.6.9-arch1-1, `x86_64`) via
 /// `/sys/kernel/tracing/events/syscalls/sys_enter_memfd_create/format`.
