@@ -124,7 +124,7 @@ impl<R: BufRead> ClassifiedJournal<R> {
         }
     }
 
-    /// How many lines were over the length cap and dropped unread. A host where this
+    /// How many lines were over the length cap, read to their end and dropped. A host where this
     /// grows has a writer that floods the journal stream; the dropped lines are the
     /// only records the tail lost for this reason.
     #[must_use]

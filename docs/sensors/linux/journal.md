@@ -105,7 +105,7 @@ restart. The first start begins at "now".
 - `su`/`sshd` failure and `sudo`/`su` wrong-password parsing follow the documented formats and are
   unit-tested; a system-manager `JOB_TYPE=stop` record has not been captured on a real host.
 - Unit failures are classified but not mapped to an event.
-- A line over 1 MiB (`MAX_LINE_BYTES`, a trailing `` included) is read to its end without being
+- A line over 1 MiB (`MAX_LINE_BYTES`, a trailing `\r` included) is read to its end without being
   kept, then dropped; the tail goes on with the next line and `ClassifiedJournal::oversize_lines_dropped`
   counts it. The line hook still fires for it. The crate logs a warning for the first drop and then
   every 1000th, with the running count and never the content. `journalctl -o json` writes a field

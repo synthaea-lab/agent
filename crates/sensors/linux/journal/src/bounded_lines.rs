@@ -286,6 +286,23 @@ mod tests {
     }
 
     #[test]
+    fn a_read_error_in_the_middle_of_a_normal_line_does_not_lose_its_head() {
+        let reader = FailsOnce {
+            parts: vec![
+                Ok(b"ab".to_vec()),
+                Err(io::Error::other("boom")),
+                Ok(b"cd\nnext\n".to_vec()),
+            ],
+            current: Vec::new(),
+        };
+        let mut it = BoundedLines::with_cap(reader, 16);
+        assert!(it.next().unwrap().is_err());
+        assert_eq!(it.next().unwrap().unwrap(), text("abcd"));
+        assert_eq!(it.next().unwrap().unwrap(), text("next"));
+        assert!(it.next().is_none());
+    }
+
+    #[test]
     fn a_crlf_line_counts_its_carriage_return_toward_the_cap() {
         let got = lines(b"abcd\r\nabc\r\n", 4);
         assert_eq!(
