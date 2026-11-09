@@ -2445,7 +2445,7 @@ mod applocker_tests {
 
     #[test]
     fn applocker_prefers_full_file_path_over_the_expanded_variable_path() {
-        // Trimmed from the real 8003 captured in the lab (#427, see xml.rs).
+        // Trimmed from the real 8003 captured in the lab (#427, see xml/records/applocker.rs).
         let block = "<Event><System><EventID>8003</EventID><EventRecordID>24</EventRecordID></System>\
             <UserData><RuleAndFileData><PolicyName>EXE</PolicyName>\
             <TargetUser>S-1-5-21-1-2-3-1001</TargetUser><TargetProcessId>7092</TargetProcessId>\
@@ -2465,7 +2465,7 @@ mod applocker_tests {
 
     #[test]
     fn a_real_8004_is_an_enforced_denial_of_its_full_file_path() {
-        // Trimmed from the real 8004 captured in the lab (#529, see xml.rs).
+        // Trimmed from the real 8004 captured in the lab (#529, see xml/records/applocker.rs).
         let block = "<Event><System><EventID>8004</EventID><EventRecordID>29</EventRecordID><Execution ProcessID='7764' ThreadID='8072'/></System>\
             <UserData><RuleAndFileData><PolicyName>EXE</PolicyName>\
             <TargetUser>S-1-5-21-1-2-3-1001</TargetUser><TargetProcessId>9184</TargetProcessId>\
@@ -2853,7 +2853,7 @@ mod session_tests {
 mod log_cleared_tests {
     use super::*;
 
-    // Trimmed from the real 104 and 1102 captured in the lab (#799, see xml.rs).
+    // Trimmed from the real 104 and 1102 captured in the lab (#799, see xml/records/log_cleared.rs).
     const BLOCK_104: &str = "<Event><System><EventID>104</EventID>\
         <TimeCreated SystemTime='2026-10-15T12:50:01.7166040Z'/><EventRecordID>78381</EventRecordID>\
         <Execution ProcessID='3792' ThreadID='44592'/><Channel>System</Channel>\

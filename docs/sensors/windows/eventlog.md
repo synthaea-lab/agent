@@ -40,11 +40,11 @@ Exact channel names and filters are in the `static ... : PollTarget` definitions
 - **Persistence as `FileOpen`.** Service installs, task creations and updates, and account creations reuse `FileOpenEvent` with a persistence flag rather than a dedicated event type ([`persistence_file_open`](../../../crates/sensors/windows/eventlog/src/sensor.rs)). The consuming rules match on the flag. A 7045 with no service name or image path is skipped.
 - **4702 (task updated)** reports an existing task whose action was rewritten. Windows rewrites its own tasks routinely, so the consuming rule adds a suspicious-action-path gate.
 - **4720** covers local SAM accounts only. A domain account creation is logged on the domain controller.
-- **Logons.** [`to_auth_event`](../../../crates/sensors/windows/eventlog/src/sensor.rs) maps 4624 to a logon, 4625 to a failure, 4648 to explicit credentials (reported as `Success` meaning "the attempt was observed": its outcome is a separate 4624/4625), and 4672 to a privileged session. For 4624/4625 the `Subject*` fields are normally SYSTEM, so the account is taken from `Target*`; 4672 has no `Target*` and uses `Subject*` ([`LogonEvent`](../../../crates/sensors/windows/eventlog/src/xml.rs)). `comm` is `lsass.exe`, the process that writes these events.
+- **Logons.** [`to_auth_event`](../../../crates/sensors/windows/eventlog/src/sensor.rs) maps 4624 to a logon, 4625 to a failure, 4648 to explicit credentials (reported as `Success` meaning "the attempt was observed": its outcome is a separate 4624/4625), and 4672 to a privileged session. For 4624/4625 the `Subject*` fields are normally SYSTEM, so the account is taken from `Target*`; 4672 has no `Target*` and uses `Subject*` ([`LogonEvent`](../../../crates/sensors/windows/eventlog/src/xml/records/logon.rs)). `comm` is `lsass.exe`, the process that writes these events.
 - **Task Scheduler 106** has no task XML. The sensor reads the actions back from the task definition under `%SystemRoot%\System32\Tasks` ([`normalize_task_registered_from`](../../../crates/sensors/windows/eventlog/src/sensor.rs)) and reports a placeholder action when the file is gone. A task seen on both 4698 and 106 is deduplicated by the rules layer, not here.
 - **Defender.** The channel is localized, so only numeric fields are read. 5007 (configuration changed) is most of the channel's volume, so only changes to exclusions, `Disable*` switches and Tamper Protection are forwarded ([`is_security_relevant_setting`](../../../crates/sensors/windows/eventlog/src/sensor.rs)).
 - **WDAC.** 3033 is not subscribed (DLL-load noise).
-- **AppLocker** allowed events are filtered out. Packaged-app deployment decisions use action `install`; paths are expanded from AppLocker's `%OSDRIVE%`-style variables ([`expand_applocker_path`](../../../crates/sensors/windows/eventlog/src/xml.rs)).
+- **AppLocker** allowed events are filtered out. Packaged-app deployment decisions use action `install`; paths are expanded from AppLocker's `%OSDRIVE%`-style variables ([`expand_applocker_path`](../../../crates/sensors/windows/eventlog/src/xml/records/applocker.rs)).
 - **Log clears.** The Event Log service writes 1102 or 104 itself after emptying a log, so these catch `EvtClearLog` and .NET `ClearLog`, not only `wevtutil cl`.
 
 ### Audit policy enablement
@@ -134,11 +134,11 @@ The agent currently uses `EventLogPolicy::default()` (every group on); no policy
 
 ## XML parsing
 
-[`xml.rs`](../../../crates/sensors/windows/eventlog/src/xml.rs) is platform-independent and extracts fields by substring (`<Data Name='...'>`), without an XML parser dependency. The shape is the one `EvtRender(EvtRenderEventXml)` and `wevtutil qe /f:xml` both produce. Entities are unescaped. All field values here come from whoever caused the event (a file name, an account name, a task action), so the parsers must never panic on any input.
+The [`xml`](../../../crates/sensors/windows/eventlog/src/xml/mod.rs) module is platform-independent and extracts fields by substring (`<Data Name='...'>`), without an XML parser dependency. `xml/scan.rs` holds the scanning primitives, `xml/time.rs` the `TimeCreated` conversion, and `xml/records/` one parser per record shape. The shape is the one `EvtRender(EvtRenderEventXml)` and `wevtutil qe /f:xml` both produce. Entities are unescaped. All field values here come from whoever caused the event (a file name, an account name, a task action), so the parsers must never panic on any input.
 
 ## Testing
 
-- Unit tests in `sensor.rs` (`config_tests` and per-normalizer tests) and `xml.rs`, with fixtures trimmed from real captures; these run on every OS.
+- Unit tests in `sensor.rs` (`config_tests` and per-normalizer tests) and the `xml` modules, with fixtures trimmed from real captures; these run on every OS.
 - Never-panic robustness suites: [`applocker_robustness.rs`](../../../crates/sensors/windows/eventlog/tests/applocker_robustness.rs), [`session_robustness.rs`](../../../crates/sensors/windows/eventlog/tests/session_robustness.rs), [`log_cleared_robustness.rs`](../../../crates/sensors/windows/eventlog/tests/log_cleared_robustness.rs), [`kerberos_delegation_failure_robustness.rs`](../../../crates/sensors/windows/eventlog/tests/kerberos_delegation_failure_robustness.rs), [`xml_parser_robustness.rs`](../../../crates/sensors/windows/eventlog/tests/xml_parser_robustness.rs).
 - Windows-only tests in [`channel.rs`](../../../crates/sensors/windows/eventlog/src/channel.rs) read real channel configuration.
 
