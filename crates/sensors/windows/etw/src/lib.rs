@@ -68,6 +68,8 @@ mod etw_sessions;
 #[cfg(windows)]
 mod hcs;
 #[cfg(any(windows, test))]
+mod kernel_process;
+#[cfg(any(windows, test))]
 mod long_path;
 pub mod normalize;
 #[cfg(any(windows, test))]

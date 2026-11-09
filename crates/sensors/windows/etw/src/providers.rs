@@ -13,7 +13,7 @@ use ferrisetw::{
     schema_locator::SchemaLocator,
 };
 use schema::{
-    AmsiContentEvent, AssemblyLoadEvent, ConnectEvent, DnsQueryEvent, Event, EventMeta, ExecEvent,
+    AmsiContentEvent, AssemblyLoadEvent, ConnectEvent, DnsQueryEvent, Event, EventMeta,
     FileOpenEvent, ImageLoadEvent, LdapSearchEvent, NtlmAuthEvent, NtlmDirection,
     ProcessAccessEvent, RegistrySetEvent, RemoteThreadEvent, ScriptBlockEvent, SmbConnectEvent,
     UdpSendEvent, WmiActivityEvent, sensor::EventSink,
@@ -22,8 +22,9 @@ use schema::{
 use crate::{
     amsi,
     cross_process::{self, ThreadOrigin},
+    kernel_process::{self, ExecContext, KernelProcessEvent, ProcessStart, UNKNOWN_IMAGE},
     normalize,
-    sensor::{SharedState, basename, find_lsass},
+    sensor::{SharedState, find_lsass},
     silo,
     sync::LockExt,
     winapi, zone_identifier,
@@ -98,12 +99,6 @@ pub(crate) const ALL_PROVIDERS: [(&str, &str); 14] = [
     ("Kernel-Audit-API-Calls", KERNEL_AUDIT_API_GUID),
 ];
 
-/// A Kernel-Process sequence number field, `None` when the event version has
-/// none or it is 0 (no stamp).
-fn sequence_number(parser: &Parser, field: &str) -> Option<u64> {
-    parser.try_parse::<u64>(field).ok().filter(|&n| n != 0)
-}
-
 /// Kernel-Process keywords the sensor reads: `WINEVENT_KEYWORD_PROCESS` (0x10,
 /// EIDs 1/2), `WINEVENT_KEYWORD_THREAD` (0x20, EID 3 for remote threads, <https://github.com/synthaea-lab/agent/issues/41>),
 /// `WINEVENT_KEYWORD_IMAGE` (0x40, EID 5) and `WINEVENT_KEYWORD_JOB_SILO` (0x4000, the
@@ -112,8 +107,6 @@ fn sequence_number(parser: &Parser, field: &str) -> Option<u64> {
 /// stops (EID 4) the keyword brings along are dropped on their id before any parsing
 /// (#715: 55 to 71 starts per second on an idle host).
 const KERNEL_PROCESS_KEYWORDS: u64 = 0x10 | 0x20 | 0x40 | 0x4000;
-/// Kernel-Process `ThreadStart`.
-const THREAD_START: u16 = 3;
 
 /// `AssemblyFlags` bit indicating a dynamic (in-memory) assembly load.
 /// File-backed assemblies are high-volume noise; only dynamic loads are forwarded.
@@ -121,159 +114,167 @@ const ASSEMBLY_FLAG_DYNAMIC: u32 = 0x2;
 
 pub(crate) fn process_provider(sink: Arc<dyn EventSink>, state: Arc<SharedState>) -> Provider {
     let callback = move |record: &EventRecord, locator: &SchemaLocator| {
-        let eid = record.event_id();
-        // 1=ProcessStart (new spawn → ExecEvent), 2=ProcessEnd (prune the store —
-        // PID recycling), 5=ImageLoad (DLL/EXE mapped into a process), 23-26=server
-        // silo create/terminate callbacks (https://github.com/synthaea-lab/agent/issues/39). Processes already running come from
-        // the pid-store seed, not from a rundown (that would be EID 15). 3=ThreadStart,
-        // for a thread started in another process (https://github.com/synthaea-lab/agent/issues/41); its sibling 4=ThreadStop is
-        // dropped here.
-        if !matches!(eid, 1 | 2 | 5 | THREAD_START | 23..=26) {
+        let Some(event) = KernelProcessEvent::from_id(record.event_id()) else {
             return;
-        }
+        };
         state.events_seen.fetch_add(1, Ordering::Relaxed);
         let Ok(schema_def) = locator.event_schema(record) else {
             return;
         };
         let parser = Parser::create(record, &schema_def);
         let pid: u32 = parser.try_parse("ProcessID").unwrap_or(0);
-
-        if eid == THREAD_START {
-            forward_remote_thread(record, &parser, pid, &state, sink.as_ref());
-            return;
-        }
-
-        if eid == 2 {
-            if pid != 0 {
-                state.pids.lock_or_recover().remove(pid);
-                state.threads.lock_or_recover().process_ended(pid);
-                // LSASS does not end short of a crash (and reboot): look it up again
-                // rather than leave the slot empty. A copy's end changes nothing.
-                state.lsass.process_ended(pid, || find_lsass(&state));
+        match event {
+            KernelProcessEvent::ProcessStart => {
+                on_process_start(record, &parser, pid, &state, sink.as_ref());
             }
-            return;
-        }
-
-        if eid >= 23 {
-            // https://github.com/synthaea-lab/agent/issues/39: a server silo is created or torn down, so whichever
-            // container its id named is stale.
-            if let Ok(silo) = parser.try_parse::<u32>("Job ID") {
-                state.silos.lock_or_recover().forget(silo);
+            KernelProcessEvent::ProcessEnd => on_process_end(pid, &state),
+            KernelProcessEvent::ThreadStart => {
+                forward_remote_thread(record, &parser, pid, &state, sink.as_ref());
             }
-            return;
-        }
-
-        if eid == 5 {
-            // EID 5 = ImageLoad: a DLL or EXE was mapped into the process.
-            // Only emit for tracked PIDs — the store is seeded at startup and
-            // populated by EID 1, so a missing PID is a kernel/driver load that
-            // we intentionally ignore at userland tier.
-            let Some(comm) = state.pids.lock_or_recover().get(pid).map(basename) else {
-                return;
-            };
-            let raw_image: String = parser
-                .try_parse("ImageFileName")
-                .unwrap_or_else(|_| String::from("<unknown>"));
-            if raw_image.is_empty() || raw_image == "<unknown>" {
-                return;
+            KernelProcessEvent::ImageLoad => {
+                on_image_load(record, &parser, pid, &state, sink.as_ref());
             }
-            let image_path = state.normalize_path(&raw_image);
-            let timestamp_ns = normalize::filetime_to_ns(record.raw_timestamp());
-            // EID 5 carries no parent pid; the old cache lookup here always
-            // yielded 0 anyway.
-            let ppid = 0;
-            sink.on_event(Event::ImageLoad(ImageLoadEvent {
-                meta: state.meta(pid, ppid, comm, timestamp_ns),
-                image_path,
-            }));
-            return;
+            KernelProcessEvent::SiloChange => on_silo_change(&parser, &state),
         }
-
-        let ppid: u32 = parser.try_parse("ParentProcessID").unwrap_or(0);
-        let raw_image: String = parser
-            .try_parse("ImageName")
-            .unwrap_or_else(|_| String::from("<unknown>"));
-        let image_path = state.normalize_path(&raw_image);
-        let timestamp_ns = normalize::filetime_to_ns(record.raw_timestamp());
-        // https://github.com/synthaea-lab/agent/issues/41: the initial thread of this process is not an injection.
-        state
-            .threads
-            .lock_or_recover()
-            .process_started(pid, timestamp_ns);
-        if cross_process::is_lsass_image(&image_path, &state.system_root) {
-            take_lsass_slot(&parser, pid, ppid, &image_path, &state);
-        }
-
-        // #725: ProcessStart v4+ carries both incarnation stamps; an older
-        // version leaves them unset rather than guessed.
-        let generation = sequence_number(&parser, "ProcessSequenceNumber");
-        let parent_generation = sequence_number(&parser, "ParentProcessSequenceNumber");
-
-        // https://github.com/synthaea-lab/agent/issues/39: read while the process most likely still runs; one already
-        // gone is in its parent's silo. Read before taking the lock: it is a system call.
-        let own_silo = winapi::read_server_silo_id(pid);
-        let parent_image_path = {
-            let mut pids = state.pids.lock_or_recover();
-            let silo = silo::exec_silo(own_silo, pids.silo(ppid));
-            // Never cache "<unknown>" as the image: a hit on it would suppress
-            // live lookups. The silo is kept either way, or the process's
-            // events would read as the host's.
-            if image_path == "<unknown>" {
-                pids.insert_without_image(pid, generation, silo);
-            } else {
-                pids.insert(pid, image_path.clone(), generation, silo);
-            }
-            // Lineage at exec time (schema parent fields): the parent is usually alive
-            // and already in the store.
-            pids.get(ppid).map(str::to_owned)
-        };
-        let parent_comm = parent_image_path.as_deref().map(basename);
-
-        // F-1: the REAL command line from the target's PEB, unbounded (F-4);
-        // fall back to the image path only when the read fails — never a
-        // placeholder pretending to be arguments.
-        let cmdline = winapi::read_process_cmdline(pid).unwrap_or_else(|| image_path.clone());
-
-        // #688: which file the image was started from, taken as early as this
-        // thread can: the T1204.002 gate compares it with the file the enrichment
-        // worker verifies later, and a dropper can rename itself and put another
-        // file at its path in between. One open (shared for delete, so it cannot
-        // block the rename) and one query, no read. Not for a network or device path:
-        // the open would be a round trip on this thread (see
-        // `image_identity_is_capturable`).
-        let image_file_id = crate::image_identity_is_capturable(&image_path)
-            .then(|| crate::winapi::image_file_id(std::path::Path::new(&image_path)))
-            .flatten();
-
-        let comm = basename(&image_path);
-        let mut meta = state.meta(pid, ppid, comm, timestamp_ns);
-        // The parent's stamp as the kernel recorded it at this creation, not
-        // whatever holds `ppid` in the store by now.
-        meta.process_generation = generation.or(meta.process_generation);
-        meta.parent_process_generation = parent_generation.or(meta.parent_process_generation);
-        sink.on_event(Event::Exec(ExecEvent {
-            meta,
-            image_path,
-            cmdline,
-            argv: vec![], // Windows has a flat command line; consumers fall back
-            cmdline_truncated: false, // CreateProcess caps it at 32,766 UTF-16 units (#1112)
-            argv_omitted_bytes: None, // read from the PEB after the fact: a lost read is not measured (ADR-0045)
-            env_security: Vec::new(), // no exec-environment capture on Windows yet (#363 is Linux-only)
-            parent_comm,
-            parent_image_path,
-            sha256: None, // filled by the agent's enrichment stage
-            signature: None,
-            original_file_name: None, // filled by the agent's enrichment stage (#983)
-            company_name: None,
-            file_description: None,
-            product_name: None,
-            image_file_id,
-        }));
     };
     Provider::by_guid(KERNEL_PROCESS_GUID)
         .any(KERNEL_PROCESS_KEYWORDS)
         .add_callback(callback)
         .build()
+}
+
+/// Kernel-Process 1 (`ProcessStart`): records the process in the pid store and forwards it
+/// as an [`ExecEvent`](schema::ExecEvent).
+fn on_process_start(
+    record: &EventRecord,
+    parser: &Parser<'_, '_>,
+    pid: u32,
+    state: &SharedState,
+    sink: &dyn EventSink,
+) {
+    let raw_image: String = parser
+        .try_parse("ImageName")
+        .unwrap_or_else(|_| String::from(UNKNOWN_IMAGE));
+    let process = ProcessStart {
+        pid,
+        ppid: parser.try_parse("ParentProcessID").unwrap_or(0),
+        image_path: state.normalize_path(&raw_image),
+        timestamp_ns: normalize::filetime_to_ns(record.raw_timestamp()),
+        generation: kernel_process::sequence_number(parser.try_parse("ProcessSequenceNumber").ok()),
+        parent_generation: kernel_process::sequence_number(
+            parser.try_parse("ParentProcessSequenceNumber").ok(),
+        ),
+    };
+    // https://github.com/synthaea-lab/agent/issues/41: the initial thread of this process is not an injection.
+    state
+        .threads
+        .lock_or_recover()
+        .process_started(pid, process.timestamp_ns);
+    if cross_process::is_lsass_image(&process.image_path, &state.system_root) {
+        take_lsass_slot(parser, pid, process.ppid, &process.image_path, state);
+    }
+    let parent_image_path = remember_process(&process, state);
+    // Read the PEB command line and the image identity (#688) before `meta`: both race the
+    // process (a short-lived one exits, a dropper renames itself), `meta` does not.
+    let cmdline = winapi::read_process_cmdline(pid);
+    let image_file_id = image_file_id(&process.image_path);
+    let meta = state.meta(
+        pid,
+        process.ppid,
+        normalize::basename(&process.image_path),
+        process.timestamp_ns,
+    );
+    let context = ExecContext {
+        meta,
+        parent_image_path,
+        cmdline,
+        image_file_id,
+    };
+    sink.on_event(Event::Exec(process.exec_event(context)));
+}
+
+/// Puts a started process in the pid store, with the server silo it runs in, and returns
+/// its parent's image path (the schema's lineage at exec time: the parent is usually alive
+/// and already in the store).
+fn remember_process(process: &ProcessStart, state: &SharedState) -> Option<String> {
+    // https://github.com/synthaea-lab/agent/issues/39: read while the process most likely still runs; one already
+    // gone is in its parent's silo. Read before taking the lock: it is a system call.
+    let own_silo = winapi::read_server_silo_id(process.pid);
+    let mut pids = state.pids.lock_or_recover();
+    let silo = silo::exec_silo(own_silo, pids.silo(process.ppid));
+    // The silo is kept even without an image, or the process's events would read as the host's.
+    match process.cacheable_image() {
+        Some(image_path) => {
+            pids.insert(process.pid, image_path.to_owned(), process.generation, silo);
+        }
+        None => pids.insert_without_image(process.pid, process.generation, silo),
+    }
+    pids.get(process.ppid).map(str::to_owned)
+}
+
+/// #688: which file the image was started from, taken as early as this thread can: the
+/// T1204.002 gate compares it with the file the enrichment worker verifies later, and a
+/// dropper can rename itself and put another file at its path in between. One open
+/// (shared for delete, so it cannot block the rename) and one query, no read. Not for a
+/// network or device path: the open would be a round trip on this thread (see
+/// `image_identity_is_capturable`).
+fn image_file_id(image_path: &str) -> Option<String> {
+    crate::image_identity_is_capturable(image_path)
+        .then(|| winapi::image_file_id(std::path::Path::new(image_path)))
+        .flatten()
+}
+
+/// Kernel-Process 2 (`ProcessEnd`): prunes the pid store, so a recycled pid is not taken
+/// for the process that ended.
+fn on_process_end(pid: u32, state: &SharedState) {
+    if pid == 0 {
+        return;
+    }
+    state.pids.lock_or_recover().remove(pid);
+    state.threads.lock_or_recover().process_ended(pid);
+    // LSASS does not end short of a crash (and reboot): look it up again rather than leave
+    // the slot empty. A copy's end changes nothing.
+    state.lsass.process_ended(pid, || find_lsass(state));
+}
+
+/// Kernel-Process 5 (`ImageLoad`): forwarded for tracked pids only. The store is seeded at
+/// startup and filled by `ProcessStart`, so a missing pid is a kernel or driver load,
+/// ignored at the userland tier.
+fn on_image_load(
+    record: &EventRecord,
+    parser: &Parser<'_, '_>,
+    pid: u32,
+    state: &SharedState,
+    sink: &dyn EventSink,
+) {
+    let Some(comm) = state
+        .pids
+        .lock_or_recover()
+        .get(pid)
+        .map(normalize::basename)
+    else {
+        return;
+    };
+    let Some(raw_image) = kernel_process::loaded_image(parser.try_parse("ImageFileName").ok())
+    else {
+        return;
+    };
+    let image_path = state.normalize_path(&raw_image);
+    let timestamp_ns = normalize::filetime_to_ns(record.raw_timestamp());
+    // EID 5 carries no parent pid.
+    let ppid = 0;
+    sink.on_event(Event::ImageLoad(ImageLoadEvent {
+        meta: state.meta(pid, ppid, comm, timestamp_ns),
+        image_path,
+    }));
+}
+
+/// Kernel-Process 23-26: a server silo is created or torn down, so whichever container its
+/// id named is stale (<https://github.com/synthaea-lab/agent/issues/39>).
+fn on_silo_change(parser: &Parser<'_, '_>, state: &SharedState) {
+    if let Ok(silo) = parser.try_parse::<u32>("Job ID") {
+        state.silos.lock_or_recover().forget(silo);
+    }
 }
 
 /// <https://github.com/synthaea-lab/agent/issues/41>: a `ProcessStart` of LSASS's image takes the tracked-LSASS slot only when the
@@ -555,7 +556,12 @@ pub(crate) fn file_provider(sink: Arc<dyn EventSink>, state: Arc<SharedState>) -
 
         // Tracked PIDs only: discards pure kernel ops and untracked churn (the
         // volume filter the old sensor validated in the lab).
-        let Some(comm) = state.pids.lock_or_recover().get(pid).map(basename) else {
+        let Some(comm) = state
+            .pids
+            .lock_or_recover()
+            .get(pid)
+            .map(normalize::basename)
+        else {
             return;
         };
         if eid == 26 {
