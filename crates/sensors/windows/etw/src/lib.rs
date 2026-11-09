@@ -71,6 +71,8 @@ mod hcs;
 mod long_path;
 pub mod normalize;
 #[cfg(any(windows, test))]
+mod path_normalizer;
+#[cfg(any(windows, test))]
 mod pid_cache;
 #[cfg(windows)]
 mod providers;
