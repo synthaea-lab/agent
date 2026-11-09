@@ -1,7 +1,7 @@
 //! Domain classes for EGRESS-DOMAIN (T1567, #380): which names are storage and paste
 //! services, and which addresses a DNS answer names. The join with the volume a process
-//! sends lives in `RuleState::check_egress_volume`; this module is the part that needs no
-//! state.
+//! sends lives in `NetworkState::check_egress_volume`; this module is the part that needs
+//! no state.
 //!
 //! The class comes from the **name the process asked for**, never from the address it
 //! connected to: a storage or paste service shares its addresses with every other site behind
