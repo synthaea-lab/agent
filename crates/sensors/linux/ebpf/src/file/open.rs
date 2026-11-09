@@ -7,9 +7,9 @@ use aya_ebpf::{
     programs::TracePointContext,
 };
 use aya_log_ebpf::warn;
-use sensor_linux_wire::{FileOpenEvent, TASK_COMM_LEN, is_filtered_path};
+use sensor_linux_wire::{FileOpenEvent, is_filtered_path};
 
-use crate::{fill_lineage, into_ret, mount_signal::signal::is_agent_own_pid};
+use crate::{fill_event_meta, into_ret, mount_signal::signal::is_agent_own_pid};
 
 /// Ring buffer shared with userspace for `open` events.
 #[map]
@@ -130,17 +130,7 @@ fn emit_file_open_event(
     unsafe {
         core::ptr::write_bytes(e, 0, 1);
 
-        (*e).meta.pid = pid;
-        fill_lineage(&mut (*e).meta);
-        (*e).meta.uid = uid_gid as u32;
-        (*e).meta.gid = (uid_gid >> 32) as u32;
-        (*e).meta.timestamp_ns = aya_ebpf::helpers::bpf_ktime_get_ns();
-        (*e).meta.cgroup_id = aya_ebpf::helpers::bpf_get_current_cgroup_id();
-        let mut i = 0usize;
-        while i < TASK_COMM_LEN {
-            (*e).meta.comm[i] = comm[i];
-            i += 1;
-        }
+        fill_event_meta(&mut (*e).meta, pid, uid_gid, &comm);
         (*e).flags = flags as u32;
 
         if filename_ptr != 0 {

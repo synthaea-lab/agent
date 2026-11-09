@@ -14,7 +14,7 @@ mod raw;
 mod uprobe;
 
 use aya_ebpf::{helpers::bpf_get_current_pid_tgid, macros::map, maps::HashMap};
-use sensor_linux_wire::LineageEntry;
+use sensor_linux_wire::{LineageEntry, TASK_COMM_LEN};
 
 // Raw scheduler tracepoints expose task pointers instead of formatted event records.
 // Their field offsets come from the running kernel's BTF in `userspace/src/btf.rs`;
@@ -38,6 +38,32 @@ fn fill_lineage(meta: &mut sensor_linux_wire::EventMeta) {
         meta.ppid = entry.ppid;
         meta.process_generation = entry.generation;
         meta.parent_generation = entry.parent_generation;
+    }
+}
+
+/// Fills the `EventMeta` every event carries, in the order each probe used to write it by
+/// hand (AS-008): `pid`, the lineage from `PROC_LINEAGE`, `uid`/`gid` from a
+/// `bpf_get_current_uid_gid()` value, the timestamp, the cgroup and `comm`. `comm` is copied
+/// with the same byte loop as before, so the generated code does not change shape.
+#[inline(always)]
+pub(crate) fn fill_event_meta(
+    meta: &mut sensor_linux_wire::EventMeta,
+    pid: u32,
+    uid_gid: u64,
+    comm: &[u8; TASK_COMM_LEN],
+) {
+    meta.pid = pid;
+    fill_lineage(meta);
+    meta.uid = uid_gid as u32;
+    meta.gid = (uid_gid >> 32) as u32;
+    // SAFETY: neither helper takes an argument; both only read the clock or the current task.
+    meta.timestamp_ns = unsafe { aya_ebpf::helpers::bpf_ktime_get_ns() };
+    // SAFETY: as above.
+    meta.cgroup_id = unsafe { aya_ebpf::helpers::bpf_get_current_cgroup_id() };
+    let mut i = 0usize;
+    while i < TASK_COMM_LEN {
+        meta.comm[i] = comm[i];
+        i += 1;
     }
 }
 

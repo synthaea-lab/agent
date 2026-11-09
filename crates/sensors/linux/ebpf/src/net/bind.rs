@@ -8,9 +8,9 @@ use aya_ebpf::{
     programs::TracePointContext,
 };
 use aya_log_ebpf::warn;
-use sensor_linux_wire::{SocketBindEvent, TASK_COMM_LEN};
+use sensor_linux_wire::SocketBindEvent;
 
-use crate::{AF_INET, AF_INET6, fill_lineage, into_ret};
+use crate::{AF_INET, AF_INET6, fill_event_meta, into_ret};
 
 /// Ring buffer shared with userspace for `bind` events.
 #[map]
@@ -122,17 +122,12 @@ fn try_sys_enter_bind(ctx: TracePointContext) -> Result<u32, u32> {
     unsafe {
         core::ptr::write_bytes(e, 0, 1);
 
-        (*e).meta.pid = (bpf_get_current_pid_tgid() >> 32) as u32;
-        fill_lineage(&mut (*e).meta);
-        (*e).meta.uid = uid_gid as u32;
-        (*e).meta.gid = (uid_gid >> 32) as u32;
-        (*e).meta.timestamp_ns = aya_ebpf::helpers::bpf_ktime_get_ns();
-        (*e).meta.cgroup_id = aya_ebpf::helpers::bpf_get_current_cgroup_id();
-        let mut i = 0usize;
-        while i < TASK_COMM_LEN {
-            (*e).meta.comm[i] = comm[i];
-            i += 1;
-        }
+        fill_event_meta(
+            &mut (*e).meta,
+            (bpf_get_current_pid_tgid() >> 32) as u32,
+            uid_gid,
+            &comm,
+        );
         (*e).is_ipv6 = family == AF_INET6;
         (*e).lport = u16::from_be(port_be);
         (*e).laddr_v4 = v4;
