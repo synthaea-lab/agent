@@ -17,7 +17,7 @@ pub(crate) use redact::{
     CommandDialect, REDACTED, is_secret_key, redact_argv, redact_command_line, redact_command_text,
     redact_url_secrets,
 };
-use schema::{Event, sensor::EventSink};
+use schema::{Event, ExecEvent, sensor::EventSink};
 
 /// Redacts output copies while allowing live detection pipelines to inspect raw command
 /// events ([`carries_command_text`]).
@@ -97,14 +97,7 @@ pub(crate) fn redact_event(event: &mut Event) {
                 evidence.value = REDACTED.to_owned();
             }
         }
-        Event::Exec(exec) => {
-            if exec.argv.is_empty() {
-                exec.cmdline = redact_command_line(&exec.image_path, &exec.cmdline).into_owned();
-            } else {
-                redact_argv(&exec.image_path, &mut exec.argv);
-                exec.cmdline = exec.argv.join(" ");
-            }
-        }
+        Event::Exec(exec) => redact_exec(exec),
         Event::ReadlineInput(readline) => {
             readline.input =
                 redact_command_text(&readline.input, CommandDialect::Posix).into_owned();
@@ -128,6 +121,18 @@ pub(crate) fn redact_event(event: &mut Event) {
             }
         }
         _ => {}
+    }
+}
+
+/// Redacts an exec's command line in place: the argv when the sensor provides one
+/// (the command line is then rebuilt from it), the raw command line otherwise
+/// (Windows/ETW reports no argv).
+pub(crate) fn redact_exec(exec: &mut ExecEvent) {
+    if exec.argv.is_empty() {
+        exec.cmdline = redact_command_line(&exec.image_path, &exec.cmdline).into_owned();
+    } else {
+        redact_argv(&exec.image_path, &mut exec.argv);
+        exec.cmdline = exec.argv.join(" ");
     }
 }
 

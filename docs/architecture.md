@@ -101,7 +101,7 @@ The detection sink ([`sink/mod.rs`](../apps/agent/src/sink/mod.rs)) has no platf
 
 | Module | Responsibility |
 | --- | --- |
-| [`sink`](../apps/agent/src/sink/mod.rs) | `DetectionSink`, the `EventSink` that runs every engine, records findings and drives response. Also `BaselineSink` for ML baseline capture. |
+| [`sink`](../apps/agent/src/sink/mod.rs) | `DetectionSink`, the `EventSink` that runs every engine, records findings and drives response. Also [`BaselineSink`](../apps/agent/src/sink/baseline.rs) for ML baseline capture. |
 | [`enrich_queue`](../apps/agent/src/enrich_queue.rs) | Bounded worker that moves hashing, signature checks, raw-event logging and spool appends off the capture thread. |
 | [`alerts`](../apps/agent/src/alerts.rs) | `AlertLog`, the single alert funnel: `alerts.ndjson`, stderr, and the 256-entry in-memory buffer that `cli detections` reads. |
 | [`upload`](../apps/agent/src/upload.rs) | The event spool and detection spool, plus their upload threads. Resolves which control plane `run` talks to. |
