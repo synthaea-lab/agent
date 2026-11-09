@@ -14,6 +14,7 @@ mod amsi;
 mod auth_state;
 mod credfiles;
 mod defender;
+mod download_state;
 mod egressdomain;
 mod exclusions;
 mod failure_join;
