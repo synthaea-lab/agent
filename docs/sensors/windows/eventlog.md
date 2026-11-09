@@ -15,7 +15,7 @@ The reader renders XML in UTF-16 ([`query_events`](../../../crates/sensors/windo
 
 ## Poll targets
 
-Every source is a [`PollTarget`](../../../crates/sensors/windows/eventlog/src/sensor.rs): a channel, an `EventID` filter, a parser that turns one `<Event>` XML block into a [`ParsedBlock`](../../../crates/sensors/windows/eventlog/src/sensor.rs), the counter it increments, an optional `auditpol` enablement and the config switch that gates it. The machinery (cursor, query, normalize, count, sink) exists once. Adding a source is one entry in [`TARGETS`](../../../crates/sensors/windows/eventlog/src/sensor.rs).
+Every source is a [`PollTarget`](../../../crates/sensors/windows/eventlog/src/sensor.rs): a channel, an `EventID` filter, a parser that turns one `<Event>` XML block into a [`ParsedBlock`](../../../crates/sensors/windows/eventlog/src/targets/mod.rs), the counter it increments, an optional `auditpol` enablement and the config switch that gates it. The machinery (cursor, query, normalize, count, sink) exists once. Adding a source is one entry in [`TARGETS`](../../../crates/sensors/windows/eventlog/src/sensor.rs).
 
 | Target (`label`) | Channel | Event ids | Emits | Switch |
 | --- | --- | --- | --- | --- |
@@ -92,7 +92,7 @@ flowchart LR
 
 `EvtNext` waits at most 30 s ([`NEXT_TIMEOUT_MS`](../../../crates/sensors/windows/eventlog/src/query.rs)); a hung call fails the tick instead of freezing the thread.
 
-**Parse outcomes** ([`ParsedBlock`](../../../crates/sensors/windows/eventlog/src/sensor.rs)): `None` (unparseable, does not advance the cursor), `Some((id, None))` (parsed but unusable, advances the cursor without counting), `Some((id, Some(event)))` (counted and forwarded). Event handles are closed by an RAII guard even when rendering fails.
+**Parse outcomes** ([`ParsedBlock`](../../../crates/sensors/windows/eventlog/src/targets/mod.rs)): `None` (unparseable, does not advance the cursor), `Some((id, None))` (parsed but unusable, advances the cursor without counting), `Some((id, Some(event)))` (counted and forwarded). Event handles are closed by an RAII guard even when rendering fails.
 
 ### Subscribe
 
