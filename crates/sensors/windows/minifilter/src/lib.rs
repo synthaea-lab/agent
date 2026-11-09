@@ -72,9 +72,8 @@ impl ConnectError {
     /// Maps a failed `FilterConnectCommunicationPort` HRESULT.
     #[must_use]
     pub fn from_hresult(hr: i32) -> Self {
-        // HRESULT_FROM_WIN32 values; the cast only reinterprets the bits.
-        #[allow(clippy::cast_sign_loss)]
-        match hr as u32 {
+        // HRESULT_FROM_WIN32 values, compared as their unsigned bit pattern.
+        match hr.cast_unsigned() {
             0x8007_0002 | 0x8007_0003 => Self::NotLoaded, // file / path not found
             0x8007_0005 => Self::AccessDenied,
             0x8007_04D6 => Self::AlreadyConnected, // ERROR_CONNECTION_COUNT_LIMIT
@@ -111,8 +110,7 @@ mod tests {
 
     #[test]
     fn each_pinned_hresult_maps_to_its_own_error() {
-        #[allow(clippy::cast_possible_wrap)]
-        let hr = |v: u32| v as i32;
+        let hr = u32::cast_signed;
         assert_eq!(
             ConnectError::from_hresult(hr(0x8007_0002)),
             ConnectError::NotLoaded
