@@ -23,7 +23,8 @@ const NETLINK_SOCK_DIAG: libc::c_int = 4;
 #[derive(Debug)]
 pub enum NetlinkError {
     Io(io::Error),
-    /// The kernel replied with `NLMSG_ERROR` and this non-zero errno.
+    /// The kernel replied with `NLMSG_ERROR` and this non-zero errno, positive
+    /// (`libc::EPERM`, not the `-EPERM` on the wire).
     Kernel(i32),
 }
 
@@ -37,6 +38,19 @@ impl std::fmt::Display for NetlinkError {
 }
 
 impl std::error::Error for NetlinkError {}
+
+/// The errno an `NLMSG_ERROR` payload (`struct nlmsgerr`) carries, as a positive
+/// value comparable with `libc::EPERM` and friends. `0` means an ACK.
+///
+/// The kernel writes the errno negated (`-EPERM`), so it is flipped here once
+/// for every socket in this crate. A payload too short to hold the field is
+/// reported as `EBADMSG`.
+pub(crate) fn nlmsg_error_errno(payload: &[u8]) -> i32 {
+    match payload {
+        [a, b, c, d, ..] => i32::from_ne_bytes([*a, *b, *c, *d]).wrapping_neg(),
+        _ => libc::EBADMSG,
+    }
+}
 
 impl From<io::Error> for NetlinkError {
     fn from(e: io::Error) -> Self {
@@ -163,12 +177,7 @@ fn read_dump(fd: &OwnedFd) -> Result<Vec<DiagMsg>, NetlinkError> {
             match header.msg_type {
                 NLMSG_DONE => break 'recv,
                 NLMSG_ERROR => {
-                    // Slice pattern, not `try_into().unwrap()` — same rule as the
-                    // parsers: no explicit panic point to document.
-                    let errno = match payload {
-                        [b0, b1, b2, b3, ..] => i32::from_ne_bytes([*b0, *b1, *b2, *b3]),
-                        _ => -1,
-                    };
+                    let errno = nlmsg_error_errno(payload);
                     if errno != 0 {
                         return Err(NetlinkError::Kernel(errno));
                     }
@@ -195,6 +204,24 @@ fn read_dump(fd: &OwnedFd) -> Result<Vec<DiagMsg>, NetlinkError> {
 mod tests {
     use super::*;
     use crate::wire::{TCP_ESTABLISHED, TCP_LISTEN};
+
+    #[test]
+    fn nlmsg_error_errno_flips_the_kernels_negative_errno() {
+        let mut payload = (-libc::EPERM).to_ne_bytes().to_vec();
+        payload.extend_from_slice(&[0u8; NLMSG_HDR_LEN]); // the echoed request header
+        assert_eq!(nlmsg_error_errno(&payload), libc::EPERM);
+    }
+
+    #[test]
+    fn nlmsg_error_errno_reads_zero_as_an_ack() {
+        assert_eq!(nlmsg_error_errno(&0i32.to_ne_bytes()), 0);
+    }
+
+    #[test]
+    fn nlmsg_error_errno_reports_a_truncated_payload_as_ebadmsg() {
+        assert_eq!(nlmsg_error_errno(&[0xff, 0xff]), libc::EBADMSG);
+        assert_eq!(nlmsg_error_errno(&[]), libc::EBADMSG);
+    }
 
     /// Not a mock — the real socket, exercised against whatever this dev/CI
     /// machine's own TCP stack happens to have open right now. Doesn't assert a

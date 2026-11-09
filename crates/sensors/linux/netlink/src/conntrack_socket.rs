@@ -28,6 +28,7 @@ use std::{
 pub use crate::socket::NetlinkError;
 use crate::{
     conntrack_attrs::ConntrackFlow,
+    socket::nlmsg_error_errno,
     wire::{NLM_F_DUMP, NLM_F_REQUEST, NLMSG_DONE, NLMSG_ERROR, NLMSG_HDR_LEN, NlMsgHeader},
 };
 
@@ -165,12 +166,7 @@ fn read_dump(fd: &OwnedFd) -> Result<Vec<ConntrackFlow>, NetlinkError> {
             match header.msg_type {
                 NLMSG_DONE => break 'recv,
                 NLMSG_ERROR => {
-                    // Byte-by-byte, not `try_into().unwrap()` — no explicit
-                    // panic point to document, matching `wire::DiagMsg::parse`.
-                    let errno = match payload {
-                        [a, b, c, d, ..] => i32::from_ne_bytes([*a, *b, *c, *d]),
-                        _ => -1,
-                    };
+                    let errno = nlmsg_error_errno(payload);
                     if errno != 0 {
                         return Err(NetlinkError::Kernel(errno));
                     }
