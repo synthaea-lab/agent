@@ -69,9 +69,9 @@ No detection engine needs the file hash or signature synchronously. Rules, Sigma
 
 ### 4. Recording a finding
 
-Every engine's finding goes through [`record_detection`](../apps/agent/src/sink/mod.rs), which is a free function so that the enrichment worker and the YARA worker record findings the same way the capture thread does:
+Every engine's finding goes through [`record_detection`](../apps/agent/src/sink/recording.rs), which is a free function so that the enrichment worker and the YARA worker record findings the same way the capture thread does:
 
-1. Builds a `schema::detection::Detection` from **redacted** copies of the trigger event and any extra evidence. Ransomware alerts carry a damage manifest of up to 100 renamed or deleted files (the server keeps 128 events per detection). The message has the raw command line replaced by its redacted form ([`safe_detection_message`](../apps/agent/src/sink/mod.rs)).
+1. Builds a `schema::detection::Detection` from **redacted** copies of the trigger event and any extra evidence. Ransomware alerts carry a damage manifest of up to 100 renamed or deleted files (the server keeps 128 events per detection). The message has the raw command line replaced by its redacted form ([`safe_detection_message`](../apps/agent/src/sink/recording.rs)).
 2. Folds the detection into [`verdict::VerdictEngine`](../crates/verdict/src/lib.rs), keyed by `EntityKey` (`ppid`, `comm`, parent incarnation when known), with a 30 s dedup window (`VERDICT_DEDUP_WINDOW_NS`).
 3. **Always** writes a line to [`AlertLog`](../apps/agent/src/alerts.rs), even when the verdict engine absorbs the finding as a duplicate. `alerts.ndjson` is the complete audit trail. The verdict is a bounded view for triage.
 4. If a new verdict snapshot comes out at `High` severity or above ([`response::should_escalate`](../crates/response/src/escalate.rs)), writes a `RESPONSE-ESCALATE` alert.

@@ -12,7 +12,7 @@ Every normalized event reaches [`DetectionSink::on_event`](../apps/agent/src/sin
 the sensor's capture thread. The first thing it does is call
 [`DetectionSink::correlate`](../apps/agent/src/sink/mod.rs); the stateless and stateful rules,
 Sigma, IOC matching and the canary checks run afterwards. Every finding from every
-engine then goes through one funnel, [`record_detection`](../apps/agent/src/sink/mod.rs), which
+engine then goes through one funnel, [`record_detection`](../apps/agent/src/sink/recording.rs), which
 writes the alert log and folds the finding into the fused verdict.
 
 ```mermaid

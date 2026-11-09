@@ -31,8 +31,10 @@ use crate::{
 };
 
 mod baseline;
+mod recording;
 
 pub(crate) use baseline::BaselineSink;
+use recording::{Finding, record_ioc_hit, record_rule_alert, spool_on_worker};
 
 /// Wires issue #25's automated response into the sink once `enable_response` sets it
 /// (Linux only for this pass — see `commands::linux::cmd_run`). Held behind
@@ -290,163 +292,6 @@ fn escalate_if_warranted(alert_log: &AlertLog, fused: &verdict::Verdict) {
     alert_log.record("RESPONSE-ESCALATE", message);
 }
 
-/// Records one finding: fused into the verdict, written to the alert log, and
-/// escalated when the fused severity warrants it, then handed to `persist` (the
-/// durable detection spool, when one is configured). A free function so the
-/// enrichment worker, which has no `DetectionSink`, records the signature-gated
-/// findings the same way (#441).
-///
-/// The worker records a gated finding when it reaches the event, so it can enter
-/// the verdict after findings the capture thread already recorded for later
-/// events of the same entity. Fusion keys on the event's own timestamp and its
-/// dedup check saturates, so a late arrival can at most be absorbed as a
-/// duplicate, never reopen a window; only the order of the evidence list differs.
-fn record_detection(
-    verdict: &Mutex<verdict::VerdictEngine>,
-    alert_log: &AlertLog,
-    finding: Finding<'_>,
-    event: &Event,
-    evidence: Vec<Event>,
-    persist: Option<&dyn Fn(schema::detection::Detection)>,
-) -> Option<verdict::Verdict> {
-    let now_ns = event.meta().timestamp_ns;
-    // Rules and Sigma have already evaluated the raw event/message. Redact only
-    // the copy that enters the verdict, alert log, and durable detection spool.
-    let safe_message = safe_detection_message(event, &evidence, finding.message);
-    let mut safe_events: Vec<Event> = std::iter::once(event.clone()).chain(evidence).collect();
-    for event in &mut safe_events {
-        crate::redact::redact_event(event);
-    }
-    let detection = schema::detection::Detection {
-        timestamp_ns: now_ns,
-        severity: finding.severity,
-        title: safe_message.clone(),
-        source: finding.source,
-        score: None,
-        attributions: Vec::new(),
-        techniques: techniques_from(finding.technique),
-        events: safe_events,
-    };
-    let spooled = persist.map(|_| detection.clone());
-    let result = verdict.lock_recovering().record(
-        finding.entity.clone(),
-        finding.technique,
-        detection,
-        now_ns,
-    );
-    alert_log.record(finding.technique, safe_message);
-    if let Some(fused) = &result {
-        escalate_if_warranted(alert_log, fused);
-    }
-    if let (Some(persist), Some(detection)) = (persist, spooled) {
-        persist(detection);
-    }
-    result
-}
-
-/// A detection's message as it may leave the process: the command text a rule quoted from
-/// the event (an Exec command line, an AMSI excerpt, #895) swapped for its redacted copy.
-fn safe_detection_message(event: &Event, evidence: &[Event], message: &str) -> String {
-    let mut related = std::iter::once(event).chain(evidence.iter());
-    let Some(source) = related.find(|e| matches!(e, Event::Exec(_) | Event::AmsiContent(_))) else {
-        return message.to_owned();
-    };
-    let mut safe = source.clone();
-    crate::redact::redact_event(&mut safe);
-    match (source, &safe) {
-        (Event::Exec(raw), Event::Exec(safe)) => {
-            redact_detection_message(&raw.cmdline, &safe.cmdline, message)
-        }
-        (Event::AmsiContent(raw), Event::AmsiContent(safe)) => redact_detection_message(
-            &rules::amsi_excerpt(raw.text.as_deref()),
-            &rules::amsi_excerpt(safe.text.as_deref()),
-            message,
-        ),
-        _ => message.to_owned(),
-    }
-}
-
-fn redact_detection_message(raw_cmdline: &str, safe_cmdline: &str, message: &str) -> String {
-    if raw_cmdline.is_empty() {
-        message.to_owned()
-    } else {
-        message.replace(raw_cmdline, safe_cmdline)
-    }
-}
-
-/// One engine's finding, as [`record_detection`] takes it.
-struct Finding<'a> {
-    entity: &'a verdict::EntityKey,
-    technique: &'a str,
-    message: &'a str,
-    source: schema::detection::DetectionSource,
-    severity: schema::detection::Severity,
-}
-
-/// [`record_detection`] for one `rules::Alert`.
-fn record_rule_alert(
-    verdict: &Mutex<verdict::VerdictEngine>,
-    alert_log: &AlertLog,
-    event: &Event,
-    alert: &rules::Alert,
-    persist: Option<&dyn Fn(schema::detection::Detection)>,
-) {
-    let finding = Finding {
-        entity: &entity_key(event.meta()),
-        technique: alert.technique,
-        message: &alert.message,
-        source: schema::detection::DetectionSource::Rule {
-            rule_id: alert.technique.to_string(),
-        },
-        severity: alert.severity,
-    };
-    record_detection(verdict, alert_log, finding, event, Vec::new(), persist);
-}
-
-/// [`record_detection`] for one IOC match (#60). The worker records it for an exec image, the
-/// capture thread through [`DetectionSink::record_ioc`] for a connect.
-fn record_ioc_hit(
-    verdict: &Mutex<verdict::VerdictEngine>,
-    alert_log: &AlertLog,
-    event: &Event,
-    hit: crate::ioc::IocHit,
-    persist: Option<&dyn Fn(schema::detection::Detection)>,
-) {
-    let message = hit.message(&event.meta().comm);
-    let severity = hit.severity();
-    let finding = Finding {
-        entity: &entity_key(event.meta()),
-        technique: crate::ioc::IOC_TECHNIQUE,
-        message: &message,
-        source: ioc_source(hit),
-        severity,
-    };
-    record_detection(verdict, alert_log, finding, event, Vec::new(), persist);
-}
-
-fn ioc_source(hit: crate::ioc::IocHit) -> schema::detection::DetectionSource {
-    schema::detection::DetectionSource::Ioc {
-        kind: hit.kind,
-        indicator: hit.indicator,
-        feed: hit.feed,
-        feed_version: hit.feed_version,
-        reference: None,
-    }
-}
-
-/// The enrichment worker's append to the durable detection spool. A failure
-/// loses only the upload copy: the finding is already in the alert log.
-fn spool_on_worker(
-    spool: Option<&Mutex<store::EventSpool>>,
-    detection: schema::detection::Detection,
-) {
-    if let Some(spool) = spool
-        && let Err(e) = crate::upload::persist_detection(spool, detection)
-    {
-        tracing::warn!(error = %e, "detection spool append failed");
-    }
-}
-
 /// What the enrichment learnt about an exec's image. `chain_verified`: the
 /// verdict is Authenticode, whose `Valid` is a chain to a trusted root; macOS
 /// `codesign` and the ES flags call ad-hoc signatures valid too.
@@ -606,14 +451,14 @@ impl DetectionSink {
             let entity = entity_key(event.meta());
             let case_id = correlator_case_id(&entity);
             let source = schema::detection::DetectionSource::Correlator { case_id };
-            self.record_and_emit(
-                &entity,
-                alert.technique,
-                &alert.message,
+            let finding = Finding {
+                entity: &entity,
+                technique: alert.technique,
+                message: &alert.message,
                 source,
-                alert.severity,
-                event,
-            );
+                severity: alert.severity,
+            };
+            self.record(finding, event, Vec::new());
             if crosses_kill_gate(alert.technique) {
                 high_confidence_pid = Some(event.meta().pid);
             }
@@ -921,92 +766,6 @@ impl DetectionSink {
         Arc::clone(&self.progress)
     }
 
-    /// Folds one engine's finding into the fused per-entity verdict (issue #131)
-    /// and always writes it to the alert log — `alerts.ndjson` is the audit
-    /// trail (`EVIDENCE_CAP`'s own doc: every finding lands there), and verdict
-    /// fusion's dedup is a separate, deliberately lossy view for live triage
-    /// (bounded evidence, kill-gate severity), not a substitute for it. A
-    /// finding verdict fusion absorbs as a duplicate (same technique, another
-    /// engine or a repeat, inside `VERDICT_DEDUP_WINDOW_NS`) still gets its own
-    /// alert line, it just doesn't produce a new [`verdict::Verdict`] snapshot.
-    /// Returns the fused verdict whenever one was produced, for a caller that
-    /// needs the entity's overall composed state (e.g. its evidence list) —
-    /// **not** for kill-gating: `correlate`'s kill gate reads this event's own
-    /// detection severity instead, deliberately not the entity's sticky
-    /// accumulated one (PR #502 review).
-    fn record_and_emit(
-        &self,
-        entity: &verdict::EntityKey,
-        technique: &str,
-        message: &str,
-        source: schema::detection::DetectionSource,
-        severity: schema::detection::Severity,
-        event: &Event,
-    ) -> Option<verdict::Verdict> {
-        self.record_and_emit_with(
-            entity,
-            technique,
-            message,
-            source,
-            severity,
-            event,
-            Vec::new(),
-        )
-    }
-
-    /// [`Self::record_and_emit`] with further evidence events after the triggering one.
-    #[allow(
-        clippy::too_many_arguments,
-        reason = "one more than the plain call: the extra evidence, appended after the trigger"
-    )]
-    fn record_and_emit_with(
-        &self,
-        entity: &verdict::EntityKey,
-        technique: &str,
-        message: &str,
-        source: schema::detection::DetectionSource,
-        severity: schema::detection::Severity,
-        event: &Event,
-        evidence: Vec<Event>,
-    ) -> Option<verdict::Verdict> {
-        let finding = Finding {
-            entity,
-            technique,
-            message,
-            source,
-            severity,
-        };
-        let persist = |detection| self.spool_detection(detection);
-        let persist = self
-            .detection_spool
-            .as_ref()
-            .map(|_| &persist as &dyn Fn(_));
-        record_detection(
-            &self.verdict,
-            &self.alert_log,
-            finding,
-            event,
-            evidence,
-            persist,
-        )
-    }
-
-    /// Hands a finding to the worker for the durable detection spool.
-    fn spool_detection(&self, detection: schema::detection::Detection) {
-        if let Err(detection) = self.enrich_queue.enqueue_detection(detection) {
-            // The queue is full, so the capture thread does this file append
-            // itself, which the #126 design otherwise keeps off it. Under sustained
-            // overload every finding takes this path; accepted on purpose (a finding
-            // is never lost), and only reached once the queue is already shedding.
-            tracing::warn!("detection queue full; persisting on capture thread");
-            if let Some(spool) = &self.detection_spool
-                && let Err(e) = crate::upload::persist_detection(spool, *detection)
-            {
-                tracing::error!(error = %e, "detection spool append failed on fallback");
-            }
-        }
-    }
-
     /// Asks for a budgeted YARA scan of the memory of the process behind `event` (#85):
     /// the payload of a fileless exec exists only there. The scan queue applies the
     /// cooldown, the global cap and the per-scan budget; a shed request is counted there.
@@ -1287,17 +1046,16 @@ impl DetectionSink {
             hit.pid,
             meta.comm
         );
-        self.record_and_emit_with(
-            &entity_key(meta),
-            CANARY_TECHNIQUE,
-            &message,
-            schema::detection::DetectionSource::Rule {
+        let finding = Finding {
+            entity: &entity_key(meta),
+            technique: CANARY_TECHNIQUE,
+            message: &message,
+            source: schema::detection::DetectionSource::Rule {
                 rule_id: CANARY_RULE_ID.to_string(),
             },
-            schema::detection::Severity::High,
-            event,
-            Vec::new(),
-        );
+            severity: schema::detection::Severity::High,
+        };
+        self.record(finding, event, Vec::new());
         if corroborated && !late {
             self.ransomware_reflex(hit.pid);
         } else if corroborated {
@@ -1324,19 +1082,11 @@ impl DetectionSink {
     /// An IOC match found on the capture thread (a connect's destination, #60).
     fn record_ioc(&self, event: &Event, hit: crate::ioc::IocHit) {
         let message = hit.message(&event.meta().comm);
-        let severity = hit.severity();
-        self.record_and_emit_with(
-            &entity_key(event.meta()),
-            crate::ioc::IOC_TECHNIQUE,
-            &message,
-            ioc_source(hit),
-            severity,
-            event,
-            Vec::new(),
-        );
+        let entity = entity_key(event.meta());
+        self.record(Finding::ioc(&entity, &message, hit), event, Vec::new());
     }
 
-    /// [`Self::record_and_emit`] for a batch of plain `rules::Alert`s (no Sigma/
+    /// [`Self::record`] for a batch of plain `rules::Alert`s (no Sigma/
     /// correlator-specific `DetectionSource` needed) — the common case for every
     /// `rule_state`/`rules::evaluate_*` call site.
     fn record_rule_alerts(&self, event: &Event, alerts: impl IntoIterator<Item = rules::Alert>) {
@@ -1345,9 +1095,6 @@ impl DetectionSink {
             if alert.technique == MEMFD_EXEC_TECHNIQUE {
                 self.request_memory_scan(event);
             }
-            let source = schema::detection::DetectionSource::Rule {
-                rule_id: alert.technique.to_string(),
-            };
             let is_burst = alert.technique == RANSOMWARE_TECHNIQUE;
             let corroborated = is_burst && self.note_ransomware_burst(event);
             let manifest = if is_burst {
@@ -1355,15 +1102,7 @@ impl DetectionSink {
             } else {
                 Vec::new()
             };
-            self.record_and_emit_with(
-                &entity,
-                alert.technique,
-                &alert.message,
-                source,
-                alert.severity,
-                event,
-                manifest,
-            );
+            self.record(Finding::rule(&entity, &alert), event, manifest);
             if corroborated {
                 self.ransomware_reflex(event.meta().pid);
             }
@@ -1563,14 +1302,14 @@ impl DetectionSink {
                 let source = schema::detection::DetectionSource::Sigma {
                     rule_id: hit.title.clone(),
                 };
-                self.record_and_emit(
-                    &entity,
-                    &technique,
-                    &hit.title,
+                let finding = Finding {
+                    entity: &entity,
+                    technique: &technique,
+                    message: &hit.title,
                     source,
-                    hit.severity,
-                    wrapped,
-                );
+                    severity: hit.severity,
+                };
+                self.record(finding, wrapped, Vec::new());
             }
         }
     }
