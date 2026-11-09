@@ -1,11 +1,8 @@
-//! The macOS `Sensor` implementation: owns the `EndpointSecurity` client
-//! (through the C shim), converts flattened messages to raw records, and
-//! pushes normalized events into the sink.
+//! The macOS `Sensor` implementation over the `EndpointSecurity` C shim.
 //!
-//! Threading: `es_new_client` spins up its own dispatch threads that invoke
-//! the handler; `run` itself just creates the client, subscribes, and parks
-//! until [`MacosSensor::stop`] (or a stop handle) fires. The client is created
-//! and destroyed on the `run` thread — a libEndpointSecurity requirement.
+//! ES invokes the handler on its own dispatch threads; `run` creates the
+//! client, subscribes and parks until stopped. The client is created and
+//! destroyed on the `run` thread, a libEndpointSecurity requirement.
 
 use std::{
     ffi::c_void,

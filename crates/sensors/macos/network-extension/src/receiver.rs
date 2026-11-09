@@ -1,18 +1,10 @@
-//! The agent side of the extension↔agent seam: a Unix-domain socket the
-//! Swift system extension connects to and writes NDJSON [`crate::wire`]
-//! records into.
+//! The Unix-domain socket the Swift system extension connects to and writes
+//! NDJSON [`crate::wire`] records into.
 //!
-//! **Why the agent listens and the extension connects** (not the reverse):
-//! the agent daemon owns its runtime directory and lifetime; the extension is
-//! started/stopped by the OS on network activity and must be the reconnecting
-//! side. The socket lives in the app-group container both parties share —
-//! a network-extension sandbox allows connecting inside its own app group,
-//! not to arbitrary filesystem paths (see `packaging/macos`).
-//!
-//! Same iterator shape as the crate's siblings: [`NormalizedNeStream`] is
-//! generic over [`BufRead`] so tests feed canned captures, and
-//! `socket::listen`/`socket::accept_loop` produce real connections on Unix
-//! hosts.
+//! The agent listens and the extension connects because the OS starts and
+//! stops the extension on network activity, so it must be the reconnecting
+//! side. [`NormalizedNeStream`] is generic over [`BufRead`] so tests feed
+//! canned captures.
 
 use std::io::BufRead;
 

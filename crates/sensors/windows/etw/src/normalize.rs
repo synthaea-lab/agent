@@ -83,26 +83,20 @@ pub fn normalize_registry_key(raw: &str) -> String {
     raw.to_string()
 }
 
-/// Session names are randomized per start (F-2): a fixed name documented its own
-/// kill command. Entropy source is deliberately boring (time ^ pid) — this is
-/// anti-fingerprinting of the session *name*, not cryptography. `prefix` is the
-/// agent's `EtwNames::session_prefix`.
+/// A session name randomized per start under the agent's
+/// `EtwNames::session_prefix`, so the name is not a fixed kill target. The
+/// time ^ pid mix is not cryptographic: the name is not a secret.
 #[must_use]
 pub fn random_session_name(prefix: &str, seed_ns: u128, pid: u32) -> String {
     let mix = (seed_ns as u64) ^ ((pid as u64) << 17) ^ 0x9E37_79B9_7F4A_7C15;
     format!("{prefix}{:016x}", mix.wrapping_mul(0xBF58_476D_1CE4_E5B9))
 }
 
-/// Parses `logman query -ets`' stdout and returns every session name matching
-/// our own session `prefix` (issue #408): every ETW session we could have
-/// orphaned, across any number of consecutive unclean shutdowns — not just the
-/// single most recent one a persisted-name file can track.
+/// Parses `logman query -ets`' stdout and returns every session name under
+/// `prefix`: every session a previous unclean shutdown may have orphaned.
 ///
-/// Pure and locale-independent: `logman`'s "Type"/"Status" columns are
-/// translated (`Suivi`/`Tracking`, `En cours d'exécution`/`Running`, …) but the
-/// session-name column always comes first and is never translated, so taking
-/// each line's first whitespace-separated token is safe on any Windows display
-/// language.
+/// Only the first column is read: `logman` translates the other columns but
+/// never the session name, so this works on any display language.
 #[must_use]
 pub fn parse_orphaned_sessions(logman_query_ets_output: &str, prefix: &str) -> Vec<String> {
     logman_query_ets_output
@@ -141,11 +135,10 @@ pub fn select_orphaned_sessions(
 }
 
 /// Runs `start`, and on failure calls `stop_session(session)` before returning
-/// the error (#408). `ferrisetw`'s `start_and_process` creates the session
-/// (`StartTrace`), then enables each provider and opens the consumer; if one of
-/// those steps fails it returns before building the `UserTrace`, so no `Drop`
-/// ever stops the session it created. Left alone, every failed start (and the
-/// watchdog retries one every few seconds) leaks a live ETW session.
+/// the error. `ferrisetw`'s `start_and_process` creates the session before
+/// enabling providers and returns early on a later failure without building
+/// the `UserTrace`, so no `Drop` stops it: without this, every failed start
+/// leaks a live ETW session.
 ///
 /// # Errors
 ///
@@ -163,11 +156,10 @@ pub fn start_or_stop_session<T, E>(
 }
 
 /// Describes our session's state from an ETW session listing, for the error
-/// the liveness canary raises after 30 s of silence (#408). "Stopped from the
-/// outside" and "still running but blind" call for different investigations, and
-/// the old message ("trace stopped or tampered") didn't tell them apart. Other
-/// sessions under our `prefix` at that point are not orphans (startup stopped those): they
-/// belong to another running instance. `None`: enumeration failed.
+/// the liveness canary raises after 30 s of silence: "stopped from the
+/// outside" and "running but blind" call for different investigations. Other
+/// sessions under `prefix` at that point belong to another running instance
+/// (startup stopped the orphans). `None`: enumeration failed.
 #[must_use]
 pub fn describe_silent_session(
     session: &str,

@@ -1,22 +1,14 @@
 //! # sensor-windows-minifilter
 //!
-//! User-mode side of the `SynthaeaFilter` minifilter's communication port
-//! (#136, ADR-0012). The agent connects to `\SynthaeaPort` with a fixed
-//! connection context; the driver accepts exactly one client, and only one
-//! running as the agent (`NT SERVICE\SynthaEDR` in its token, guardrail 5).
+//! User-mode side of the `SynthaeaFilter` minifilter's communication port. The agent connects
+//! to [`PORT_NAME`] with a fixed connection context; the driver accepts exactly one client,
+//! running as `NT SERVICE\SynthaEDR`. [`wire`] decodes the protocol v5 messages (deletes,
+//! renames, timestamp changes, mounted-volume opens, heartbeats), [`events`] maps them to
+//! schema events, [`stats`] accounts for loss, and `channel::run` (Windows only) drives the
+//! loop.
 //!
-//! Milestone 2c: the event channel. The driver sends one message per delete
-//! or rename, and an idle heartbeat ([`wire`]); `channel::run` (Windows only) receives,
-//! decodes and forwards them as `FileDelete`/`FileRename` ([`events`]), with
-//! the loss visible from both sides ([`stats`]). The design is
-//! `docs/architecture/minifilter-event-channel.md`.
-//!
-//! The protocol constants mirror `driver/minifilter/SynthaeaFilter.c`: a
-//! change on one side is a change on the other. This crate sits next to
-//! `driver/` and depends only on `schema` among the workspace crates
-//! (ADR-0012 guardrail 8, `tools/check-deps.py`).
-//!
-//! Protocol v5 adds mounted logical-volume opens to v4's timestamp, delete and rename channel.
+//! The protocol constants mirror `driver/minifilter/SynthaeaFilter.c`: a change on one side is
+//! a change on the other. See `docs/sensors/windows/minifilter.md`.
 
 /// Name of the driver's communication port.
 pub const PORT_NAME: &str = r"\SynthaeaPort";

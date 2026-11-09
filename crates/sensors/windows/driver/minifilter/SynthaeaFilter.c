@@ -12,15 +12,13 @@ Module Name:
 
 Abstract:
 
-    This is the main module of the SynthaeaFilter mini filter driver.
-    Milestone 2c (#136): it reports successful deletes, renames, timestamp
-    requests, and mounted-volume opens over the agent communication port. The port
-    follows ADR-0012 guardrails 2 and 5: SYSTEM/Administrators-only
-    security descriptor, a single connection, and a connect callback that
-    accepts only the agent (NT SERVICE\SynthaEDR in its token) and
-    validates the client's connection context before accepting it. No
-    message callback is registered, so user mode cannot send anything to
-    the driver; the channel is kernel -> user only.
+    Main module of the SynthaeaFilter minifilter. Reports successful
+    deletes, renames, timestamp requests and mounted-volume opens over the
+    agent communication port. The port's security descriptor admits only
+    SYSTEM and Administrators, and the connect callback accepts a single
+    client whose token holds NT SERVICE\SynthaEDR and whose connection
+    context validates. No message callback is registered: the channel is
+    kernel -> user only.
 
 Environment:
 

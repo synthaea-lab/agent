@@ -1,7 +1,5 @@
-//! The Windows sensor: ETW providers (Kernel-Process, Kernel-Network, Kernel-File)
-//! normalized into schema events. Migrated from the old iteration; the provider
-//! wiring and its lab-earned notes (`TcpClient` emits no eid=42 — 2026-08-25; PID
-//! recycling; orphan named sessions) carry over, the audit findings are fixed here.
+//! The Windows `Sensor`: builds the shared state, stops orphaned sessions, runs
+//! the ETW trace and watches its liveness.
 
 use std::sync::{
     Arc, Mutex,
@@ -74,14 +72,13 @@ const REMOTE_THREAD_DEDUP_WINDOW_NS: u64 = 60_000_000_000;
 /// threads in many targets (a debugger attaching widely, a spray) is capped, counted.
 const REMOTE_THREAD_PER_PID_LIMIT: u32 = 32;
 const REMOTE_THREAD_PER_PID_WINDOW_NS: u64 = 10_000_000_000;
-/// An identical open of LSASS (caller, access mask, status) is reported once per window
-/// (<https://github.com/synthaea-lab/agent/issues/41>): security products and the service host re-open it on a schedule.
+/// An identical open of LSASS (caller, access mask, status) is reported once per window:
+/// security products and the service host re-open it on a schedule.
 const LSASS_OPEN_DEDUP_WINDOW_NS: u64 = 60_000_000_000;
 
-/// Stops an orphaned ETW session. Named sessions are kernel objects that outlive
-/// the creating process: after a `taskkill /f` or crash the session stays Running
-/// and any restart fails with `AlreadyExist` — without this cleanup the agent
-/// could never restart after an unclean shutdown, defeating the watchdog.
+/// Stops an orphaned ETW session. Named sessions are kernel objects that outlive the
+/// creating process, so a crashed run leaves its session running and costing ETW
+/// resources.
 fn stop_orphaned_session(name: &str) {
     let out = std::process::Command::new("logman")
         .args(["stop", name, "-ets"])
@@ -98,35 +95,15 @@ fn stop_orphaned_session(name: &str) {
     }
 }
 
-/// Stops every ETW session we could have orphaned (issue #408), not just the
-/// one from the most recent unclean shutdown. The previous mechanism persisted
-/// a single session name to a state file and only ever cleaned that one up — a
-/// *second* consecutive unclean shutdown overwrote the file before the first
-/// orphan was ever stopped, and it accumulated forever (each one a kernel
-/// session that keeps costing ETW resources and, per #408's lab observation,
-/// may leave a freshly started session receiving zero events).
+/// Stops every ETW session under our prefix ([`EtwNames::session_prefix`]), so no
+/// state is persisted and every orphan of any number of unclean shutdowns is caught.
 ///
-/// Enumerates `logman query -ets` and stops every session matching our session
-/// prefix ([`EtwNames::session_prefix`], `normalize::random_session_name`) — no persisted state
-/// needed, and it catches every orphan regardless of how many unclean shutdowns
-/// preceded this start. See `normalize::parse_orphaned_sessions` for the pure,
-/// tested parsing logic.
+/// Assumes one agent per host: a second instance starting while another runs would
+/// blind the first one's live session, which then trips its own [`liveness_watch`].
+/// This crate depends only on `schema` and cannot ask whether another instance runs;
+/// that check belongs a layer up.
 ///
-/// Single-instance assumption (Jean's #408 review, non-blocking): this stops
-/// every live session under the prefix, not just ones this install actually orphaned
-/// — correct only as long as at most one agent runs per host. Two instances
-/// overlapping even briefly (a watchdog restart racing a slow shutdown, a
-/// future Windows self-update swap, a manual `agent run` while the service is
-/// up) would have the new instance silently blind the old one's still-live
-/// session, which then trips the old instance's own silence watchdog
-/// ([`liveness_watch`]). `sensor-windows-etw` depends only on `schema`
-/// (workspace dependency rules), so it has no way to ask the agent/watchdog
-/// whether another instance is already running — that check, if ever needed,
-/// belongs a layer up, not here.
-///
-/// Also best-effort removes the pre-#408 state file (`synthaea-etw-session`,
-/// see the old `session_state_path`) so a host upgraded from that version
-/// doesn't keep it around forever — the new mechanism doesn't use it.
+/// Also removes the `synthaea-etw-session` state file an older version wrote.
 fn stop_all_orphaned_sessions(prefix: &str) {
     let _ = std::fs::remove_file(std::env::temp_dir().join("synthaea-etw-session"));
     match etw_sessions::running_sessions() {
@@ -206,7 +183,7 @@ fn logman_listing() -> Option<String> {
         .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
 }
 
-/// Stops the session a failed `start_and_process` left behind (#408, see
+/// Stops the session a failed `start_and_process` left behind (see
 /// `normalize::start_or_stop_session`). "Not found" is nominal: the failure may
 /// have come before `StartTrace` created anything.
 fn stop_session_after_failed_start(session: &str) {
@@ -221,7 +198,7 @@ fn stop_session_after_failed_start(session: &str) {
     }
 }
 
-/// The liveness error's diagnosis (#408): is our silent session still listed by
+/// The liveness error's diagnosis: is our silent session still listed by
 /// `logman query -ets` (running but blind) or gone (stopped from outside)? And
 /// which foreign sessions enable our providers: a real-time one nobody consumes
 /// blinds every real-time consumer on the host (lab, 2026-10-01), so naming it
@@ -329,15 +306,12 @@ pub(crate) struct SharedState {
     /// <https://github.com/synthaea-lab/agent/issues/41>: LSASS's pid, 0 until found. Only ever a process
     /// `cross_process::is_system_lsass` confirmed.
     pub(crate) lsass: cross_process::LsassTracker,
-    /// <https://github.com/synthaea-lab/agent/issues/41>: opens of LSASS, one per (caller, mask, status) per minute.
+    /// Opens of LSASS, one per (caller, mask, status) per minute.
     pub(crate) lsass_opens: Mutex<budget::KeyDedup>,
     /// `%SystemRoot%` (`C:\Windows`), where LSASS's image is looked for.
     pub(crate) system_root: String,
-    /// The liveness canary file: the run loop touches it every heartbeat, which
-    /// MUST produce a Kernel-File event (our pid is tracked) — so sensor liveness
-    /// is deterministic instead of traffic-dependent (a quiet host produces no
-    /// guaranteed events in 30s; review finding on #100). Canary events are
-    /// filtered from emission below.
+    /// The liveness canary file (see [`liveness_watch`]); its events are filtered
+    /// from emission.
     pub(crate) canary_path: String,
 }
 
@@ -520,12 +494,10 @@ fn new_session_name(prefix: &str) -> String {
     )
 }
 
-/// F-2: the silence watchdog, made deterministic by a canary: every heartbeat the
-/// loop touches our own temp file, which MUST produce a Kernel-File event (our pid
-/// is tracked and create-dispositions pass the filter). A healthy-but-idle host
-/// therefore still advances the counter — only a trace actually stopped out from
-/// under us (logman by an attacker) freezes it, and that is a loud sensor error
-/// the watchdog restarts.
+/// The silence watchdog. Every heartbeat writes our own canary file, which must
+/// produce a Kernel-File event (our pid is tracked and the create passes the
+/// filter), so an idle host still advances the counter and only a trace stopped
+/// from outside freezes it, as a sensor error rather than quiet blindness.
 fn liveness_watch(
     stop: &AtomicBool,
     state: &SharedState,
@@ -560,14 +532,13 @@ fn liveness_watch(
 
 // ── The sensor ───────────────────────────────────────────────────────────────
 
-/// The names the sensor leaves on the host, chosen by the agent (#596): this
-/// crate depends only on `schema`, so it cannot read the agent's identity
-/// constants itself.
+/// The names the sensor leaves on the host, chosen by the agent: this crate
+/// depends only on `schema`, so it cannot read the agent's identity constants.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EtwNames {
     /// Prefix of every session name; a random suffix follows it per start.
-    /// Startup stops every running session under it as an orphan (#408), so it
-    /// must stay the same from one start to the next on a host.
+    /// Startup stops every running session under it as an orphan, so it must
+    /// stay the same from one start to the next on a host.
     pub session_prefix: String,
     /// Prefix of the liveness canary file in the temp directory; the process
     /// id follows it.
@@ -607,11 +578,9 @@ impl Sensor for WindowsSensor {
             exec_events: true,
             file_events: true,
             connect_events: true,
-            user_attribution: true, // F-3: token SID + integrity level
+            user_attribution: true, // token SID + integrity level
             parent_lineage: true,   // parent path/comm resolved at exec time
-            // ETW (this sensor) only covers Kernel-Process/File/Network — it
-            // doesn't emit logon/auth events. That's `sensor-windows-eventlog`'s
-            // job (#94, Security 4624/4625/4648/4672 via wevtutil polling).
+            // Logons come from `sensor-windows-eventlog` (Security 4624/4625/4648/4672).
             auth_events: false,
         }
     }

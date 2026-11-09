@@ -14,16 +14,11 @@ schema = { path = "../../../schema" }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 
-# `EvtSubscribe`-backed transport (issue #322) — the push-based alternative to
-# the default `wevtutil`-polling loop. Kept as a Windows-only target dep so the
-# Linux CI leg still compiles this crate (only `xml/` and `targets/` build
-# cross-platform; `sensor.rs` and `subscribe.rs` are `#[cfg(windows)]`-gated).
-# `Win32_Foundation` gives us `ERROR_SUCCESS` / `GetLastError`; the
-# `Win32_System_EventLog` feature is what actually pulls in `EvtSubscribe`,
-# `EvtRender`, `EvtQuery`/`EvtNext` (the polling read, #1126), `EvtClose`, the
-# `EVT_HANDLE` type, and the notify-action enum.
-# `Win32_Security` is what windows-sys gates `EVT_VARIANT` and
-# `EvtGetChannelConfigProperty` behind (the channel `Enabled` check, #786).
+# The Event Log API (`EvtQuery`/`EvtNext` polling, `EvtSubscribe`, `EvtRender`,
+# the channel `Enabled` check) for the Windows-gated `sensor.rs`, `query.rs`,
+# `subscribe.rs` and `channel.rs`; Windows-only so the portable `xml/` and
+# `targets/` modules still build and test elsewhere. `Win32_Security` is where
+# windows-sys gates `EVT_VARIANT` and `EvtGetChannelConfigProperty`.
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = [
     "Win32_Foundation",

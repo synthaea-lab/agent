@@ -1,29 +1,11 @@
 //! # sensor-macos-sockets
 //!
-//! Probe-free socket-table snapshots on macOS (issue #358) — the sibling of
-//! `sensor-linux-netlink`'s `sock_diag` path (#92), and the one macOS source
-//! that needs **no entitlement**: it delivers listening-port telemetry and the
-//! LISTENER-DRIFT baseline on hosts where the `EndpointSecurity` grant hasn't
-//! landed yet.
-//!
-//! Mechanism: a libproc walk (`proc_listpids` → per-pid fd tables →
-//! `PROC_PIDFDSOCKETINFO`), done in a C shim compiled against the SDK's own
-//! headers — `socket_fdinfo` is a union-heavy struct whose layout is exactly
-//! what this workspace never transcribes into Rust by hand (the
-//! `sensor-macos` ES shim set the precedent). Unlike the Linux inode join,
-//! attribution is direct: the walk is per-process, so pid, **real ppid**,
-//! uid/gid and executable path ride every entry.
-//!
-//! Snapshot semantics are [`schema::ListenPortEvent`]'s own: poll-time
-//! timestamps, short-lived listeners between polls invisible, detection value
-//! in the drift across snapshots. Established sockets are snapshotted (for
-//! callers that want the table) but deliberately produce no event — the NE
-//! flow stream (#33) is the connection source, and a poll echo would
-//! double-count (the same documented gap as the Linux crate).
-//!
-//! Like its poll/tail siblings there is no [`schema::sensor::Sensor`]
-//! implementation — `agent::commands::macos` seeds the listener baseline from
-//! one startup snapshot and runs the poll loop alongside the other sensors.
+//! Listening-TCP-socket snapshots on macOS through a libproc walk in a C shim,
+//! the one macOS source that needs no entitlement. Each entry carries pid,
+//! real ppid, uid/gid and executable path. Only listeners become
+//! [`schema::ListenPortEvent`]s: connections come from the Network Extension
+//! flow stream. There is no [`schema::sensor::Sensor`] implementation; the
+//! agent polls `snapshot`. See `docs/sensors/macos/sockets.md`.
 
 pub mod normalize;
 pub mod raw;

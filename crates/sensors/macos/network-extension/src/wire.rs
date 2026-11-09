@@ -1,18 +1,10 @@
-//! The extension↔agent wire protocol: newline-delimited JSON records the
-//! Swift system extension (see `extension/`) writes over the local socket and
-//! this crate's receiver reads.
+//! The extension-to-agent wire protocol: newline-delimited JSON records.
 //!
-//! JSON rather than a fixed `repr(C)` layout (the `sensor-linux-wire`
-//! approach) deliberately: the two sides are different languages built by
-//! different toolchains (`swiftc` vs `cargo`) with independent release
-//! timing — a self-describing, versioned format degrades additively instead
-//! of corrupting on skew. Volume is far below the eBPF ring buffer's, so the
-//! serialization cost is irrelevant here.
-//!
-//! Versioning follows the same discipline as `sensor-linux-wire`'s
-//! `WIRE_VERSION`, independent of `schema::SCHEMA_VERSION`: bump on any
-//! change a deployed extension could disagree with; the receiver skips (and
-//! counts) records with an unknown `v` rather than guessing.
+//! JSON rather than a `repr(C)` layout because the two sides are built by
+//! different toolchains and released independently, so a skew skips records
+//! instead of corrupting them. Bump [`WIRE_VERSION`] (independent of
+//! `schema::SCHEMA_VERSION`) on any change a deployed extension could
+//! disagree with; the receiver skips and counts records with another `v`.
 
 use serde::{Deserialize, Serialize};
 

@@ -169,6 +169,6 @@ Everything else (provider set, keyword masks, budgets, windows) is a constant in
 
 ## Known gaps
 
-- Kernel-Network, Kernel-Registry, DNS-Client, PowerShell, WMI, DotNETRuntime and the other user-mode providers are enabled with every keyword. Filtering happens on the event id in the callback, after the record has been delivered. The DotNETRuntime comment names the Assembly keyword, but no mask is set.
+- Kernel-Network, Kernel-Registry, DNS-Client, PowerShell, WMI, DotNETRuntime and the other user-mode providers are enabled with every keyword. Filtering happens on the event id in the callback, after the record has been delivered.
 - Injection without a new thread (APC, thread hijack), handle duplication into LSASS and kernel-mode activity are not visible to ETW from a non-PPL session. They need the driver work tracked in [#32](https://github.com/synthaea-lab/agent/issues/32) and [#27](https://github.com/synthaea-lab/agent/issues/27).
 - The image file identity is taken in the `ProcessStart` callback, so a rename-and-replace faster than ETW delivery still wins: [#46](https://github.com/synthaea-lab/agent/issues/46).

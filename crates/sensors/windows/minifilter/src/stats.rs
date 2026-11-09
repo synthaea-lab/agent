@@ -1,12 +1,10 @@
-//! What the agent knows about the event channel's health (milestone 2c, #136).
+//! What the agent knows about the event channel's health.
 //!
-//! Loss is visible from two sides, as the design asks. The driver counts what it could not
-//! queue or send, and carries the cumulative counters in every message. The agent sees a gap
-//! in the per-connection sequence number, and counts what it could not decode. Neither side
-//! alone is enough: a record lost between the queue and `FilterGetMessage` shows only as a
-//! sequence gap, and a record never queued shows only in the driver's counters.
-//!
-//! Platform-independent: tested on every OS.
+//! Loss is visible from two sides, and neither alone is enough: the driver counts what it
+//! could not queue or send (carried in every message), and the agent sees gaps in the
+//! per-connection sequence number and counts what it could not decode. A record lost between
+//! the queue and `FilterGetMessage` shows only as a gap; one never queued shows only in the
+//! driver's counters. Portable: tested on every OS.
 
 use crate::wire::{Counters, Message};
 

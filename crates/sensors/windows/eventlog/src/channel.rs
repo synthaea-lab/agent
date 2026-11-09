@@ -1,14 +1,10 @@
-//! Whether an event log channel is enabled (#786).
+//! Whether an event log channel is enabled.
 //!
-//! A disabled channel is silent: `wevtutil qe` on it exits 0 with no events (lab,
-//! Windows 11 25H2, `Microsoft-Windows-TaskScheduler/Operational`), so the poll
-//! loop treats it as a quiet, healthy channel, its liveness counter moves, and
-//! nothing says the target can never see an event. `EvtSubscribe` registers on it
-//! just as happily. The sensor therefore reads the channel's own `Enabled` setting
-//! once at start-up and warns about a target whose channel is off.
-//!
-//! Read-only: enabling a channel is the operator's call (see the `AppLocker`
-//! target's `enable_audit` comment in `sensor.rs`).
+//! A disabled channel is silent: a query on it succeeds with no events (lab,
+//! Windows 11 25H2, `Microsoft-Windows-TaskScheduler/Operational`), so it looks
+//! like a quiet, healthy channel. The sensor reads each channel's `Enabled`
+//! setting once at start-up and warns about a target whose channel is off.
+//! Read-only: enabling a channel is the operator's call.
 
 #![cfg(windows)]
 

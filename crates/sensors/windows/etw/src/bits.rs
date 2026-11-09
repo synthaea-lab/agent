@@ -1,14 +1,12 @@
-//! BITS jobs (#284, T1197): the `Microsoft-Windows-Bits-Client` records that
-//! tie a BITS download, whose network I/O the BITS service does itself, back
-//! to the process that asked for it, reported as `schema::BitsJobEvent`.
+//! BITS jobs (T1197): the `Microsoft-Windows-Bits-Client` records that tie a
+//! download the BITS service does itself back to the client process, reported
+//! as `schema::BitsJobEvent`.
 //!
-//! Platform-independent on purpose: the URL is attacker-controlled (any client
-//! picks it), so the host check is unit-tested on every CI leg and has a
-//! never-panic suite in `tests/robustness.rs`. Only the ETW hook lives in the
-//! Windows-gated `providers`.
+//! Portable because the URL is attacker-controlled: the host check is
+//! unit-tested on every OS and has a never-panic suite in
+//! `tests/robustness.rs`. Only the ETW hook lives in `providers`.
 //!
-//! The provider's job-level records don't all carry what the event needs.
-//! Field layout read off the local Windows 11 `Bits-Client/Operational` log
+//! Field layout read off the Windows 11 `Bits-Client/Operational` log
 //! (2026-10-01):
 //!
 //! | EID | Meaning | Client pid | URL / local path |
@@ -19,11 +17,8 @@
 //! | 61 | transfer error | none (service) | `url` / none |
 //!
 //! So [`BitsJobs`] remembers each job's files from their file-added records
-//! and fills the later records in from them: a completion or a cancellation
-//! becomes one event per file, so every path the job wrote gets its window.
-//! That is also where the filter applies, per file: a file fetched from a
-//! Microsoft update host is never remembered, and a job holding only such
-//! files forwards nothing.
+//! and turns a completion or cancellation into one event per file. Files from
+//! a Microsoft update host are never remembered.
 
 use std::collections::HashMap;
 

@@ -1,219 +1,39 @@
 //! # sensor-windows-eventlog
 //!
-//! Windows Event Log channels as a supplementary, driverless sensor, read on
-//! an allowlist through one of two transports: an `EvtQuery` poll loop (the
-//! default) or `EvtSubscribe` push subscriptions (opt-in, see "Transport"
-//! below). The channels and events:
-//! - Security: 4624/4625/4648/4672 (logons — lateral movement), 4698/4702
-//!   (scheduled tasks), 4720 (local account creation), 1102 (audit log cleared)
-//! - System: 7045 (service install — persistence), 104 (log cleared)
-//! - Microsoft-Windows-AppLocker + WDAC, Defender operational, Task-Scheduler
-//! - Terminal Services: session lifecycle 21/23/24/25 and RDP authentication
-//!   1149 (#285, see the section below)
-//! - Kerberos operational: 201/202 delegation failures (#364)
+//! Windows Event Log channels as a supplementary, driverless sensor: an
+//! allowlist of Security, System, `AppLocker`, WDAC, Defender, Task Scheduler,
+//! Terminal Services and Kerberos events, normalized into `schema` events
+//! (persistence artifacts, logons, sessions, policy denials, Defender
+//! verdicts, log clears).
 //!
-//! Implements these persistence detections (7045 and 4698 ported from a spike
-//! validated end-to-end on a real Windows VM, ADR-0004; summary below), plus
-//! logon/session-event normalization:
+//! Both transports go through the Event Log reader API, never a live ETW
+//! subscription: System 7045 comes from a classic provider TDH cannot decode,
+//! and an ad-hoc ETW consumer never receives Security 4698. The default
+//! transport polls with `EvtQuery` every 2 s; `EvtSubscribe` push delivery is
+//! opt-in per host. Both share the target table, the [`xml`] parsers and the
+//! counters.
 //!
-//! - **T1543.003** — Create or Modify System Process: Windows Service. System log,
-//!   event **7045** ("A service was installed in the system").
-//! - **T1053.005** — Scheduled Task/Job: Scheduled Task. Security log, event
-//!   **4698** ("A scheduled task was created").
-//! - **T1053.005**, task-hijack sub-case — an *existing* task's action rewritten.
-//!   Security log, event **4702** ("A scheduled task was updated"), same audit
-//!   subcategory as 4698, lab-validated via `schtasks /change` (2026-09-22). Own
-//!   flag (`schema::FLAG_PERSISTENCE_TASK_UPDATE_ARTIFACT`); Windows rewrites its
-//!   own tasks routinely, so the consuming rule adds a suspicious-action-path gate
-//!   the other persistence rules do not need.
-//! - **T1136.001** — Create Account: Local Account. Security log, event **4720**
-//!   ("A user account was created"). Scoped to local SAM accounts on this host;
-//!   domain account creation writes 4720 on the DC, not the reporting machine,
-//!   so it is T1136.002 territory and out of scope for a userland EDR here.
-//! - **Logon/session events** (#94): Security log events **4624** (successful
-//!   logon), **4625** (failed logon), **4648** (explicit-credential logon — a
-//!   classic RunAs/lateral-movement signal), and **4672** (special privileges
-//!   assigned to a new logon), normalized into `schema::Event::Auth` — the same
-//!   shape `sensor-linux-journal` emits for its sshd/sudo/PAM auth events
-//!   (ADR-0005). The parsed field names were reconciled against a real lab-VM
-//!   capture; see `xml::LogonEvent`'s doc.
-//!
-//! ## Why the reader API, not a raw ETW subscription
-//!
-//! Both transports go through the Windows Event Log reader API (`EvtQuery` +
-//! `EvtNext` + `EvtRender` in `query.rs`, or `EvtSubscribe` in `subscribe.rs`),
-//! never through a live ETW subscription (`ferrisetw`/TDH, the mechanism
-//! `sensor-windows` uses for the kernel providers). That choice is validated in
-//! lab, on a real Windows VM, true positive + true negative for both 7045 and
-//! 4698: consuming these events via a raw ETW subscription does not work, for
-//! two unrelated reasons —
-//! - **7045**: "Service Control Manager" is a classic/legacy ETW provider
-//!   (`Qualifiers='16384'` in `wevtutil`'s XML rendering); `ferrisetw`/TDH can only
-//!   resolve a schema for manifest-based providers, so `event_id()` always reports
-//!   `0` and `event_schema()` fails with `TdhNativeError(IoError { code: 1168 })`.
-//! - **4698**: "Microsoft-Windows-Security-Auditing" IS manifest-based (GUID
-//!   confirmed, keyword filter adjusted, `SeSecurityPrivilege` enabled successfully)
-//!   — yet the ETW callback is simply never invoked, even for events confirmed via
-//!   `wevtutil` to have just been generated while the sensor was running. The
-//!   Security log appears to not be subscribable in real time by a third-party ETW
-//!   consumer created ad hoc, regardless of settings.
-//!
-//! The reader API sidesteps both. Polling it (the default transport) costs up to
-//! `POLL_INTERVAL` (2s, `sensor.rs`) of detection latency — an accepted trade-off
-//! for a persistence detection (the attacker already had to run `sc create` /
-//! `schtasks /create` before the event exists at all; a couple of seconds of
-//! latency does not change the outcome). `EvtSubscribe` removes that latency and
-//! is the long-term target; it stays opt-in until validated host by host.
-//!
-//! Polling originally shelled out to `wevtutil qe` with the same `XPath`
-//! queries. Since #1126 it calls the reader API `wevtutil` wraps directly:
-//! `wevtutil` wrote to its redirected stdout in the system ANSI code page, so an
-//! account name that page cannot hold (Cyrillic or CJK on a Windows-1252 host)
-//! reached the rules as `?`s; the API renders UTF-16 and keeps it, like the
-//! `Subscribe` transport.
-//!
-//! ## Schema fit
-//!
-//! The persistence detections are reported as `schema::FileOpenEvent` (not a
-//! new `Event` variant), marked with `schema::FLAG_PERSISTENCE_ARTIFACT` /
-//! `FLAG_PERSISTENCE_TASK_ARTIFACT` / `FLAG_PERSISTENCE_TASK_UPDATE_ARTIFACT` /
-//! `FLAG_PERSISTENCE_ACCOUNT_ARTIFACT` — see those constants' docs for why, and
-//! `rules::check_service_persistence` / `check_scheduled_task_persistence` for
-//! the consuming rules. Pragmatic reuse, not the final shape: a dedicated event
-//! family (`docs/architecture/event-schema.md` already lists "Registry" as a
-//! planned Windows-only family) is the natural home once one exists for other
-//! reasons too.
-//!
-//! Logon events are different: `schema::Event::Auth` is a real, dedicated
-//! variant (schema version bumped for #94) rather than another reuse of
-//! `FileOpenEvent` — deliberately, since it is meant to be shared with a future
-//! Linux sensor rather than staying Windows-only stopgap plumbing (ADR-0005).
-//!
-//! ## Additional detection channels (#283)
-//!
-//! Extra operational channels supplement the Security-channel poll targets
-//! above. None needs an `auditpol` toggle, but each is only as on as the host
-//! makes it: `AppLocker`'s exists where `AppLocker` is configured, and Task
-//! Scheduler's is off by default (#786). A target whose channel is disabled is
-//! logged at start-up rather than polled in silence:
-//!
-//! - **`AppLocker` policy decisions** (EXE/DLL **8003/8004**, MSI/Script
-//!   **8006/8007**, Packaged app-Execution **8021/8022**, and Packaged
-//!   app-Deployment **8024/8025**): audit and enforced policy decisions are
-//!   reported as the existing `schema::PolicyDenialEvent` with
-//!   `schema::POLICY_MECHANISM_APPLOCKER` (#427). `enforced` distinguishes the
-//!   modes; `object_path` carries a file path or, for packaged apps, the package
-//!   identity. Deployment decisions use action `install`. Allowed events are
-//!   filtered out. A defensive signal, not a persistence artifact. **Volume:**
-//!   not measured by channel yet. The targets are gated
-//!   by `EventLogConfig::applocker_blocks_enabled`, which the agent currently
-//!   sets to `true` unconditionally (no `agent.toml` switch yet).
-//! - **Microsoft Defender Operational** (`Microsoft-Windows-Windows Defender/Operational`,
-//!   events **1116/1117** verdicts and **5001/5010/5012/5007** tamper traces):
-//!   reported as `schema::DefenderEvent`, gated by
-//!   `EventLogConfig::defender_enabled`. The channel is localized, so only
-//!   numeric ids are read. **Volume:** 5007 is the bulk of the channel (service
-//!   start-up progress), so only exclusions, the `Disable*` switches and Tamper
-//!   Protection are forwarded.
-//! - **WDAC** (`Microsoft-Windows-CodeIntegrity/Operational`, events **3077**
-//!   enforced / **3076** audit): reported as `schema::PolicyDenialEvent` with
-//!   `schema::POLICY_MECHANISM_WDAC`, gated by `EventLogConfig::wdac_enabled`.
-//!   3033 is deliberately not subscribed (Chrome DLL-load noise).
-//! - **Task Scheduler Operational — task registered**
-//!   (`Microsoft-Windows-TaskScheduler/Operational` channel, event **106**):
-//!   the complement to Security 4698 where Task Scheduler history is enabled
-//!   (off by default, #786). Emitted whenever any scheduled task is registered
-//!   on this host. The event carries no task XML, so the
-//!   sensor reads the actions back from the task's definition file under
-//!   `%SystemRoot%\System32\Tasks` and reports the same shape as a 4698
-//!   (`schema::FLAG_PERSISTENCE_TASK_ARTIFACT`, action-unknown placeholder when
-//!   the file is gone or unreadable). A registration seen on *both* channels is
-//!   reported once by the rules layer (`rules::RuleState`, #422); both raw
-//!   events are kept.
-//!
-//! ## Session lifecycle (#285)
-//!
-//! Two Terminal Services channels report what 4624 cannot: whether a logon is
-//! a new session or a reconnect, when a session was disconnected (left alive
-//! for later) rather than logged off, and which client each step came from.
-//! Both become `schema::SessionEvent`:
-//!
-//! - `Microsoft-Windows-TerminalServices-LocalSessionManager/Operational`
-//!   **21** logon, **23** logoff, **24** disconnect, **25** reconnect, each
-//!   with the `SessionID` and, except 23, the client (`Address`: an IP, or
-//!   `LOCAL` for the console). The console session logs them too, so the
-//!   channel is not RDP-only.
-//! - `Microsoft-Windows-TerminalServices-RemoteConnectionManager/Operational`
-//!   **1149**: a client authenticated to the RDP listener (with Network Level
-//!   Authentication, the default, the credentials were good), with its source
-//!   IP and no session yet.
-//!
-//! Both are on by default on every SKU and need no audit toggle; one switch,
-//! `EventLogConfig::terminal_sessions_enabled`, gates the pair. The consuming
-//! rule (`rules`' `session` module) flags a disconnected session reconnected
-//! from another client, T1563.002.
-//!
-//! ## Log clearing (#799)
-//!
-//! The Event Log service writes the first record of a log it has just emptied
-//! itself: Security **1102** for the audit log, System **104** (provider
-//! `Microsoft-Windows-Eventlog`) naming any other channel. Both become
-//! `schema::LogClearedEvent`, whatever did the clearing: the command-line rule
-//! sees `wevtutil cl` and `Clear-EventLog`, these also see `EvtClearLog` and
-//! .NET's `EventLogSession.ClearLog`. No audit subcategory gates them; one
-//! switch, `EventLogConfig::log_clears_enabled`, gates the pair.
-//!
-//! ## Transport: polling (default) vs. `EvtSubscribe` (#322)
-//!
-//! The two transports coexist and are selected per host via
-//! `EventLogTransport` in `EventLogConfig`:
-//!
-//! - `EventLogTransport::Polling` — the default. One thread per
-//!   enabled target runs an `EvtQuery` loop at the `POLL_INTERVAL`
-//!   cadence (2s), same shape as the pre-#322 implementation and same
-//!   trade-offs as documented in the reader-API section above.
-//! - `EventLogTransport::Subscribe` — one `EvtSubscribe`
-//!   subscription per enabled target, with a Windows callback delivering
-//!   events the moment they land in the channel. Removes the polling
-//!   latency. Available since #322; opt-in at the
-//!   config layer so hosts adopt it after validation rather than the whole
-//!   fleet flipping on a version bump.
-//!
-//! Both transports reuse the same `PollTarget` table (`sensor.rs`), the
-//! same `xml::parse_*` parsers, and the same `EventLogCounters` — only the
-//! delivery mechanism differs. See `subscribe.rs` for the OS-facing details
-//! of the callback-based path.
-//!
-//! ## Configurable allowlist and volume counters (#94)
-//!
-// Plain code spans, not intra-doc links, for the three items below: they are
-// Windows-gated, so links to them would break the Linux docs build CI runs.
-//! `EventLogConfig` toggles the poll targets above independently (4698 and
-//! 4702 share one toggle; a disabled target is never even queried), and
-//! `EventLogCounters` (via `EventLogSensor::counters`) exposes a live count
-//! of events actually normalized per target. This crate cannot depend on
-//! `policy` (`sensor-*` crates depend only on `schema` —
-//! `tools/check-deps.py`), so `EventLogConfig` is this crate's own type; the
-//! `agent` binary converts `policy::EventLogPolicy` into it at construction
-//! time (ADR-0006).
+//! `EventLogConfig` is this crate's own type, since sensor crates depend only
+//! on `schema`; the agent converts its policy into it. See
+//! `docs/sensors/windows/eventlog.md`.
+// `EventLogConfig` is a code span, not an intra-doc link: it is Windows-gated,
+// so a link would break the docs build on other hosts.
 
 pub mod xml;
 
 // Reads a channel's `Enabled` setting, so a disabled one is reported rather
-// than polled in silence (#786).
+// than polled in silence.
 #[cfg(windows)]
 mod channel;
 // Portable so its messages are tested on every host.
 #[cfg_attr(not(windows), allow(dead_code))]
 mod error;
-// The polling transport's channel read (`EvtQuery`, UTF-16), #1126.
+// The polling transport's channel read (`EvtQuery`, UTF-16).
 #[cfg(windows)]
 mod query;
 #[cfg(windows)]
 mod sensor;
-// The `EvtSubscribe` transport (issue #322) — enabled per-host via
-// `EventLogConfig::transport`. Gated `#[cfg(windows)]` because it binds
-// against `windows-sys`; the Linux CI leg keeps compiling `xml` and `targets`.
+// The `EvtSubscribe` transport, selected per host by `EventLogConfig::transport`.
 #[cfg(windows)]
 mod subscribe;
 // Only `sensor.rs` calls into it outside tests, so it is dead code off Windows.

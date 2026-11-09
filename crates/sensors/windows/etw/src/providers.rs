@@ -1,8 +1,6 @@
-//! The ETW provider callbacks (Kernel-Process, Kernel-Network, Kernel-File, DNS-Client,
-//! Kernel-Registry), each normalizing its records into schema events. Lab-earned notes carry over
-//! each normalizing its records into schema events. Lab-earned notes carry over
-//! from the old iteration: `TcpClient` emits no eid=42 (2026-08-25), PID recycling
-//! prunes on `ProcessEnd`, canary events are filtered from emission.
+//! The ETW provider callbacks, each normalizing its records into schema events.
+//! Lab notes: `TcpClient` emits no EID 42 (2026-08-25), PID recycling prunes on
+//! `ProcessEnd`, canary events are filtered from emission.
 
 use std::sync::{Arc, atomic::Ordering};
 
@@ -61,19 +59,19 @@ const KERNEL_REGISTRY_GUID: &str = "70EB4F03-C1DE-4F73-A051-33D13D5413BD";
 const POWERSHELL_GUID: &str = "A0C1853B-5C40-4B15-8766-3CF1C58F985A";
 /// Microsoft-Windows-WMI-Activity
 const WMI_ACTIVITY_GUID: &str = "1418EF04-B0B4-4623-BF7E-D74AB47BBDAA";
-/// Microsoft-Windows-DotNETRuntime (Assembly keyword, EID 154 `AssemblyLoad`)
+/// Microsoft-Windows-DotNETRuntime (EID 154 `AssemblyLoad`), enabled with no keyword mask
 const DOTNET_RUNTIME_GUID: &str = "e13c0d23-ccbc-4e12-931b-d9cc2eee27e4";
-/// Microsoft-Antimalware-Scan-Interface (EID 1101, the scanned buffer, #282)
+/// Microsoft-Antimalware-Scan-Interface (EID 1101, the scanned buffer)
 const AMSI_GUID: &str = "2A576B87-09A7-520E-C21A-4942F0271D67";
-/// Microsoft-Windows-LDAP-Client (EID 30, the search request, #364)
+/// Microsoft-Windows-LDAP-Client (EID 30, the search request)
 const LDAP_CLIENT_GUID: &str = "099614a5-5dd7-4788-8bc9-e29f43db28fc";
-/// Microsoft-Windows-NTLM (EIDs 4020-4023/4026/4027, NTLM usage, #364)
+/// Microsoft-Windows-NTLM (EIDs 4020-4023/4026/4027, NTLM usage)
 const NTLM_GUID: &str = "ac43300d-5fcc-4800-8e99-1bd3f85f0320";
 /// Microsoft-Windows-SMBClient (EID 30704 — TCP connection established to SMB server)
 const SMB_CLIENT_GUID: &str = "988C59C5-0A1C-45B6-A555-0C62276E327D";
-/// Microsoft-Windows-Bits-Client (EIDs 16403/4/5/61 — BITS jobs, #284)
+/// Microsoft-Windows-Bits-Client (EIDs 16403/4/5/61, BITS jobs)
 const BITS_CLIENT_GUID: &str = "EF1CC15B-46C1-414E-BB95-E76B077BD51E";
-/// Microsoft-Windows-Kernel-Audit-API-Calls (EID 5 `PsOpenProcess`, <https://github.com/synthaea-lab/agent/issues/41>). The manifest
+/// Microsoft-Windows-Kernel-Audit-API-Calls (EID 5 `PsOpenProcess`). The manifest
 /// declares no keywords, so every id arrives and the callback keeps 5.
 const KERNEL_AUDIT_API_GUID: &str = "E02A841C-75A3-4FA7-AFC8-AE09CF9B7F23";
 /// Kernel-Audit-API-Calls `PsOpenProcess`: `TargetProcessId`, `DesiredAccess`,
@@ -100,12 +98,11 @@ pub(crate) const ALL_PROVIDERS: [(&str, &str); 14] = [
 ];
 
 /// Kernel-Process keywords the sensor reads: `WINEVENT_KEYWORD_PROCESS` (0x10,
-/// EIDs 1/2), `WINEVENT_KEYWORD_THREAD` (0x20, EID 3 for remote threads, <https://github.com/synthaea-lab/agent/issues/41>),
-/// `WINEVENT_KEYWORD_IMAGE` (0x40, EID 5) and `WINEVENT_KEYWORD_JOB_SILO` (0x4000, the
-/// server silo EIDs 23-26, <https://github.com/synthaea-lab/agent/issues/39>). Left unset, ferrisetw enables every keyword. #726 had
-/// taken THREAD out when nothing read thread starts; <https://github.com/synthaea-lab/agent/issues/41> reads them, and the thread
-/// stops (EID 4) the keyword brings along are dropped on their id before any parsing
-/// (#715: 55 to 71 starts per second on an idle host).
+/// EIDs 1/2), `WINEVENT_KEYWORD_THREAD` (0x20, EID 3 for remote threads),
+/// `WINEVENT_KEYWORD_IMAGE` (0x40, EID 5) and `WINEVENT_KEYWORD_JOB_SILO` (0x4000,
+/// the server silo EIDs 23-26). Left unset, ferrisetw enables every keyword. The
+/// thread stops (EID 4) THREAD brings along are dropped on their id before any
+/// parsing.
 const KERNEL_PROCESS_KEYWORDS: u64 = 0x10 | 0x20 | 0x40 | 0x4000;
 
 /// `AssemblyFlags` bit indicating a dynamic (in-memory) assembly load.
@@ -197,8 +194,8 @@ fn on_process_start(
 /// its parent's image path (the schema's lineage at exec time: the parent is usually alive
 /// and already in the store).
 fn remember_process(process: &ProcessStart, state: &SharedState) -> Option<String> {
-    // https://github.com/synthaea-lab/agent/issues/39: read while the process most likely still runs; one already
-    // gone is in its parent's silo. Read before taking the lock: it is a system call.
+    // Read while the process most likely still runs (one already gone is in its parent's
+    // silo), and before taking the lock: it is a system call.
     let own_silo = winapi::read_server_silo_id(process.pid);
     let mut pids = state.pids.lock_or_recover();
     let silo = silo::exec_silo(own_silo, pids.silo(process.ppid));
@@ -212,12 +209,10 @@ fn remember_process(process: &ProcessStart, state: &SharedState) -> Option<Strin
     pids.get(process.ppid).map(str::to_owned)
 }
 
-/// #688: which file the image was started from, taken as early as this thread can: the
-/// T1204.002 gate compares it with the file the enrichment worker verifies later, and a
-/// dropper can rename itself and put another file at its path in between. One open
-/// (shared for delete, so it cannot block the rename) and one query, no read. Not for a
-/// network or device path: the open would be a round trip on this thread (see
-/// `image_identity_is_capturable`).
+/// Which file the image was started from, taken as early as possible: the T1204.002 gate
+/// compares it with the file enrichment verifies later, and a dropper can swap the file at
+/// its path in between. The open shares delete so it cannot block a rename. Not for a
+/// network or device path (see `image_identity_is_capturable`).
 fn image_file_id(image_path: &str) -> Option<String> {
     crate::image_identity_is_capturable(image_path)
         .then(|| winapi::image_file_id(std::path::Path::new(image_path)))
@@ -372,11 +367,9 @@ fn forward_remote_thread(
     }));
 }
 
-/// The full image path of `pid` (<https://github.com/synthaea-lab/agent/issues/45>: what the LSASS rule decides an expected reader on;
-/// <https://github.com/synthaea-lab/agent/issues/41>: LSASS's parent):
-/// the pid store's when it holds a path, else a live lookup. The startup seed stores only
-/// file names (toolhelp), and a bare name is exactly what a renamed dumper controls, so it
-/// is never returned as a path.
+/// The full image path of `pid` (an LSASS reader, or LSASS's parent): the pid store's when
+/// it holds a path, else a live lookup. The startup seed stores only file names, and a bare
+/// name is exactly what a renamed dumper controls, so it is never returned as a path.
 fn full_image_path(pid: u32, state: &SharedState) -> Option<String> {
     let cached = state.pids.lock_or_recover().get(pid).map(str::to_owned);
     cached
@@ -384,17 +377,16 @@ fn full_image_path(pid: u32, state: &SharedState) -> Option<String> {
         .or_else(|| winapi::resolve_pid_live(pid).map(|path| state.normalize_path(&path)))
 }
 
-/// Opens of LSASS that can reach its memory (<https://github.com/synthaea-lab/agent/issues/41>, the native Sysmon 10, T1003.001), from
+/// Opens of LSASS that can reach its memory (the native Sysmon 10, T1003.001), from
 /// Microsoft-Windows-Kernel-Audit-API-Calls EID 5 (`PsOpenProcess`). Every other id, and
-/// every open of another process, is dropped before anything else: #715 counted 280 to
-/// 330 opens per second on an idle host, about half of them with `PROCESS_VM_READ`, so
-/// the target is the filter. An identical open (caller, mask, status) is reported once
-/// per minute.
+/// every open of another process, is dropped first: the target is the filter (see
+/// `cross_process` for the rates). An identical open (caller, mask, status) is reported
+/// once per minute.
 ///
 /// # Field notes (manifest, Windows 11 build 26300, 2026-11-05)
 ///
 /// EID 5 v0: `TargetProcessId`, `DesiredAccess`, `ReturnCode` (u32). The caller is the
-/// record header's pid (#715 capture). No keyword is declared, so the provider is
+/// record header's pid. No keyword is declared, so the provider is
 /// enabled whole and ids 1-8 all reach the callback.
 pub(crate) fn audit_api_provider(sink: Arc<dyn EventSink>, state: Arc<SharedState>) -> Provider {
     let callback = move |record: &EventRecord, locator: &SchemaLocator| {
@@ -540,8 +532,7 @@ pub(crate) fn file_provider(sink: Arc<dyn EventSink>, state: Arc<SharedState>) -
     let callback = move |record: &EventRecord, locator: &SchemaLocator| {
         let eid = record.event_id();
         // 12=Create; 30=CreateNewFile; 26=DeletePath, for mark-of-the-web
-        // removal only (F-6 partial — general delete/rename semantics land with
-        // #82/#39).
+        // removal only.
         if file_event_keyword(eid).is_none() {
             return;
         }
@@ -591,8 +582,8 @@ pub(crate) fn file_provider(sink: Arc<dyn EventSink>, state: Arc<SharedState>) -
         if path.ends_with(&state.canary_path) {
             return;
         }
-        // #365: a create/write on `host:Zone.Identifier` is the mark-of-the-web
-        // being written. The stream is read back off this thread (#439).
+        // A create/write on `host:Zone.Identifier` is the mark-of-the-web being
+        // written. The stream is read back off this thread.
         let meta = state.meta(pid, 0, comm, timestamp_ns);
         if let Some(host) = zone_identifier::stream_host_path(&path) {
             state.marks.offer(zone_identifier::MarkWrite {
@@ -610,20 +601,16 @@ pub(crate) fn file_provider(sink: Arc<dyn EventSink>, state: Arc<SharedState>) -
 }
 
 /// Kernel-File 26 (`DeletePath`, `FilePath` field): forwards the deletion of a
-/// `:Zone.Identifier` stream — the mark-of-the-web being removed by
-/// `Unblock-File`, `Remove-Item -Stream` or Explorer's "Unblock" (T1553.005,
-/// #442) — as a `FileDelete` of the stream path. Every other delete is
-/// dropped: Windows delete semantics in general land with the minifilter
-/// (#136), which also sees what this userland path can't.
+/// `:Zone.Identifier` stream (the mark-of-the-web removed, T1553.005) as a
+/// `FileDelete` of the stream path. Every other delete is dropped: the minifilter
+/// reports deletes.
 ///
-/// The stream check runs on the raw NT path first, so the path normalization
-/// (volume map, 8.3 expansion) and the token lookup behind `meta` only run
-/// for the rare matching delete, never for the host's whole delete volume on
-/// the ETW thread (#481, #408).
+/// The stream check runs on the raw NT path first, so path normalization and the
+/// token lookup behind `meta` only run for the rare matching delete, never for the
+/// host's whole delete volume on the ETW thread.
 ///
-/// Not distinguished: a disposition call that *clears* delete-on-close. The
-/// event doesn't carry the flag's value, and un-deleting a mark is not
-/// something tools do.
+/// Not distinguished: a disposition call that *clears* delete-on-close. The event
+/// does not carry the flag's value.
 fn forward_mark_removal(
     parser: &Parser<'_, '_>,
     state: &SharedState,
@@ -1121,11 +1108,9 @@ pub(crate) fn wmi_provider(sink: Arc<dyn EventSink>, state: Arc<SharedState>) ->
 /// In-memory .NET assembly loads (EID 154 — `AssemblyLoad`) from
 /// `Microsoft-Windows-DotNETRuntime`.
 ///
-/// Only dynamic (in-memory) assemblies are forwarded (`flags & 0x2 != 0`).
-/// File-backed loads are high-volume noise (every .NET app triggers dozens on
-/// startup) with almost no detection value at this tier. Dynamic loads are rare
-/// in legitimate software and are the hallmark of execute-assembly / fileless
-/// .NET injection (T1620, T1055).
+/// Only dynamic (in-memory) assemblies are forwarded (`flags & 0x2 != 0`):
+/// file-backed loads are high-volume noise, dynamic loads are rare in legitimate
+/// software and mark execute-assembly and fileless .NET injection (T1620, T1055).
 ///
 /// # Field notes (Windows Server 2022, 2026-09-07)
 ///
