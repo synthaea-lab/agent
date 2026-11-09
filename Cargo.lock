@@ -691,6 +691,8 @@ dependencies = [
  "policy",
  "proptest",
  "schema",
+ "serde_json",
+ "siblings",
  "store",
  "tracing",
 ]
