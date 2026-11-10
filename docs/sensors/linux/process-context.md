@@ -15,7 +15,7 @@ sensor tracks forks itself in the `PROC_LINEAGE` map
 - [`raw_sched_process_fork`](../../../crates/sensors/linux/ebpf/src/raw.rs) inserts the child with
   the parent's tgid and comm, a fresh `generation`, the parent's generation, and `execd = 0`.
 - [`raw_sched_process_exit`](../../../crates/sensors/linux/ebpf/src/raw.rs) removes it.
-- [`record_sched_process_exec`](../../../crates/sensors/linux/ebpf/src/main.rs) sets `execd = 1` on
+- [`record_sched_process_exec`](../../../crates/sensors/linux/ebpf/src/exec.rs) sets `execd = 1` on
   the process's own entry, after reading the entries it reports.
 - At start, [`prime_proc_lineage`](../../../crates/sensors/linux/userspace/src/ebpf.rs) inserts
   every process already running, from `/proc/<pid>/stat`, in two passes so each entry can name
@@ -62,7 +62,7 @@ administrative commands rules care about. A `/proc` read is also not exec-time: 
 rewrite its argument region before it.
 
 So the probe reads the argument block itself, using `task->mm->arg_start..arg_end` at BTF-derived
-offsets ([`read_exec_argv`](../../../crates/sensors/linux/ebpf/src/main.rs)):
+offsets ([`read_exec_argv`](../../../crates/sensors/linux/ebpf/src/exec.rs)):
 
 - the whole block when it is at most 1024 bytes;
 - otherwise the first 768 bytes and the last 256. The tail exists so padding placed in front of a
