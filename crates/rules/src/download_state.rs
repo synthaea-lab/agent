@@ -278,7 +278,7 @@ impl DownloadState {
 
     /// Linux browser downloads carry no usable xattr mark, so the finished download is
     /// marked from the browser's own rename of its partial file (#221): a `FileRename`
-    /// whose `old_path` ends in `.crdownload` or `.part` and whose `new_path` does not,
+    /// whose `old_path` ends in `.crdownload`, `.opdownload` or `.part` and whose `new_path` does not,
     /// by a process whose `executable_path` is in [`BROWSER_DOWNLOAD_IMAGES`]. The mark is
     /// the same one [`Self::on_file_quarantine`] records, with the browser's file name as
     /// the agent and no origin URL, so [`Self::check_quarantined_exec`] joins it.

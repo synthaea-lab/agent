@@ -103,8 +103,9 @@ pub(crate) const BROWSER_DOWNLOAD_IMAGES: &[&str] = &[
 ];
 
 /// Suffixes of a browser's partial download file. A rename out of one of these, to a name
-/// without one, is the browser finishing the download.
-pub(crate) const BROWSER_PARTIAL_SUFFIXES: &[&str] = &[".crdownload", ".part"];
+/// without one, is the browser finishing the download. `.opdownload` is Opera's (captured
+/// 2026-11-10, with and without a Save-as dialog).
+pub(crate) const BROWSER_PARTIAL_SUFFIXES: &[&str] = &[".crdownload", ".opdownload", ".part"];
 
 /// Window between a BITS job adding or completing a file and an exec of that
 /// file that still counts as "BITS-downloaded, then run" (T1197, #284). The

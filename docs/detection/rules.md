@@ -211,7 +211,7 @@ judges against its built-in baseline.
 
 Linux browsers leave no usable xattr mark, so `on_file_rename` marks the finished download
 instead ([`on_browser_download_rename`](../../crates/rules/src/download_state.rs), #221). A
-`FileRename` marks `new_path` when `old_path` ends in `.crdownload` or `.part`, `new_path`
+`FileRename` marks `new_path` when `old_path` ends in `.crdownload`, `.opdownload` (Opera) or `.part`, `new_path`
 does not, and the event's `executable_path` is in
 [`BROWSER_DOWNLOAD_IMAGES`](../../crates/rules/src/exclusions.rs). The mark is the one a
 `FileQuarantine` records (agent = the image's file name, no origin URL), so

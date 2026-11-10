@@ -69,6 +69,37 @@ fn firefox_part_rename_then_exec_alerts() {
 }
 
 #[test]
+fn an_opdownload_rename_is_a_finished_download() {
+    // Opera's partial suffix (lab capture 2026-11-10, with and without a Save-as dialog:
+    // `saved.bin.opdownload -> saved.bin`). Opera's own image is not in
+    // `BROWSER_DOWNLOAD_IMAGES` yet, so a listed image stands in: this pins the suffix.
+    let mut state = RuleState::new();
+    state.on_file_rename(&rename(
+        "/home/u/Downloads/test.bin.opdownload",
+        FINAL,
+        Some(CHROMIUM),
+        0,
+    ));
+    let alerts = exec(&mut state, &run(FINAL, 1));
+    assert_eq!(alerts.len(), 1);
+    assert_eq!(alerts[0].technique, "T1204.002");
+}
+
+#[test]
+fn a_rename_into_an_opdownload_marks_nothing() {
+    // The first rename (`/tmp/... -> .opdownload`) lands on the partial file, not the download.
+    let partial = "/home/u/Downloads/test.bin.opdownload";
+    let mut state = RuleState::new();
+    state.on_file_rename(&rename(
+        "/tmp/.org.chromium.Chromium.AbC123",
+        partial,
+        Some(CHROMIUM),
+        0,
+    ));
+    assert!(exec(&mut state, &run(partial, 1)).is_empty());
+}
+
+#[test]
 fn chromium_crdownload_rename_then_exec_alerts() {
     let mut state = RuleState::new();
     state.on_file_rename(&rename(
