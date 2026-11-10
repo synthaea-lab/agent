@@ -162,13 +162,6 @@ fn is_suspicious_image_path(path: &str) -> bool {
         .any(|s| lower.contains(s))
 }
 
-/// Returns true if the IPv4 address belongs to a private range, is loopback, or is
-/// not a real destination (unspecified address `0.0.0.0`).
-/// `0.0.0.0` has no place in RFC1918 but must not count as "external" either —
-/// observed on 2026-08-31 on `sshd` (`daddr=0.0.0.0`, cause of the `connect()` still
-/// unidentified): without this exclusion, the unspecified address was classified as
-/// external by default, contributing to `dest_is_external` Bayesian LLR on traffic
-/// unrelated to any real C2.
 /// Loopback, unspecified, link-local (`fe80::/10`), unique-local (`fc00::/7`),
 /// multicast (`ff00::/8`) — the non-global classes legitimate local traffic uses.
 fn is_non_global_ipv6(addr: std::net::Ipv6Addr) -> bool {
@@ -180,6 +173,13 @@ fn is_non_global_ipv6(addr: std::net::Ipv6Addr) -> bool {
         || (seg[0] & 0xff00) == 0xff00
 }
 
+/// Returns true if the IPv4 address belongs to a private range, is loopback, or is
+/// not a real destination (unspecified address `0.0.0.0`).
+/// `0.0.0.0` has no place in RFC1918 but must not count as "external" either —
+/// observed on 2026-08-31 on `sshd` (`daddr=0.0.0.0`, cause of the `connect()` still
+/// unidentified): without this exclusion, the unspecified address was classified as
+/// external by default, contributing to `dest_is_external` Bayesian LLR on traffic
+/// unrelated to any real C2.
 fn is_private_ipv4(addr: [u8; 4]) -> bool {
     matches!(
         addr,

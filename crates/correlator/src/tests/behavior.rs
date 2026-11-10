@@ -89,6 +89,89 @@ fn bv_unspecified_ip_not_external() {
     assert_eq!(bv.dest_is_external, 0.0);
 }
 
+fn connect_to_v6(meta: EventMeta, daddr: std::net::Ipv6Addr, dport: u16) -> Event {
+    Event::Connect(ConnectEvent {
+        meta,
+        daddr: std::net::IpAddr::V6(daddr),
+        dport,
+    })
+}
+
+fn dest_is_external_v6(pid: u32, daddr: &str) -> f32 {
+    let mut engine = CorrelationEngine::new();
+    let addr: std::net::Ipv6Addr = daddr.parse().unwrap();
+    engine.on_event(connect_to_v6(meta(pid, 1_000_000_000), addr, 443));
+    engine
+        .behavior_vector_for_pid(pid, None)
+        .unwrap()
+        .dest_is_external
+}
+
+#[test]
+fn bv_global_ipv6_is_external() {
+    // Parity with the ml mirror (agent#203): a public IPv6 C2 must score 1.0,
+    // not be skipped. Rust is the reference for this case.
+    assert_eq!(dest_is_external_v6(56, "2606:4700:4700::1111"), 1.0);
+    assert_eq!(dest_is_external_v6(57, "2001:4860:4860::8888"), 1.0);
+}
+
+#[test]
+fn bv_non_global_ipv6_is_not_external() {
+    for (pid, addr) in [
+        (58, "::1"),
+        (59, "::"),
+        (60, "fe80::1"),
+        (61, "fc00::1"),
+        (62, "fd12:3456:789a::1"),
+        (63, "ff02::1"),
+    ] {
+        assert_eq!(dest_is_external_v6(pid, addr), 0.0, "{addr}");
+    }
+}
+
+#[test]
+fn bv_unspecified_is_internal_for_v4_and_v6_alike() {
+    // agent#203 case 2: `0.0.0.0` is not external, same as `::`. The ml mirror
+    // counted it as external; Rust is the reference.
+    let mut engine = CorrelationEngine::new();
+    engine.on_event(connect_to(meta(64, 1_000_000_000), [0, 0, 0, 0], 22));
+    let v4 = engine.behavior_vector_for_pid(64, None).unwrap();
+    assert_eq!(v4.dest_is_external, 0.0);
+    assert_eq!(dest_is_external_v6(65, "::"), 0.0);
+}
+
+fn is_suspicious_path_of(image_path: &str) -> f32 {
+    let mut engine = CorrelationEngine::new();
+    engine.on_event(exec_with_meta(meta(66, 1_000_000_000), image_path));
+    engine
+        .behavior_vector_for_pid(66, None)
+        .unwrap()
+        .is_suspicious_path
+}
+
+#[test]
+fn bv_suspicious_path_is_case_insensitive_for_ascii() {
+    assert_eq!(
+        is_suspicious_path_of("C:\\Users\\x\\APPDATA\\Roaming\\a.exe"),
+        1.0
+    );
+    assert_eq!(is_suspicious_path_of("C:\\Users\\x\\DoWnLoAdS\\a.exe"), 1.0);
+    assert_eq!(is_suspicious_path_of("C:\\Windows\\System32\\a.exe"), 0.0);
+}
+
+#[test]
+fn bv_suspicious_path_lowercasing_is_ascii_only() {
+    // agent#203 case 3: Rust is the reference (ASCII-only lowercasing); the ml
+    // mirror must align (https://github.com/synthaea-lab/ml/issues/51).
+    // U+212A KELVIN SIGN lowercases to ASCII `k` under Unicode lowering, so
+    // `DES<U+212A>TOP` would match `desktop` there; it must not match here.
+    assert_eq!(
+        is_suspicious_path_of("C:\\Users\\x\\DES\u{212A}TOP\\a.exe"),
+        0.0
+    );
+    assert_eq!(is_suspicious_path_of("C:\\Users\\x\\DESKTOP\\a.exe"), 1.0);
+}
+
 #[test]
 fn bv_distinct_dports() {
     let mut engine = CorrelationEngine::new();
