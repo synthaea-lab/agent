@@ -177,7 +177,7 @@ fn read_inet_dest(addr_ptr: u64) -> Option<(DnsFdEntry, u16)> {
 /// only with `--enable-dns-capture`. Kept out of `raw_sys_enter` on purpose: that is one verifier
 /// unit shared by every `sys_enter_*` handler, and the verifier of the 5.15 kernel rejects it
 /// outright (`E2BIG`, before one instruction) once this code is added to it. Each reads the
-/// descriptor and arguments from the synthetic record, as the handlers above do.
+/// descriptor and arguments from the synthetic record, as the `connect` and `sendto` handlers do.
 ///
 /// `connect(2)`: remembers a socket connected to port 53, so that a later `write(2)`/`send(2)`
 /// without an address is recognised as a DNS query; a connect of the same descriptor to anything
