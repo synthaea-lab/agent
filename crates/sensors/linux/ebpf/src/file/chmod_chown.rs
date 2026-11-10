@@ -9,7 +9,10 @@ use aya_ebpf::{
 use aya_log_ebpf::warn;
 use sensor_linux_wire::{FileChmodEvent, FileChownEvent, is_filtered_path};
 
-use crate::{fill_event_meta, into_ret};
+use crate::{
+    arch::{SyscallRecord, arg_offset},
+    fill_event_meta, into_ret,
+};
 
 /// Ring buffer shared with userspace for `chmod`/`fchmodat` events.
 #[map]
@@ -30,45 +33,29 @@ static CHOWN_SCRATCH: PerCpuArray<FileChownEvent> = PerCpuArray::with_max_entrie
 /// Offsets of the `syscalls:sys_enter_chmod` tracepoint (`x86_64`/`aarch64`): `filename`(16),
 /// `mode`(24). Verified on 2026-09-22 on Alpine (kernel 6.18.50-0-virt, `x86_64`) via
 /// `/sys/kernel/tracing/events/syscalls/sys_enter_chmod/format`.
-#[cfg(any(bpf_target_arch = "x86_64", bpf_target_arch = "aarch64"))]
-const CHMOD_FILENAME_PTR_OFFSET: usize = 16;
-#[cfg(any(bpf_target_arch = "x86_64", bpf_target_arch = "aarch64"))]
-const CHMOD_MODE_OFFSET: usize = 24;
+///
 /// i686: inferred, not independently verified (see `sys_enter_open`'s i686 note).
-#[cfg(bpf_target_arch = "x86")]
-const CHMOD_FILENAME_PTR_OFFSET: usize = 12;
-#[cfg(bpf_target_arch = "x86")]
-const CHMOD_MODE_OFFSET: usize = 16;
+const CHMOD_FILENAME_PTR_OFFSET: usize = arg_offset(0);
+const CHMOD_MODE_OFFSET: usize = arg_offset(1);
 
 /// Offsets of the `syscalls:sys_enter_fchmodat` tracepoint (`x86_64`/`aarch64`): `dfd`(16),
 /// `filename`(24), `mode`(32). Verified on 2026-09-22 on Alpine (kernel 6.18.50-0-virt,
 /// `x86_64`) via `/sys/kernel/tracing/events/syscalls/sys_enter_fchmodat/format`.
-#[cfg(any(bpf_target_arch = "x86_64", bpf_target_arch = "aarch64"))]
-const FCHMODAT_FILENAME_PTR_OFFSET: usize = 24;
-#[cfg(any(bpf_target_arch = "x86_64", bpf_target_arch = "aarch64"))]
-const FCHMODAT_MODE_OFFSET: usize = 32;
+///
 /// i686: inferred, not independently verified (see `sys_enter_open`'s i686 note).
-#[cfg(bpf_target_arch = "x86")]
-const FCHMODAT_FILENAME_PTR_OFFSET: usize = 16;
-#[cfg(bpf_target_arch = "x86")]
-const FCHMODAT_MODE_OFFSET: usize = 20;
+const FCHMODAT_FILENAME_PTR_OFFSET: usize = arg_offset(1);
+const FCHMODAT_MODE_OFFSET: usize = arg_offset(2);
 
 pub fn sys_enter_chmod(ctx: TracePointContext) -> u32 {
     into_ret(try_sys_enter_chmod(ctx))
 }
 
 fn try_sys_enter_chmod(ctx: TracePointContext) -> Result<u32, u32> {
-    #[cfg(any(bpf_target_arch = "x86_64", bpf_target_arch = "aarch64"))]
-    let filename_ptr: u64 = unsafe { ctx.read_at(CHMOD_FILENAME_PTR_OFFSET).map_err(|_| 1u32)? };
-    #[cfg(bpf_target_arch = "x86")]
     let filename_ptr: u64 = unsafe {
-        ctx.read_at::<u32>(CHMOD_FILENAME_PTR_OFFSET)
-            .map_err(|_| 1u32)? as u64
+        ctx.read_ulong_arg(CHMOD_FILENAME_PTR_OFFSET)
+            .map_err(|_| 1u32)?
     };
-    #[cfg(any(bpf_target_arch = "x86_64", bpf_target_arch = "aarch64"))]
-    let mode: u64 = unsafe { ctx.read_at(CHMOD_MODE_OFFSET).map_err(|_| 1u32)? };
-    #[cfg(bpf_target_arch = "x86")]
-    let mode: u64 = unsafe { ctx.read_at::<u32>(CHMOD_MODE_OFFSET).map_err(|_| 1u32)? as u64 };
+    let mode: u64 = unsafe { ctx.read_ulong_arg(CHMOD_MODE_OFFSET).map_err(|_| 1u32)? };
 
     emit_file_chmod_event(&ctx, filename_ptr, mode)
 }
@@ -78,20 +65,11 @@ pub fn sys_enter_fchmodat(ctx: TracePointContext) -> u32 {
 }
 
 fn try_sys_enter_fchmodat(ctx: TracePointContext) -> Result<u32, u32> {
-    #[cfg(any(bpf_target_arch = "x86_64", bpf_target_arch = "aarch64"))]
     let filename_ptr: u64 = unsafe {
-        ctx.read_at(FCHMODAT_FILENAME_PTR_OFFSET)
+        ctx.read_ulong_arg(FCHMODAT_FILENAME_PTR_OFFSET)
             .map_err(|_| 1u32)?
     };
-    #[cfg(bpf_target_arch = "x86")]
-    let filename_ptr: u64 = unsafe {
-        ctx.read_at::<u32>(FCHMODAT_FILENAME_PTR_OFFSET)
-            .map_err(|_| 1u32)? as u64
-    };
-    #[cfg(any(bpf_target_arch = "x86_64", bpf_target_arch = "aarch64"))]
-    let mode: u64 = unsafe { ctx.read_at(FCHMODAT_MODE_OFFSET).map_err(|_| 1u32)? };
-    #[cfg(bpf_target_arch = "x86")]
-    let mode: u64 = unsafe { ctx.read_at::<u32>(FCHMODAT_MODE_OFFSET).map_err(|_| 1u32)? as u64 };
+    let mode: u64 = unsafe { ctx.read_ulong_arg(FCHMODAT_MODE_OFFSET).map_err(|_| 1u32)? };
 
     emit_file_chmod_event(&ctx, filename_ptr, mode)
 }
@@ -140,76 +118,43 @@ fn emit_file_chmod_event(
 /// Offsets of the `syscalls:sys_enter_chown` tracepoint (`x86_64`/`aarch64`): `filename`(16),
 /// `user`(24), `group`(32). Verified on 2026-09-22 on Alpine (kernel 6.18.50-0-virt,
 /// `x86_64`) via `/sys/kernel/tracing/events/syscalls/sys_enter_chown/format`.
-#[cfg(any(bpf_target_arch = "x86_64", bpf_target_arch = "aarch64"))]
-const CHOWN_FILENAME_PTR_OFFSET: usize = 16;
-#[cfg(any(bpf_target_arch = "x86_64", bpf_target_arch = "aarch64"))]
-const CHOWN_USER_OFFSET: usize = 24;
-#[cfg(any(bpf_target_arch = "x86_64", bpf_target_arch = "aarch64"))]
-const CHOWN_GROUP_OFFSET: usize = 32;
+///
 /// i686: inferred, not independently verified (see `sys_enter_open`'s i686 note).
-#[cfg(bpf_target_arch = "x86")]
-const CHOWN_FILENAME_PTR_OFFSET: usize = 12;
-#[cfg(bpf_target_arch = "x86")]
-const CHOWN_USER_OFFSET: usize = 16;
-#[cfg(bpf_target_arch = "x86")]
-const CHOWN_GROUP_OFFSET: usize = 20;
+const CHOWN_FILENAME_PTR_OFFSET: usize = arg_offset(0);
+const CHOWN_USER_OFFSET: usize = arg_offset(1);
+const CHOWN_GROUP_OFFSET: usize = arg_offset(2);
 
 /// Offsets of the `syscalls:sys_enter_lchown` tracepoint (`x86_64`/`aarch64`): identical
 /// shape to `sys_enter_chown` above — `filename`(16), `user`(24), `group`(32). Verified
 /// on 2026-09-22 on Alpine (kernel 6.18.50-0-virt, `x86_64`) via
 /// `/sys/kernel/tracing/events/syscalls/sys_enter_lchown/format`.
-#[cfg(any(bpf_target_arch = "x86_64", bpf_target_arch = "aarch64"))]
-const LCHOWN_FILENAME_PTR_OFFSET: usize = 16;
-#[cfg(any(bpf_target_arch = "x86_64", bpf_target_arch = "aarch64"))]
-const LCHOWN_USER_OFFSET: usize = 24;
-#[cfg(any(bpf_target_arch = "x86_64", bpf_target_arch = "aarch64"))]
-const LCHOWN_GROUP_OFFSET: usize = 32;
+///
 /// i686: inferred, not independently verified (see `sys_enter_open`'s i686 note).
-#[cfg(bpf_target_arch = "x86")]
-const LCHOWN_FILENAME_PTR_OFFSET: usize = 12;
-#[cfg(bpf_target_arch = "x86")]
-const LCHOWN_USER_OFFSET: usize = 16;
-#[cfg(bpf_target_arch = "x86")]
-const LCHOWN_GROUP_OFFSET: usize = 20;
+const LCHOWN_FILENAME_PTR_OFFSET: usize = arg_offset(0);
+const LCHOWN_USER_OFFSET: usize = arg_offset(1);
+const LCHOWN_GROUP_OFFSET: usize = arg_offset(2);
 
 /// Offsets of the `syscalls:sys_enter_fchownat` tracepoint (`x86_64`/`aarch64`): `dfd`(16),
 /// `filename`(24), `user`(32), `group`(40), `flag`(48). Verified on 2026-09-22 on Alpine
 /// (kernel 6.18.50-0-virt, `x86_64`) via
 /// `/sys/kernel/tracing/events/syscalls/sys_enter_fchownat/format`.
-#[cfg(any(bpf_target_arch = "x86_64", bpf_target_arch = "aarch64"))]
-const FCHOWNAT_FILENAME_PTR_OFFSET: usize = 24;
-#[cfg(any(bpf_target_arch = "x86_64", bpf_target_arch = "aarch64"))]
-const FCHOWNAT_USER_OFFSET: usize = 32;
-#[cfg(any(bpf_target_arch = "x86_64", bpf_target_arch = "aarch64"))]
-const FCHOWNAT_GROUP_OFFSET: usize = 40;
+///
 /// i686: inferred, not independently verified (see `sys_enter_open`'s i686 note).
-#[cfg(bpf_target_arch = "x86")]
-const FCHOWNAT_FILENAME_PTR_OFFSET: usize = 16;
-#[cfg(bpf_target_arch = "x86")]
-const FCHOWNAT_USER_OFFSET: usize = 20;
-#[cfg(bpf_target_arch = "x86")]
-const FCHOWNAT_GROUP_OFFSET: usize = 24;
+const FCHOWNAT_FILENAME_PTR_OFFSET: usize = arg_offset(1);
+const FCHOWNAT_USER_OFFSET: usize = arg_offset(2);
+const FCHOWNAT_GROUP_OFFSET: usize = arg_offset(3);
 
 pub fn sys_enter_chown(ctx: TracePointContext) -> u32 {
     into_ret(try_sys_enter_chown(ctx))
 }
 
 fn try_sys_enter_chown(ctx: TracePointContext) -> Result<u32, u32> {
-    #[cfg(any(bpf_target_arch = "x86_64", bpf_target_arch = "aarch64"))]
-    let filename_ptr: u64 = unsafe { ctx.read_at(CHOWN_FILENAME_PTR_OFFSET).map_err(|_| 1u32)? };
-    #[cfg(bpf_target_arch = "x86")]
     let filename_ptr: u64 = unsafe {
-        ctx.read_at::<u32>(CHOWN_FILENAME_PTR_OFFSET)
-            .map_err(|_| 1u32)? as u64
+        ctx.read_ulong_arg(CHOWN_FILENAME_PTR_OFFSET)
+            .map_err(|_| 1u32)?
     };
-    #[cfg(any(bpf_target_arch = "x86_64", bpf_target_arch = "aarch64"))]
-    let user: u64 = unsafe { ctx.read_at(CHOWN_USER_OFFSET).map_err(|_| 1u32)? };
-    #[cfg(bpf_target_arch = "x86")]
-    let user: u64 = unsafe { ctx.read_at::<u32>(CHOWN_USER_OFFSET).map_err(|_| 1u32)? as u64 };
-    #[cfg(any(bpf_target_arch = "x86_64", bpf_target_arch = "aarch64"))]
-    let group: u64 = unsafe { ctx.read_at(CHOWN_GROUP_OFFSET).map_err(|_| 1u32)? };
-    #[cfg(bpf_target_arch = "x86")]
-    let group: u64 = unsafe { ctx.read_at::<u32>(CHOWN_GROUP_OFFSET).map_err(|_| 1u32)? as u64 };
+    let user: u64 = unsafe { ctx.read_ulong_arg(CHOWN_USER_OFFSET).map_err(|_| 1u32)? };
+    let group: u64 = unsafe { ctx.read_ulong_arg(CHOWN_GROUP_OFFSET).map_err(|_| 1u32)? };
 
     emit_file_chown_event(&ctx, filename_ptr, user, group)
 }
@@ -219,21 +164,12 @@ pub fn sys_enter_lchown(ctx: TracePointContext) -> u32 {
 }
 
 fn try_sys_enter_lchown(ctx: TracePointContext) -> Result<u32, u32> {
-    #[cfg(any(bpf_target_arch = "x86_64", bpf_target_arch = "aarch64"))]
-    let filename_ptr: u64 = unsafe { ctx.read_at(LCHOWN_FILENAME_PTR_OFFSET).map_err(|_| 1u32)? };
-    #[cfg(bpf_target_arch = "x86")]
     let filename_ptr: u64 = unsafe {
-        ctx.read_at::<u32>(LCHOWN_FILENAME_PTR_OFFSET)
-            .map_err(|_| 1u32)? as u64
+        ctx.read_ulong_arg(LCHOWN_FILENAME_PTR_OFFSET)
+            .map_err(|_| 1u32)?
     };
-    #[cfg(any(bpf_target_arch = "x86_64", bpf_target_arch = "aarch64"))]
-    let user: u64 = unsafe { ctx.read_at(LCHOWN_USER_OFFSET).map_err(|_| 1u32)? };
-    #[cfg(bpf_target_arch = "x86")]
-    let user: u64 = unsafe { ctx.read_at::<u32>(LCHOWN_USER_OFFSET).map_err(|_| 1u32)? as u64 };
-    #[cfg(any(bpf_target_arch = "x86_64", bpf_target_arch = "aarch64"))]
-    let group: u64 = unsafe { ctx.read_at(LCHOWN_GROUP_OFFSET).map_err(|_| 1u32)? };
-    #[cfg(bpf_target_arch = "x86")]
-    let group: u64 = unsafe { ctx.read_at::<u32>(LCHOWN_GROUP_OFFSET).map_err(|_| 1u32)? as u64 };
+    let user: u64 = unsafe { ctx.read_ulong_arg(LCHOWN_USER_OFFSET).map_err(|_| 1u32)? };
+    let group: u64 = unsafe { ctx.read_ulong_arg(LCHOWN_GROUP_OFFSET).map_err(|_| 1u32)? };
 
     emit_file_chown_event(&ctx, filename_ptr, user, group)
 }
@@ -243,26 +179,14 @@ pub fn sys_enter_fchownat(ctx: TracePointContext) -> u32 {
 }
 
 fn try_sys_enter_fchownat(ctx: TracePointContext) -> Result<u32, u32> {
-    #[cfg(any(bpf_target_arch = "x86_64", bpf_target_arch = "aarch64"))]
     let filename_ptr: u64 = unsafe {
-        ctx.read_at(FCHOWNAT_FILENAME_PTR_OFFSET)
+        ctx.read_ulong_arg(FCHOWNAT_FILENAME_PTR_OFFSET)
             .map_err(|_| 1u32)?
     };
-    #[cfg(bpf_target_arch = "x86")]
-    let filename_ptr: u64 = unsafe {
-        ctx.read_at::<u32>(FCHOWNAT_FILENAME_PTR_OFFSET)
-            .map_err(|_| 1u32)? as u64
-    };
-    #[cfg(any(bpf_target_arch = "x86_64", bpf_target_arch = "aarch64"))]
-    let user: u64 = unsafe { ctx.read_at(FCHOWNAT_USER_OFFSET).map_err(|_| 1u32)? };
-    #[cfg(bpf_target_arch = "x86")]
-    let user: u64 = unsafe { ctx.read_at::<u32>(FCHOWNAT_USER_OFFSET).map_err(|_| 1u32)? as u64 };
-    #[cfg(any(bpf_target_arch = "x86_64", bpf_target_arch = "aarch64"))]
-    let group: u64 = unsafe { ctx.read_at(FCHOWNAT_GROUP_OFFSET).map_err(|_| 1u32)? };
-    #[cfg(bpf_target_arch = "x86")]
+    let user: u64 = unsafe { ctx.read_ulong_arg(FCHOWNAT_USER_OFFSET).map_err(|_| 1u32)? };
     let group: u64 = unsafe {
-        ctx.read_at::<u32>(FCHOWNAT_GROUP_OFFSET)
-            .map_err(|_| 1u32)? as u64
+        ctx.read_ulong_arg(FCHOWNAT_GROUP_OFFSET)
+            .map_err(|_| 1u32)?
     };
 
     emit_file_chown_event(&ctx, filename_ptr, user, group)

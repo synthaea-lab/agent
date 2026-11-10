@@ -20,6 +20,7 @@ use sensor_linux_wire::{
 
 use crate::{
     PROC_LINEAGE,
+    arch::{SysEnterRecord, SysExitRecord},
     cred::{
         capset::sys_enter_capset,
         identity::{
@@ -282,30 +283,6 @@ pub fn raw_signal_generate(ctx: RawTracePointContext) -> u32 {
     }
 }
 
-#[cfg(any(bpf_target_arch = "x86_64", bpf_target_arch = "aarch64"))]
-#[repr(C)]
-struct SysEnterRecord {
-    common_header: [u32; 2],
-    id: i64,
-    args: [u64; 6],
-}
-
-#[cfg(bpf_target_arch = "x86")]
-#[repr(C)]
-struct SysEnterRecord {
-    common_header: [u32; 2],
-    id: i32,
-    args: [u32; 6],
-}
-
-#[cfg(any(bpf_target_arch = "x86_64", bpf_target_arch = "aarch64"))]
-#[repr(C)]
-struct SysExitRecord {
-    common_header: [u32; 2],
-    id: i64,
-    ret: i64,
-}
-
 // Keeping these synthetic tracepoint records in per-CPU maps avoids adding their
 // full size to the raw dispatcher’s BPF stack on top of each legacy handler’s
 // stack frame. The verifier accounts for the whole call chain, which otherwise
@@ -314,14 +291,6 @@ struct SysExitRecord {
 static SYSCALL_ENTER_SCRATCH: PerCpuArray<SysEnterRecord> = PerCpuArray::with_max_entries(1, 0);
 #[map]
 static SYSCALL_EXIT_SCRATCH: PerCpuArray<SysExitRecord> = PerCpuArray::with_max_entries(1, 0);
-
-#[cfg(bpf_target_arch = "x86")]
-#[repr(C)]
-struct SysExitRecord {
-    common_header: [u32; 2],
-    id: i32,
-    ret: i32,
-}
 
 #[raw_tracepoint(tracepoint = "sched_process_fork")]
 pub fn raw_sched_process_fork(ctx: RawTracePointContext) -> u32 {
