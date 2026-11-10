@@ -290,6 +290,7 @@ jobs:
   # on 5.15 and 6.1, accepted on 6.18) passed every other job. This loads every program on
   # the oldest kernels we support, in a VM, and fails on any refusal (#226).
   linux-ebpf-verify:
+    name: linux-ebpf-verify (${{ matrix.kernel-version || matrix.image }})
     needs: linux-ebpf
     runs-on: ubuntu-latest
     timeout-minutes: 20
@@ -298,7 +299,19 @@ jobs:
       matrix:
         # Vanilla stable kernels built by little-vm-helper-images with BPF LSM, BTF, uprobes
         # and syscall tracepoints enabled. Dated tags, not `-main`, so a run is reproducible.
-        kernel: ["5.15-20261021.083220", "6.1-20261021.083220"]
+        # The current head of a stable series is not enough: 5.15.223 and the 6.1 head accept
+        # the uninitialized padding #204 tripped on, which Debian 12's 6.1.0-17 (6.1.69) and
+        # Ubuntu 22.04's 5.15.0-91 refused. Each series therefore also boots an old build
+        # from the same months as those distro kernels, on the current root image.
+        image: ["5.15-20261021.083220", "6.1-20261021.083220"]
+        kernel: ["", "old"]
+        include:
+          - image: "5.15-20261021.083220"
+            kernel: "old"
+            kernel-version: "5.15-20230922.193656"
+          - image: "6.1-20261021.083220"
+            kernel: "old"
+            kernel-version: "6.1-20231220.153727"
     steps:
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
@@ -309,9 +322,10 @@ jobs:
       # as optional (#1044).
       - uses: cilium/little-vm-helper@c8b0bfbae3bdda7bc69fb9cd370e4b74ce84986d # v0.0.33
         with:
-          test-name: verify-probes-${{ matrix.kernel }}
+          test-name: verify-probes-${{ matrix.image }}-${{ matrix.kernel-version }}
           image: complexity-test
-          image-version: ${{ matrix.kernel }}
+          image-version: ${{ matrix.image }}
+          kernel-version: ${{ matrix.kernel-version }}
           host-mount: ${{ runner.temp }}/verify-probes
           install-dependencies: "true"
           cmd: |
