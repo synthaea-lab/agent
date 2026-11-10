@@ -25,9 +25,12 @@ the rest of the repository is Apache-2.0.
 | `inode_setattr` | LSM | `inode_setattr` | Caller-chosen timestamps ([lsm](lsm.md)) |
 | `ssl_*`, `readline_exit`, `getaddrinfo_*` | uprobe / uretprobe | user libraries | [Uprobes](uprobes.md) |
 
-The scheduler and syscall entry points are in [`raw.rs`](../../../crates/sensors/linux/ebpf/src/raw.rs);
-the per-syscall handlers, maps and the LSM and uprobe programs are in
-[`main.rs`](../../../crates/sensors/linux/ebpf/src/main.rs). The list of raw tracepoints userspace
+The scheduler and syscall entry points are in [`raw.rs`](../../../crates/sensors/linux/ebpf/src/raw.rs).
+The per-syscall handlers, with their maps and offsets, are grouped by domain in modules under
+[`src/`](../../../crates/sensors/linux/ebpf/src/) (for example `file/`, `net/`, `cred/`, `kernel/`),
+and the uprobe programs are in `uprobe/`.
+[`main.rs`](../../../crates/sensors/linux/ebpf/src/main.rs) holds the maps and helpers they share,
+and any handler not yet split into a module. The list of raw tracepoints userspace
 attaches is [`RAW_TRACEPOINTS`](../../../crates/sensors/linux/userspace/src/ebpf.rs).
 
 ## Why raw tracepoints
@@ -73,8 +76,8 @@ argument registers at BTF-derived `pt_regs` offsets and writes a synthetic recor
 regular `syscalls:sys_enter_*` tracepoint record (an 8-byte common header, the syscall id, then the
 arguments in 8-byte slots on 64-bit, 4-byte slots on i686) into a per-CPU scratch map. The existing
 handlers read that record through `TracePointContext` at fixed offsets, so the `*_OFFSET` constants
-in `main.rs` (for example `OPENAT_FILENAME_PTR_OFFSET`) are offsets into this synthetic record, not
-into a kernel structure. They do not drift with the kernel.
+next to each handler (for example `OPENAT_FILENAME_PTR_OFFSET` in `file/open.rs`) are offsets into
+this synthetic record, not into a kernel structure. They do not drift with the kernel.
 
 The handler ids are plain integers shared by three places: the `match` in `raw_sys_enter`, the
 `match` in `raw_dns_udp_enter`, and [`DISPATCH_ENTRIES`](../../../crates/sensors/linux/userspace/src/syscall.rs).
@@ -246,7 +249,8 @@ Stated so a reader does not assume coverage:
 
 ## Changing a probe
 
-- A new syscall route needs: a handler in `main.rs`, a handler id in the `raw_sys_enter` match, an
+- A new syscall route needs: a handler in its domain module (for example `net/connect.rs` for
+  `connect`, or a new module for a new domain), a handler id in the `raw_sys_enter` match, an
   entry in both `DISPATCH_ENTRIES` tables, a ring buffer, a wire struct, a `WIRE_VERSION` bump, a
   `normalize` function, a `RingBuffers` field and a `drain_wire` branch.
 - Verify on the oldest supported verifier (the lab matrix includes 5.14 and 5.15) with
