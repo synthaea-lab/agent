@@ -21,7 +21,11 @@ use aya_ebpf::{
 use aya_log_ebpf::warn;
 use sensor_linux_wire::SocketAcceptEvent;
 
-use crate::{AF_INET, AF_INET6, SYS_EXIT_RET_OFFSET, fill_event_meta, into_ret};
+use crate::{
+    AF_INET, AF_INET6, SYS_EXIT_RET_OFFSET,
+    arch::{SyscallRecord, arg_offset},
+    fill_event_meta, into_ret,
+};
 
 /// Ring buffer shared with userspace for `accept`/`accept4` events.
 #[map]
@@ -52,15 +56,10 @@ static ACCEPT_ARGS: LruHashMap<u64, AcceptArgs> = LruHashMap::with_max_entries(1
 /// (accept4's extra `flags` argument trails at 40, not needed here). Verified on
 /// 2026-09-22 on Alpine (kernel 6.18.50-0-virt, `x86_64`) via
 /// `/sys/kernel/tracing/events/syscalls/sys_enter_accept{,4}/format`.
-#[cfg(any(bpf_target_arch = "x86_64", bpf_target_arch = "aarch64"))]
-const ACCEPT_FD_OFFSET: usize = 16;
-#[cfg(any(bpf_target_arch = "x86_64", bpf_target_arch = "aarch64"))]
-const ACCEPT_ADDR_PTR_OFFSET: usize = 24;
+///
 /// i686: inferred, not independently verified (see `sys_enter_open`'s i686 note).
-#[cfg(bpf_target_arch = "x86")]
-const ACCEPT_FD_OFFSET: usize = 12;
-#[cfg(bpf_target_arch = "x86")]
-const ACCEPT_ADDR_PTR_OFFSET: usize = 16;
+const ACCEPT_FD_OFFSET: usize = arg_offset(0);
+const ACCEPT_ADDR_PTR_OFFSET: usize = arg_offset(1);
 
 pub fn sys_enter_accept(ctx: TracePointContext) -> u32 {
     into_ret(stash_accept_args(&ctx))
@@ -73,17 +72,11 @@ pub fn sys_enter_accept4(ctx: TracePointContext) -> u32 {
 /// Shared by `sys_enter_accept` and `sys_enter_accept4` — both have the same
 /// `fd`/`upeer_sockaddr` layout.
 fn stash_accept_args(ctx: &TracePointContext) -> Result<u32, u32> {
-    #[cfg(any(bpf_target_arch = "x86_64", bpf_target_arch = "aarch64"))]
-    let fd: u64 = unsafe { ctx.read_at(ACCEPT_FD_OFFSET).map_err(|_| 1u32)? };
-    #[cfg(bpf_target_arch = "x86")]
-    let fd: u64 = unsafe { ctx.read_at::<u32>(ACCEPT_FD_OFFSET).map_err(|_| 1u32)? as u64 };
+    let fd: u64 = unsafe { ctx.read_ulong_arg(ACCEPT_FD_OFFSET).map_err(|_| 1u32)? };
 
-    #[cfg(any(bpf_target_arch = "x86_64", bpf_target_arch = "aarch64"))]
-    let addr_ptr: u64 = unsafe { ctx.read_at(ACCEPT_ADDR_PTR_OFFSET).map_err(|_| 1u32)? };
-    #[cfg(bpf_target_arch = "x86")]
     let addr_ptr: u64 = unsafe {
-        ctx.read_at::<u32>(ACCEPT_ADDR_PTR_OFFSET)
-            .map_err(|_| 1u32)? as u64
+        ctx.read_ulong_arg(ACCEPT_ADDR_PTR_OFFSET)
+            .map_err(|_| 1u32)?
     };
 
     let pid_tgid = bpf_get_current_pid_tgid();
@@ -113,10 +106,7 @@ pub fn sys_exit_accept4(ctx: TracePointContext) -> u32 {
 /// or an evicted stash), the call failed (`ret < 0`), or the peer's address
 /// family isn't one this sensor tracks.
 fn try_sys_exit_accept(ctx: TracePointContext) -> Result<u32, u32> {
-    #[cfg(any(bpf_target_arch = "x86_64", bpf_target_arch = "aarch64"))]
-    let ret: i64 = unsafe { ctx.read_at(SYS_EXIT_RET_OFFSET).map_err(|_| 1u32)? };
-    #[cfg(bpf_target_arch = "x86")]
-    let ret: i64 = unsafe { ctx.read_at::<i32>(SYS_EXIT_RET_OFFSET).map_err(|_| 1u32)? as i64 };
+    let ret: i64 = unsafe { ctx.read_long_arg(SYS_EXIT_RET_OFFSET).map_err(|_| 1u32)? };
 
     let pid_tgid = bpf_get_current_pid_tgid();
     let args = match unsafe { ACCEPT_ARGS.get(&pid_tgid) } {

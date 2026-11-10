@@ -14,7 +14,11 @@ use aya_ebpf::{
 use aya_log_ebpf::warn;
 use sensor_linux_wire::UdpRecvEvent;
 
-use crate::{AF_INET, AF_INET6, SYS_EXIT_RET_OFFSET, fill_event_meta, into_ret};
+use crate::{
+    AF_INET, AF_INET6, SYS_EXIT_RET_OFFSET,
+    arch::{SyscallRecord, arg_offset},
+    fill_event_meta, into_ret,
+};
 
 /// Ring buffer shared with userspace for `recvfrom` events.
 #[map]
@@ -46,37 +50,23 @@ static RECVFROM_ARGS: LruHashMap<u64, RecvfromArgs> = LruHashMap::with_max_entri
 /// (`x86_64`/`aarch64`): `fd`(16), `ubuf`(24), `size`(32), `flags`(40), the same layout
 /// `sys_enter_sendto` reports. Verified on 2026-10-05 on Alpine (kernel 6.18.50-0-virt,
 /// `x86_64`) via `/sys/kernel/tracing/events/syscalls/sys_enter_recvfrom/format`.
-#[cfg(any(bpf_target_arch = "x86_64", bpf_target_arch = "aarch64"))]
-const RECVFROM_ADDR_PTR_OFFSET: usize = 48;
-#[cfg(any(bpf_target_arch = "x86_64", bpf_target_arch = "aarch64"))]
-const RECVFROM_ADDR_LEN_PTR_OFFSET: usize = 56;
+///
 /// i686: inferred, not independently verified (see `sys_enter_open`'s i686 note).
-#[cfg(bpf_target_arch = "x86")]
-const RECVFROM_ADDR_PTR_OFFSET: usize = 28;
-#[cfg(bpf_target_arch = "x86")]
-const RECVFROM_ADDR_LEN_PTR_OFFSET: usize = 32;
+const RECVFROM_ADDR_PTR_OFFSET: usize = arg_offset(4);
+const RECVFROM_ADDR_LEN_PTR_OFFSET: usize = arg_offset(5);
 
 pub fn sys_enter_recvfrom(ctx: TracePointContext) -> u32 {
     into_ret(stash_recvfrom_addr(&ctx))
 }
 
 fn stash_recvfrom_addr(ctx: &TracePointContext) -> Result<u32, u32> {
-    #[cfg(any(bpf_target_arch = "x86_64", bpf_target_arch = "aarch64"))]
-    let addr_ptr: u64 = unsafe { ctx.read_at(RECVFROM_ADDR_PTR_OFFSET).map_err(|_| 1u32)? };
-    #[cfg(any(bpf_target_arch = "x86_64", bpf_target_arch = "aarch64"))]
-    let addr_len_ptr: u64 = unsafe {
-        ctx.read_at(RECVFROM_ADDR_LEN_PTR_OFFSET)
+    let addr_ptr: u64 = unsafe {
+        ctx.read_ulong_arg(RECVFROM_ADDR_PTR_OFFSET)
             .map_err(|_| 1u32)?
     };
-    #[cfg(bpf_target_arch = "x86")]
-    let addr_ptr: u64 = unsafe {
-        ctx.read_at::<u32>(RECVFROM_ADDR_PTR_OFFSET)
-            .map_err(|_| 1u32)? as u64
-    };
-    #[cfg(bpf_target_arch = "x86")]
     let addr_len_ptr: u64 = unsafe {
-        ctx.read_at::<u32>(RECVFROM_ADDR_LEN_PTR_OFFSET)
-            .map_err(|_| 1u32)? as u64
+        ctx.read_ulong_arg(RECVFROM_ADDR_LEN_PTR_OFFSET)
+            .map_err(|_| 1u32)?
     };
 
     let pid_tgid = bpf_get_current_pid_tgid();
@@ -102,10 +92,7 @@ pub fn sys_exit_recvfrom(ctx: TracePointContext) -> u32 {
 /// whose `addr` buffer still holds whatever the caller put there), or the sender's
 /// address family isn't `AF_INET`/`AF_INET6`.
 fn try_sys_exit_recvfrom(ctx: TracePointContext) -> Result<u32, u32> {
-    #[cfg(any(bpf_target_arch = "x86_64", bpf_target_arch = "aarch64"))]
-    let ret: i64 = unsafe { ctx.read_at(SYS_EXIT_RET_OFFSET).map_err(|_| 1u32)? };
-    #[cfg(bpf_target_arch = "x86")]
-    let ret: i64 = unsafe { ctx.read_at::<i32>(SYS_EXIT_RET_OFFSET).map_err(|_| 1u32)? as i64 };
+    let ret: i64 = unsafe { ctx.read_long_arg(SYS_EXIT_RET_OFFSET).map_err(|_| 1u32)? };
 
     let pid_tgid = bpf_get_current_pid_tgid();
     let args = match unsafe { RECVFROM_ARGS.get(&pid_tgid) } {
