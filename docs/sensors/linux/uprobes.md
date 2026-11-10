@@ -52,7 +52,8 @@ attach is a configuration mistake. Attachment is system-wide
 
 ## The probes
 
-All handlers are in [`main.rs`](../../../crates/sensors/linux/ebpf/src/main.rs).
+The handlers are in [`uprobe/`](../../../crates/sensors/linux/ebpf/src/uprobe/): `tls.rs`, `readline.rs` and
+`getaddrinfo.rs`.
 
 - **`SSL_write`** (entry): copies the first `MAX_TLS_CAPTURE` (256) bytes of the plaintext buffer
   with one clamped read, before encryption.
