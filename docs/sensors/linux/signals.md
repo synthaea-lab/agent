@@ -14,7 +14,7 @@ container resolved is the sender's), the target is `target_pid`.
 
 ## Signals to the agent
 
-Userspace writes its own pid into [`SIGNAL_WATCH_PID`](../../../crates/sensors/linux/ebpf/src/main.rs)
+Userspace writes its own pid into [`SIGNAL_WATCH_PID`](../../../crates/sensors/linux/ebpf/src/mount_signal/signal.rs)
 before attaching ([`write_signal_watch_pid`](../../../crates/sensors/linux/userspace/src/ebpf.rs)).
 A zero slot means "watch nothing", so attaching first would silently drop early signals. The same
 value drives the kernel-side drop of the agent's own file activity.
@@ -27,7 +27,7 @@ not hooked: it takes a thread id, which cannot be compared with a process id. gl
 
 A `SIGKILL` cannot be attributed through the ring buffer: the agent dies before it drains. So the
 kill handlers also write the event synchronously into
-[`SIGNAL_TAMPER_LAST`](../../../crates/sensors/linux/ebpf/src/main.rs), a one-entry array, at
+[`SIGNAL_TAMPER_LAST`](../../../crates/sensors/linux/ebpf/src/mount_signal/signal.rs), a one-entry array, at
 syscall entry, before the kernel delivers the signal. The map is pinned under
 `/sys/fs/bpf/synthaea/signal_tamper_last_v<WIRE_VERSION>`
 ([`load_ebpf_for_run`](../../../crates/sensors/linux/userspace/src/ebpf.rs)), so it survives the
