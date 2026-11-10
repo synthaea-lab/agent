@@ -237,8 +237,11 @@ jobs:
         with:
           toolchain: stable
           components: clippy
-          # `verify_probes` is built static so the VM's userspace cannot break it (below).
-          targets: x86_64-unknown-linux-musl
+      # `verify_probes` is built static so the VM's userspace cannot break it (below).
+      # Not the action's `targets:`: that installs it for `stable`, while cargo builds
+      # with the toolchain rust-toolchain.toml pins, which would lack it.
+      - name: musl target for the pinned toolchain
+        run: rustup target add x86_64-unknown-linux-musl
       - name: pinned nightly + rust-src (aya-build compiles the probes with it)
         run: rustup toolchain install "$(tr -d '[:space:]' < packaging/toolchain/ebpf-toolchain.txt)" --profile minimal --component rust-src
       - name: bpf-linker (prebuilt, musl-static, bundled LLVM, SHA-256 pinned)
