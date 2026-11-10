@@ -9,7 +9,7 @@ Two properties make them worth having next to the tracepoints:
 - **A blocking path.** An LSM program can return `-EPERM`. Tracepoints cannot prevent anything.
 
 Both hooks live in the same eBPF object as the tracepoints
-([`main.rs`](../../../crates/sensors/linux/ebpf/src/main.rs)). They need a kernel with
+([`lsm/`](../../../crates/sensors/linux/ebpf/src/lsm/)). They need a kernel with
 `CONFIG_BPF_LSM` and BTF, and `bpf` in the active `lsm=` boot list. Both are optional: when either
 cannot attach the agent logs why and runs without it.
 
@@ -28,7 +28,7 @@ reports which step failed (`LsmAttachError`: no BTF, program missing, load refus
 
 ## `file_open`
 
-[`file_open`](../../../crates/sensors/linux/ebpf/src/main.rs) increments `LSM_FILE_OPEN_HITS` and
+[`file_open`](../../../crates/sensors/linux/ebpf/src/lsm/file_open.rs) increments `LSM_FILE_OPEN_HITS` and
 allows the open. [`file_open_hit_count`](../../../crates/sensors/linux/lsm/src/attach.rs) sums the
 counter. It reads no `struct file` field and emits no `FileOpenEvent`: an LSM-sourced open and the
 tracepoint-sourced one would double-count the same open until a deduplication rule exists. Its
@@ -56,7 +56,7 @@ hook returns is a generic deny, not the original LSM's errno.
 ## `inode_setattr`
 
 Timestomping (T1070.006) sets a file's times to a value the caller chose. The hook
-([`inode_setattr`](../../../crates/sensors/linux/ebpf/src/main.rs)) fires for every attribute change
+([`inode_setattr`](../../../crates/sensors/linux/ebpf/src/lsm/inode_setattr.rs)) fires for every attribute change
 that reaches `notify_change`, whichever syscall or `io_uring` op asked (`utimensat`, `utimes`,
 `futimens`). It reads `iattr.ia_valid` and emits only when `ATTR_ATIME_SET` or `ATTR_MTIME_SET` is
 set, which means the caller named the time. `ATTR_ATIME`/`ATTR_MTIME` alone are the kernel's own

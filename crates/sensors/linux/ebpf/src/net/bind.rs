@@ -25,7 +25,7 @@ static SOCKET_BIND_EVENTS: RingBuf = RingBuf::with_byte_size(256 * 1024, 0);
 static BIND_SCRATCH: PerCpuArray<SocketBindEvent> = PerCpuArray::with_max_entries(1, 0);
 
 /// Offsets of the `syscalls:sys_enter_bind` tracepoint (`x86_64`/`aarch64`): `fd`(16),
-/// `umyaddr`(24), `addrlen`(32) — identical shape to `sys_enter_connect` above.
+/// `umyaddr`(24), `addrlen`(32) — identical shape to `sys_enter_connect` (`connect.rs`).
 /// Verified on 2026-09-21 on Alpine (kernel 6.18.50-0-virt, `x86_64`) via
 /// `/sys/kernel/tracing/events/syscalls/sys_enter_bind/format`.
 ///
@@ -71,7 +71,7 @@ pub fn sys_enter_bind(ctx: TracePointContext) -> u32 {
     into_ret(try_sys_enter_bind(ctx))
 }
 
-/// Mirrors `try_sys_enter_connect` above field for field — same family filter, same
+/// Mirrors `try_sys_enter_connect` (`connect.rs`) field for field — same family filter, same
 /// raw-byte address read (avoids the endianness bug documented on `ConnectEvent`),
 /// same per-CPU-scratch assembly. Only the wire type, ring buffer, and field names
 /// (`laddr`/`lport` vs `daddr`/`dport`) differ. Also records the address into

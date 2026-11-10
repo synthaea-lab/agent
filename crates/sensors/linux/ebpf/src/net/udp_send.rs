@@ -38,8 +38,8 @@ pub fn sys_enter_sendto(ctx: TracePointContext) -> u32 {
     into_ret(try_sys_enter_sendto(ctx))
 }
 
-/// Mirrors `try_sys_enter_connect`/`try_sys_enter_bind` above for the address read —
-/// same family filter, same raw-byte address read (avoids the endianness bug
+/// Mirrors `try_sys_enter_connect`/`try_sys_enter_bind` (`connect.rs`, `bind.rs`) for the
+/// address read — same family filter, same raw-byte address read (avoids the endianness bug
 /// documented on `ConnectEvent`) — plus the requested payload size from `len`.
 fn try_sys_enter_sendto(ctx: TracePointContext) -> Result<u32, u32> {
     let len: u64 = unsafe { ctx.read_ulong_arg(SENDTO_LEN_OFFSET).map_err(|_| 1u32)? };
