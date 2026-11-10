@@ -42,6 +42,7 @@ use crate::{
         },
         xattr::{sys_enter_removexattr, sys_enter_setxattr},
     },
+    into_ret,
     kernel::{
         bpf::sys_enter_bpf,
         module::{sys_enter_delete_module, sys_enter_finit_module, sys_enter_init_module},
@@ -278,9 +279,7 @@ pub fn raw_signal_generate(ctx: RawTracePointContext) -> u32 {
     if (aya_ebpf::helpers::bpf_get_current_pid_tgid() >> 32) as u32 == target {
         return 0;
     }
-    match emit_tool_signal_event(&ctx, target, sig) {
-        Ok(ret) | Err(ret) => ret,
-    }
+    into_ret(emit_tool_signal_event(&ctx, target, sig))
 }
 
 // Keeping these synthetic tracepoint records in per-CPU maps avoids adding their
