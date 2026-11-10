@@ -25,10 +25,10 @@ use aya_ebpf::{
 use aya_log_ebpf::warn;
 use sensor_linux_wire::{
     FileSetTimeEvent, SET_TIME_ATIME, SET_TIME_COMPONENT_LEN, SET_TIME_COMPONENTS, SET_TIME_MTIME,
-    SET_TIME_TRUNCATED, TASK_COMM_LEN,
+    SET_TIME_TRUNCATED,
 };
 
-use crate::{fill_lineage, into_ret};
+use crate::{fill_event_meta, into_ret};
 
 /// 1 when the offsets below were resolved. Patched by the loader.
 #[unsafe(no_mangle)]
@@ -113,17 +113,12 @@ fn try_inode_setattr(ctx: LsmContext) -> Result<i32, i32> {
     let e = SET_TIME_SCRATCH.get_ptr_mut(0).ok_or(0i32)?;
     unsafe {
         core::ptr::write_bytes(e, 0, 1);
-        (*e).meta.pid = (bpf_get_current_pid_tgid() >> 32) as u32;
-        fill_lineage(&mut (*e).meta);
-        (*e).meta.uid = uid_gid as u32;
-        (*e).meta.gid = (uid_gid >> 32) as u32;
-        (*e).meta.timestamp_ns = aya_ebpf::helpers::bpf_ktime_get_ns();
-        (*e).meta.cgroup_id = aya_ebpf::helpers::bpf_get_current_cgroup_id();
-        let mut i = 0usize;
-        while i < TASK_COMM_LEN {
-            (*e).meta.comm[i] = comm[i];
-            i += 1;
-        }
+        fill_event_meta(
+            &mut (*e).meta,
+            (bpf_get_current_pid_tgid() >> 32) as u32,
+            uid_gid,
+            &comm,
+        );
 
         if flags & SET_TIME_ATIME != 0
             && let Some((sec, nsec)) = read_timespec(attr, IATTR_ATIME_OFFSET.load())

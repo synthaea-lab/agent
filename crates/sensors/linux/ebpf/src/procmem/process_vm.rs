@@ -7,9 +7,9 @@ use aya_ebpf::{
     programs::TracePointContext,
 };
 use aya_log_ebpf::warn;
-use sensor_linux_wire::{ProcessVmReadEvent, ProcessVmWriteEvent, TASK_COMM_LEN};
+use sensor_linux_wire::{ProcessVmReadEvent, ProcessVmWriteEvent};
 
-use crate::{fill_lineage, into_ret};
+use crate::{fill_event_meta, into_ret};
 
 /// Ring buffer shared with userspace for `process_vm_readv` events (issue #265).
 #[map]
@@ -121,17 +121,12 @@ fn try_sys_enter_process_vm_readv(ctx: TracePointContext) -> Result<u32, u32> {
     let e = PROCESS_VM_READ_SCRATCH.get_ptr_mut(0).ok_or(1u32)?;
     unsafe {
         core::ptr::write_bytes(e, 0, 1);
-        (*e).meta.pid = (bpf_get_current_pid_tgid() >> 32) as u32;
-        fill_lineage(&mut (*e).meta);
-        (*e).meta.uid = uid_gid as u32;
-        (*e).meta.gid = (uid_gid >> 32) as u32;
-        (*e).meta.timestamp_ns = aya_ebpf::helpers::bpf_ktime_get_ns();
-        (*e).meta.cgroup_id = aya_ebpf::helpers::bpf_get_current_cgroup_id();
-        let mut i = 0usize;
-        while i < TASK_COMM_LEN {
-            (*e).meta.comm[i] = comm[i];
-            i += 1;
-        }
+        fill_event_meta(
+            &mut (*e).meta,
+            (bpf_get_current_pid_tgid() >> 32) as u32,
+            uid_gid,
+            &comm,
+        );
         (*e).target_pid = target_pid as u32;
         (*e).local_iov_count = local_iov_count;
         (*e).remote_iov_count = remote_iov_count;
@@ -196,17 +191,12 @@ fn try_sys_enter_process_vm_writev(ctx: TracePointContext) -> Result<u32, u32> {
     let e = PROCESS_VM_WRITE_SCRATCH.get_ptr_mut(0).ok_or(1u32)?;
     unsafe {
         core::ptr::write_bytes(e, 0, 1);
-        (*e).meta.pid = (bpf_get_current_pid_tgid() >> 32) as u32;
-        fill_lineage(&mut (*e).meta);
-        (*e).meta.uid = uid_gid as u32;
-        (*e).meta.gid = (uid_gid >> 32) as u32;
-        (*e).meta.timestamp_ns = aya_ebpf::helpers::bpf_ktime_get_ns();
-        (*e).meta.cgroup_id = aya_ebpf::helpers::bpf_get_current_cgroup_id();
-        let mut i = 0usize;
-        while i < TASK_COMM_LEN {
-            (*e).meta.comm[i] = comm[i];
-            i += 1;
-        }
+        fill_event_meta(
+            &mut (*e).meta,
+            (bpf_get_current_pid_tgid() >> 32) as u32,
+            uid_gid,
+            &comm,
+        );
         (*e).target_pid = target_pid as u32;
         (*e).local_iov_count = local_iov_count;
         (*e).remote_iov_count = remote_iov_count;
