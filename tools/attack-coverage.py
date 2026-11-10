@@ -250,7 +250,7 @@ UNVERIFIED_NOTES = [
     "rule until a lab capture shows the mark and its writer "
     "(https://github.com/synthaea-lab/agent/issues/17).",
     "T1204.002 on Linux joins a browser download through the rename of its partial "
-    "file (`.crdownload`, `.part`), by the renaming process's `executable_path`; "
+    "file (`.crdownload`, `.opdownload`, `.part`), by the renaming process's `executable_path`; "
     "verified once, on Fedora 43 packages (Chromium 156, Firefox 159, headed under "
     "Xvfb, profile without a download dialog). **Not verified:** other browsers "
     "(Chrome, Edge, Brave, Opera, Vivaldi, Firefox ESR) until their image path is "
