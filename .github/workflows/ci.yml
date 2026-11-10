@@ -266,8 +266,8 @@ jobs:
             fi
             ls -la "$obj"
           done
-      # The loader finds every probe and map by name, and nothing in CI loads them: a rename
-      # or a program moved to another section must fail here, not on a kernel (AS-003).
+      # The loader finds every probe and map by name: a rename or a program moved to another
+      # section must fail here, not on a kernel (AS-003).
       - name: probe and map names unchanged
         run: |
           for crate in sensor-linux sensor-linux-uprobes; do
@@ -275,3 +275,59 @@ jobs:
               -regex ".*/build/${crate}-[0-9a-f]{16}/out/sensor-linux-ebpf" -type f -print -quit)
             python3 tools/check-ebpf-symbols.py "$obj" crates/sensors/linux/ebpf/symbols.txt
           done
+      # The object is embedded in the binary, so `linux-ebpf-verify` needs nothing else.
+      - name: build verify_probes
+        run: cargo build -p sensor-linux --example verify_probes
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: verify-probes
+          path: target/debug/examples/verify_probes
+          if-no-files-found: error
+          retention-days: 3
+
+  # The verifier differs a lot between kernels, and the agent only logs a warning when a
+  # probe is refused, then runs without it. #204 (three `ssl_read_entry_*` programs refused
+  # on 5.15 and 6.1, accepted on 6.18) passed every other job. This loads every program on
+  # the oldest kernels we support, in a VM, and fails on any refusal (#226).
+  linux-ebpf-verify:
+    name: linux-ebpf-verify (${{ matrix.kernel-version || matrix.image }})
+    needs: linux-ebpf
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        # Vanilla stable kernels built by little-vm-helper-images with BPF LSM, BTF, uprobes
+        # and syscall tracepoints enabled. Dated tags, not `-main`, so a run is reproducible.
+        # The current head of a stable series is not enough: 5.15.223 and the 6.1 head accept
+        # the uninitialized padding #204 tripped on, which Debian 12's 6.1.0-17 (6.1.69) and
+        # Ubuntu 22.04's 5.15.0-91 refused. Each series therefore also boots an old build
+        # from the same months as those distro kernels, on the current root image.
+        image: ["5.15-20261021.083220", "6.1-20261021.083220"]
+        kernel: ["", "old"]
+        include:
+          - image: "5.15-20261021.083220"
+            kernel: "old"
+            kernel-version: "5.15-20230922.193656"
+          - image: "6.1-20261021.083220"
+            kernel: "old"
+            kernel-version: "6.1-20231220.153727"
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: verify-probes
+          path: ${{ runner.temp }}/verify-probes
+      - run: chmod +x "$RUNNER_TEMP/verify-probes/verify_probes"
+      # `inode_setattr` has fewer hook arguments on 5.15 and 6.1, and the loader treats it
+      # as optional (#1044).
+      - uses: cilium/little-vm-helper@c8b0bfbae3bdda7bc69fb9cd370e4b74ce84986d # v0.0.33
+        with:
+          test-name: verify-probes-${{ matrix.image }}-${{ matrix.kernel-version }}
+          image: complexity-test
+          image-version: ${{ matrix.image }}
+          kernel-version: ${{ matrix.kernel-version }}
+          host-mount: ${{ runner.temp }}/verify-probes
+          install-dependencies: "true"
+          cmd: |
+            uname -r
+            /host/verify_probes --allow inode_setattr
