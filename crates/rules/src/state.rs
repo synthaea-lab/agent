@@ -327,6 +327,28 @@ impl RuleState {
             .map(|s| s.trim_end().to_string())
     }
 
+    /// What the rules know a pid is called: its comm (`resolve_comm`) and the basename of its
+    /// image path (the comm is cut to 15 bytes). For the target of `prlimit`, where no event
+    /// names the incarnation, so no generation is compared. Empty when nothing is known.
+    fn names_of_pid(&self, pid: u32) -> Vec<String> {
+        let image = PidFact::current(&self.pid_image_path, pid, None)
+            .map(str::to_owned)
+            .or_else(|| {
+                std::fs::read_link(format!("/proc/{pid}/exe"))
+                    .ok()
+                    .map(|path| path.to_string_lossy().into_owned())
+            })
+            .and_then(|path| {
+                path.rsplit(['/', '\\'])
+                    .next()
+                    .map(|base| base.trim_end_matches(" (deleted)").to_owned())
+            });
+        self.resolve_comm(pid, None)
+            .into_iter()
+            .chain(image)
+            .collect()
+    }
+
     /// T1059 — a shell executed directly by a web or database service process.
     /// Originally web-server-only (`nginx`/`apache2`/`httpd`); extended to
     /// `mysqld`/`mariadbd`/`postgres` and (by prefix) `php-fpm*` for issue
@@ -826,6 +848,10 @@ impl RuleState {
         alerts.extend(self.check_recon_burst(event, lineage));
         alerts.extend(self.check_security_discovery(event, lineage));
         alerts.extend(self.check_service_stop_burst(event, lineage));
+        alerts.extend(crate::securitytool::check_security_tool_prlimit(
+            event,
+            |pid| self.names_of_pid(pid),
+        ));
         self.unit_stops.on_exec(event);
         alerts.extend(self.check_shutdown_context(event, lineage));
         alerts.extend(crate::stateless::check_ld_preload_hijack(
