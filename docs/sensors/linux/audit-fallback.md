@@ -33,11 +33,12 @@ value that merely looks like hex (a file named `6162`) passes unchanged.
 
 ## Classification
 
-[`classify`](../../../crates/sensors/linux/audit/src/classify.rs) maps one record at a time:
+[`classify`](../../../crates/sensors/linux/audit/src/classify.rs) maps one record at a time; the sensor
+joins an exec's `EXECVE` records first ([Split argv](#split-argv)):
 
 | Record type | Event | Read from the record |
 | --- | --- | --- |
-| `EXECVE` (1309) | `Exec` | `argc`, `a0..aN` (hex-decoded), `pid`/`uid`/`gid` if present |
+| `EXECVE` (1309) | `Exec` | `argc`, `a0..aN` or `aN[i]` pieces (hex-decoded), `pid`/`uid`/`gid` if present |
 | `SOCKADDR` (1306) | `Connect` | `saddr` parsed as `sockaddr_in`/`in6`, `pid`/`uid`/`gid` if present |
 | `AVC` (1400) | `PolicyDenial` | `scontext`, `tcontext`, `tclass`, `permissive`, `comm`, requested permissions, `path`/`name` |
 
@@ -46,6 +47,25 @@ The AVC body starts with free text (`avc:  denied  { read } for  pid=1234 ...`),
 ([`avc_action`](../../../crates/sensors/linux/audit/src/classify.rs)); `pid` is not. `path=`/`name=`
 are hex-decoded when unquoted, otherwise a file name with a space would arrive encoded. A record
 without `scontext` and `tclass` is skipped.
+
+### Split argv
+
+The kernel writes an argument that does not fit in the record as `aN_len=` plus pieces `aN[0]=`,
+`aN[1]=`, ..., and continues a long argv in further `EXECVE` records with the same serial; only the
+first carries `argc`. The sensor does not classify `EXECVE` records one at a time:
+[`ExecveAssembler`](../../../crates/sensors/linux/audit/src/execve.rs) holds each exec's `EXECVE`
+records, keyed by serial, and rebuilds the argv when a record of another type with that serial
+(`CWD`) arrives. Records of execs on other CPUs can be queued in between, so several execs can be
+in progress at once. The hold is bounded:
+
+- 128 KiB of field values per exec, then further records are dropped;
+- 16 execs, then the oldest is closed;
+- 2 s of audit time, then an exec whose closing record never came is closed when the next record
+  arrives.
+
+An argv that cannot be rebuilt whole (a lost record, a short piece against `aN_len`, a bound hit)
+is still emitted with the head that arrived and `cmdline_truncated` set. `classify` on a lone
+`EXECVE` record flags a split exec the same way.
 
 ## The drain
 
@@ -74,21 +94,23 @@ counter, and keeps only `PolicyDenial`.
 ## Limits
 
 - **One record at a time.** An audit event is several records sharing a serial (`SYSCALL`,
-  `EXECVE`, `CWD`, `PATH`, `PROCTITLE`, `EOE`). The classifier does not join them, so fields that
+  `EXECVE`, `CWD`, `PATH`, `PROCTITLE`, `EOE`). Apart from an exec's `EXECVE` records (see
+  [Split argv](#split-argv)), the classifier does not join them, so fields that
   live on the `SYSCALL` record (`pid`, `uid`, `exe`) are 0 or absent unless the classified record
   itself carries them, and `image_path` is `argv[0]`, not the executed file.
 - **No lineage**: `ppid` is always 0 and `Capabilities::parent_lineage` is `false`.
 - **Connect protocol** is assumed TCP.
-- **Long arguments** are logged by the kernel as `aN_len` plus `aN[i]` pieces, possibly across
-  several `EXECVE` records; such an exec produces no event
-  ([#51](https://github.com/synthaea-lab/agent/issues/51)).
+- **Split argv**: an exec is emitted once its `CWD` record (or a later one, see
+  [Split argv](#split-argv)) arrives. An exec whose `CWD` was lost stays held until the next record
+  or the sensor's exit.
 - **AVC**: no pid; a rare `auditallow` grant would be classified as a denial; the object path is
   from the AVC line alone (often a bare file name).
 - No file events.
 
 ## Testing
 
-Unit tests for parse, classify and normalize; a deterministic never-panic suite
+Unit tests for parse, classify, the argv assembler and normalize, and a sensor-level test of
+interleaved split execs through `forward`; a deterministic never-panic suite
 ([`tests/robustness.rs`](../../../crates/sensors/linux/audit/tests/robustness.rs)) and a fuzz target
 ([`audit_parse`](../../../tests/fuzz/fuzz_targets/audit_parse.rs)) on the parser; `AvcReader` is tested
 over a `socketpair`.
