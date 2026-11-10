@@ -285,11 +285,14 @@ jobs:
         run: |
           cargo build -p sensor-linux --example verify_probes --target x86_64-unknown-linux-musl
           bin=target/x86_64-unknown-linux-musl/debug/examples/verify_probes
-          file "$bin"
-          if ! file "$bin" | grep -Eq 'static(-pie)? linked'; then
+          # `file` says "statically linked" for a plain static binary and "static-pie linked"
+          # for a static PIE (what current Rust musl targets produce).
+          if ! linkage=$(file "$bin" | grep -Eo 'statically linked|static-pie linked'); then
+            file "$bin"
             echo "::error::verify_probes is not statically linked"
             exit 1
           fi
+          echo "verify_probes: $linkage"
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: verify-probes
