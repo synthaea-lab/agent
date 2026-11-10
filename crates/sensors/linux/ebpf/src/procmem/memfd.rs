@@ -9,7 +9,10 @@ use aya_ebpf::{
 use aya_log_ebpf::warn;
 use sensor_linux_wire::MemfdCreateEvent;
 
-use crate::{SYS_EXIT_RET_OFFSET, fill_event_meta, into_ret};
+use crate::{
+    arch::{SYS_EXIT_RET_OFFSET, SyscallRecord, arg_offset},
+    fill_event_meta, into_ret,
+};
 
 /// Ring buffer shared with userspace for `memfd_create` events (issue #265).
 #[map]
@@ -34,37 +37,23 @@ static MEMFD_ARGS: HashMap<u64, MemfdCreateEvent> = HashMap::with_max_entries(10
 /// `uname`(16), `flags`(24). Verified on 2026-09-22 on Arch (kernel
 /// 6.6.9-arch1-1, `x86_64`) via
 /// `/sys/kernel/tracing/events/syscalls/sys_enter_memfd_create/format`.
-#[cfg(any(bpf_target_arch = "x86_64", bpf_target_arch = "aarch64"))]
-const MEMFD_CREATE_NAME_PTR_OFFSET: usize = 16;
-#[cfg(any(bpf_target_arch = "x86_64", bpf_target_arch = "aarch64"))]
-const MEMFD_CREATE_FLAGS_OFFSET: usize = 24;
+///
 /// i686: inferred, not independently verified (see `sys_enter_open`'s i686 note).
-#[cfg(bpf_target_arch = "x86")]
-const MEMFD_CREATE_NAME_PTR_OFFSET: usize = 12;
-#[cfg(bpf_target_arch = "x86")]
-const MEMFD_CREATE_FLAGS_OFFSET: usize = 16;
+const MEMFD_CREATE_NAME_PTR_OFFSET: usize = arg_offset(0);
+const MEMFD_CREATE_FLAGS_OFFSET: usize = arg_offset(1);
 
 pub fn sys_enter_memfd_create(ctx: TracePointContext) -> u32 {
     into_ret(try_sys_enter_memfd_create(ctx))
 }
 
 fn try_sys_enter_memfd_create(ctx: TracePointContext) -> Result<u32, u32> {
-    #[cfg(any(bpf_target_arch = "x86_64", bpf_target_arch = "aarch64"))]
     let name_ptr: u64 = unsafe {
-        ctx.read_at(MEMFD_CREATE_NAME_PTR_OFFSET)
+        ctx.read_ulong_arg(MEMFD_CREATE_NAME_PTR_OFFSET)
             .map_err(|_| 1u32)?
     };
-    #[cfg(bpf_target_arch = "x86")]
-    let name_ptr: u64 = unsafe {
-        ctx.read_at::<u32>(MEMFD_CREATE_NAME_PTR_OFFSET)
-            .map_err(|_| 1u32)? as u64
-    };
-    #[cfg(any(bpf_target_arch = "x86_64", bpf_target_arch = "aarch64"))]
-    let flags: u64 = unsafe { ctx.read_at(MEMFD_CREATE_FLAGS_OFFSET).map_err(|_| 1u32)? };
-    #[cfg(bpf_target_arch = "x86")]
     let flags: u64 = unsafe {
-        ctx.read_at::<u32>(MEMFD_CREATE_FLAGS_OFFSET)
-            .map_err(|_| 1u32)? as u64
+        ctx.read_ulong_arg(MEMFD_CREATE_FLAGS_OFFSET)
+            .map_err(|_| 1u32)?
     };
 
     let comm = bpf_get_current_comm().map_err(|_| 1u32)?;
@@ -105,10 +94,7 @@ pub fn sys_exit_memfd_create(ctx: TracePointContext) -> u32 {
 /// enter wasn't tracked (`MEMFD_ARGS` was full) or the call failed (`ret < 0`), so the
 /// `fd` a consumer sees is always the real descriptor.
 fn try_sys_exit_memfd_create(ctx: TracePointContext) -> Result<u32, u32> {
-    #[cfg(any(bpf_target_arch = "x86_64", bpf_target_arch = "aarch64"))]
-    let ret: i64 = unsafe { ctx.read_at(SYS_EXIT_RET_OFFSET).map_err(|_| 1u32)? };
-    #[cfg(bpf_target_arch = "x86")]
-    let ret: i64 = unsafe { ctx.read_at::<i32>(SYS_EXIT_RET_OFFSET).map_err(|_| 1u32)? as i64 };
+    let ret: i64 = unsafe { ctx.read_long_arg(SYS_EXIT_RET_OFFSET).map_err(|_| 1u32)? };
 
     let pid_tgid = bpf_get_current_pid_tgid();
     let e = match MEMFD_ARGS.get_ptr_mut(&pid_tgid) {

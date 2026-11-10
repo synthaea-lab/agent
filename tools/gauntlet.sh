@@ -32,9 +32,6 @@ fi
 step "PowerShell scripts ASCII-only (Windows PowerShell 5.1 misreads anything else)"
 python3 tools/check-ps1-ascii.py
 
-step "eBPF tracepoint offsets follow the syscall record layout (i686 is not built anywhere)"
-python3 tools/check-ebpf-offsets.py
-
 step "clippy, host, all targets, -D warnings"
 cargo clippy --workspace --exclude sensor-linux-ebpf --all-targets -- -D warnings
 

@@ -9,7 +9,10 @@ use aya_ebpf::{
 use aya_log_ebpf::warn;
 use sensor_linux_wire::BpfEvent;
 
-use crate::{fill_event_meta, into_ret};
+use crate::{
+    arch::{SyscallRecord, arg_offset},
+    fill_event_meta, into_ret,
+};
 
 /// Ring buffer shared with userspace for filtered `bpf(2)` events.
 #[map]
@@ -30,21 +33,16 @@ const BPF_CMD_PROG_ATTACH: u32 = 8;
 
 /// Offsets of the `syscalls:sys_enter_bpf` tracepoint (`cmd`, `uattr`, `size`),
 /// assumed standard layout — see `INIT_MODULE_LEN_OFFSET`'s note in `module.rs`.
-#[cfg(any(bpf_target_arch = "x86_64", bpf_target_arch = "aarch64"))]
-const BPF_CMD_OFFSET: usize = 16;
+///
 /// i686: inferred, not independently verified.
-#[cfg(bpf_target_arch = "x86")]
-const BPF_CMD_OFFSET: usize = 12;
+const BPF_CMD_OFFSET: usize = arg_offset(0);
 
 pub fn sys_enter_bpf(ctx: TracePointContext) -> u32 {
     into_ret(try_sys_enter_bpf(ctx))
 }
 
 fn try_sys_enter_bpf(ctx: TracePointContext) -> Result<u32, u32> {
-    #[cfg(any(bpf_target_arch = "x86_64", bpf_target_arch = "aarch64"))]
-    let cmd: u64 = unsafe { ctx.read_at(BPF_CMD_OFFSET).map_err(|_| 1u32)? };
-    #[cfg(bpf_target_arch = "x86")]
-    let cmd: u64 = unsafe { ctx.read_at::<u32>(BPF_CMD_OFFSET).map_err(|_| 1u32)? as u64 };
+    let cmd: u64 = unsafe { ctx.read_ulong_arg(BPF_CMD_OFFSET).map_err(|_| 1u32)? };
     let cmd = cmd as u32;
 
     if cmd != BPF_CMD_MAP_CREATE && cmd != BPF_CMD_PROG_LOAD && cmd != BPF_CMD_PROG_ATTACH {

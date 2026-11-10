@@ -9,7 +9,10 @@ use aya_ebpf::{
 use aya_log_ebpf::warn;
 use sensor_linux_wire::PrctlEvent;
 
-use crate::{fill_event_meta, into_ret};
+use crate::{
+    arch::{SyscallRecord, arg_offset},
+    fill_event_meta, into_ret,
+};
 
 /// Ring buffer shared with userspace for filtered `prctl(2)` events.
 #[map]
@@ -30,25 +33,17 @@ const PR_SET_SECUREBITS: u64 = 28;
 /// Offsets of the `syscalls:sys_enter_prctl` tracepoint (`option`, `arg2`),
 /// assumed standard layout — see `INIT_MODULE_LEN_OFFSET`'s note in `kernel/module.rs`; verify
 /// against `/sys/kernel/tracing/events/syscalls/sys_enter_prctl/format`.
-#[cfg(any(bpf_target_arch = "x86_64", bpf_target_arch = "aarch64"))]
-const PRCTL_OPTION_OFFSET: usize = 16;
-#[cfg(any(bpf_target_arch = "x86_64", bpf_target_arch = "aarch64"))]
-const PRCTL_ARG2_OFFSET: usize = 24;
+///
 /// i686: inferred, not independently verified.
-#[cfg(bpf_target_arch = "x86")]
-const PRCTL_OPTION_OFFSET: usize = 12;
-#[cfg(bpf_target_arch = "x86")]
-const PRCTL_ARG2_OFFSET: usize = 16;
+const PRCTL_OPTION_OFFSET: usize = arg_offset(0);
+const PRCTL_ARG2_OFFSET: usize = arg_offset(1);
 
 pub fn sys_enter_prctl(ctx: TracePointContext) -> u32 {
     into_ret(try_sys_enter_prctl(ctx))
 }
 
 fn try_sys_enter_prctl(ctx: TracePointContext) -> Result<u32, u32> {
-    #[cfg(any(bpf_target_arch = "x86_64", bpf_target_arch = "aarch64"))]
-    let option: u64 = unsafe { ctx.read_at(PRCTL_OPTION_OFFSET).map_err(|_| 1u32)? };
-    #[cfg(bpf_target_arch = "x86")]
-    let option: u64 = unsafe { ctx.read_at::<u32>(PRCTL_OPTION_OFFSET).map_err(|_| 1u32)? as u64 };
+    let option: u64 = unsafe { ctx.read_ulong_arg(PRCTL_OPTION_OFFSET).map_err(|_| 1u32)? };
 
     // `option` is an `int`: on 64-bit the register's upper half is unspecified,
     // so compare the low 32 bits only.
@@ -57,10 +52,7 @@ fn try_sys_enter_prctl(ctx: TracePointContext) -> Result<u32, u32> {
         return Ok(0);
     }
 
-    #[cfg(any(bpf_target_arch = "x86_64", bpf_target_arch = "aarch64"))]
-    let arg: u64 = unsafe { ctx.read_at(PRCTL_ARG2_OFFSET).map_err(|_| 1u32)? };
-    #[cfg(bpf_target_arch = "x86")]
-    let arg: u64 = unsafe { ctx.read_at::<u32>(PRCTL_ARG2_OFFSET).map_err(|_| 1u32)? as u64 };
+    let arg: u64 = unsafe { ctx.read_ulong_arg(PRCTL_ARG2_OFFSET).map_err(|_| 1u32)? };
 
     let comm = bpf_get_current_comm().map_err(|_| 1u32)?;
     let uid_gid = aya_ebpf::helpers::bpf_get_current_uid_gid();
