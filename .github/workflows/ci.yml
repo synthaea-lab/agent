@@ -237,6 +237,8 @@ jobs:
         with:
           toolchain: stable
           components: clippy
+          # `verify_probes` is built static so the VM's userspace cannot break it (below).
+          targets: x86_64-unknown-linux-musl
       - name: pinned nightly + rust-src (aya-build compiles the probes with it)
         run: rustup toolchain install "$(tr -d '[:space:]' < packaging/toolchain/ebpf-toolchain.txt)" --profile minimal --component rust-src
       - name: bpf-linker (prebuilt, musl-static, bundled LLVM, SHA-256 pinned)
@@ -275,13 +277,23 @@ jobs:
               -regex ".*/build/${crate}-[0-9a-f]{16}/out/sensor-linux-ebpf" -type f -print -quit)
             python3 tools/check-ebpf-symbols.py "$obj" crates/sensors/linux/ebpf/symbols.txt
           done
-      # The object is embedded in the binary, so `linux-ebpf-verify` needs nothing else.
-      - name: build verify_probes
-        run: cargo build -p sensor-linux --example verify_probes
+      # The object is embedded in the binary, so `linux-ebpf-verify` needs nothing else. Static
+      # musl, not the runner's glibc: the binary runs in the LVH image, whose userspace is
+      # updated independently of this runner, and a glibc mismatch there would fail the job
+      # for a reason unrelated to the probes (review on #229).
+      - name: build verify_probes (static musl)
+        run: |
+          cargo build -p sensor-linux --example verify_probes --target x86_64-unknown-linux-musl
+          bin=target/x86_64-unknown-linux-musl/debug/examples/verify_probes
+          file "$bin"
+          if ! file "$bin" | grep -Eq 'static(-pie)? linked'; then
+            echo "::error::verify_probes is not statically linked"
+            exit 1
+          fi
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: verify-probes
-          path: target/debug/examples/verify_probes
+          path: target/x86_64-unknown-linux-musl/debug/examples/verify_probes
           if-no-files-found: error
           retention-days: 3
 

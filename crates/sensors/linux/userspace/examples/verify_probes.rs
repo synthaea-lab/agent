@@ -5,7 +5,8 @@
 //! uninitialized padding, an LSM hook with fewer arguments). The agent then only logs a warning
 //! and runs without that probe, so the loss is silent. This loads each program once, prints the
 //! kernel's processed-instruction count (`verified_insns`, kernel 5.16 and later) and translated
-//! size, and exits 1 if any was refused or has a type this check cannot load.
+//! size, and exits 1 if any was refused or has a type this check cannot load. A build without
+//! the embedded probes exits 2.
 //!
 //! `inode_setattr` is expected to be refused where the LSM hook has fewer arguments (5.15, 6.1):
 //! the loader treats it as optional (#1044). Pass `--allow inode_setattr` to accept that.
@@ -116,9 +117,12 @@ fn main() -> std::process::ExitCode {
     }
 }
 
+// Exit 2, not 0: a binary built without the probes loads nothing, and CI must not read that as a
+// pass.
 #[cfg(not(all(target_os = "linux", ebpf_embedded)))]
-fn main() {
-    println!(
+fn main() -> std::process::ExitCode {
+    eprintln!(
         "verify_probes needs Linux and the embedded eBPF probes (build with the eBPF toolchain)"
     );
+    std::process::ExitCode::from(2)
 }
