@@ -5,7 +5,11 @@ use std::sync::Arc;
 use schema::sensor::{Capabilities, EventSink, Sensor, SensorError};
 use tokio::sync::Notify;
 
-use crate::{AuditSocket, classify, normalize, parse};
+use crate::{
+    AuditSocket, classify,
+    execve::{AssembledExec, ExecveAssembler},
+    normalize, parse,
+};
 
 /// Records read per readiness wakeup before yielding back to `select!`. One
 /// exec is 7 records on the lab kernel (SYSCALL, EXECVE, CWD, PATH ×2,
@@ -50,6 +54,7 @@ impl AuditSensor {
         // record it received (#504).
         let mut unparsed: u64 = 0;
         let mut overruns: u64 = 0;
+        let mut execve = ExecveAssembler::default();
         loop {
             tokio::select! {
                 _ = &mut ctrl_c => break,
@@ -65,7 +70,7 @@ impl AuditSensor {
                     for _ in 0..DRAIN_BUDGET {
                         match guard.get_inner_mut().recv(&mut buf) {
                             Ok(n) => match parse::parse_audit_message(&buf[..n]) {
-                                Ok(record) => forward(&record, sink.as_ref()),
+                                Ok(record) => forward(&record, &mut execve, sink.as_ref()),
                                 Err(e) => {
                                     unparsed += 1;
                                     // Powers of two only: a stream of bad records must not flood the log.
@@ -104,6 +109,9 @@ impl AuditSensor {
             }
         }
 
+        if let Some(exec) = execve.finish() {
+            emit_exec(exec, sink.as_ref());
+        }
         tracing::info!("sensor-linux-audit: exiting");
         Ok(())
     }
@@ -145,7 +153,14 @@ impl Sensor for AuditSensor {
 }
 
 /// Classifies one parsed record and hands the resulting event, if any, to `sink`.
-fn forward(record: &parse::AuditRecord, sink: &dyn EventSink) {
+/// `EXECVE` records go to `execve`, which hands back the exec once its records end.
+fn forward(record: &parse::AuditRecord, execve: &mut ExecveAssembler, sink: &dyn EventSink) {
+    if let Some(exec) = execve.push(record) {
+        emit_exec(exec, sink);
+    }
+    if record.record_type == classify::AUDIT_EXECVE {
+        return;
+    }
     let Some(event) = classify::classify(record) else {
         return;
     };
@@ -158,6 +173,11 @@ fn forward(record: &parse::AuditRecord, sink: &dyn EventSink) {
         }
     };
     sink.on_event(schema_event);
+}
+
+fn emit_exec(exec: AssembledExec, sink: &dyn EventSink) {
+    let timestamp_ns = audit_ts_to_epoch_ns(exec.timestamp_sec, exec.timestamp_ms);
+    sink.on_event(normalize::exec_event(&exec.event, timestamp_ns));
 }
 
 pub(crate) fn audit_ts_to_epoch_ns(sec: u64, ms: u32) -> u64 {
