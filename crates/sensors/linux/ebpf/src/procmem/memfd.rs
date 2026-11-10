@@ -30,9 +30,9 @@ static MEMFD_CREATE_SCRATCH: PerCpuArray<MemfdCreateEvent> = PerCpuArray::with_m
 #[map]
 static MEMFD_ARGS: HashMap<u64, MemfdCreateEvent> = HashMap::with_max_entries(1024, 0);
 
-/// Offsets of the `syscalls:sys_enter_memfd_create` tracepoint (x86_64/aarch64):
+/// Offsets of the `syscalls:sys_enter_memfd_create` tracepoint (`x86_64`/`aarch64`):
 /// `uname`(16), `flags`(24). Verified on 2026-09-22 on Arch (kernel
-/// 6.6.9-arch1-1, x86_64) via
+/// 6.6.9-arch1-1, `x86_64`) via
 /// `/sys/kernel/tracing/events/syscalls/sys_enter_memfd_create/format`.
 #[cfg(any(bpf_target_arch = "x86_64", bpf_target_arch = "aarch64"))]
 const MEMFD_CREATE_NAME_PTR_OFFSET: usize = 16;
@@ -80,10 +80,10 @@ fn try_sys_enter_memfd_create(ctx: TracePointContext) -> Result<u32, u32> {
             &comm,
         );
 
-        if name_ptr != 0 {
-            if let Ok(name) = bpf_probe_read_user_str_bytes(name_ptr as *const u8, &mut (*e).name) {
-                (*e).name_len = name.len() as u16;
-            }
+        if name_ptr != 0
+            && let Ok(name) = bpf_probe_read_user_str_bytes(name_ptr as *const u8, &mut (*e).name)
+        {
+            (*e).name_len = name.len() as u16;
         }
         (*e).flags = flags as u32;
         (*e).fd = -1;

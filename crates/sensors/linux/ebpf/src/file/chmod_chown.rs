@@ -27,8 +27,8 @@ static FILE_CHOWN_EVENTS: RingBuf = RingBuf::with_byte_size(256 * 1024, 0);
 #[map]
 static CHOWN_SCRATCH: PerCpuArray<FileChownEvent> = PerCpuArray::with_max_entries(1, 0);
 
-/// Offsets of the `syscalls:sys_enter_chmod` tracepoint (x86_64/aarch64): `filename`(16),
-/// `mode`(24). Verified on 2026-09-22 on Alpine (kernel 6.18.50-0-virt, x86_64) via
+/// Offsets of the `syscalls:sys_enter_chmod` tracepoint (`x86_64`/`aarch64`): `filename`(16),
+/// `mode`(24). Verified on 2026-09-22 on Alpine (kernel 6.18.50-0-virt, `x86_64`) via
 /// `/sys/kernel/tracing/events/syscalls/sys_enter_chmod/format`.
 #[cfg(any(bpf_target_arch = "x86_64", bpf_target_arch = "aarch64"))]
 const CHMOD_FILENAME_PTR_OFFSET: usize = 16;
@@ -40,9 +40,9 @@ const CHMOD_FILENAME_PTR_OFFSET: usize = 12;
 #[cfg(bpf_target_arch = "x86")]
 const CHMOD_MODE_OFFSET: usize = 16;
 
-/// Offsets of the `syscalls:sys_enter_fchmodat` tracepoint (x86_64/aarch64): `dfd`(16),
+/// Offsets of the `syscalls:sys_enter_fchmodat` tracepoint (`x86_64`/`aarch64`): `dfd`(16),
 /// `filename`(24), `mode`(32). Verified on 2026-09-22 on Alpine (kernel 6.18.50-0-virt,
-/// x86_64) via `/sys/kernel/tracing/events/syscalls/sys_enter_fchmodat/format`.
+/// `x86_64`) via `/sys/kernel/tracing/events/syscalls/sys_enter_fchmodat/format`.
 #[cfg(any(bpf_target_arch = "x86_64", bpf_target_arch = "aarch64"))]
 const FCHMODAT_FILENAME_PTR_OFFSET: usize = 24;
 #[cfg(any(bpf_target_arch = "x86_64", bpf_target_arch = "aarch64"))]
@@ -115,15 +115,14 @@ fn emit_file_chmod_event(
             &comm,
         );
 
-        if filename_ptr != 0 {
-            if let Ok(path) =
+        if filename_ptr != 0
+            && let Ok(path) =
                 bpf_probe_read_user_str_bytes(filename_ptr as *const u8, &mut (*e).path)
-            {
-                if is_filtered_path(path, 0, true) {
-                    return Ok(0);
-                }
-                (*e).path_len = path.len() as u16;
+        {
+            if is_filtered_path(path, 0, true) {
+                return Ok(0);
             }
+            (*e).path_len = path.len() as u16;
         }
         (*e).mode = mode as u32;
 
@@ -138,9 +137,9 @@ fn emit_file_chmod_event(
     Ok(0)
 }
 
-/// Offsets of the `syscalls:sys_enter_chown` tracepoint (x86_64/aarch64): `filename`(16),
+/// Offsets of the `syscalls:sys_enter_chown` tracepoint (`x86_64`/`aarch64`): `filename`(16),
 /// `user`(24), `group`(32). Verified on 2026-09-22 on Alpine (kernel 6.18.50-0-virt,
-/// x86_64) via `/sys/kernel/tracing/events/syscalls/sys_enter_chown/format`.
+/// `x86_64`) via `/sys/kernel/tracing/events/syscalls/sys_enter_chown/format`.
 #[cfg(any(bpf_target_arch = "x86_64", bpf_target_arch = "aarch64"))]
 const CHOWN_FILENAME_PTR_OFFSET: usize = 16;
 #[cfg(any(bpf_target_arch = "x86_64", bpf_target_arch = "aarch64"))]
@@ -155,9 +154,9 @@ const CHOWN_USER_OFFSET: usize = 16;
 #[cfg(bpf_target_arch = "x86")]
 const CHOWN_GROUP_OFFSET: usize = 20;
 
-/// Offsets of the `syscalls:sys_enter_lchown` tracepoint (x86_64/aarch64): identical
+/// Offsets of the `syscalls:sys_enter_lchown` tracepoint (`x86_64`/`aarch64`): identical
 /// shape to `sys_enter_chown` above — `filename`(16), `user`(24), `group`(32). Verified
-/// on 2026-09-22 on Alpine (kernel 6.18.50-0-virt, x86_64) via
+/// on 2026-09-22 on Alpine (kernel 6.18.50-0-virt, `x86_64`) via
 /// `/sys/kernel/tracing/events/syscalls/sys_enter_lchown/format`.
 #[cfg(any(bpf_target_arch = "x86_64", bpf_target_arch = "aarch64"))]
 const LCHOWN_FILENAME_PTR_OFFSET: usize = 16;
@@ -173,9 +172,9 @@ const LCHOWN_USER_OFFSET: usize = 16;
 #[cfg(bpf_target_arch = "x86")]
 const LCHOWN_GROUP_OFFSET: usize = 20;
 
-/// Offsets of the `syscalls:sys_enter_fchownat` tracepoint (x86_64/aarch64): `dfd`(16),
+/// Offsets of the `syscalls:sys_enter_fchownat` tracepoint (`x86_64`/`aarch64`): `dfd`(16),
 /// `filename`(24), `user`(32), `group`(40), `flag`(48). Verified on 2026-09-22 on Alpine
-/// (kernel 6.18.50-0-virt, x86_64) via
+/// (kernel 6.18.50-0-virt, `x86_64`) via
 /// `/sys/kernel/tracing/events/syscalls/sys_enter_fchownat/format`.
 #[cfg(any(bpf_target_arch = "x86_64", bpf_target_arch = "aarch64"))]
 const FCHOWNAT_FILENAME_PTR_OFFSET: usize = 24;
@@ -289,15 +288,14 @@ fn emit_file_chown_event(
             &comm,
         );
 
-        if filename_ptr != 0 {
-            if let Ok(path) =
+        if filename_ptr != 0
+            && let Ok(path) =
                 bpf_probe_read_user_str_bytes(filename_ptr as *const u8, &mut (*e).path)
-            {
-                if is_filtered_path(path, 0, true) {
-                    return Ok(0);
-                }
-                (*e).path_len = path.len() as u16;
+        {
+            if is_filtered_path(path, 0, true) {
+                return Ok(0);
             }
+            (*e).path_len = path.len() as u16;
         }
         (*e).uid = user as u32;
         (*e).gid = group as u32;

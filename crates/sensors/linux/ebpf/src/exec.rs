@@ -23,7 +23,7 @@ use crate::PROC_LINEAGE;
 /// the per-CPU `EXEC_SCRATCH` entry (not on the stack — `image` is `MAX_PATH_LEN`
 /// bytes) and emitted with a single `output` copy — the standard libbpf/Tetragon
 /// "heap map" pattern. Filling a reserved ring-buffer slot field by field instead
-/// needs per-byte loops over MAX_PATH_LEN, which blow the verifier's 1M-instruction
+/// needs per-byte loops over `MAX_PATH_LEN`, which blow the verifier's 1M-instruction
 /// budget on pre-6.6 kernels (5.15, 6.1).
 ///
 /// 512 KiB since a record carries the argv bytes it read (<https://github.com/synthaea-lab/agent/issues/48>, ADR-0045): a record is the
@@ -166,12 +166,12 @@ pub(crate) fn record_sched_process_exec(pid: u32, filename_ptr: *const u8) -> u3
             // entry. Only when that entry is the incarnation this child was forked from: if
             // the parent exited and its pid was reused, the entry describes someone else
             // and its forker would be lent to the child. Left zero otherwise.
-            if let Some(parent) = PROC_LINEAGE.get(&l.ppid) {
-                if parent.generation == l.parent_generation {
-                    (*e).grandparent_pid = parent.ppid;
-                    (*e).grandparent_generation = parent.parent_generation;
-                    (*e).parent_execd = parent.execd;
-                }
+            if let Some(parent) = PROC_LINEAGE.get(&l.ppid)
+                && parent.generation == l.parent_generation
+            {
+                (*e).grandparent_pid = parent.ppid;
+                (*e).grandparent_generation = parent.parent_generation;
+                (*e).parent_execd = parent.execd;
             }
         }
         // This process has exec'd: its children can no longer be told it runs its forker's

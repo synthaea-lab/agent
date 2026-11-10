@@ -116,6 +116,12 @@ publish = false
 license = "Apache-2.0"
 edition = "2024"
 
+[workspace.lints.rust]
+# `bpf_target_arch` is set by aya-build when it compiles sensor-linux-ebpf (the only crate that
+# reads it). It is declared here because a crate that opts into `lints.workspace` cannot also
+# carry its own `[lints.rust]` table.
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(bpf_target_arch, values("x86", "x86_64", "aarch64"))'] }
+
 [workspace.lints.clippy]
 # Hard bans: debug/placeholder constructs never ship.
 dbg_macro = "deny"

@@ -67,6 +67,13 @@ if [[ $FAST -eq 0 ]]; then
     cargo clippy --workspace --exclude sensor-linux-ebpf --all-targets \
         --target x86_64-unknown-linux-gnu -- -D warnings
 
+    step "clippy, the eBPF probes (bpfel, pinned nightly)"
+    if rustup run "$(tr -d '[:space:]' < packaging/toolchain/ebpf-toolchain.txt)" cargo clippy --version >/dev/null 2>&1; then
+        bash tools/clippy-ebpf.sh
+    else
+        echo "skipped: the pinned eBPF nightly (packaging/toolchain/ebpf-toolchain.txt) with clippy is not installed"
+    fi
+
     step "clippy, Windows sensor crates, x86_64-pc-windows-msvc"
     # Only the Windows-gated crates: a full workspace pass needs a cross C
     # toolchain for ring (transport) that most dev machines lack; CI's native

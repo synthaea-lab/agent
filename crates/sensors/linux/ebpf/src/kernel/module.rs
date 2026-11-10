@@ -26,7 +26,7 @@ const KERNEL_MODULE_ACTION_UNLOAD: u8 = 2;
 
 /// Offsets of the `syscalls:sys_enter_init_module` tracepoint (`umod`, `len`,
 /// `uargs`), assumed standard layout (16-byte header + 8 bytes/arg on
-/// x86_64/aarch64) — re-verify against `/format` on any newly supported kernel,
+/// `x86_64/aarch64`) — re-verify against `/format` on any newly supported kernel,
 /// same posture as every other offset const in this file.
 #[cfg(any(bpf_target_arch = "x86_64", bpf_target_arch = "aarch64"))]
 const INIT_MODULE_LEN_OFFSET: usize = 24;
@@ -88,10 +88,10 @@ fn emit_kernel_module_event(
         (*e).image_len = image_len;
         (*e).flags = flags;
 
-        if name_ptr != 0 {
-            if let Ok(name) = bpf_probe_read_user_str_bytes(name_ptr as *const u8, &mut (*e).name) {
-                (*e).name_len = name.len() as u16;
-            }
+        if name_ptr != 0
+            && let Ok(name) = bpf_probe_read_user_str_bytes(name_ptr as *const u8, &mut (*e).name)
+        {
+            (*e).name_len = name.len() as u16;
         }
 
         if KERNEL_MODULE_EVENTS

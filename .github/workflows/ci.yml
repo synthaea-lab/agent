@@ -238,7 +238,7 @@ jobs:
           toolchain: stable
           components: clippy
       - name: pinned nightly + rust-src (aya-build compiles the probes with it)
-        run: rustup toolchain install "$(tr -d '[:space:]' < packaging/toolchain/ebpf-toolchain.txt)" --profile minimal --component rust-src
+        run: rustup toolchain install "$(tr -d '[:space:]' < packaging/toolchain/ebpf-toolchain.txt)" --profile minimal --component rust-src --component clippy
       - name: bpf-linker (prebuilt, musl-static, bundled LLVM, SHA-256 pinned)
         run: |
           curl -fsSL --retry 3 --retry-all-errors -o "$RUNNER_TEMP/bpf-linker.tar.zst" \
@@ -255,6 +255,10 @@ jobs:
           key: ebpf-embedded
       - name: clippy (embedded probes)
         run: cargo clippy -p sensor-linux -p sensor-linux-uprobes -p agent --all-targets -- -D warnings
+      # The probes themselves: the host passes exclude sensor-linux-ebpf (bpfel only), so its
+      # workspace lints would otherwise never run (AS-029).
+      - name: clippy (the eBPF probes, bpfel)
+        run: bash tools/clippy-ebpf.sh
       - name: probes are embedded
         run: |
           for crate in sensor-linux sensor-linux-uprobes; do
