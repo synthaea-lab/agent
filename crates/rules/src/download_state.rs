@@ -12,8 +12,9 @@ use store::BoundedMap;
 use crate::{
     Alert,
     exclusions::{
-        BITS_EXEC_WINDOW_NS, DOWNLOAD_EXEC_WINDOW_NS, DOWNLOADER_COMMS,
-        MAIL_CLIENT_QUARANTINE_AGENTS, QUARANTINE_EXEC_WINDOW_NS,
+        BITS_EXEC_WINDOW_NS, BROWSER_DOWNLOAD_IMAGES, BROWSER_PARTIAL_SUFFIXES,
+        DOWNLOAD_EXEC_WINDOW_NS, DOWNLOADER_COMMS, MAIL_CLIENT_QUARANTINE_AGENTS,
+        QUARANTINE_EXEC_WINDOW_NS,
     },
     has_write_intent,
     signature_gate::SignatureGatedAlert,
@@ -270,6 +271,42 @@ impl DownloadState {
                 timestamp_ns: event.meta.timestamp_ns,
                 agent: event.agent.clone(),
                 origin_url: event.origin_url.clone(),
+                alerted: false,
+            },
+        );
+    }
+
+    /// Linux browser downloads carry no usable xattr mark, so the finished download is
+    /// marked from the browser's own rename of its partial file (#221): a `FileRename`
+    /// whose `old_path` ends in `.crdownload` or `.part` and whose `new_path` does not,
+    /// by a process whose `executable_path` is in [`BROWSER_DOWNLOAD_IMAGES`]. The mark is
+    /// the same one [`Self::on_file_quarantine`] records, with the browser's file name as
+    /// the agent and no origin URL, so [`Self::check_quarantined_exec`] joins it.
+    ///
+    /// Keyed on the image, never on `comm` (a thread-pool worker name). An empty or absent
+    /// `executable_path` (the sensor lost the `/proc/<pid>/exe` race) marks nothing: the
+    /// process-lineage fallback is not implemented, the capture ran under `strace` so its
+    /// lineage was not real. Chromium's first rename (`/tmp/... -> .crdownload`, fails with
+    /// `EXDEV` across devices) and cache renames have no partial-suffix `old_path` and
+    /// are ignored.
+    pub(crate) fn on_browser_download_rename(&mut self, event: &FileRenameEvent) {
+        let Some(image) = event
+            .executable_path
+            .as_deref()
+            .filter(|image| BROWSER_DOWNLOAD_IMAGES.contains(image))
+        else {
+            return;
+        };
+        let is_partial = |path: &str| BROWSER_PARTIAL_SUFFIXES.iter().any(|s| path.ends_with(s));
+        if !is_partial(&event.old_path) || is_partial(&event.new_path) {
+            return;
+        }
+        self.recent_quarantines.insert(
+            event.new_path.to_lowercase(),
+            RecentQuarantine {
+                timestamp_ns: event.meta.timestamp_ns,
+                agent: Some(image.rsplit('/').next().unwrap_or(image).to_string()),
+                origin_url: None,
                 alerted: false,
             },
         );
