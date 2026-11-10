@@ -5,7 +5,8 @@
 //! uninitialized padding, an LSM hook with fewer arguments). The agent then only logs a warning
 //! and runs without that probe, so the loss is silent. This loads each program once, prints the
 //! kernel's processed-instruction count (`verified_insns`, kernel 5.16 and later) and translated
-//! size, and exits 1 if any was refused.
+//! size, and exits 1 if any was refused or has a type this check cannot load. A build without
+//! the embedded probes exits 2.
 //!
 //! `inode_setattr` is expected to be refused where the LSM hook has fewer arguments (5.15, 6.1):
 //! the loader treats it as optional (#1044). Pass `--allow inode_setattr` to accept that.
@@ -46,8 +47,16 @@ mod linux {
                 // Each LSM program is named after its hook (`#[lsm(hook = "...")]` on a fn of
                 // the same name), which is also how `attach_inode_setattr` loads it.
                 Program::Lsm(p) => p.load(name, &btf),
+                // A program type this check cannot load is a failure, not a pass: otherwise a
+                // new kprobe or socket filter would ship without the verifier ever seeing it
+                // (#226). `--allow` still accepts it by name.
                 other => {
-                    println!("SKIP {name} {:?}", other.prog_type());
+                    if allowed.contains(name.as_str()) {
+                        println!("ALLOWED {name}: unsupported type {:?}", other.prog_type());
+                    } else {
+                        refused += 1;
+                        println!("FAIL {name}: unsupported type {:?}", other.prog_type());
+                    }
                     continue;
                 }
             };
@@ -108,9 +117,12 @@ fn main() -> std::process::ExitCode {
     }
 }
 
+// Exit 2, not 0: a binary built without the probes loads nothing, and CI must not read that as a
+// pass.
 #[cfg(not(all(target_os = "linux", ebpf_embedded)))]
-fn main() {
-    println!(
+fn main() -> std::process::ExitCode {
+    eprintln!(
         "verify_probes needs Linux and the embedded eBPF probes (build with the eBPF toolchain)"
     );
+    std::process::ExitCode::from(2)
 }
