@@ -11,7 +11,7 @@ use sensor_linux_wire::{
     FileDeleteEvent, FileRenameEvent, FileWriteEvent, TASK_COMM_LEN, is_filtered_path,
 };
 
-use crate::{fill_lineage, is_agent_own_pid};
+use crate::{fill_lineage, mount_signal::signal::is_agent_own_pid};
 
 /// Ring buffer shared with userspace for `write` events.
 #[map]
