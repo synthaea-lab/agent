@@ -41,7 +41,7 @@ flowchart LR
 | --- | --- | --- | --- |
 | TLS | `libssl.so*`, `libgnutls.so*` | `SSL_write`, `SSL_write_ex`, `SSL_read`, `SSL_read_ex`, `gnutls_record_send`, `gnutls_record_recv` | uprobe on write; uprobe + uretprobe on read |
 | readline | `libreadline.so*`, `libedit.so*` | `readline` | uretprobe |
-| DNS | libc | `getaddrinfo` | uprobe + uretprobe |
+| DNS | `libc.so*`, `libc-*` (glibc), `ld-musl-*` (musl) | `getaddrinfo` | uprobe + uretprobe |
 
 Symlinks are deduplicated by inode, and offsets are read from the ELF dynamic symbol table with
 `goblin`. A program loaded once is attached to every matching offset (OpenSSL 3 exports both
@@ -94,7 +94,7 @@ the text unredacted rather than crashing the sensor; `all_patterns_compile` test
 
 ## UDP/53 capture
 
-Resolvers that do not go through libc (Go, musl, Rust resolvers, `dig`) are invisible to the
+Resolvers that do not go through libc's `getaddrinfo` (Go, Rust resolvers, `dig`) are invisible to the
 `getaddrinfo` uprobe. [`raw_dns_udp_enter`](../../../crates/sensors/linux/ebpf/src/raw.rs) is a second
 `sys_enter` program, attached by `LinuxSensor` only with
 [`with_dns_udp_capture`](../../../crates/sensors/linux/userspace/src/sensor.rs). It acts on three
