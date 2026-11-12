@@ -130,6 +130,21 @@ fn bv_non_global_ipv6_is_not_external() {
 }
 
 #[test]
+fn bv_ipv4_mapped_ipv6_is_classified_as_its_ipv4_address() {
+    // A dual-stack `AF_INET6` socket connecting to an IPv4 peer records `::ffff:a.b.c.d`.
+    // Loopback, RFC 1918 and unspecified peers stay internal; a public one stays external.
+    for (pid, addr) in [
+        (70, "::ffff:127.0.0.1"),
+        (71, "::ffff:10.0.0.1"),
+        (72, "::ffff:192.168.1.1"),
+        (73, "::ffff:0.0.0.0"),
+    ] {
+        assert_eq!(dest_is_external_v6(pid, addr), 0.0, "{addr}");
+    }
+    assert_eq!(dest_is_external_v6(74, "::ffff:8.8.8.8"), 1.0);
+}
+
+#[test]
 fn bv_unspecified_is_internal_for_v4_and_v6_alike() {
     // agent#203 case 2: `0.0.0.0` is not external, same as `::`. The ml mirror
     // counted it as external; Rust is the reference.

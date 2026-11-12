@@ -99,7 +99,9 @@ fn connect_features(connect_events: &[&ConnectEvent]) -> (f32, bool) {
     let mut dest_is_external = false;
     for c in connect_events {
         dports.insert(c.dport);
-        let external = match c.daddr {
+        // An IPv4-mapped address (`::ffff:a.b.c.d`) is what a dual-stack `AF_INET6` socket
+        // records for an IPv4 peer: classify it as that IPv4 address, not as IPv6.
+        let external = match c.daddr.to_canonical() {
             IpAddr::V4(v4) => !is_private_ipv4(v4.octets()),
             // Review finding: IPv6 was skipped entirely, so public IPv6 C2 was
             // systematically underscored. Non-global v6 classes are excluded
