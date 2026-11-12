@@ -249,6 +249,29 @@ UNVERIFIED_NOTES = [
     "it, is still to be observed. Thunderbird is not verified. Neither is in the "
     "rule until a lab capture shows the mark and its writer "
     "(https://github.com/synthaea-lab/agent/issues/17).",
+    "T1204.002 on Linux joins a browser download through the rename of its partial "
+    "file (`.crdownload`, `.opdownload`, `.part`), by the renaming process's `executable_path`; "
+    "verified once, on a Fedora 43 lab VM (Chromium 156, Firefox 159, Chrome 157, Edge, "
+    "Brave 1.99, Opera, Vivaldi 8.3, headed under Xvfb, profile without a download "
+    "dialog; a second run with the download directory on the temp directory's "
+    "filesystem, for Chromium, Chrome, Edge and Opera, gives the same final rename and "
+    "the same `executable_path`; on a Rocky 9.8 VM, Firefox 140 ESR from the distribution "
+    "package has the same `/usr/lib64/firefox/firefox` and a `.part` rename). "
+    "**Not verified:** Firefox from a tarball (the process is `firefox-bin` under an "
+    "install-specific directory), the Snap (`/snap/firefox/<rev>/usr/lib/firefox/firefox`, "
+    "the revision changes), Debian's `firefox-esr` package (captured on a Debian 13 VM "
+    "under strace: the renaming process is `/usr/lib/firefox-esr/firefox-esr`, not "
+    "`firefox-bin`, with a `.part` rename; that path is not in the list, so it "
+    "raises nothing), Ubuntu and other distributions' image paths until "
+    "captured, so they raise nothing; Flatpak installs (another image "
+    "path); a Wayland session; a download through a Save-as dialog. Resumed "
+    "downloads were captured: Chrome resumes by itself, and after a browser kill and "
+    "relaunch a manual Resume ends with the same single `.crdownload` -> final rename "
+    "(same `executable_path`); Firefox's manual retry ends with the same `.part` -> "
+    "final rename. An empty `executable_path` marks nothing: the "
+    "process-lineage fallback is not implemented, and the capture ran under `strace` "
+    "so its lineage was not real "
+    "(https://github.com/synthaea-lab/agent/issues/221).",
 ]
 
 

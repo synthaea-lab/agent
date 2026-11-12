@@ -4,9 +4,10 @@
 //! is not decided, <https://github.com/synthaea-lab/agent/issues/43>), `recovery` is held offline and reserved for a key-rotation release
 //! ([`crate::rotation`]).
 //!
-//! A production build embeds the keys in `crates/updater/keys/*.pub` (hex). Until the real
-//! keys are committed there those files say `unprovisioned`, the statics below are `None`,
-//! and nothing verifies: the build fails closed instead of trusting a public seed.
+//! A production build embeds the keys in `crates/updater/keys/*.pub` (hex). Since 2026-11-12 they
+//! hold TEMPORARY `release`, `content` and `recovery` keys, generated outside the ADR-0027 ceremony
+//! and replaced when the real ones exist; `snapshot` stays `unprovisioned`. A file that says `unprovisioned` makes its static `None` and nothing verifies: the
+//! build fails closed instead of trusting a public seed.
 //!
 //! The public test set (a seed checked into the repository) exists only under the
 //! `test-key` cargo feature or `cfg(test)`, so a build without either cannot ship it by
@@ -181,16 +182,27 @@ mod tests {
     }
 
     #[test]
-    fn an_unprovisioned_key_file_embeds_no_key() {
+    fn a_committed_key_file_is_a_valid_key_and_never_the_public_test_key() {
+        // The files are provisioned (temporarily, see their header): each holds a key, and none
+        // of them is the public test set, whose seed anyone can read in this file.
+        let test_keys = [
+            public_of(&TEST_KEY_SEED).unwrap(),
+            public_of(&TEST_SNAPSHOT_SEED).unwrap(),
+            public_of(&TEST_RECOVERY_SEED).unwrap(),
+        ];
         for file in ["release", "content", "snapshot", "recovery"] {
             let text =
                 std::fs::read_to_string(format!("{}/keys/{file}.pub", env!("CARGO_MANIFEST_DIR")))
                     .unwrap();
-            assert_eq!(
-                parse_key_file(&text),
-                None,
-                "{file}.pub holds a key now: this test pins the unprovisioned state and is meant \
-                 to be replaced with a check that the embedded keys are the committed ones"
+            // `snapshot` stays `unprovisioned` on purpose: a key there turns the agent's snapshot
+            // fetch loop on (ADR-0033), which is gated on tenant binding and an undecided custody.
+            let Some(key) = parse_key_file(&text) else {
+                assert_eq!(file, "snapshot", "{file}.pub does not hold one 64-hex key");
+                continue;
+            };
+            assert!(
+                !test_keys.contains(&key),
+                "{file}.pub holds a public test key"
             );
         }
     }
@@ -215,6 +227,7 @@ mod tests {
     fn every_committed_key_file_is_unprovisioned_or_a_valid_key() {
         // A typo or a truncated key parses to `None`, which at run time reads as "no
         // production key" and hides the real cause. Catch it where the file is committed.
+        // `unprovisioned` stays accepted: it is how a file is put back to the fail-closed state.
         for file in ["release", "content", "snapshot", "recovery"] {
             let text =
                 std::fs::read_to_string(format!("{}/keys/{file}.pub", env!("CARGO_MANIFEST_DIR")))
@@ -234,8 +247,7 @@ mod tests {
     #[test]
     fn committed_keys_are_distinct_per_role_and_not_all_zero() {
         // Identical files would silently collapse the role separation (ADR-0027): a
-        // content signer could then sign releases. Vacuous while the files are
-        // `unprovisioned`, and the day real keys land it starts to bite.
+        // content signer could then sign releases. Vacuous for a file that is `unprovisioned`.
         let keys: Vec<(&str, [u8; 32])> = ["release", "content", "snapshot", "recovery"]
             .into_iter()
             .filter_map(|file| {

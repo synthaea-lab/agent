@@ -12,6 +12,10 @@ pub enum AuditEvent {
         gid: u32,
         image_path: String,
         argv: Vec<String>,
+        /// The kernel's `EXECVE` records did not carry every argument: a piece or a
+        /// follow-on record never arrived, or the hold bound in `execve.rs` was hit.
+        /// `argv` is the head that did arrive (#51).
+        argv_incomplete: bool,
     },
     Connect {
         pid: u32,
@@ -66,59 +70,23 @@ pub enum AuditEvent {
     },
 }
 
-const AUDIT_EXECVE: u32 = 1309;
+pub(crate) const AUDIT_EXECVE: u32 = 1309;
 const AUDIT_SOCKADDR: u32 = 1306;
 const AUDIT_AVC: u32 = 1400;
 
 /// Maps `AuditRecord` to `AuditEvent`, or None if not interesting.
+///
+/// An `EXECVE` record is read on its own here: an exec whose argv the kernel split
+/// over several records comes out flagged `argv_incomplete`. The sensor rebuilds such
+/// an exec from all its records instead (`execve.rs`, #51).
 #[must_use]
 pub fn classify(record: &AuditRecord) -> Option<AuditEvent> {
     match record.record_type {
-        AUDIT_EXECVE => classify_exec(record),
+        AUDIT_EXECVE => crate::execve::assemble(std::slice::from_ref(record), false),
         AUDIT_SOCKADDR => classify_connect(record),
         AUDIT_AVC => classify_avc(record),
         _ => None,
     }
-}
-
-fn classify_exec(record: &AuditRecord) -> Option<AuditEvent> {
-    // Extract argc to know how many arguments to collect
-    let argc: usize = record.fields.get("argc")?.parse().ok()?;
-
-    // Reconstruct argv (auditd uses a0, a1, a2, ...)
-    let mut argv = Vec::new();
-    for i in 0..argc {
-        let key = format!("a{i}");
-        argv.push(decoded_field(record, &key)?);
-    }
-
-    // First argument is the image path
-    let image_path = argv.first()?.clone();
-
-    // Extract process metadata (may not always be present)
-    let pid: u32 = record
-        .fields
-        .get("pid")
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(0);
-    let uid: u32 = record
-        .fields
-        .get("uid")
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(0);
-    let gid: u32 = record
-        .fields
-        .get("gid")
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(0);
-
-    Some(AuditEvent::Exec {
-        pid,
-        uid,
-        gid,
-        image_path,
-        argv,
-    })
 }
 
 fn classify_connect(record: &AuditRecord) -> Option<AuditEvent> {
@@ -213,7 +181,7 @@ fn avc_action(record: &AuditRecord) -> Option<String> {
 /// `String` by `parse_fields`. Without this gate, a value that's quoted
 /// *and* happens to look hex-shaped (a file genuinely named `6162`) gets
 /// silently misdecoded (to `"ab"`) instead of passed through untouched.
-fn decoded_field(record: &AuditRecord, key: &str) -> Option<String> {
+pub(crate) fn decoded_field(record: &AuditRecord, key: &str) -> Option<String> {
     let value = record.fields.get(key)?;
     Some(if record.unquoted_fields.contains(key) {
         decode_audit_value(value)
@@ -242,7 +210,7 @@ fn decode_audit_value(value: &str) -> String {
     value.to_string()
 }
 
-fn hex_decode(s: &str) -> Result<Vec<u8>, ()> {
+pub(crate) fn hex_decode(s: &str) -> Result<Vec<u8>, ()> {
     if !s.len().is_multiple_of(2) {
         return Err(());
     }
@@ -324,7 +292,9 @@ mod tests {
                 gid,
                 image_path,
                 argv,
+                argv_incomplete,
             } => {
+                assert!(!argv_incomplete);
                 assert_eq!(pid, 1234);
                 assert_eq!(uid, 1000);
                 assert_eq!(gid, 1000);

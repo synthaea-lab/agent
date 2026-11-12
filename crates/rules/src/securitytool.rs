@@ -418,6 +418,10 @@ const THROTTLE_FILES: &[&str] = &[
     "memory.high",
     "cgroup.freeze",
     "pids.max",
+    // The CPU quota: `echo '1000 100000' > cpu.max` leaves a tool 1% of a CPU, like
+    // `systemctl set-property CPUQuota=1%`. The open does not carry the value, so any write
+    // alerts, as for `memory.max` (a write that lifts the limit alerts too).
+    "cpu.max",
     "memory.limit_in_bytes",
     "memory.soft_limit_in_bytes",
     "freezer.state",
@@ -427,40 +431,40 @@ const THROTTLE_FILES: &[&str] = &[
 const OPEN_WRITE_INTENT: u32 = 0o3 | 0o1000;
 
 /// The unit and the control file a cgroup path names, read the way the kernel does for the
-/// forms that reach the rule: empty and `.` segments are dropped (`//sys/fs//cgroup/x/./y`),
-/// an absolute path must sit under `/sys/fs/cgroup`, and a **relative** path (the shell did a
-/// `cd` first, and `openat` with a directory fd gives one too) is read on its last two
-/// segments, `<unit>.service/<file>`. A relative path of one segment (`cgroup.freeze` after a
-/// `cd` into the unit's directory) names no unit and is not read: the event carries no working
-/// directory. `..` is not resolved. A relative `x.service/memory.max` from an unrelated
-/// directory is read as the cgroup of `x` (a false positive only for a listed tool's name).
+/// forms that reach the rule: empty and `.` segments are dropped (`//sys/fs//cgroup/x/./y`) and
+/// `..` pops the segment before it (`/sys/fs/../fs/cgroup/x/y`), then the path is read on its
+/// last two segments, `<unit>.service/<file>`, whether it is absolute or relative (the shell did
+/// a `cd` first, and `openat` with a directory fd gives a relative one too). So a cgroup2 mounted
+/// elsewhere (`mount -t cgroup2 none /mnt/cg2`) is read too. A path of one segment
+/// (`cgroup.freeze` after a `cd` into the unit's directory) names no unit and is not read: the
+/// event carries no working directory. An `x.service/memory.max` from an unrelated directory is
+/// read as the cgroup of `x` (a false positive only for a listed tool's name).
 fn cgroup_unit_and_file(path: &str) -> Option<(&str, &str)> {
-    let segments: Vec<&str> = path
-        .split('/')
-        .filter(|segment| !segment.is_empty() && *segment != ".")
-        .collect();
-    let rest = if path.starts_with('/') {
-        segments.strip_prefix(&["sys", "fs", "cgroup"][..])?
-    } else {
-        &segments[..]
-    };
-    let [.., unit, file] = rest else {
+    let mut segments: Vec<&str> = Vec::new();
+    for segment in path.split('/').filter(|s| !s.is_empty() && *s != ".") {
+        if segment == ".." {
+            segments.pop();
+        } else {
+            segments.push(segment);
+        }
+    }
+    let [.., unit, file] = &segments[..] else {
         return None;
     };
     Some((unit.strip_suffix(".service")?, file))
 }
 
-/// T1562.001 — a write-intent open of `memory.max`, `memory.high`, `cgroup.freeze` or `pids.max`
+/// T1562.001 — a write-intent open of `memory.max`, `memory.high`, `cgroup.freeze`, `pids.max` or `cpu.max`
 /// (or the cgroup v1 equivalents) in the cgroup of a listed unit: `echo 1M >
 /// /sys/fs/cgroup/system.slice/auditd.service/memory.max`. The kernel then OOM-kills or freezes
 /// the tool with no signal the probe reports (<https://github.com/synthaea-lab/agent/issues/49>).
 ///
-/// **The Linux probe does not deliver the canonical path yet**: `is_filtered_path` drops a path
-/// that *starts with* `/sys/`, so `/sys/fs/cgroup/...` never leaves the kernel, while a
-/// relative path or one written `//sys/...` passes the filter and is read here
-/// ([`cgroup_unit_and_file`]; not measured on a VM that these forms leave the probe). For the
-/// canonical path the rule is the contract of the probe change in ADR-0046 and fires for any
-/// source that reports such an open. Pid 1 is skipped: the manager writes these files when
+/// The Linux open probe passes a write-intent open of such a file under `/sys/`
+/// (`is_cgroup_limit_write` in `sensor-linux-wire`: a tail match with no `/sys/fs/cgroup/` prefix test,
+/// a little wider than this list,
+/// since the probe cannot know the listed units); the filter is unit-tested and was run on Fedora
+/// 43 (kernel 7.2.9) and Rocky 9.8 (5.14). A relative path or one written `//sys/...` also reaches the rule
+/// ([`cgroup_unit_and_file`]). The rule fires for any source that reports such an open. Pid 1 is skipped: the manager writes these files when
 /// it starts a unit that has a configured limit, and when it carries out `systemctl
 /// set-property` and `freeze`, which `check_security_tool_throttle` reads from the exec.
 /// Medium.

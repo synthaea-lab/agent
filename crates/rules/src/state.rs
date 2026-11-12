@@ -1147,6 +1147,7 @@ impl RuleState {
     /// #82's write-volume corroboration).
     pub fn on_file_rename(&mut self, event: &FileRenameEvent) -> Vec<Alert> {
         self.downloads.record_motw_stream_rename(event);
+        self.downloads.on_browser_download_rename(event);
         let mut alerts = self.impact.on_file_rename(event, &self.pid_image_path);
         self.note_t1486(&event.meta, &mut alerts);
         alerts

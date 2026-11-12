@@ -14,9 +14,10 @@ use updater::{
     key::{CONTENT_PUBLIC_KEY, RECOVERY_PUBLIC_KEY, RELEASE_PUBLIC_KEY, SYNTHAEA_UPDATER_TEST_KEY},
 };
 
-/// Any keypair will do: the point is that a build with no key refuses to look at the
-/// signature at all, so even a manifest signed by a well-formed key is not "invalid", the
-/// build just has nothing to verify against.
+/// The public test seed, which anyone can read in `crates/updater/src/key.rs`. The committed keys
+/// are not derived from it, so a packaged build must refuse what it signs (the fail-closed
+/// `SigningKeyUnprovisioned` path, for a key file that says `unprovisioned`, is covered by the
+/// tests below that pass `None` to `verify_signature_with`, and by the snapshot and rotation unit tests).
 fn some_key_pair() -> Ed25519KeyPair {
     Ed25519KeyPair::from_seed_unchecked(&[0x42; 32]).unwrap()
 }
@@ -27,28 +28,59 @@ fn a_build_without_the_test_key_feature_does_not_claim_the_test_set() {
     assert!(!std::hint::black_box(SYNTHAEA_UPDATER_TEST_KEY));
 }
 
-#[test]
-fn a_build_without_the_test_key_feature_embeds_no_key_while_the_key_files_are_unprovisioned() {
-    // Fails the day the real keys are committed under `crates/updater/keys/`: that is the
-    // moment to replace this with a check that the embedded keys are the committed ones and
-    // that the three roles differ.
-    assert_eq!(*RELEASE_PUBLIC_KEY, None);
-    assert_eq!(*CONTENT_PUBLIC_KEY, None);
-    assert_eq!(*RECOVERY_PUBLIC_KEY, None);
+/// The first non-comment line of a committed key file, as `parse_key_file` reads it.
+fn committed(file: &str) -> String {
+    let text =
+        std::fs::read_to_string(format!("{}/keys/{file}.pub", env!("CARGO_MANIFEST_DIR"))).unwrap();
+    text.lines()
+        .map(str::trim)
+        .find(|l| !l.is_empty() && !l.starts_with('#'))
+        .unwrap()
+        .to_owned()
+}
+
+fn hex(key: &Option<[u8; 32]>) -> Option<String> {
+    key.map(|k| k.iter().map(|b| format!("{b:02x}")).collect())
 }
 
 #[test]
-fn a_release_manifest_is_refused_as_unprovisioned_when_no_key_is_embedded() {
+fn a_build_without_the_test_key_feature_embeds_exactly_the_committed_keys() {
+    // A file that says `unprovisioned` embeds no key; a file that holds a key embeds that key
+    // and nothing else. The three roles must differ (ADR-0027: a content signer must not be
+    // able to sign releases).
+    for (file, embedded) in [
+        ("release", &*RELEASE_PUBLIC_KEY),
+        ("content", &*CONTENT_PUBLIC_KEY),
+        ("recovery", &*RECOVERY_PUBLIC_KEY),
+    ] {
+        let line = committed(file);
+        let expected = (line != "unprovisioned").then_some(line);
+        assert_eq!(hex(embedded), expected, "{file}");
+    }
+    let keys = [
+        *RELEASE_PUBLIC_KEY,
+        *CONTENT_PUBLIC_KEY,
+        *RECOVERY_PUBLIC_KEY,
+    ];
+    for (i, a) in keys.iter().enumerate() {
+        for b in &keys[i + 1..] {
+            assert!(a.is_none() || a != b, "two roles share one key");
+        }
+    }
+}
+
+#[test]
+fn a_release_manifest_signed_by_the_public_test_seed_is_refused() {
     let mut manifest = ReleaseManifest::new(2, BTreeMap::new());
     manifest.sign(&some_key_pair());
     assert!(matches!(
         manifest.verify_signature(),
-        Err(UpdaterError::SigningKeyUnprovisioned)
+        Err(UpdaterError::SignatureInvalid)
     ));
 }
 
 #[test]
-fn a_content_manifest_is_refused_as_unprovisioned_when_no_key_is_embedded() {
+fn a_content_manifest_signed_by_the_public_test_seed_is_refused() {
     let mut manifest = ContentManifest {
         entries: Vec::new(),
         release_version: 2,
@@ -60,12 +92,12 @@ fn a_content_manifest_is_refused_as_unprovisioned_when_no_key_is_embedded() {
     manifest.sign(&some_key_pair());
     assert!(matches!(
         manifest.verify_signature(),
-        Err(UpdaterError::SigningKeyUnprovisioned)
+        Err(UpdaterError::SignatureInvalid)
     ));
 }
 
 #[test]
-fn a_key_rotation_is_refused_as_unprovisioned_when_no_recovery_key_is_embedded() {
+fn a_key_rotation_signed_by_a_test_recovery_seed_is_refused() {
     use updater::{KeyRotationManifest, rotation::ROTATION_SCHEMA_VERSION};
 
     let mut rotation = KeyRotationManifest {
@@ -86,6 +118,31 @@ fn a_key_rotation_is_refused_as_unprovisioned_when_no_recovery_key_is_embedded()
         .unwrap();
     assert!(matches!(
         rotation.verify_signature(),
+        Err(UpdaterError::SignatureInvalid)
+    ));
+}
+
+#[test]
+fn a_release_or_content_manifest_is_refused_as_unprovisioned_when_its_key_file_says_so() {
+    // What `release.pub` / `content.pub` containing `unprovisioned` makes of the static: `None`.
+    let mut release = ReleaseManifest::new(2, BTreeMap::new());
+    release.sign(&some_key_pair());
+    assert!(matches!(
+        release.verify_signature_with(None),
+        Err(UpdaterError::SigningKeyUnprovisioned)
+    ));
+
+    let mut content = ContentManifest {
+        entries: Vec::new(),
+        release_version: 2,
+        released_at: "2026-10-12T00:00:00Z".into(),
+        ring: "prod".into(),
+        schema_version: CONTENT_MANIFEST_SCHEMA_VERSION,
+        signature: String::new(),
+    };
+    content.sign(&some_key_pair());
+    assert!(matches!(
+        content.verify_signature_with(None),
         Err(UpdaterError::SigningKeyUnprovisioned)
     ));
 }
