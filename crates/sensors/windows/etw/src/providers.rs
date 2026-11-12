@@ -146,10 +146,10 @@ pub(crate) const ALL_PROVIDERS: [(&str, &str); 14] = [
 const KERNEL_PROCESS_KEYWORDS: u64 = 0x10 | 0x20 | 0x40 | 0x4000;
 
 /// A provider enabled for the `event_ids` its callback handles. ETW drops every other id
-/// before delivery (an event-id filter, honored from Windows 8.1); `keywords`, where the
-/// manifest has keywords that isolate those ids, stops the provider writing the rest at all.
-/// `None` enables every keyword. Callbacks still check the id, so a filter the OS ignores
-/// changes nothing. See `docs/sensors/windows/etw.md#providers`.
+/// before delivery (`EVENT_FILTER_TYPE_EVENT_ID`: Windows 8.1 / Server 2012 R2 and later;
+/// older systems reject it and the session does not start). `keywords`, where the manifest
+/// has keywords that isolate those ids, stops the provider writing the rest at all; `None`
+/// enables every keyword. See `docs/sensors/windows/etw.md#providers`.
 fn enabled_for(guid: &str, keywords: Option<u64>, event_ids: &[u16]) -> ProviderBuilder {
     let provider = Provider::by_guid(guid).add_filter(EventFilter::ByEventIds(event_ids.to_vec()));
     match keywords {

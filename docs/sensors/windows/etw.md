@@ -46,10 +46,10 @@ Named ETW sessions are kernel objects. They outlive the process that created the
 
 All providers are enabled on the one session, each for the event ids its callback handles ([`enabled_for`](../../../crates/sensors/windows/etw/src/providers.rs)), in two layers:
 
-- **Event-id filter** ("Event IDs kept"): ETW drops every other id before delivery (`EVENT_FILTER_TYPE_EVENT_ID`, Windows 8.1+). It is the same list the callback checks, so it changes no output; a filter the OS ignores only costs the delivery it was meant to save.
+- **Event-id filter** ("Event IDs kept"): ETW drops every other id before delivery (`EVENT_FILTER_TYPE_EVENT_ID`). It is the same list the callback checks, so it changes no output. It needs Windows 8.1 / Server 2012 R2 or later: an older system rejects the filter in `EnableTraceEx2` and the session does not start, so the sensor reports itself failed rather than running unfiltered.
 - **Keyword mask** ("Keywords", match-any): where the manifest has a keyword that isolates the kept ids, the provider is not asked for anything else, so it does not even write the rest. This matters most for DotNETRuntime, whose other keywords (GC, JIT, stacks) make every .NET process on the host do work. "none isolates" means the kept ids carry only their channel's keyword bit, so all keywords stay enabled and the id filter does the work.
 
-Keyword values come from the installed manifests (`Get-WinEvent -ListProvider <name>`, Windows 11 26300, 2026-11-12). The `#[ignore]` real-session tests under [Testing](#testing) check them against a live session.
+Keyword values come from the installed manifests (`Get-WinEvent -ListProvider <name>`, Windows 11 26300, 2026-11-12). A wrong mask is the one way this can lose events, silently. The `#[ignore]` real-session tests under [Testing](#testing) check the masks against a live session; their runs are reported on [#253](https://github.com/synthaea-lab/agent/pull/253), and Kernel-Network, PowerShell, AMSI and LDAP masks have no live check yet ([#91](https://github.com/synthaea-lab/agent/issues/91)).
 
 | Provider | Keywords | Event IDs kept | Emits | Volume control |
 | --- | --- | --- | --- | --- |
