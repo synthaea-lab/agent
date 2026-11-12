@@ -251,9 +251,9 @@ UNVERIFIED_NOTES = [
     "(https://github.com/synthaea-lab/agent/issues/17).",
     "T1204.002 on Linux joins a browser download through the rename of its partial "
     "file (`.crdownload`, `.opdownload`, `.part`), by the renaming process's `executable_path`; "
-    "verified once, on Fedora 43 packages (Chromium 156, Firefox 159, headed under "
-    "Xvfb, profile without a download dialog). **Not verified:** other browsers "
-    "(Chrome, Edge, Brave, Opera, Vivaldi, Firefox ESR) until their image path is "
+    "verified once, on a Fedora 43 lab VM (Chromium 156, Firefox 159, Chrome 157, Edge, "
+    "Brave 1.99, Opera, Vivaldi 8.3, headed under Xvfb, profile without a download "
+    "dialog). **Not verified:** Firefox ESR and other distributions' image paths until "
     "captured, so they raise nothing; Flatpak and Snap installs (other image "
     "paths); a Wayland session; a download through a Save-as dialog; a same-device "
     "Chromium rename (the capture's `/tmp` rename failed with `EXDEV`); a download "

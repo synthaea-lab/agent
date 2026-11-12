@@ -9,6 +9,7 @@ use crate::{Alert, ImageSignature, RuleState, exclusions::QUARANTINE_EXEC_WINDOW
 
 const CHROMIUM: &str = "/usr/lib64/chromium-browser/chromium-browser";
 const FIREFOX: &str = "/usr/lib64/firefox/firefox";
+const OPERA: &str = "/usr/lib64/opera-stable/opera";
 const FINAL: &str = "/home/u/Downloads/test.bin";
 
 fn rename(old: &str, new: &str, image: Option<&str>, timestamp_ns: u64) -> FileRenameEvent {
@@ -71,18 +72,43 @@ fn firefox_part_rename_then_exec_alerts() {
 #[test]
 fn an_opdownload_rename_is_a_finished_download() {
     // Opera's partial suffix (lab capture 2026-11-10, with and without a Save-as dialog:
-    // `saved.bin.opdownload -> saved.bin`). Opera's own image is not in
-    // `BROWSER_DOWNLOAD_IMAGES` yet, so a listed image stands in: this pins the suffix.
+    // `saved.bin.opdownload -> saved.bin`), by Opera's own image.
     let mut state = RuleState::new();
     state.on_file_rename(&rename(
         "/home/u/Downloads/test.bin.opdownload",
         FINAL,
-        Some(CHROMIUM),
+        Some(OPERA),
         0,
     ));
     let alerts = exec(&mut state, &run(FINAL, 1));
     assert_eq!(alerts.len(), 1);
     assert_eq!(alerts[0].technique, "T1204.002");
+    assert!(alerts[0].message.contains("marked by opera"));
+}
+
+#[test]
+fn every_captured_browser_image_marks_a_finished_download() {
+    // (image, partial suffix) as the 2026-11-10 captures showed them.
+    for (image, suffix) in [
+        (CHROMIUM, ".crdownload"),
+        (FIREFOX, ".part"),
+        ("/opt/google/chrome/chrome", ".crdownload"),
+        ("/opt/microsoft/msedge/msedge", ".crdownload"),
+        ("/opt/brave.com/brave/brave", ".crdownload"),
+        (OPERA, ".opdownload"),
+        ("/opt/vivaldi/vivaldi-bin", ".crdownload"),
+    ] {
+        let mut state = RuleState::new();
+        state.on_file_rename(&rename(
+            &format!("/home/u/Downloads/test.bin{suffix}"),
+            FINAL,
+            Some(image),
+            0,
+        ));
+        let alerts = exec(&mut state, &run(FINAL, 1));
+        assert_eq!(alerts.len(), 1, "{image}");
+        assert_eq!(alerts[0].technique, "T1204.002", "{image}");
+    }
 }
 
 #[test]

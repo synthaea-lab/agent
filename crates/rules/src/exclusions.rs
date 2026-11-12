@@ -93,13 +93,19 @@ pub(crate) const MAIL_CLIENT_QUARANTINE_AGENTS: &[&str] = &["Mail"];
 /// event's `executable_path`, compared exactly (Linux paths are case-sensitive). The one
 /// place to add a browser: one line per image.
 ///
-/// Only what a lab capture showed (2026-11-10, Fedora 43 packages: Chromium 156, Firefox
-/// 159). Chrome, Edge, Brave, Opera, Vivaldi, Firefox ESR and the Flatpak/Snap paths are
-/// not here until a capture reports their image. `comm` is useless as the key: the rename
+/// Only what a lab capture showed (2026-11-10, Fedora 43 lab VM, vendor packages: Chromium
+/// 156, Firefox 159, Chrome 157, Edge, Brave 1.99, Opera, Vivaldi 8.3). Firefox ESR (a tarball
+/// path that depends on where it is unpacked), other distributions' paths and the
+/// Flatpak/Snap paths are not here until a capture reports their image. `comm` is useless as the key: the rename
 /// runs on a thread-pool worker (`ThreadPoolForeg`, `BgIOThr~Pool #N`).
 pub(crate) const BROWSER_DOWNLOAD_IMAGES: &[&str] = &[
     "/usr/lib64/chromium-browser/chromium-browser",
     "/usr/lib64/firefox/firefox",
+    "/opt/google/chrome/chrome",
+    "/opt/microsoft/msedge/msedge",
+    "/opt/brave.com/brave/brave",
+    "/usr/lib64/opera-stable/opera",
+    "/opt/vivaldi/vivaldi-bin",
 ];
 
 /// Suffixes of a browser's partial download file. A rename out of one of these, to a name

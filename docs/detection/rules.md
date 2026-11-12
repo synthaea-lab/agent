@@ -222,8 +222,11 @@ same signature gate applies.
   in Chromium, `BgIOThr~Pool #N` in Firefox).
 - Chromium's first rename (`/tmp/... -> .crdownload`, `EXDEV` across devices) and cache renames
   have no partial-suffix `old_path` and mark nothing.
-- Adding a browser is one line in `BROWSER_DOWNLOAD_IMAGES`. It holds only the two images a
-  capture showed (`/usr/lib64/chromium-browser/chromium-browser`, `/usr/lib64/firefox/firefox`).
+- Adding a browser is one line in `BROWSER_DOWNLOAD_IMAGES`. It holds only the images a capture
+  showed (2026-11-10, Fedora 43 lab VM): Chromium and Firefox from the distribution packages,
+  and the vendor packages of Chrome (`/opt/google/chrome/chrome`), Edge
+  (`/opt/microsoft/msedge/msedge`), Brave (`/opt/brave.com/brave/brave`), Opera
+  (`/usr/lib64/opera-stable/opera`) and Vivaldi (`/opt/vivaldi/vivaldi-bin`).
 - An empty or absent `executable_path` marks nothing. What is still unchecked is listed under
   "Not verified" in [attack-coverage.md](../attack-coverage.md).
 
