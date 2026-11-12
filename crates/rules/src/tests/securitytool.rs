@@ -458,6 +458,47 @@ fn a_cpu_quota_that_starves_a_listed_tool_alerts_medium() {
 }
 
 #[test]
+fn a_machine_or_host_option_before_the_verb_does_not_hide_the_command() {
+    // `-M host` and `-H host` take the next argument as a value: it is not the verb (#246).
+    // The command is still read, because `-M .host` and `-H localhost` reach this host.
+    for command in [
+        "systemctl -M host set-property auditd CPUQuota=1%",
+        "systemctl -H host set-property auditd CPUQuota=1%",
+        "systemctl --machine host set-property auditd CPUQuota=1%",
+        "systemctl --host host set-property auditd CPUQuota=1%",
+        "systemctl --mac host set-property auditd CPUQuota=1%",
+        "systemctl --ho host set-property auditd CPUQuota=1%",
+        "systemctl -M .host --runtime set-property auditd CPUQuota=1%",
+        // the attached forms were never read as a verb
+        "systemctl --machine=host set-property auditd CPUQuota=1%",
+        "systemctl -Mhost set-property auditd CPUQuota=1%",
+        "systemctl --host=host set-property auditd CPUQuota=1%",
+    ] {
+        let alerts = throttle_alerts(command);
+        assert_eq!(alerts.len(), 1, "{command}: {alerts:?}");
+        assert!(alerts[0].message.contains("auditd"), "{command}");
+    }
+    for command in [
+        "systemctl -M host freeze auditd",
+        "systemctl --host host set-property auditd MemoryMax=1M",
+    ] {
+        assert_eq!(throttle_alerts(command).len(), 1, "{command}");
+    }
+}
+
+#[test]
+fn an_ambiguous_long_option_prefix_does_not_swallow_the_verb() {
+    // `--ma` is ambiguous (machine, marked) and `--h` too (help, host): systemctl rejects
+    // them, so the next argument is not a value and the verb stays the first positional one.
+    for command in [
+        "systemctl --ma set-property auditd CPUQuota=1%",
+        "systemctl --h set-property auditd CPUQuota=1%",
+    ] {
+        assert_eq!(throttle_alerts(command).len(), 1, "{command}");
+    }
+}
+
+#[test]
 fn a_cpu_quota_that_only_tunes_a_tool_or_lifts_one_does_not_alert() {
     for command in [
         "systemctl set-property auditd CPUQuota=10%",

@@ -247,7 +247,9 @@ at the agent, and the restarted agent reports the sender through a rule. Under t
 audit fallback sensor that gap remains. Kernel-mediated stops that involve no signal
 from a process (a CPU rlimit, a cgroup memory limit, `cgroup.freeze`) are read from the
 command that causes them: `systemctl freeze|set-property` (a memory or task limit, or a
-`CPUQuota` below 10 %, in `%`, `‰` or `‱`) on a listed tool is Medium, and
+`CPUQuota` below 10 %, in `%`, `‰` or `‱`) on a listed tool is Medium, also after `-M`, `-H`,
+`--machine` or `--host` and their value (the command is read, not skipped: `-M .host` and
+`-H localhost` reach this host), and
 `prlimit --pid <pid> --cpu|--as` (`--pid` may be abbreviated to `--p` or `--pi`) is Medium when
 the pid is a listed tool (comm or image name, from what the rules recorded or from `/proc`) and
 Low otherwise.

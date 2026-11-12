@@ -112,7 +112,7 @@ fn cpu_quota_starves(value: &str) -> bool {
 /// or a `CPUQuota` that [`cpu_quota_starves`].
 /// Lowercase unit names, without `.service`.
 fn cgroup_squeeze(args: &[String]) -> Option<(&'static str, Vec<String>)> {
-    let mut positional = args.iter().filter(|a| !a.starts_with('-'));
+    let mut positional = positional_arguments(args).into_iter();
     let verb = positional.next()?;
     match verb.as_str() {
         "freeze" => Some((
@@ -131,6 +131,40 @@ fn cgroup_squeeze(args: &[String]) -> Option<(&'static str, Vec<String>)> {
             limits.then(|| ("set-property limit", vec![unit_base(unit)]))
         }
         _ => None,
+    }
+}
+
+/// The arguments of a `systemctl` exec that are not options, in order. `-M`/`--machine` and
+/// `-H`/`--host` take their value as the next argument (`systemctl -M host set-property ...`):
+/// that value is not the verb. The command is still read, not skipped: `-M .host` and
+/// `-H localhost` reach the local host, so a command line that names a target cannot be told
+/// from a local one, and an alert on a remote host's tool is the safer error. The long names
+/// are matched as `getopt_long` does, by any unambiguous prefix (`--mac` and `--ho`; `--ma`
+/// is ambiguous with `--marked`, and `--h` with `--help`).
+fn positional_arguments(args: &[String]) -> Vec<&String> {
+    let mut out = Vec::new();
+    let mut iter = args.iter();
+    while let Some(arg) = iter.next() {
+        if !arg.starts_with('-') {
+            out.push(arg);
+        } else if takes_separate_target(arg) {
+            iter.next();
+        }
+    }
+    out
+}
+
+/// Whether `arg` is `-M`, `-H` or a long form of `--machine`/`--host` with no `=`: its value is
+/// the next argument. The arguments are lowercased before they get here, so the short forms are
+/// `-m` and `-h` (a lone `-h` is `--help` in a real command line, which never precedes a verb).
+fn takes_separate_target(arg: &str) -> bool {
+    match arg {
+        "-m" | "-h" => true,
+        _ => arg.strip_prefix("--").is_some_and(|name| {
+            !name.contains('=')
+                && (("machine".starts_with(name) && name.len() >= 3)
+                    || ("host".starts_with(name) && name.len() >= 2))
+        }),
     }
 }
 
