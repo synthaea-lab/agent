@@ -614,7 +614,7 @@ impl DetectionSink {
         );
         // This event moved the stream clock: a queued unit stop may be due (#1085).
         self.record_due_unit_stops();
-        if event.flags & 0o103 != 0
+        if rules::has_write_intent(event.flags)
             && let Some((yara, _)) = self.yara.lock_recovering().as_ref()
         {
             let meta = wrapped.meta();

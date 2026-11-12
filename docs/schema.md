@@ -171,7 +171,8 @@ kernel does: `O_WRONLY` or `O_RDWR`, or `O_CREAT` or `O_TRUNC` with any mode
 [#233](https://github.com/synthaea-lab/agent/issues/233)). `0o3` is not
 write intent, because `open(2)` refuses it with `EINVAL`. Counting it would let
 deliberately failing opens inflate write counters. The Python feature code
-mirrors this predicate and is tested against the same fixtures.
+mirrors this predicate; [ml#52](https://github.com/synthaea-lab/ml/pull/52)
+adds the `O_TRUNC` case to it and the shared fixtures both sides test against.
 
 The high bits of `flags` carry **synthetic flags**. Some userspace sensors report
 an OS record as a `FileOpenEvent` instead of adding a new variant. The Windows
