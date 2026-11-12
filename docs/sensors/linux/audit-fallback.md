@@ -52,7 +52,9 @@ without `scontext` and `tclass` is skipped.
 `AuditSensor` runs a current-thread tokio runtime with the socket in an `AsyncFd`. Readiness is
 edge-triggered, so each wake-up drains up to `DRAIN_BUDGET` (256) records, about 36 execs at seven
 records each, and leaves readiness set if the budget ran out. The socket asks for an 8 MiB receive
-buffer (`SO_RCVBUFFORCE`, else `SO_RCVBUF`) and logs what the kernel granted: the default held fewer
+buffer and logs what the kernel granted. `SO_RCVBUFFORCE` needs `CAP_NET_ADMIN`, which the packaged
+unit grants as an ambient capability; without it, `SO_RCVBUF` is capped at `net.core.rmem_max` and the
+agent warns. The default held fewer
 than ten execs with a long argument, so a burst of them was mostly dropped
 ([#237](https://github.com/synthaea-lab/agent/issues/237)). Records are read into a 64 KiB buffer; a
 longer one is parsed cut and counted. Errors are handled per kind:

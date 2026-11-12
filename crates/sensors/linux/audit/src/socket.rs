@@ -93,10 +93,19 @@ impl AuditSocket {
         }
 
         match grow_receive_buffer(fd, SOCKET_RECEIVE_BYTES) {
-            Some(granted) => tracing::info!(
+            // The kernel reports twice what it accepted, so a full grant reads `2 * requested`.
+            Some(granted) if granted >= SOCKET_RECEIVE_BYTES.saturating_mul(2) => tracing::info!(
                 requested = SOCKET_RECEIVE_BYTES,
                 granted,
                 "sensor-linux-audit: socket receive buffer"
+            ),
+            // Without CAP_NET_ADMIN, SO_RCVBUF is capped at `net.core.rmem_max`, and the
+            // burst loss of #237 comes back on a host that keeps that limit low.
+            Some(granted) => tracing::warn!(
+                requested = SOCKET_RECEIVE_BYTES,
+                granted,
+                "sensor-linux-audit: socket receive buffer capped by net.core.rmem_max (no \
+                 CAP_NET_ADMIN for SO_RCVBUFFORCE); bursts of long execs may be dropped"
             ),
             // Not fatal: the socket works at the default size, it only drops more under a burst.
             None => tracing::warn!(
@@ -144,8 +153,9 @@ impl AuditSocket {
     }
 }
 
-/// Raises `fd`'s receive buffer to `bytes`: `SO_RCVBUFFORCE` first, which root may use
-/// past `net.core.rmem_max`, else `SO_RCVBUF`, which the kernel caps there. Returns
+/// Raises `fd`'s receive buffer to `bytes`: `SO_RCVBUFFORCE` first, which a process with
+/// `CAP_NET_ADMIN` may use past `net.core.rmem_max` (the packaged unit grants it as an
+/// ambient capability; root has it), else `SO_RCVBUF`, which the kernel caps there. Returns
 /// the size the kernel reports afterwards (it doubles the request for bookkeeping), or
 /// `None` if neither call took.
 fn grow_receive_buffer(fd: RawFd, bytes: usize) -> Option<usize> {
@@ -262,30 +272,48 @@ mod tests {
         );
     }
 
-    #[test]
-    fn the_receive_buffer_grows_past_the_default() {
-        // Unprivileged, SO_RCVBUFFORCE fails and SO_RCVBUF is capped at rmem_max; as
-        // root the force call takes. Either way the buffer must not stay at the default.
-        let (_writer, reader) = datagram_pair();
-        let fd = reader.as_raw_fd();
-        let mut before: libc::c_int = 0;
-        let mut len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
-        // SAFETY: getsockopt(2) into a local c_int whose size `len` holds.
+    /// `net.core.rmem_max`, the cap `SO_RCVBUF` applies without `CAP_NET_ADMIN`.
+    fn rmem_max() -> usize {
+        std::fs::read_to_string("/proc/sys/net/core/rmem_max")
+            .expect("read rmem_max")
+            .trim()
+            .parse()
+            .expect("rmem_max is a number")
+    }
+
+    /// Whether this process may use `SO_RCVBUFFORCE`, asked of a throwaway socket so the
+    /// answer does not depend on the code under test.
+    fn may_force_receive_buffer() -> bool {
+        let (_writer, probe) = datagram_pair();
+        let size: libc::c_int = 4096;
+        // SAFETY: setsockopt(2) on a socket this function owns, with a pointer to a local
+        // c_int and its exact size.
         let ret = unsafe {
-            libc::getsockopt(
-                fd,
+            libc::setsockopt(
+                probe.as_raw_fd(),
                 libc::SOL_SOCKET,
-                libc::SO_RCVBUF,
-                std::ptr::addr_of_mut!(before).cast(),
-                &raw mut len,
+                libc::SO_RCVBUFFORCE,
+                std::ptr::addr_of!(size).cast(),
+                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
             )
         };
-        assert_eq!(ret, 0);
-        let granted = grow_receive_buffer(fd, SOCKET_RECEIVE_BYTES).expect("SO_RCVBUF takes");
-        assert!(
-            granted >= usize::try_from(before).unwrap_or(0),
-            "granted {granted} < default {before}"
-        );
+        ret == 0
+    }
+
+    #[test]
+    fn the_receive_buffer_is_sized_to_the_request_or_the_rmem_max_cap() {
+        // The kernel stores twice the accepted size. With CAP_NET_ADMIN the force call
+        // takes the whole request; without it SO_RCVBUF takes at most rmem_max. Leaving
+        // the buffer at its default (the #237 bug) matches neither.
+        let (_writer, reader) = datagram_pair();
+        let accepted = if may_force_receive_buffer() {
+            SOCKET_RECEIVE_BYTES
+        } else {
+            SOCKET_RECEIVE_BYTES.min(rmem_max())
+        };
+        let granted =
+            grow_receive_buffer(reader.as_raw_fd(), SOCKET_RECEIVE_BYTES).expect("SO_RCVBUF takes");
+        assert_eq!(granted, 2 * accepted);
     }
 
     #[test]
