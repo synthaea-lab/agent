@@ -83,14 +83,26 @@ const LIMIT_PROPERTIES: &[&str] = &["memorymax", "memoryhigh", "tasksmax"];
 /// and a quota just above it starves the tool as well.
 const CPU_QUOTA_STARVE_BELOW_PERCENT: f64 = 10.0;
 
-/// Whether the value of `CPUQuota=` is a percentage below [`CPU_QUOTA_STARVE_BELOW_PERCENT`].
-/// An empty value lifts the quota, and a value without `%` is not one systemd accepts: neither
-/// alerts. `0%` is read by systemd as an invalid quota too, but a zero is still a starving one.
+/// Whether the value of `CPUQuota=` is below [`CPU_QUOTA_STARVE_BELOW_PERCENT`] percent of one
+/// CPU. systemd reads the value as a per-myriad number, so `%`, `‰` (per mille, a tenth of a
+/// percent) and `‱` (per ten thousand, a hundredth) all set the same quota: `5%`, `50‰` and
+/// `500‱` are one 5% quota. An empty value lifts the quota, and a value with none of these
+/// suffixes is not one systemd accepts: neither alerts. `0%` is read by systemd as an invalid
+/// quota too, but a zero is still a starving one.
 fn cpu_quota_starves(value: &str) -> bool {
-    value
-        .strip_suffix('%')
-        .and_then(|percent| percent.parse::<f64>().ok())
-        .is_some_and(|percent| percent < CPU_QUOTA_STARVE_BELOW_PERCENT)
+    let (number, divisor) = if let Some(number) = value.strip_suffix('%') {
+        (number, 1.0)
+    } else if let Some(number) = value.strip_suffix('\u{2030}') {
+        (number, 10.0)
+    } else if let Some(number) = value.strip_suffix('\u{2031}') {
+        (number, 100.0)
+    } else {
+        return false;
+    };
+    number
+        .parse::<f64>()
+        .ok()
+        .is_some_and(|quota| quota / divisor < CPU_QUOTA_STARVE_BELOW_PERCENT)
 }
 
 /// What a `systemctl` exec does to the cgroups of units besides stopping them, and the units:
@@ -303,16 +315,30 @@ pub(crate) fn check_security_tool_prlimit(
     })
 }
 
-/// The pid `prlimit` is told to act on: `--pid N`, `--pid=N`, `-p N`, `-pN` or `-p=N`.
-/// `None` when it is not a number (`prlimit` accepts none other).
+/// Whether `name` (the part of a long option after `--` and before any `=`) is the `pid` option
+/// of `prlimit`: `getopt_long` accepts any non-empty prefix of a long option that no other one
+/// shares, and `pid` is the only long option of util-linux `prlimit` starting with `p`, so `--p`,
+/// `--pi` and `--pid` all name it (live, on util-linux 2.38: `prlimit --pi=N --cpu=…` sets the
+/// limit).
+fn is_pid_long_option(name: &str) -> bool {
+    !name.is_empty() && "pid".starts_with(name)
+}
+
+/// The pid `prlimit` is told to act on: `--pid N`, `--pid=N` (or any prefix of `--pid`:
+/// `--p N`, `--pi=N`), `-p N`, `-pN` or `-p=N`. `None` when it is not a number (`prlimit`
+/// accepts none other).
 fn prlimit_target_pid(args: &[String]) -> Option<u32> {
     let mut iter = args.iter();
     while let Some(arg) = iter.next() {
-        let value = if arg == "--pid" || arg == "-p" {
+        let value = if let Some(long) = arg.strip_prefix("--") {
+            match long.split_once('=') {
+                Some((name, value)) if is_pid_long_option(name) => Some(value),
+                None if is_pid_long_option(long) => iter.next().map(String::as_str),
+                _ => continue,
+            }
+        } else if arg == "-p" {
             iter.next().map(String::as_str)
-        } else if let Some(value) = arg.strip_prefix("--pid=") {
-            Some(value)
-        } else if let Some(value) = arg.strip_prefix("-p").filter(|_| !arg.starts_with("--")) {
+        } else if let Some(value) = arg.strip_prefix("-p") {
             Some(value.trim_start_matches('='))
         } else {
             continue;
@@ -330,8 +356,9 @@ fn prlimit_target_pid(args: &[String]) -> Option<u32> {
 /// read. That is the
 /// argv-reading limit of ADR-0006.
 fn prlimit_sets_cpu_or_as_on_a_pid(args: &[String]) -> bool {
-    let names_pid = args.iter().any(|a| {
-        a == "--pid" || a.starts_with("--pid=") || (a.starts_with("-p") && !a.starts_with("--"))
+    let names_pid = args.iter().any(|a| match a.strip_prefix("--") {
+        Some(long) => is_pid_long_option(long.split_once('=').map_or(long, |(name, _)| name)),
+        None => a.starts_with("-p"),
     });
     let sets = args.iter().any(|a| {
         if let Some(long) = a.strip_prefix("--") {

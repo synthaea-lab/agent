@@ -247,8 +247,10 @@ at the agent, and the restarted agent reports the sender through a rule. Under t
 audit fallback sensor that gap remains. Kernel-mediated stops that involve no signal
 from a process (a CPU rlimit, a cgroup memory limit, `cgroup.freeze`) are read from the
 command that causes them: `systemctl freeze|set-property` (a memory or task limit, or a
-`CPUQuota` below 10 %) on a listed tool is Medium, and `prlimit --pid <pid> --cpu|--as` is
-Medium when the pid is a listed tool the rules know (comm or image name) and Low otherwise.
+`CPUQuota` below 10 %, in `%`, `‰` or `‱`) on a listed tool is Medium, and
+`prlimit --pid <pid> --cpu|--as` (`--pid` may be abbreviated to `--p` or `--pi`) is Medium when
+the pid is a listed tool (comm or image name, from what the rules recorded or from `/proc`) and
+Low otherwise.
 A direct write to a cgroup control file and the memcg OOM kill raise nothing, because no
 event reaches the rules for them ([#49](https://github.com/synthaea-lab/agent/issues/49)). The full
 mask-wait-exit flow is not unit-tested because it terminates the test runner; only the

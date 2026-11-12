@@ -327,26 +327,37 @@ impl RuleState {
             .map(|s| s.trim_end().to_string())
     }
 
-    /// What the rules know a pid is called: its comm (`resolve_comm`) and the basename of its
-    /// image path (the comm is cut to 15 bytes). For the target of `prlimit`, where no event
-    /// names the incarnation, so no generation is compared. Empty when nothing is known.
-    fn names_of_pid(&self, pid: u32) -> Vec<String> {
-        let image = PidFact::current(&self.pid_image_path, pid, None)
-            .map(str::to_owned)
-            .or_else(|| {
-                std::fs::read_link(format!("/proc/{pid}/exe"))
-                    .ok()
-                    .map(|path| path.to_string_lossy().into_owned())
-            })
-            .and_then(|path| {
-                path.rsplit(['/', '\\'])
-                    .next()
-                    .map(|base| base.trim_end_matches(" (deleted)").to_owned())
-            });
-        self.resolve_comm(pid, None)
+    /// What the rules know a pid is called: its comm and the basename of its image path (the
+    /// comm is cut to 15 bytes), **from both sources**: what an exec event recorded and what
+    /// `/proc` says now. For the target of `prlimit`, where no event names the incarnation, so no
+    /// generation is compared. The union, not the first answer: the cache is never cleared when
+    /// a process exits, so a pid reused by a process that never exec'd would otherwise answer
+    /// with the old name, and a target already ended by `--cpu=1:1` has no `/proc` entry left.
+    /// The caller alerts on any of them being a listed tool. Empty when nothing is known.
+    pub(crate) fn names_of_pid(&self, pid: u32) -> Vec<String> {
+        let basename = |path: &str| {
+            path.rsplit(['/', '\\'])
+                .next()
+                .map(|base| base.trim_end_matches(" (deleted)").to_owned())
+        };
+        let cached_comm = PidFact::current(&self.pid_comm, pid, None).map(str::to_owned);
+        let cached_image = PidFact::current(&self.pid_image_path, pid, None).and_then(basename);
+        let live_comm = std::fs::read_to_string(format!("/proc/{pid}/comm"))
+            .ok()
+            .map(|comm| comm.trim_end().to_owned());
+        let live_image = std::fs::read_link(format!("/proc/{pid}/exe"))
+            .ok()
+            .and_then(|path| basename(&path.to_string_lossy()));
+        let mut names: Vec<String> = Vec::new();
+        for name in [cached_comm, cached_image, live_comm, live_image]
             .into_iter()
-            .chain(image)
-            .collect()
+            .flatten()
+        {
+            if !names.contains(&name) {
+                names.push(name);
+            }
+        }
+        names
     }
 
     /// T1059 — a shell executed directly by a web or database service process.
