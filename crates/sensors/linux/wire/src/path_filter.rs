@@ -12,7 +12,9 @@
 //! open (`O_WRONLY`/`O_RDWR`/`O_CREAT`/`O_TRUNC`) or any of
 //! delete/rename/chmod/chown/setxattr/removexattr is the payload lifecycle itself,
 //! and is never dropped there. `/dev/` (minus `/dev/shm/`, handled above) and
-//! `/sys/` are unconditional, unchanged from #325.
+//! `/sys/` are unconditional, unchanged from #325, with one exception: a write-intent open of
+//! a cgroup limit file (`memory.max`, `cgroup.freeze`...) is how a security tool is ended or
+//! frozen without a signal, and passes ([`is_cgroup_limit_write`], #49).
 //!
 //! `/proc/` gets the same intent rule as the tmp family, not the unconditional
 //! drop #429 originally gave it (review on #429/#426): `/proc/<pid>/root/...` is
@@ -116,6 +118,34 @@ fn is_proc_pid_root(path: &[u8]) -> bool {
     matches!(path.get(root_start + ROOT.len()), None | Some(&b'/'))
 }
 
+/// Whether `path` is a write to a cgroup control file that ends, freezes or starves the unit it
+/// sits in (<https://github.com/synthaea-lab/agent/issues/49>): `memory.max`, `memory.high`,
+/// `pids.max` (and any other `*.max`, `cpu.max` included), `cgroup.freeze`, and the cgroup v1
+/// `freezer.state` and `memory.*_in_bytes`.
+///
+/// `echo 1M > .../auditd.service/memory.max` makes the kernel OOM-kill the tool with a
+/// `SEND_SIG_PRIV` signal no probe reports, and `echo 1 > cgroup.freeze` sends no signal at all;
+/// the file open is the only event either leaves. The match is on the path **tail**, fail-open
+/// like [`is_proc_pid_root`]: a few constant compares of at most seven bytes, no loop and no
+/// per-name `memcmp`, because this is inlined into the open program and the verifier budget on
+/// 5.15 is what bounded the earlier versions of this file. It lets through a few files the rule
+/// ignores (`io.max`, `memory.swap.max`); whether the unit is a listed tool is the rule's job
+/// (`check_security_tool_cgroup_write`), the probe cannot know the list.
+///
+/// Only an open with write intent counts, and only `open`/`openat` (`is_mutation` false): the
+/// mutation syscalls never name these files in a way that matters, so for them this folds away
+/// at compile time and costs the other 13 file programs nothing.
+fn is_cgroup_limit_write(path: &[u8], flags: i64, is_mutation: bool) -> bool {
+    if is_mutation || !is_write_intent(flags) || !path.starts_with(b"/sys/fs/cgroup/") {
+        return false;
+    }
+    path.ends_with(b".max")
+        || path.ends_with(b".high")
+        || path.ends_with(b".freeze")
+        || path.ends_with(b".state")
+        || path.ends_with(b"_bytes")
+}
+
 /// Whether a file event on `path` should be dropped before it reaches the ring
 /// buffer. `flags` is the raw `open(2)`/`openat(2)` flags for an open-family event;
 /// pass `0` together with `is_mutation: true` for the mutation-only syscalls
@@ -131,7 +161,9 @@ pub fn is_filtered_path(path: &[u8], flags: i64, is_mutation: bool) -> bool {
         return !(is_mutation || is_write_intent(flags));
     }
     if path.starts_with(b"/sys/") {
-        return true;
+        // Only a write to a cgroup limit file leaves `/sys/` (see `is_cgroup_limit_write`);
+        // every other path under it, and every read, stays dropped.
+        return !is_cgroup_limit_write(path, flags, is_mutation);
     }
     if path.starts_with(b"/dev/shm/")
         || path.starts_with(b"/tmp/")
@@ -265,9 +297,82 @@ mod tests {
     }
 
     #[test]
-    fn sys_is_always_filtered() {
+    fn sys_is_filtered_except_a_cgroup_limit_write() {
         assert!(is_filtered_path(b"/sys/kernel/x", O_WRONLY, false));
         assert!(is_filtered_path(b"/sys/kernel/x", 0, true));
+        assert!(is_filtered_path(
+            b"/sys/class/leds/x/brightness",
+            O_WRONLY,
+            false
+        ));
+    }
+
+    #[test]
+    fn a_write_open_of_a_cgroup_limit_file_passes() {
+        // `echo 1M > memory.max` opens O_WRONLY|O_CREAT|O_TRUNC; a python write is O_WRONLY.
+        for path in [
+            &b"/sys/fs/cgroup/system.slice/auditd.service/memory.max"[..],
+            b"/sys/fs/cgroup/system.slice/auditd.service/memory.high",
+            b"/sys/fs/cgroup/system.slice/auditd.service/pids.max",
+            b"/sys/fs/cgroup/system.slice/auditd.service/cpu.max",
+            b"/sys/fs/cgroup/system.slice/auditd.service/cgroup.freeze",
+            b"/sys/fs/cgroup/freezer/system.slice/auditd.service/freezer.state",
+            b"/sys/fs/cgroup/memory/system.slice/auditd.service/memory.limit_in_bytes",
+            b"/sys/fs/cgroup/memory/system.slice/auditd.service/memory.soft_limit_in_bytes",
+        ] {
+            for flags in [O_WRONLY, O_RDWR, O_WRONLY | O_CREAT | O_TRUNC] {
+                assert!(!is_filtered_path(path, flags, false), "{path:?} {flags:o}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_read_of_a_cgroup_limit_file_stays_filtered() {
+        for path in [
+            &b"/sys/fs/cgroup/system.slice/auditd.service/memory.max"[..],
+            b"/sys/fs/cgroup/system.slice/auditd.service/cgroup.freeze",
+            b"/sys/fs/cgroup/system.slice/auditd.service/pids.max",
+            b"/sys/fs/cgroup/system.slice/auditd.service/memory.events",
+        ] {
+            assert!(is_filtered_path(path, 0, false), "{path:?}");
+        }
+    }
+
+    #[test]
+    fn other_cgroup_writes_stay_filtered() {
+        // systemd moves pids and tunes weights all day: volume, and no stop.
+        for path in [
+            &b"/sys/fs/cgroup/system.slice/auditd.service/cgroup.procs"[..],
+            b"/sys/fs/cgroup/system.slice/auditd.service/cgroup.subtree_control",
+            b"/sys/fs/cgroup/system.slice/auditd.service/cpu.weight",
+            b"/sys/fs/cgroup/system.slice/auditd.service/memory.oom.group",
+            b"/sys/fs/cgroup/system.slice/auditd.service/cgroup.kill",
+        ] {
+            assert!(is_filtered_path(path, O_WRONLY, false), "{path:?}");
+        }
+    }
+
+    #[test]
+    fn a_limit_file_name_outside_the_cgroup_tree_stays_filtered() {
+        assert!(is_filtered_path(
+            b"/sys/kernel/mm/memory.max",
+            O_WRONLY,
+            false
+        ));
+        assert!(is_filtered_path(
+            b"/sys/fs/cgroupx/a.service/memory.max",
+            O_WRONLY,
+            false
+        ));
+        assert!(is_filtered_path(b"/sys/fs/cgroup", O_WRONLY, false));
+    }
+
+    #[test]
+    fn a_mutation_syscall_on_a_cgroup_limit_file_stays_filtered() {
+        // unlink/rename/chmod/chown/xattr: not how a limit is set, and they must not pay for it.
+        let path = b"/sys/fs/cgroup/system.slice/auditd.service/memory.max";
+        assert!(is_filtered_path(path, 0, true));
+        assert!(is_filtered_path(path, O_WRONLY, true));
     }
 
     #[test]

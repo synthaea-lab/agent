@@ -424,8 +424,16 @@ They must fail closed when the target is wrong.
 - **Admin or root uninstall.** A legitimate uninstall and a malicious one look the same.
   What tells them apart is the recorded actor and the timing, not the act.
 - **A kernel stop through resource limits** (prlimit CPU limit, `memory.max` OOM kill,
-  `cgroup.freeze`) aimed at a security tool raises no alert on Linux
-  ([#49](https://github.com/synthaea-lab/agent/issues/49)).
+  `cgroup.freeze`) aimed at a security tool is only partly covered on Linux
+  ([#49](https://github.com/synthaea-lab/agent/issues/49)). The rules read the setup:
+  `systemctl set-property` and `freeze`, `prlimit --pid`, and a write to a limit file
+  (`memory.max`, `memory.high`, `pids.max`, `cgroup.freeze`, and the cgroup v1 equivalents) in
+  the cgroup of a listed unit. **The OOM kill that follows raises no alert on its own**: the
+  kernel sends `SIGKILL` as `SEND_SIG_PRIV`, so there is no sending process to attribute, and
+  the signal probes drop it by design. Reporting it would take a new probe on the OOM victim,
+  which is not built. Not verified: whether such a probe is usable on every supported kernel.
+  A limit set by a means no rule reads (a process that writes the file through a path the
+  rule cannot map to a unit, an unlisted tool) is not seen either.
 - **Local-only deployments** have no server-side silence detection, and their evidence
   never leaves the host.
 - **Unsigned updates on Windows and macOS.** Self-update is Linux-only today

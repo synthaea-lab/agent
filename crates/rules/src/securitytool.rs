@@ -315,12 +315,11 @@ fn cgroup_unit_and_file(path: &str) -> Option<(&str, &str)> {
 /// /sys/fs/cgroup/system.slice/auditd.service/memory.max`. The kernel then OOM-kills or freezes
 /// the tool with no signal the probe reports (<https://github.com/synthaea-lab/agent/issues/49>).
 ///
-/// **The Linux probe does not deliver the canonical path yet**: `is_filtered_path` drops a path
-/// that *starts with* `/sys/`, so `/sys/fs/cgroup/...` never leaves the kernel, while a
-/// relative path or one written `//sys/...` passes the filter and is read here
-/// ([`cgroup_unit_and_file`]; not measured on a VM that these forms leave the probe). For the
-/// canonical path the rule is the contract of the probe change in ADR-0046 and fires for any
-/// source that reports such an open. Pid 1 is skipped: the manager writes these files when
+/// The Linux open probe passes a write-intent open of such a file under `/sys/fs/cgroup/`
+/// (`is_cgroup_limit_write` in `sensor-linux-wire`: a tail match, a little wider than this list,
+/// since the probe cannot know the listed units); the filter is unit-tested, **not yet run on
+/// a VM**. A relative path or one written `//sys/...` also reaches the rule
+/// ([`cgroup_unit_and_file`]). The rule fires for any source that reports such an open. Pid 1 is skipped: the manager writes these files when
 /// it starts a unit that has a configured limit, and when it carries out `systemctl
 /// set-property` and `freeze`, which `check_security_tool_throttle` reads from the exec.
 /// Medium.
