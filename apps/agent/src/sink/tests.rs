@@ -119,6 +119,22 @@ fn sink_in(dir: &std::path::Path) -> Arc<DetectionSink> {
     )
 }
 
+/// Asserts that the recording kill hook was called for exactly `pid`. On a mismatch it prints the
+/// alert log: `maybe_kill` refuses before it calls the hook (the agent's own pid, pid 1, a verdict
+/// shield), and that refusal is only in `RESPONSE-KILL` there. A bare `left: []` (agent#247, seen once
+/// on macOS CI) names none of those.
+#[track_caller]
+fn assert_killed(killed: &Mutex<Vec<u32>>, dir: &std::path::Path, pid: u32) {
+    let got = killed.lock().unwrap().clone();
+    assert_eq!(
+        got,
+        vec![pid],
+        "test process pid {}; alert log:\n{}",
+        std::process::id(),
+        alerts_in(dir)
+    );
+}
+
 fn alerts_in(dir: &std::path::Path) -> String {
     std::fs::read_to_string(dir.join("alerts.ndjson")).unwrap_or_default()
 }
@@ -1189,7 +1205,7 @@ fn a_beacon_with_a_dropped_payload_is_killed_and_quarantined_and_both_are_audite
     let alerts = wait_for_alert(&dir, "RESPONSE-QUARANTINE");
 
     // Killed, audited.
-    assert_eq!(*killed.lock().unwrap(), vec![6262]);
+    assert_killed(&killed, &dir, 6262);
     assert!(alerts.contains("RESPONSE-KILL"), "{alerts}");
     assert!(alerts.contains("killed pid 6262"), "{alerts}");
     // Quarantined, audited.
@@ -1619,7 +1635,7 @@ fn the_same_crossing_from_a_tmp_binary_is_still_killed() {
     let sink = sink_in(&dir);
     let killed = enable_recording_kill(&sink, &dir);
     drive_bayes_crossing_from(&sink, 6002, "/tmp/NetworkManager");
-    assert_eq!(*killed.lock().unwrap(), vec![6002]);
+    assert_killed(&killed, &dir, 6002);
 }
 
 /// Execs the `sshd-session` that holds one login under the `sshd` listener, as on
@@ -1709,7 +1725,7 @@ fn a_shell_inside_a_reexecd_sshd_login_crossing_bayes_is_still_killed() {
     shell.parent_image_path = Some("/usr/sbin/sshd".into());
     sink.on_event(Event::Exec(shell));
     drive_bayes_connects(&sink, 6132);
-    assert_eq!(*killed.lock().unwrap(), vec![6132]);
+    assert_killed(&killed, &dir, 6132);
 }
 
 /// The real `sshd` binary started from a user's shell is not a login session: it
@@ -1726,7 +1742,7 @@ fn an_sshd_started_from_a_shell_crossing_bayes_is_still_killed() {
     e.parent_image_path = Some("/bin/bash".into());
     sink.on_event(Event::Exec(e));
     drive_bayes_connects(&sink, 6142);
-    assert_eq!(*killed.lock().unwrap(), vec![6142]);
+    assert_killed(&killed, &dir, 6142);
 }
 
 /// The control: a shell inside that login session crossing BAYES is still killed.
@@ -1742,7 +1758,7 @@ fn a_shell_inside_an_ssh_login_crossing_bayes_is_still_killed() {
     shell.meta.ppid = 6111;
     sink.on_event(Event::Exec(shell));
     drive_bayes_connects(&sink, 6112);
-    assert_eq!(*killed.lock().unwrap(), vec![6112]);
+    assert_killed(&killed, &dir, 6112);
 }
 
 /// Observe-only mode says the truth too: a service is "refused", not "would have
@@ -2040,7 +2056,7 @@ fn a_burst_then_a_canary_touch_by_the_same_process_kills_it() {
         "a burst alone never kills"
     );
     sink.on_event(canary_open_at(&canary, 900, BURST_END_NS + 1_000_000));
-    assert_eq!(*killed.lock().unwrap(), vec![900]);
+    assert_killed(&killed, &dir, 900);
     let alerts = alerts_in(&dir);
     assert!(
         alerts.contains("killed pid 900 on a corroborated ransomware signal"),
@@ -2153,7 +2169,7 @@ fn a_process_that_is_not_on_the_allow_list_is_still_killed_when_a_list_exists() 
     ));
     burst(&sink, 900);
     sink.on_event(canary_open_at(&canary, 900, BURST_END_NS + 1_000_000));
-    assert_eq!(*killed.lock().unwrap(), vec![900]);
+    assert_killed(&killed, &dir, 900);
 }
 
 #[test]
