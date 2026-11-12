@@ -234,7 +234,7 @@ Live status and ordering are on the [project board](https://github.com/orgs/synt
 
 - Signals to listed security tools (signal_generate, unit cgroup membership, reload filtering, drop counter) (partial, Signal tamper telemetry). See [sensors/linux/signals.md#signals-to-security-tools](sensors/linux/signals.md#signals-to-security-tools).
 - Kill loudness: record the sender of a termination signal before exit (partial, Self-protection). See [self-protection.md#kill-loudness](self-protection.md#kill-loudness).
-- Detection of a security tool stopped through kernel resource limits (prlimit, memory.max, cgroup.freeze) (planned, Security model). See [security-model.md#what-is-not-defended](security-model.md#what-is-not-defended).
+- Detection of a security tool stopped through kernel resource limits (prlimit, memory.max, cgroup.freeze) (partial, Security model). See [security-model.md#what-is-not-defended](security-model.md#what-is-not-defended).
 
 ### [#62](https://github.com/synthaea-lab/agent/issues/62) arm64 builds (Linux aarch64, Windows ARM64)
 

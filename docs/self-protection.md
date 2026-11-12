@@ -245,14 +245,13 @@ from a catchable termination signal, it records who sent it.
 sensor covers that from the kernel side: its signal probes record a `SIGKILL` aimed
 at the agent, and the restarted agent reports the sender through a rule. Under the
 audit fallback sensor that gap remains. Kernel-mediated stops that involve no signal
-from a process (a CPU rlimit, a cgroup memory limit, `cgroup.freeze`) are read from the
-command that causes them: `systemctl freeze|set-property` (a memory or task limit, or a
-`CPUQuota` below 10 %, in `%`, `‰` or `‱`) on a listed tool is Medium, and
-`prlimit --pid <pid> --cpu|--as` (`--pid` may be abbreviated to `--p` or `--pi`) is Medium when
-the pid is a listed tool (comm or image name, from what the rules recorded or from `/proc`) and
-Low otherwise.
-A direct write to a cgroup control file and the memcg OOM kill raise nothing, because no
-event reaches the rules for them ([#49](https://github.com/synthaea-lab/agent/issues/49)). The full
+from a process (a CPU rlimit, a cgroup memory limit, `cgroup.freeze`) are read from how
+they are set: the command (`systemctl freeze|set-property`, a memory or task limit, or a
+`CPUQuota` below 10 %, in `%`, `‰` or `‱`, on a listed tool is Medium; `prlimit --pid <pid>
+--cpu|--as`, with `--pid` abbreviated to `--p` or `--pi`, is Medium when the pid is a listed tool,
+from its comm or image name, and Low otherwise), or a write to a cgroup limit file of a listed
+unit. The kill that a memory limit then causes is not reported
+([#49](https://github.com/synthaea-lab/agent/issues/49)). The full
 mask-wait-exit flow is not unit-tested because it terminates the test runner; only the
 pure helpers are.
 
