@@ -179,6 +179,41 @@ mod registry {
     fn a_record_whose_key_was_not_resolved_is_dropped() {
         assert!(registry_set(&Fields::default(), meta()).is_none());
     }
+
+    #[test]
+    fn a_write_naming_its_key_only_by_handle_is_dropped() {
+        let by_handle = Fields::of(&[
+            (
+                "KeyObject",
+                Value::Bytes(vec![0x10, 0x20, 0, 0, 0, 0xff, 0xff, 0xff]),
+            ),
+            ("KeyName", text_value("")),
+            ("ValueName", text_value("updater")),
+            ("Type", Value::U32(REG_SZ)),
+        ]);
+
+        assert!(registry_set(&by_handle, meta()).is_none());
+    }
+
+    #[test]
+    fn a_captured_prefix_cut_inside_a_utf16_unit_keeps_its_whole_units() {
+        let mut captured = utf16("C:\\long\\path");
+        captured.push(b'x');
+        let mut fields = set_value(REG_SZ, captured);
+        fields.0.insert("DataSize", Value::U32(200));
+
+        let event = registry_set(&fields, meta()).expect("named key");
+
+        assert_eq!(event.data.as_deref(), Some("C:\\long\\path"));
+    }
+
+    #[test]
+    fn a_complete_value_of_odd_length_is_not_text() {
+        let mut fields = set_value(REG_SZ, vec![b'a', 0, b'b']);
+        fields.0.insert("DataSize", Value::U32(3));
+
+        assert_eq!(registry_set(&fields, meta()).expect("named key").data, None);
+    }
 }
 
 mod powershell {
@@ -538,7 +573,8 @@ mod ntlm {
 mod never_panics {
     use super::*;
 
-    const NAMES: [&str; 35] = [
+    const NAMES: [&str; 36] = [
+        "DataSize",
         "Username",
         "DomainName",
         "TargetService",

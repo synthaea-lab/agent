@@ -53,8 +53,9 @@ fn file_event_keyword(event_id: u16) -> Option<u64> {
 const DNS_CLIENT_GUID: &str = "1C95126E-7EEA-49A9-A3FE-A378B03DDB4D";
 /// Microsoft-Windows-Kernel-Registry
 const KERNEL_REGISTRY_GUID: &str = "70EB4F03-C1DE-4F73-A051-33D13D5413BD";
-/// Kernel-Registry EID 5, `SetValueKey`, and its manifest keyword. Checked against a real
-/// session by `tests/kernel_registry_set_value.rs` (`#[ignore]`, elevated).
+/// Kernel-Registry EID 5, `SetValueKey`, and its keyword, both taken from the manifest.
+/// `tests/kernel_registry_set_value.rs` (`#[ignore]`, elevated) checks them against a real
+/// session; its run is reported on the PR that introduced them (#252).
 const REGISTRY_SET_VALUE_KEY_EVENT: u16 = 5;
 const REGISTRY_KEYWORD_SET_VALUE_KEY: u64 = 0x100;
 /// Microsoft-Windows-PowerShell (script-block logging)
@@ -667,14 +668,18 @@ pub(crate) fn dns_provider(sink: Arc<dyn EventSink>, state: Arc<SharedState>) ->
 /// T1546, T1543). Only value writes are enabled: reads (EID 2 `OpenKey`, 4
 /// `QueryKey`, 7 `QueryValueKey`) are high-volume noise at userland tier.
 ///
-/// # Field notes (manifest, Windows 11 26300, 2026-11-12)
+/// # Field notes (manifest-derived, not lab-captured: Windows 11 26300, 2026-11-12)
 ///
 /// EID 5: `KeyName` (the key's NT path, `\REGISTRY\MACHINE\...`, rewritten to
 /// `HKLM\...`/`HKU\...`), `ValueName`, `Type` (u32), `DataSize` (u32),
 /// `CapturedDataSize` (u16), `CapturedData` (Binary, `CapturedDataSize` bytes).
-/// EID 4 is `QueryKey`: until 2026-11-12 the sensor read it as the write
-/// (<https://github.com/synthaea-lab/agent/issues/91>), so every key read came out
-/// as a `RegistrySet` with no value and no write was seen.
+///
+/// The previous notes (Windows Server 2022, 2026-09-07) named EID 4 the write, with
+/// `DataType`/`Data`. The manifest has no such fields: EID 4 is `QueryKey` (`InfoClass`,
+/// `CapturedData`), a read. Read that way, every key read came out as a `RegistrySet`
+/// with no value name, type 0 and no data, and no write was seen
+/// (<https://github.com/synthaea-lab/agent/issues/91>). No lab capture held a registry
+/// event to catch it.
 pub(crate) fn registry_provider(sink: Arc<dyn EventSink>, state: Arc<SharedState>) -> Provider {
     let callback = move |record: &EventRecord, locator: &SchemaLocator| {
         if record.event_id() != REGISTRY_SET_VALUE_KEY_EVENT {
