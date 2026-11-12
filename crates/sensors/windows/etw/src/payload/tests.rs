@@ -111,15 +111,15 @@ mod dns {
 mod registry {
     use super::*;
 
+    const RUN_KEY: &str = r"\REGISTRY\MACHINE\SOFTWARE\Microsoft\Windows\CurrentVersion\Run";
+
+    /// The EID 5 `SetValueKey` template of the manifest.
     fn set_value(data_type: u32, data: Vec<u8>) -> Fields {
         Fields::of(&[
-            (
-                "KeyName",
-                text_value(r"\REGISTRY\MACHINE\SOFTWARE\Microsoft\Windows\CurrentVersion\Run"),
-            ),
+            ("KeyName", text_value(RUN_KEY)),
             ("ValueName", text_value("updater")),
-            ("DataType", Value::U32(data_type)),
-            ("Data", Value::Bytes(data)),
+            ("Type", Value::U32(data_type)),
+            ("CapturedData", Value::Bytes(data)),
         ])
     }
 
@@ -469,8 +469,8 @@ mod never_panics {
         "QueryStatus",
         "KeyName",
         "ValueName",
-        "DataType",
-        "Data",
+        "Type",
+        "CapturedData",
         "ScriptBlockText",
         "ScriptBlockId",
         "Path",

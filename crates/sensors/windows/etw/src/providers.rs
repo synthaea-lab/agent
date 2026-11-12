@@ -53,6 +53,10 @@ fn file_event_keyword(event_id: u16) -> Option<u64> {
 const DNS_CLIENT_GUID: &str = "1C95126E-7EEA-49A9-A3FE-A378B03DDB4D";
 /// Microsoft-Windows-Kernel-Registry
 const KERNEL_REGISTRY_GUID: &str = "70EB4F03-C1DE-4F73-A051-33D13D5413BD";
+/// Kernel-Registry EID 5, `SetValueKey`, and its manifest keyword. Checked against a real
+/// session by `tests/kernel_registry_set_value.rs` (`#[ignore]`, elevated).
+const REGISTRY_SET_VALUE_KEY_EVENT: u16 = 5;
+const REGISTRY_KEYWORD_SET_VALUE_KEY: u64 = 0x100;
 /// Microsoft-Windows-PowerShell (script-block logging)
 const POWERSHELL_GUID: &str = "A0C1853B-5C40-4B15-8766-3CF1C58F985A";
 /// Microsoft-Windows-WMI-Activity
@@ -657,25 +661,23 @@ pub(crate) fn dns_provider(sink: Arc<dyn EventSink>, state: Arc<SharedState>) ->
         .build()
 }
 
-/// Registry write events (EID 4 — `RegSetValueKey`).
+/// Registry value writes (EID 5 `SetValueKey`, keyword `SetValueKey`).
 ///
 /// Covers persistence writes to Run keys, IFEO, Services, and Winlogon (T1547,
-/// T1546, T1543). Only write operations are captured; reads (EID 2 `RegOpenKey`)
-/// are high-volume noise with negligible detection value at userland tier.
+/// T1546, T1543). Only value writes are enabled: reads (EID 2 `OpenKey`, 4
+/// `QueryKey`, 7 `QueryValueKey`) are high-volume noise at userland tier.
 ///
-/// # Field notes (Windows Server 2022, 2026-09-07)
+/// # Field notes (manifest, Windows 11 26300, 2026-11-12)
 ///
-/// `KeyName` in EID 4 contains the full NT path of the key being written, e.g.
-/// `\REGISTRY\MACHINE\SOFTWARE\Microsoft\Windows\CurrentVersion\Run`. The sensor
-/// normalizes this to the Win32 hive prefix (`HKLM\...`, `HKU\...`).
-///
-/// `Data` is a raw binary blob. For `DataType` 1 (`REG_SZ`) and 2 (`REG_EXPAND_SZ`)
-/// the sensor decodes it as UTF-16 LE; other types (DWORD, BINARY, `MULTI_SZ`) are
-/// left as `None` — raw bytes have no safe string representation for rules.
+/// EID 5: `KeyName` (the key's NT path, `\REGISTRY\MACHINE\...`, rewritten to
+/// `HKLM\...`/`HKU\...`), `ValueName`, `Type` (u32), `DataSize` (u32),
+/// `CapturedDataSize` (u16), `CapturedData` (Binary, `CapturedDataSize` bytes).
+/// EID 4 is `QueryKey`: until 2026-11-12 the sensor read it as the write
+/// (<https://github.com/synthaea-lab/agent/issues/91>), so every key read came out
+/// as a `RegistrySet` with no value and no write was seen.
 pub(crate) fn registry_provider(sink: Arc<dyn EventSink>, state: Arc<SharedState>) -> Provider {
     let callback = move |record: &EventRecord, locator: &SchemaLocator| {
-        // EID 4 = RegSetValueKey — the only operation that writes persistence.
-        if record.event_id() != 4 {
+        if record.event_id() != REGISTRY_SET_VALUE_KEY_EVENT {
             return;
         }
         state.events_seen.fetch_add(1, Ordering::Relaxed);
@@ -689,6 +691,7 @@ pub(crate) fn registry_provider(sink: Arc<dyn EventSink>, state: Arc<SharedState
     };
 
     Provider::by_guid(KERNEL_REGISTRY_GUID)
+        .any(REGISTRY_KEYWORD_SET_VALUE_KEY)
         .add_callback(callback)
         .build()
 }
