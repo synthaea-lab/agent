@@ -8,7 +8,7 @@
 use aya_ebpf::{
     helpers::{
         bpf_get_current_comm, bpf_get_current_pid_tgid, bpf_probe_read_user,
-        bpf_probe_read_user_buf, bpf_probe_read_user_str_bytes,
+        bpf_probe_read_user_str_bytes,
     },
     macros::{map, uprobe, uretprobe},
     maps::{HashMap, PerCpuArray, RingBuf},
@@ -19,9 +19,9 @@ use sensor_linux_wire::{GetAddrInfoEvent, MAX_DNS_ANSWERS, TASK_COMM_LEN};
 
 use crate::{AF_INET, AF_INET6, fill_lineage};
 
-/// Ring buffer for DNS query events.
+/// Ring buffer for DNS query events, shared with the `gethostbyname*_r` pair.
 #[map]
-static DNS_QUERY_EVENTS: RingBuf = RingBuf::with_byte_size(256 * 1024, 0);
+pub(super) static DNS_QUERY_EVENTS: RingBuf = RingBuf::with_byte_size(256 * 1024, 0);
 
 /// Per-CPU scratch for building one `GetAddrInfoEvent` (see `EXEC_SCRATCH`).
 #[map]
@@ -103,37 +103,6 @@ fn try_getaddrinfo_exit(ctx: RetProbeContext) -> Result<u32, u32> {
     let mut answer_count = 0usize;
     let mut answers_truncated = false;
 
-    // Each match arm gives LLVM a constant destination slot. Assigning a
-    // `DnsAnswer` at a runtime index caused the BPF target to synthesize a
-    // per-answer memset; write into the existing map value instead.
-    macro_rules! copy_dns_answer {
-        ($slot:literal, $family:ident, $address_ptr:ident) => {{
-            // SAFETY: `e` points to this CPU's writable scratch map value and
-            // `$slot` is a compile-time index within the fixed [`MAX_DNS_ANSWERS`]-slot array.
-            unsafe { (*e).answers[$slot].family = $family as u8 };
-            if $family == i32::from(AF_INET) {
-                // SAFETY: `sockaddr_ptr` came from a user-memory read. The BPF
-                // helper validates the source and writes only four bytes to the
-                // statically indexed scratch address.
-                unsafe {
-                    bpf_probe_read_user_buf(
-                        $address_ptr as *const u8,
-                        &mut (&mut (*e).answers[$slot].address)[..4],
-                    )
-                }
-            } else {
-                // SAFETY: same user-pointer validation; destination is the full
-                // 16-byte field at a statically known map-value offset.
-                unsafe {
-                    bpf_probe_read_user_buf(
-                        $address_ptr as *const u8,
-                        &mut (*e).answers[$slot].address,
-                    )
-                }
-            }
-        }};
-    }
-
     if status == 0 && res_ptr_ptr != 0 {
         let mut current = unsafe { bpf_probe_read_user(res_ptr_ptr as *const u64) }.unwrap_or(0);
         // Keep this loop statically bounded. #429 showed that seemingly simple
@@ -171,33 +140,7 @@ fn try_getaddrinfo_exit(ctx: RetProbeContext) -> Result<u32, u32> {
                     break;
                 };
 
-                let copied = match answer_count {
-                    0 => copy_dns_answer!(0, family, address_ptr),
-                    1 => copy_dns_answer!(1, family, address_ptr),
-                    2 => copy_dns_answer!(2, family, address_ptr),
-                    3 => copy_dns_answer!(3, family, address_ptr),
-                    4 => copy_dns_answer!(4, family, address_ptr),
-                    5 => copy_dns_answer!(5, family, address_ptr),
-                    6 => copy_dns_answer!(6, family, address_ptr),
-                    7 => copy_dns_answer!(7, family, address_ptr),
-                    8 => copy_dns_answer!(8, family, address_ptr),
-                    9 => copy_dns_answer!(9, family, address_ptr),
-                    10 => copy_dns_answer!(10, family, address_ptr),
-                    11 => copy_dns_answer!(11, family, address_ptr),
-                    12 => copy_dns_answer!(12, family, address_ptr),
-                    13 => copy_dns_answer!(13, family, address_ptr),
-                    14 => copy_dns_answer!(14, family, address_ptr),
-                    15 => copy_dns_answer!(15, family, address_ptr),
-                    16 => copy_dns_answer!(16, family, address_ptr),
-                    17 => copy_dns_answer!(17, family, address_ptr),
-                    18 => copy_dns_answer!(18, family, address_ptr),
-                    19 => copy_dns_answer!(19, family, address_ptr),
-                    20 => copy_dns_answer!(20, family, address_ptr),
-                    21 => copy_dns_answer!(21, family, address_ptr),
-                    22 => copy_dns_answer!(22, family, address_ptr),
-                    23 => copy_dns_answer!(23, family, address_ptr),
-                    _ => break,
-                };
+                let copied = copy_dns_answer!(e, answer_count, family, address_ptr);
                 if copied.is_err() {
                     break;
                 }

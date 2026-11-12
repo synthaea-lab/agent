@@ -82,6 +82,9 @@ const READLINE_LIBRARY_PREFIXES: &[&str] = &["libreadline.so", "libedit.so"];
 /// build tools has only `ld-musl-*` and the `libc.musl-*` symlink to it.
 const LIBC_LIBRARY_PREFIXES: &[&str] = &["libc.so", "libc-", "ld-musl-"];
 
+/// The libc functions [`resolve_dns_symbols`] looks up.
+pub(crate) const DNS_SYMBOLS: [&str; 3] = ["getaddrinfo", "gethostbyname_r", "gethostbyname2_r"];
+
 /// Lists the regular files under `root`/[`LIBRARY_DIRS`] whose name starts with one of
 /// `prefixes`, one path per inode so a library reached through several symlinks is resolved once.
 /// Missing or unreadable directories are skipped: not every layout exists on every distro.
@@ -105,15 +108,16 @@ fn has_any_prefix(path: &Path, prefixes: &[&str]) -> bool {
         .is_some_and(|name| prefixes.iter().any(|prefix| name.starts_with(prefix)))
 }
 
-/// Resolves the `getaddrinfo(3)` symbol from system libc libraries (issue
-/// #267 Phase 1).
+/// Resolves the DNS lookup symbols from system libc libraries: `getaddrinfo(3)` (issue
+/// #267 Phase 1) and the reentrant `gethostbyname_r`/`gethostbyname2_r` that the legacy
+/// `gethostbyname`/`gethostbyname2` call on glibc and musl (agent#240).
 ///
 /// # Errors
 ///
 /// Returns [`ResolverError`] if library discovery or symbol parsing fails.
 pub fn resolve_dns_symbols() -> Result<Vec<SymbolInfo>, ResolverError> {
     let libraries = find_libraries(Path::new("/"), LIBC_LIBRARY_PREFIXES);
-    let target_symbols = ["getaddrinfo"];
+    let target_symbols = DNS_SYMBOLS;
 
     let mut all_symbols = Vec::new();
     for lib in &libraries {
