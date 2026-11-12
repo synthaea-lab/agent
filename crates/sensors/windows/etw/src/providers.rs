@@ -859,35 +859,26 @@ pub(crate) fn ntlm_provider(sink: Arc<dyn EventSink>, state: Arc<SharedState>) -
             return;
         };
         let parser = Parser::create(record, &schema_def);
-        let pid = payload::ntlm_pid(&parser, record.process_id());
-        let comm = state
-            .comm_for(pid)
-            .unwrap_or_else(|| payload::ntlm_process_name(&parser));
+        let auth = payload::ntlm_auth(direction, &parser);
         let timestamp_ns = normalize::filetime_to_ns(record.raw_timestamp());
-        let event = payload::ntlm_auth(direction, &parser, state.meta(pid, 0, comm, timestamp_ns));
-        // The status and the event id are part of the key: an incoming failure and the
-        // success that follows it within the window (same account, address, target and
-        // version) are two different facts, and the success is the one the rules need
-        // (#744 review: without them the success was swallowed as a duplicate).
-        let key = normalize::ntlm_dedup_key(
-            direction,
-            record.event_id(),
-            &event.user,
-            &event.target,
-            event.remote_address,
-            &event.ntlm_version,
-            event.status.as_deref(),
-        );
+        // Deduplicated before the process lookup, so a burst of identical
+        // authentications costs one token read, not one per record.
+        let key = auth.dedup_key(record.event_id());
         if !state.ntlm.lock_or_recover().first(&key, timestamp_ns) {
             return;
         }
         // Only `NTLMv2` was ever observed; the weak-version rule matches the other
         // spellings loosely. Log any version that is not `NTLMv2` (once per dedup key) so
         // the first real sample of `NTLMv1`/`LM` shows how the provider writes it.
-        if !event.ntlm_version.trim().eq_ignore_ascii_case("NTLMv2") {
-            tracing::debug!(version = %event.ntlm_version, "NTLM version other than NTLMv2");
+        if !auth.ntlm_version.trim().eq_ignore_ascii_case("NTLMv2") {
+            tracing::debug!(version = %auth.ntlm_version, "NTLM version other than NTLMv2");
         }
-        sink.on_event(Event::NtlmAuth(event));
+        let pid = payload::ntlm_pid(&parser, record.process_id());
+        let comm = state
+            .comm_for(pid)
+            .unwrap_or_else(|| payload::ntlm_process_name(&parser));
+        let meta = state.meta(pid, 0, comm, timestamp_ns);
+        sink.on_event(Event::NtlmAuth(auth.into_event(meta)));
     };
 
     Provider::by_guid(NTLM_GUID).add_callback(callback).build()
