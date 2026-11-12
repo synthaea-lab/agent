@@ -53,10 +53,12 @@ Splitting roles means a leaked `content` key cannot ship binaries, and a leaked 
 be replaced over the air by a rotation that only `recovery` can sign.
 
 **Production keys.** A build without the `test-key` feature reads the keys from
-`crates/updater/keys/*.pub` (one line of 64 hex characters). Until real keys are committed those
-files say `unprovisioned`, the statics are `None`, and every verification fails with
+`crates/updater/keys/*.pub` (one line of 64 hex characters). Since 2026-11-12 those files hold
+**temporary** keys (generated outside the ADR-0027 ceremony, no custody, to be replaced). A file
+that says `unprovisioned` makes its static `None` and every verification of that role fails with
 [`SigningKeyUnprovisioned`](../crates/updater/src/error.rs): the build fails closed instead of
-trusting a public seed. Provisioning is tracked in
+trusting a public seed. A build that embeds the temporary keys refuses anything signed by the
+public test seed. Real provisioning is tracked in
 [#43](https://github.com/synthaea-lab/agent/issues/43).
 
 **Test keys.** With the `test-key` feature (on by default for development) or under `cfg(test)`,
@@ -362,7 +364,7 @@ Key sources ([`KeySource`](../tools/release/src/main.rs)):
 | New release never shows progress | Rolled back to the last proven release or bootstrap, banned. |
 | New watchdog cannot execute | `recover` rolls back and bans before the service starts. |
 | Corrupt `key-rotations.json` | Every verifying command refuses until an operator removes the file on purpose. |
-| Production build, keys unprovisioned | Every verification fails closed with an explicit message. |
+| Production build, a key file `unprovisioned` | Every verification of that role fails closed with an explicit message. |
 
 ## Platform differences
 

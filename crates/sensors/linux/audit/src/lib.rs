@@ -20,6 +20,7 @@
 //! that host. See its module doc for why a second socket doesn't lose records.
 
 mod classify;
+mod execve;
 mod normalize;
 mod parse;
 

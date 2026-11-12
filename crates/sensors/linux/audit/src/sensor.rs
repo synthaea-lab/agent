@@ -5,7 +5,11 @@ use std::sync::Arc;
 use schema::sensor::{Capabilities, EventSink, Sensor, SensorError};
 use tokio::sync::Notify;
 
-use crate::{AuditSocket, classify, normalize, parse};
+use crate::{
+    AuditSocket, classify,
+    execve::{AssembledExec, ExecveAssembler},
+    normalize, parse,
+};
 
 /// Records read per readiness wakeup before yielding back to `select!`. One
 /// exec is 7 records on the lab kernel (SYSCALL, EXECVE, CWD, PATH ×2,
@@ -50,6 +54,7 @@ impl AuditSensor {
         // record it received (#504).
         let mut unparsed: u64 = 0;
         let mut overruns: u64 = 0;
+        let mut execve = ExecveAssembler::default();
         let mut truncated: u64 = 0;
         loop {
             tokio::select! {
@@ -76,7 +81,7 @@ impl AuditSensor {
                                     }
                                 }
                                 match parse::parse_audit_message(&buf[..received.len]) {
-                                    Ok(record) => forward(&record, sink.as_ref()),
+                                    Ok(record) => forward(&record, &mut execve, sink.as_ref()),
                                     Err(e) => {
                                         unparsed += 1;
                                         // Powers of two only: a stream of bad records must not flood the log.
@@ -116,6 +121,9 @@ impl AuditSensor {
             }
         }
 
+        for exec in execve.finish() {
+            emit_exec(exec, sink.as_ref());
+        }
         tracing::info!("sensor-linux-audit: exiting");
         Ok(())
     }
@@ -157,7 +165,14 @@ impl Sensor for AuditSensor {
 }
 
 /// Classifies one parsed record and hands the resulting event, if any, to `sink`.
-fn forward(record: &parse::AuditRecord, sink: &dyn EventSink) {
+/// `EXECVE` records go to `execve`, which hands back each exec once its records end.
+fn forward(record: &parse::AuditRecord, execve: &mut ExecveAssembler, sink: &dyn EventSink) {
+    for exec in execve.push(record) {
+        emit_exec(exec, sink);
+    }
+    if record.record_type == classify::AUDIT_EXECVE {
+        return;
+    }
     let Some(event) = classify::classify(record) else {
         return;
     };
@@ -172,6 +187,11 @@ fn forward(record: &parse::AuditRecord, sink: &dyn EventSink) {
     sink.on_event(schema_event);
 }
 
+fn emit_exec(exec: AssembledExec, sink: &dyn EventSink) {
+    let timestamp_ns = audit_ts_to_epoch_ns(exec.timestamp_sec, exec.timestamp_ms);
+    sink.on_event(normalize::exec_event(&exec.event, timestamp_ns));
+}
+
 pub(crate) fn audit_ts_to_epoch_ns(sec: u64, ms: u32) -> u64 {
     sec * 1_000_000_000 + (ms as u64) * 1_000_000
 }
@@ -184,6 +204,68 @@ mod tests {
     fn timestamp_conversion() {
         let ns = audit_ts_to_epoch_ns(1234567890, 123);
         assert_eq!(ns, 1_234_567_890_123_000_000);
+    }
+
+    #[derive(Default)]
+    struct Collect(std::sync::Mutex<Vec<schema::Event>>);
+
+    impl EventSink for Collect {
+        fn on_event(&self, event: schema::Event) {
+            self.0.lock().expect("test sink lock").push(event);
+        }
+    }
+
+    fn wire(record_type: u16, seq: u64, fields: &str) -> parse::AuditRecord {
+        let raw = parse::build_wire_message(record_type, &format!("audit(1000.5:{seq}): {fields}"));
+        parse::parse_audit_message(&raw).expect("test record parses")
+    }
+
+    #[test]
+    fn interleaved_split_execs_reach_the_sink_whole() {
+        // #51 at the sensor boundary: two execs' records interleaved as on a multi-CPU
+        // host, one of them split into pieces, plus a connect in between.
+        let script = "x".repeat(9000);
+        let encoded: String = script.bytes().map(|b| format!("{b:02X}")).collect();
+        let (p0, p1) = encoded.split_at(7400);
+        let head = format!(
+            "argc=2 a0=\"/bin/true\" a1_len={} a1[0]={p0}",
+            encoded.len()
+        );
+        let tail = format!("a1[1]={p1}");
+        let sink = Collect::default();
+        let mut execve = ExecveAssembler::default();
+        for record in [
+            wire(1300, 10, "syscall=59"),
+            wire(1309, 10, &head),
+            wire(1309, 11, "argc=1 a0=\"/bin/id\""),
+            wire(1306, 12, "saddr=02001F907F000001"),
+            wire(1309, 10, &tail),
+            wire(1307, 11, "cwd=\"/\""),
+            wire(1307, 10, "cwd=\"/\""),
+            wire(1309, 13, "argc=1 a0=\"/bin/ls\""),
+        ] {
+            forward(&record, &mut execve, &sink);
+        }
+        for exec in execve.finish() {
+            emit_exec(exec, &sink);
+        }
+        let events = sink.0.into_inner().expect("test sink lock");
+        let execs: Vec<(Vec<String>, bool)> = events
+            .iter()
+            .filter_map(|e| match e {
+                schema::Event::Exec(x) => Some((x.argv.clone(), x.cmdline_truncated)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            execs,
+            [
+                (vec!["/bin/id".to_string()], false),
+                (vec!["/bin/true".to_string(), script], false),
+                (vec!["/bin/ls".to_string()], false),
+            ]
+        );
+        assert_eq!(events.len(), 4, "the connect is forwarded too");
     }
 
     #[test]
