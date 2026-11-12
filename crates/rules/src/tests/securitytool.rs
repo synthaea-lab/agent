@@ -290,6 +290,8 @@ fn a_write_to_a_listed_units_throttle_file_alerts() {
         "/sys/fs/cgroup/system.slice/auditd.service/memory.high",
         "/sys/fs/cgroup/system.slice/falco.service/cgroup.freeze",
         "/sys/fs/cgroup/system.slice/osqueryd.service/pids.max",
+        // agent#49 lab, 2026-11-12: the probe passes this open and nothing read it
+        "/sys/fs/cgroup/system.slice/osqueryd.service/cpu.max",
         "/sys/fs/cgroup/memory/system.slice/auditd.service/memory.limit_in_bytes",
         "/sys/fs/cgroup/freezer/system.slice/auditd.service/freezer.state",
     ] {

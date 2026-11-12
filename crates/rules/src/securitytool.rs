@@ -278,6 +278,10 @@ const THROTTLE_FILES: &[&str] = &[
     "memory.high",
     "cgroup.freeze",
     "pids.max",
+    // The CPU quota: `echo '1000 100000' > cpu.max` leaves a tool 1% of a CPU, like
+    // `systemctl set-property CPUQuota=1%`. The open does not carry the value, so any write
+    // alerts, as for `memory.max` (a write that lifts the limit alerts too).
+    "cpu.max",
     "memory.limit_in_bytes",
     "memory.soft_limit_in_bytes",
     "freezer.state",
@@ -310,7 +314,7 @@ fn cgroup_unit_and_file(path: &str) -> Option<(&str, &str)> {
     Some((unit.strip_suffix(".service")?, file))
 }
 
-/// T1562.001 — a write-intent open of `memory.max`, `memory.high`, `cgroup.freeze` or `pids.max`
+/// T1562.001 — a write-intent open of `memory.max`, `memory.high`, `cgroup.freeze`, `pids.max` or `cpu.max`
 /// (or the cgroup v1 equivalents) in the cgroup of a listed unit: `echo 1M >
 /// /sys/fs/cgroup/system.slice/auditd.service/memory.max`. The kernel then OOM-kills or freezes
 /// the tool with no signal the probe reports (<https://github.com/synthaea-lab/agent/issues/49>).

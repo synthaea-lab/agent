@@ -427,7 +427,7 @@ They must fail closed when the target is wrong.
   `cgroup.freeze`) aimed at a security tool is only partly covered on Linux
   ([#49](https://github.com/synthaea-lab/agent/issues/49)). The rules read the setup:
   `systemctl set-property` and `freeze`, `prlimit --pid`, and a write to a limit file
-  (`memory.max`, `memory.high`, `pids.max`, `cgroup.freeze`, and the cgroup v1 equivalents) in
+  (`memory.max`, `memory.high`, `pids.max`, `cpu.max`, `cgroup.freeze`, and the cgroup v1 equivalents) in
   the cgroup of a listed unit. **The OOM kill that follows raises no alert on its own**: the
   kernel sends `SIGKILL` as `SEND_SIG_PRIV`, so there is no sending process to attribute, and
   the signal probes drop it by design. Reporting it would take a new probe on the OOM victim,
