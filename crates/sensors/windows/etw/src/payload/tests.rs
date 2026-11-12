@@ -101,6 +101,15 @@ mod dns {
     }
 
     #[test]
+    fn a_query_without_type_or_status_reads_as_type_0_and_success() {
+        let fields = Fields::of(&[("QueryName", text_value("example.org"))]);
+
+        let event = dns_query(&fields, meta()).expect("named query");
+
+        assert_eq!((event.qtype, event.status), (0, 0));
+    }
+
+    #[test]
     fn a_record_without_a_query_name_is_dropped() {
         assert!(dns_query(&Fields::default(), meta()).is_none());
         let empty = Fields::of(&[("QueryName", text_value(""))]);
@@ -170,6 +179,41 @@ mod registry {
     fn a_record_whose_key_was_not_resolved_is_dropped() {
         assert!(registry_set(&Fields::default(), meta()).is_none());
     }
+
+    #[test]
+    fn a_write_naming_its_key_only_by_handle_is_dropped() {
+        let by_handle = Fields::of(&[
+            (
+                "KeyObject",
+                Value::Bytes(vec![0x10, 0x20, 0, 0, 0, 0xff, 0xff, 0xff]),
+            ),
+            ("KeyName", text_value("")),
+            ("ValueName", text_value("updater")),
+            ("Type", Value::U32(REG_SZ)),
+        ]);
+
+        assert!(registry_set(&by_handle, meta()).is_none());
+    }
+
+    #[test]
+    fn a_captured_prefix_cut_inside_a_utf16_unit_keeps_its_whole_units() {
+        let mut captured = utf16("C:\\long\\path");
+        captured.push(b'x');
+        let mut fields = set_value(REG_SZ, captured);
+        fields.0.insert("DataSize", Value::U32(200));
+
+        let event = registry_set(&fields, meta()).expect("named key");
+
+        assert_eq!(event.data.as_deref(), Some("C:\\long\\path"));
+    }
+
+    #[test]
+    fn a_complete_value_of_odd_length_is_not_text() {
+        let mut fields = set_value(REG_SZ, vec![b'a', 0, b'b']);
+        fields.0.insert("DataSize", Value::U32(3));
+
+        assert_eq!(registry_set(&fields, meta()).expect("named key").data, None);
+    }
 }
 
 mod powershell {
@@ -220,6 +264,8 @@ mod wmi {
         assert_eq!(WmiOperation::from_id(23), Some(WmiOperation::ExecQuery));
         assert_eq!(WmiOperation::from_id(24), Some(WmiOperation::ExecMethod));
         assert_eq!(WmiOperation::from_id(11), None);
+        assert_eq!(WmiOperation::from_id(22), None);
+        assert_eq!(WmiOperation::from_id(25), None);
     }
 
     #[test]
@@ -261,6 +307,24 @@ mod wmi {
 
         assert_eq!(event.method.as_deref(), Some("Win32_Process.Create"));
         assert_eq!(event.query, None);
+    }
+
+    #[test]
+    fn a_method_call_naming_only_its_class_or_only_its_method_is_kept() {
+        let class_only = Fields::of(&[("ObjectPath", text_value("Win32_Process"))]);
+        let method_only = Fields::of(&[("MethodName", text_value("Create"))]);
+
+        let class = wmi_activity(WmiOperation::ExecMethod, &class_only, meta());
+        let method = wmi_activity(WmiOperation::ExecMethod, &method_only, meta());
+
+        assert_eq!(
+            class.and_then(|event| event.method).as_deref(),
+            Some("Win32_Process.")
+        );
+        assert_eq!(
+            method.and_then(|event| event.method).as_deref(),
+            Some(".Create")
+        );
     }
 
     #[test]
@@ -411,7 +475,7 @@ mod ntlm {
             ("Status", Value::U32(0xc000_006d)),
         ]);
 
-        let event = ntlm_auth(NtlmDirection::Outgoing, &fields, meta());
+        let event = ntlm_auth(NtlmDirection::Outgoing, &fields);
 
         assert_eq!(event.user, r"CORP\alice");
         assert_eq!(event.target, "cifs/10.0.0.5");
@@ -428,7 +492,7 @@ mod ntlm {
                 ("TargetMachine", text_value("FILESRV01")),
             ]);
 
-            let event = ntlm_auth(NtlmDirection::Outgoing, &fields, meta());
+            let event = ntlm_auth(NtlmDirection::Outgoing, &fields);
 
             assert_eq!(event.target, "FILESRV01", "service {absent:?}");
         }
@@ -442,10 +506,57 @@ mod ntlm {
             ("Status", Value::U32(0xc000_006d)),
         ]);
 
-        let event = ntlm_auth(NtlmDirection::Incoming, &fields, meta());
+        let event = ntlm_auth(NtlmDirection::Incoming, &fields);
 
         assert_eq!(event.remote_address, "10.0.0.9".parse().ok());
         assert_eq!(event.status.as_deref(), Some("0xc000006d"));
+    }
+
+    #[test]
+    fn an_integer_status_is_padded_to_eight_hex_digits() {
+        let fields = Fields::of(&[("Status", Value::U32(4))]);
+
+        let status = ntlm_auth(NtlmDirection::Incoming, &fields).status;
+
+        assert_eq!(status.as_deref(), Some("0x00000004"));
+    }
+
+    #[test]
+    fn the_event_carries_the_authentication_and_the_process_meta() {
+        let fields = Fields::of(&[
+            ("Username", text_value("alice")),
+            ("TargetService", text_value("cifs/srv")),
+            ("NtlmVersion", text_value("NTLMv2")),
+        ]);
+        let auth = ntlm_auth(NtlmDirection::Outgoing, &fields);
+
+        let event = auth.clone().into_event(meta());
+
+        assert_eq!(event.meta, meta());
+        assert_eq!(
+            (
+                event.direction,
+                event.user,
+                event.target,
+                event.ntlm_version
+            ),
+            (auth.direction, auth.user, auth.target, auth.ntlm_version)
+        );
+    }
+
+    #[test]
+    fn a_failure_and_the_success_after_it_are_two_dedup_keys() {
+        let failure = Fields::of(&[
+            ("Username", text_value("alice")),
+            ("Status", Value::U32(0xc000_006d)),
+        ]);
+        let success = Fields::of(&[("Username", text_value("alice")), ("Status", Value::U32(0))]);
+        let failure = ntlm_auth(NtlmDirection::Incoming, &failure);
+        let success = ntlm_auth(NtlmDirection::Incoming, &success);
+
+        assert_ne!(failure.dedup_key(4023), success.dedup_key(4022));
+        assert_ne!(failure.dedup_key(4023), failure.dedup_key(4022));
+        assert_eq!(failure.dedup_key(4023), failure.clone().dedup_key(4023));
     }
 
     #[test]
@@ -453,8 +564,8 @@ mod ntlm {
         let hex = Fields::of(&[("Status", text_value("0xc000006d"))]);
         let word = Fields::of(&[("Status", text_value("Success"))]);
 
-        let hex_status = ntlm_auth(NtlmDirection::Incoming, &hex, meta()).status;
-        let word_status = ntlm_auth(NtlmDirection::Incoming, &word, meta()).status;
+        let hex_status = ntlm_auth(NtlmDirection::Incoming, &hex).status;
+        let word_status = ntlm_auth(NtlmDirection::Incoming, &word).status;
 
         assert_eq!(hex_status.as_deref(), Some("0xc000006d"));
         assert_eq!(word_status, None);
@@ -465,7 +576,7 @@ mod ntlm {
         let fields = Fields::of(&[("TargetIP", text_value("-"))]);
 
         assert_eq!(
-            ntlm_auth(NtlmDirection::Outgoing, &fields, meta()).remote_address,
+            ntlm_auth(NtlmDirection::Outgoing, &fields).remote_address,
             None
         );
     }
@@ -484,7 +595,21 @@ mod ntlm {
 mod never_panics {
     use super::*;
 
-    const NAMES: [&str; 22] = [
+    const NAMES: [&str; 36] = [
+        "DataSize",
+        "Username",
+        "DomainName",
+        "TargetService",
+        "TargetMachine",
+        "TargetIP",
+        "ClientIP",
+        "NtlmVersion",
+        "ProcessName",
+        "ScopeOfSearch",
+        "ProcessId",
+        "SearchFilter",
+        "DistinguishedName",
+        "MessageTotal",
         "QueryName",
         "QueryType",
         "QueryResults",
@@ -537,8 +662,8 @@ mod never_panics {
             let _ = ldap_pid(&fields, 0);
             let _ = ldap_search(&fields, meta());
             let _ = ntlm_pid(&fields, 0);
-            let _ = ntlm_auth(NtlmDirection::Outgoing, &fields, meta());
-            let _ = ntlm_auth(NtlmDirection::Incoming, &fields, meta());
+            let _ = ntlm_auth(NtlmDirection::Outgoing, &fields);
+            let _ = ntlm_auth(NtlmDirection::Incoming, &fields).dedup_key(4022);
         }
     }
 }

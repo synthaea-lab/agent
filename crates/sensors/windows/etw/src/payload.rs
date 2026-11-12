@@ -69,8 +69,8 @@ pub(crate) fn dns_query(fields: &impl PayloadFields, meta: EventMeta) -> Option<
 }
 
 /// Kernel-Registry EID 5 (`SetValueKey`); `None` when the kernel did not resolve the key
-/// name. Only string data is decoded: raw DWORD or binary bytes have no text form for rules.
-/// `CapturedData` is the part of the value the kernel captured, so long data is a prefix.
+/// name (the record then names the key only by its `KeyObject` handle). Only string data is
+/// decoded: raw DWORD or binary bytes have no text form for rules.
 pub(crate) fn registry_set(
     fields: &impl PayloadFields,
     meta: EventMeta,
@@ -78,9 +78,7 @@ pub(crate) fn registry_set(
     let raw_key = non_empty(fields.text_or_empty("KeyName"))?;
     let data_type = fields.u32("Type").unwrap_or(0);
     let data = match data_type {
-        REG_SZ | REG_EXPAND_SZ => {
-            decode_reg_string(&fields.bytes("CapturedData").unwrap_or_default())
-        }
+        REG_SZ | REG_EXPAND_SZ => decode_reg_string(&captured_text_bytes(fields)),
         _ => None,
     };
     Some(RegistrySetEvent {
@@ -90,6 +88,20 @@ pub(crate) fn registry_set(
         data_type,
         data,
     })
+}
+
+/// The value bytes to decode as text. `CapturedData` is the part of the value the kernel
+/// captured: when it is shorter than `DataSize` the data is a prefix, cut wherever the
+/// capture limit fell, so a half UTF-16 unit at its end is dropped rather than the value.
+fn captured_text_bytes(fields: &impl PayloadFields) -> Vec<u8> {
+    let mut captured = fields.bytes("CapturedData").unwrap_or_default();
+    let is_prefix = fields
+        .u32("DataSize")
+        .is_some_and(|size| captured.len() < usize::try_from(size).unwrap_or(usize::MAX));
+    if is_prefix {
+        captured.truncate(captured.len() & !1);
+    }
+    captured
 }
 
 /// A `REG_SZ` / `REG_EXPAND_SZ` value: UTF-16 LE, trailing NULs dropped. `None` for an
@@ -242,14 +254,51 @@ pub(crate) fn ntlm_process_name(fields: &impl PayloadFields) -> String {
     fields.text_or_empty("ProcessName")
 }
 
+/// An NTLM authentication before it has a process: enough to deduplicate it, so a duplicate
+/// costs no process lookup (token read, live pid resolve) on the callback thread.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct NtlmAuth {
+    pub(crate) direction: NtlmDirection,
+    pub(crate) user: String,
+    pub(crate) target: String,
+    pub(crate) remote_address: Option<IpAddr>,
+    pub(crate) ntlm_version: String,
+    pub(crate) status: Option<String>,
+}
+
+impl NtlmAuth {
+    /// Two records with the same key within the window are one fact. The status and the
+    /// event id are part of it: an incoming failure and the success that follows it (same
+    /// account, address, target and version) are two facts, and the rules need the success.
+    pub(crate) fn dedup_key(&self, event_id: u16) -> String {
+        normalize::ntlm_dedup_key(
+            self.direction,
+            event_id,
+            &self.user,
+            &self.target,
+            self.remote_address,
+            &self.ntlm_version,
+            self.status.as_deref(),
+        )
+    }
+
+    pub(crate) fn into_event(self, meta: EventMeta) -> NtlmAuthEvent {
+        NtlmAuthEvent {
+            meta,
+            direction: self.direction,
+            user: self.user,
+            target: self.target,
+            remote_address: self.remote_address,
+            ntlm_version: self.ntlm_version,
+            status: self.status,
+        }
+    }
+}
+
 /// An NTLM authentication. The target is the service (`cifs/127.0.0.1`), else the machine;
 /// the remote address is the target's going out and the client's coming in; only an incoming
 /// record has a status.
-pub(crate) fn ntlm_auth(
-    direction: NtlmDirection,
-    fields: &impl PayloadFields,
-    meta: EventMeta,
-) -> NtlmAuthEvent {
+pub(crate) fn ntlm_auth(direction: NtlmDirection, fields: &impl PayloadFields) -> NtlmAuth {
     let service = fields.text_or_empty("TargetService");
     let target = if NTLM_ABSENT.contains(&service.trim()) {
         fields.text_or_empty("TargetMachine")
@@ -260,8 +309,7 @@ pub(crate) fn ntlm_auth(
         NtlmDirection::Outgoing => ("TargetIP", None),
         NtlmDirection::Incoming => ("ClientIP", ntlm_status(fields)),
     };
-    NtlmAuthEvent {
-        meta,
+    NtlmAuth {
         direction,
         user: normalize::ntlm_account(
             &fields.text_or_empty("Username"),
