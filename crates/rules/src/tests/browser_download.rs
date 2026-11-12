@@ -98,7 +98,7 @@ fn every_captured_browser_image_marks_a_finished_download() {
         ("/opt/brave.com/brave/brave", ".crdownload"),
         (OPERA, ".opdownload"),
         ("/opt/vivaldi/vivaldi-bin", ".crdownload"),
-        // Debian 13 firefox-esr, read from /proc under strace (the sensor did not run there)
+        // Debian 13 firefox-esr: /proc under strace, and the sensor's own file_rename event
         (DEBIAN_FIREFOX_ESR, ".part"),
     ] {
         let mut state = RuleState::new();
