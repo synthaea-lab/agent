@@ -88,6 +88,31 @@ pub(crate) const QUARANTINE_EXEC_WINDOW_NS: u64 = 600_000_000_000; // 10 min
 /// mark and its writer.
 pub(crate) const MAIL_CLIENT_QUARANTINE_AGENTS: &[&str] = &["Mail"];
 
+/// Executable images of the browsers whose finished download is marked from the rename of
+/// its partial file (T1204.002, <https://github.com/synthaea-lab/agent/issues/221>): the
+/// event's `executable_path`, compared exactly (Linux paths are case-sensitive). The one
+/// place to add a browser: one line per image.
+///
+/// Only what a lab capture showed (2026-11-10, Fedora 43 lab VM, vendor packages: Chromium
+/// 156, Firefox 159, Chrome 157, Edge, Brave 1.99, Opera, Vivaldi 8.3). Firefox ESR (a tarball
+/// path that depends on where it is unpacked), other distributions' paths and the
+/// Flatpak/Snap paths are not here until a capture reports their image. `comm` is useless as the key: the rename
+/// runs on a thread-pool worker (`ThreadPoolForeg`, `BgIOThr~Pool #N`).
+pub(crate) const BROWSER_DOWNLOAD_IMAGES: &[&str] = &[
+    "/usr/lib64/chromium-browser/chromium-browser",
+    "/usr/lib64/firefox/firefox",
+    "/opt/google/chrome/chrome",
+    "/opt/microsoft/msedge/msedge",
+    "/opt/brave.com/brave/brave",
+    "/usr/lib64/opera-stable/opera",
+    "/opt/vivaldi/vivaldi-bin",
+];
+
+/// Suffixes of a browser's partial download file. A rename out of one of these, to a name
+/// without one, is the browser finishing the download. `.opdownload` is Opera's (captured
+/// 2026-11-10, with and without a Save-as dialog).
+pub(crate) const BROWSER_PARTIAL_SUFFIXES: &[&str] = &[".crdownload", ".opdownload", ".part"];
+
 /// Window between a BITS job adding or completing a file and an exec of that
 /// file that still counts as "BITS-downloaded, then run" (T1197, #284). The
 /// same 10 min as [`QUARANTINE_EXEC_WINDOW_NS`]: the window runs from the

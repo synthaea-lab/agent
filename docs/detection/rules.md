@@ -207,6 +207,29 @@ These are called once, before the sensors start
 Every seed is best effort. A missing file or an unreadable `/proc` entry only means the rule
 judges against its built-in baseline.
 
+## Linux browser downloads (T1204.002)
+
+Linux browsers leave no usable xattr mark, so `on_file_rename` marks the finished download
+instead ([`on_browser_download_rename`](../../crates/rules/src/download_state.rs), #221). A
+`FileRename` marks `new_path` when `old_path` ends in `.crdownload`, `.opdownload` (Opera) or `.part`, `new_path`
+does not, and the event's `executable_path` is in
+[`BROWSER_DOWNLOAD_IMAGES`](../../crates/rules/src/exclusions.rs). The mark is the one a
+`FileQuarantine` records (agent = the image's file name, no origin URL), so
+`check_quarantined_exec` joins a later exec of that path inside the same window and the
+same signature gate applies.
+
+- The key is the image, not `comm`: the rename runs on a thread-pool worker (`ThreadPoolForeg`
+  in Chromium, `BgIOThr~Pool #N` in Firefox).
+- Chromium's first rename (`/tmp/... -> .crdownload`, `EXDEV` across devices) and cache renames
+  have no partial-suffix `old_path` and mark nothing.
+- Adding a browser is one line in `BROWSER_DOWNLOAD_IMAGES`. It holds only the images a capture
+  showed (2026-11-10, Fedora 43 lab VM): Chromium and Firefox from the distribution packages,
+  and the vendor packages of Chrome (`/opt/google/chrome/chrome`), Edge
+  (`/opt/microsoft/msedge/msedge`), Brave (`/opt/brave.com/brave/brave`), Opera
+  (`/usr/lib64/opera-stable/opera`) and Vivaldi (`/opt/vivaldi/vivaldi-bin`).
+- An empty or absent `executable_path` marks nothing. What is still unchecked is listed under
+  "Not verified" in [attack-coverage.md](../attack-coverage.md).
+
 ## Signature-gated findings
 
 Some findings are only true when the executed image is not validly signed. T1204.002 (a
@@ -264,6 +287,7 @@ verification and window calibration are tracked in
 | A table reaches its cap | LRU eviction. A forgotten key can re-alert once; first-seen tables log each eviction rise |
 | Parent not in the cache and gone from `/proc` | parent-name rules cannot fire for that exec |
 | Linux `comm` truncated to 15 bytes | T1105 compares `comm` to the downloaded file's basename, so a longer name does not match |
+| Linux browser download, `executable_path` empty or not in `BROWSER_DOWNLOAD_IMAGES` | no T1204.002 mark: the join is keyed on the renaming process's image, never `comm`, and there is no lineage fallback (not validated: the capture ran under `strace`) |
 | A downloaded script run through an interpreter | image is the interpreter; T1204.002 and T1105 do not join |
 | Events out of order across sensor threads | windows tolerate it; deferred findings wait for the clock |
 | No generation stamp (macOS) | pid-only behaviour, recycled pids possible |

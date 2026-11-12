@@ -39,4 +39,4 @@ pub use parse::{AuditRecord, parse_audit_message};
 #[cfg(target_os = "linux")]
 pub use sensor::AuditSensor;
 #[cfg(target_os = "linux")]
-pub use socket::{AuditError, AuditSocket};
+pub use socket::{AuditError, AuditSocket, Received};

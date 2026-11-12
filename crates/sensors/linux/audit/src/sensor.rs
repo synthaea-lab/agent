@@ -48,13 +48,14 @@ impl AuditSensor {
         let ctrl_c = tokio::signal::ctrl_c();
         tokio::pin!(ctrl_c);
 
-        let mut buf = vec![0u8; 8192];
+        let mut buf = vec![0u8; crate::socket::RECV_BUFFER_LEN];
         // A record this parser can't read is skipped and counted, never fatal:
         // returning the parse error here once stopped the sensor on the first
         // record it received (#504).
         let mut unparsed: u64 = 0;
         let mut overruns: u64 = 0;
         let mut execve = ExecveAssembler::default();
+        let mut truncated: u64 = 0;
         loop {
             tokio::select! {
                 _ = &mut ctrl_c => break,
@@ -69,20 +70,31 @@ impl AuditSensor {
                     // readiness stays set when the budget runs out.
                     for _ in 0..DRAIN_BUDGET {
                         match guard.get_inner_mut().recv(&mut buf) {
-                            Ok(n) => match parse::parse_audit_message(&buf[..n]) {
-                                Ok(record) => forward(&record, &mut execve, sink.as_ref()),
-                                Err(e) => {
-                                    unparsed += 1;
-                                    // Powers of two only: a stream of bad records must not flood the log.
-                                    if unparsed.is_power_of_two() {
+                            Ok(received) => {
+                                if received.truncated {
+                                    truncated += 1;
+                                    if truncated.is_power_of_two() {
                                         tracing::warn!(
-                                            error = %e,
-                                            unparsed_total = unparsed,
-                                            "sensor-linux-audit: unparseable record skipped"
+                                            truncated_total = truncated,
+                                            "sensor-linux-audit: record longer than the receive buffer, parsed cut"
                                         );
                                     }
                                 }
-                            },
+                                match parse::parse_audit_message(&buf[..received.len]) {
+                                    Ok(record) => forward(&record, &mut execve, sink.as_ref()),
+                                    Err(e) => {
+                                        unparsed += 1;
+                                        // Powers of two only: a stream of bad records must not flood the log.
+                                        if unparsed.is_power_of_two() {
+                                            tracing::warn!(
+                                                error = %e,
+                                                unparsed_total = unparsed,
+                                                "sensor-linux-audit: unparseable record skipped"
+                                            );
+                                        }
+                                    }
+                                }
+                            }
                             Err(crate::AuditError::Netlink(errno))
                                 if errno == libc::EAGAIN || errno == libc::EWOULDBLOCK =>
                             {

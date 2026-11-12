@@ -246,8 +246,11 @@ sensor covers that from the kernel side: its signal probes record a `SIGKILL` ai
 at the agent, and the restarted agent reports the sender through a rule. Under the
 audit fallback sensor that gap remains. Kernel-mediated stops that involve no signal
 from a process (a CPU rlimit, a cgroup memory limit, `cgroup.freeze`) are read from how
-they are set (`systemctl set-property` or `freeze`, `prlimit --pid`, a write to a cgroup
-limit file); the kill that a memory limit then causes is not reported
+they are set: the command (`systemctl freeze|set-property`, a memory or task limit, or a
+`CPUQuota` below 10 %, in `%`, `‰` or `‱`, on a listed tool is Medium; `prlimit --pid <pid>
+--cpu|--as`, with `--pid` abbreviated to `--p` or `--pi`, is Medium when the pid is a listed tool,
+from its comm or image name, and Low otherwise), or a write to a cgroup limit file of a listed
+unit. The kill that a memory limit then causes is not reported
 ([#49](https://github.com/synthaea-lab/agent/issues/49)). The full
 mask-wait-exit flow is not unit-tested because it terminates the test runner; only the
 pure helpers are.
