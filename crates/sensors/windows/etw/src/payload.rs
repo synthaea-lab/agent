@@ -236,14 +236,51 @@ pub(crate) fn ntlm_process_name(fields: &impl PayloadFields) -> String {
     fields.text_or_empty("ProcessName")
 }
 
+/// An NTLM authentication before it has a process: enough to deduplicate it, so a duplicate
+/// costs no process lookup (token read, live pid resolve) on the callback thread.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct NtlmAuth {
+    pub(crate) direction: NtlmDirection,
+    pub(crate) user: String,
+    pub(crate) target: String,
+    pub(crate) remote_address: Option<IpAddr>,
+    pub(crate) ntlm_version: String,
+    pub(crate) status: Option<String>,
+}
+
+impl NtlmAuth {
+    /// Two records with the same key within the window are one fact. The status and the
+    /// event id are part of it: an incoming failure and the success that follows it (same
+    /// account, address, target and version) are two facts, and the rules need the success.
+    pub(crate) fn dedup_key(&self, event_id: u16) -> String {
+        normalize::ntlm_dedup_key(
+            self.direction,
+            event_id,
+            &self.user,
+            &self.target,
+            self.remote_address,
+            &self.ntlm_version,
+            self.status.as_deref(),
+        )
+    }
+
+    pub(crate) fn into_event(self, meta: EventMeta) -> NtlmAuthEvent {
+        NtlmAuthEvent {
+            meta,
+            direction: self.direction,
+            user: self.user,
+            target: self.target,
+            remote_address: self.remote_address,
+            ntlm_version: self.ntlm_version,
+            status: self.status,
+        }
+    }
+}
+
 /// An NTLM authentication. The target is the service (`cifs/127.0.0.1`), else the machine;
 /// the remote address is the target's going out and the client's coming in; only an incoming
 /// record has a status.
-pub(crate) fn ntlm_auth(
-    direction: NtlmDirection,
-    fields: &impl PayloadFields,
-    meta: EventMeta,
-) -> NtlmAuthEvent {
+pub(crate) fn ntlm_auth(direction: NtlmDirection, fields: &impl PayloadFields) -> NtlmAuth {
     let service = fields.text_or_empty("TargetService");
     let target = if NTLM_ABSENT.contains(&service.trim()) {
         fields.text_or_empty("TargetMachine")
@@ -254,8 +291,7 @@ pub(crate) fn ntlm_auth(
         NtlmDirection::Outgoing => ("TargetIP", None),
         NtlmDirection::Incoming => ("ClientIP", ntlm_status(fields)),
     };
-    NtlmAuthEvent {
-        meta,
+    NtlmAuth {
         direction,
         user: normalize::ntlm_account(
             &fields.text_or_empty("Username"),
