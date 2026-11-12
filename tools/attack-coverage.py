@@ -257,8 +257,11 @@ UNVERIFIED_NOTES = [
     "filesystem, for Chromium, Chrome, Edge and Opera, gives the same final rename and "
     "the same `executable_path`). **Not verified:** Firefox ESR and other distributions' image paths until "
     "captured, so they raise nothing; Flatpak and Snap installs (other image "
-    "paths); a Wayland session; a download through a Save-as dialog; a download "
-    "resumed after a restart. An empty `executable_path` marks nothing: the "
+    "paths); a Wayland session; a download through a Save-as dialog. Resumed "
+    "downloads were captured: Chrome resumes by itself, and after a browser kill and "
+    "relaunch a manual Resume ends with the same single `.crdownload` -> final rename "
+    "(same `executable_path`); Firefox's manual retry ends with the same `.part` -> "
+    "final rename. An empty `executable_path` marks nothing: the "
     "process-lineage fallback is not implemented, and the capture ran under `strace` "
     "so its lineage was not real "
     "(https://github.com/synthaea-lab/agent/issues/221).",
