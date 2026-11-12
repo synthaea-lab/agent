@@ -317,6 +317,13 @@ fn the_forms_of_the_path_that_pass_the_probe_filter_alert_too() {
         "auditd.service/memory.max",
         "./auditd.service/memory.max",
         "system.slice/auditd.service/pids.max",
+        // non-normalized spellings the kernel resolves to the same file (live: Debian 12, 6.1)
+        "/sys/fs/../fs/cgroup/system.slice/osqueryd.service/memory.high",
+        "/sys//fs/cgroup/system.slice/osqueryd.service/memory.high",
+        "/sys/./fs/cgroup/system.slice/osqueryd.service/memory.high",
+        "/sys/fs/cgroup/system.slice/auditd.service/x/../memory.max",
+        // cgroup2 mounted somewhere else: `mount -t cgroup2 none /mnt/cg2`
+        "/mnt/cg2/system.slice/osqueryd.service/memory.high",
     ] {
         let alerts = all_file_open_alerts(&cgroup_open(path, O_WRONLY, 4242));
         assert_eq!(alerts.len(), 1, "{path}: {alerts:?}");
@@ -373,7 +380,6 @@ fn reads_other_units_other_files_and_the_manager_do_not_alert() {
             1,
         ),
         ("/sys/fs/cgroup/system.slice/memory.max", O_WRONLY, 4242),
-        ("/tmp/auditd.service/memory.max", O_WRONLY, 4242),
         (
             "/sys/fs/cgroup/system.slice/auditd.scope/memory.max",
             O_WRONLY,

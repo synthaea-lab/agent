@@ -118,14 +118,17 @@ fn is_proc_pid_root(path: &[u8]) -> bool {
     matches!(path.get(root_start + ROOT.len()), None | Some(&b'/'))
 }
 
-/// Whether `path` is a write to a cgroup control file that ends, freezes or starves the unit it
+/// Whether `path` (already known to start with `/sys/`) is a write to a cgroup control file that ends, freezes or starves the unit it
 /// sits in (<https://github.com/synthaea-lab/agent/issues/49>): `memory.max`, `memory.high`,
 /// `pids.max` (and any other `*.max`, `cpu.max` included), `cgroup.freeze`, and the cgroup v1
 /// `freezer.state` and `memory.*_in_bytes`.
 ///
 /// `echo 1M > .../auditd.service/memory.max` makes the kernel OOM-kill the tool with a
 /// `SEND_SIG_PRIV` signal no probe reports, and `echo 1 > cgroup.freeze` sends no signal at all;
-/// the file open is the only event either leaves. The match is on the path **tail**, fail-open
+/// the file open is the only event either leaves. The match is on the path **tail** and does not
+/// test for `/sys/fs/cgroup/`: the probe reads the path as the caller wrote it, and the kernel
+/// resolves `/sys/fs/../fs/cgroup/...`, `/sys//fs/cgroup/...` and `/sys/./fs/cgroup/...` to the
+/// same file, so a literal prefix test is one character from being bypassed. Fail-open
 /// like [`is_proc_pid_root`]: a few constant compares of at most seven bytes, no loop and no
 /// per-name `memcmp`, because this is inlined into the open program and the verifier budget on
 /// 5.15 is what bounded the earlier versions of this file. It lets through a few files the rule
@@ -136,7 +139,7 @@ fn is_proc_pid_root(path: &[u8]) -> bool {
 /// mutation syscalls never name these files in a way that matters, so for them this folds away
 /// at compile time and costs the other 13 file programs nothing.
 fn is_cgroup_limit_write(path: &[u8], flags: i64, is_mutation: bool) -> bool {
-    if is_mutation || !is_write_intent(flags) || !path.starts_with(b"/sys/fs/cgroup/") {
+    if is_mutation || !is_write_intent(flags) {
         return false;
     }
     path.ends_with(b".max")
@@ -340,7 +343,10 @@ mod tests {
 
     #[test]
     fn other_cgroup_writes_stay_filtered() {
-        // systemd moves pids and tunes weights all day: volume, and no stop.
+        // systemd moves pids and tunes weights all day: volume, and no stop. `cgroup.kill` is
+        // filtered on purpose too, although it is the most direct stop: its `SIGKILL` reaches
+        // `signal_generate` as `SEND_SIG_NOINFO`, attributed to the writer (`signals.md`), so
+        // the signal probe already reports it.
         for path in [
             &b"/sys/fs/cgroup/system.slice/auditd.service/cgroup.procs"[..],
             b"/sys/fs/cgroup/system.slice/auditd.service/cgroup.subtree_control",
@@ -353,17 +359,31 @@ mod tests {
     }
 
     #[test]
-    fn a_limit_file_name_outside_the_cgroup_tree_stays_filtered() {
-        assert!(is_filtered_path(
+    fn a_non_normalized_spelling_of_a_cgroup_limit_file_passes() {
+        // The kernel resolves each of these to the same file as the plain path (live on Debian
+        // 12, 6.1: the value is applied); the probe must not drop them.
+        for path in [
+            &b"/sys/fs/../fs/cgroup/system.slice/osqueryd.service/memory.high"[..],
+            b"/sys//fs/cgroup/system.slice/osqueryd.service/memory.high",
+            b"/sys/./fs/cgroup/system.slice/osqueryd.service/memory.high",
+            b"/sys/fs/cgroup/system.slice/osqueryd.service/../osqueryd.service/memory.max",
+            b"/sys/fs/cgroup/system.slice/osqueryd.service/cgroup.freeze",
+        ] {
+            assert!(!is_filtered_path(path, O_WRONLY, false), "{path:?}");
+            assert!(is_filtered_path(path, 0, false), "{path:?}");
+        }
+    }
+
+    #[test]
+    fn a_limit_file_name_elsewhere_under_sys_passes_and_the_rule_decides() {
+        // Fail-open by design: the probe cannot tell `/sys/kernel/mm/memory.max` from a cgroup
+        // file without the prefix test it no longer has; the rule reads the unit.
+        assert!(!is_filtered_path(
             b"/sys/kernel/mm/memory.max",
             O_WRONLY,
             false
         ));
-        assert!(is_filtered_path(
-            b"/sys/fs/cgroupx/a.service/memory.max",
-            O_WRONLY,
-            false
-        ));
+        assert!(is_filtered_path(b"/sys/kernel/mm/memory.max", 0, false));
         assert!(is_filtered_path(b"/sys/fs/cgroup", O_WRONLY, false));
     }
 
