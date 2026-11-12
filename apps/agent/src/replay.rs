@@ -19,7 +19,9 @@
 //!   and replaces it when the parent pid is recycled, and it evicts the least recently
 //!   used entity past its cap. A live run has already emitted the replaced verdict by
 //!   then; the replay keeps a snapshot of every case after each of its events instead of
-//!   reading the engine once at the end.
+//!   reading the engine once at the end, and before the first event of a newer
+//!   incarnation it drains the enrichment worker, so the findings the worker still owed
+//!   the earlier one are in its case.
 //!
 //! Known limits: a recorded trace is already redacted, so a rule that matched on a
 //! redacted value does not fire again; an exec recorded without a hash (the live hash
@@ -109,7 +111,11 @@ pub(crate) fn cmd_replay(
     sink.stop_host_scans();
 
     let mut summary = ReplaySummary::default();
+    // Every entity seen, for the last pass; those with an event since the last drain; and the
+    // case id of the latest incarnation of each `(ppid, comm)`.
     let mut entities: HashMap<String, schema::EventMeta> = HashMap::new();
+    let mut touched: HashMap<String, schema::EventMeta> = HashMap::new();
+    let mut incarnations: HashMap<(u32, String), String> = HashMap::new();
     let mut cases_seen: HashMap<String, Case> = HashMap::new();
     let mut clock_ns = 0_u64;
     for line in BufReader::new(input).lines() {
@@ -122,16 +128,28 @@ pub(crate) fn cmd_replay(
             continue;
         };
         let meta = event.meta().clone();
+        let key = case_key(&meta);
+        if let Some(previous) = incarnations.insert((meta.ppid, meta.comm.clone()), key.clone())
+            && previous != key
+            && let Some(previous_meta) = entities.get(&previous)
+        {
+            // A newer incarnation of this `(ppid, comm)`: its first finding replaces the
+            // earlier incarnation's state. The worker may still owe that state findings
+            // (signature-gated rules, hash IOC hits), so they land before it can be replaced.
+            drain(&sink)?;
+            snapshot(&sink, &mut cases_seen, &previous, previous_meta);
+        }
         clock_ns = clock_ns.max(meta.timestamp_ns);
         sink.on_event(event);
         sink.advance_correlation_time(clock_ns);
-        let key = case_key(&meta);
         snapshot(&sink, &mut cases_seen, &key, &meta);
-        entities.insert(key, meta);
+        entities.insert(key.clone(), meta.clone());
+        touched.insert(key, meta);
         summary.events += 1;
         if summary.events % FLUSH_EVERY == 0 {
             drain(&sink)?;
-            snapshot_all(&sink, &mut cases_seen, &entities);
+            snapshot_all(&sink, &mut cases_seen, &touched);
+            touched.clear();
         }
     }
     drain(&sink)?;
@@ -181,9 +199,11 @@ fn snapshot(
     }
 }
 
-/// Snapshots every entity seen so far: picks up the findings the enrichment worker
-/// recorded after the entity's own last event. An entity whose state the engine has
-/// since replaced or evicted keeps its earlier snapshot.
+/// Snapshots `entities` after a drain: picks up the findings the enrichment worker
+/// recorded after each entity's own last event. Between drains only the entities with a
+/// new event are visited; the last pass visits all of them, for the findings the
+/// correlator raises when its windows expire. An entity whose state the engine has since
+/// replaced or evicted keeps its earlier snapshot.
 fn snapshot_all(
     sink: &DetectionSink,
     cases: &mut HashMap<String, Case>,
@@ -347,6 +367,42 @@ mod tests {
             .map(|c| c["case_id"].as_str().unwrap())
             .collect();
         assert_eq!(ids, ["100:sh@1", "100:sh@2"]);
+        assert_eq!(summary.cases, 2);
+    }
+
+    #[test]
+    fn a_worker_finding_survives_a_newer_incarnation_of_its_parent() {
+        // The quarantined-exec finding is recorded on the enrichment worker, after the exec
+        // is fed. The second incarnation's base64 finding must not replace the first
+        // incarnation's state before that finding has landed in it.
+        let mut quarantine = schema::fixtures::file_quarantine();
+        quarantine.path = "/tmp/dl".into();
+        quarantine.meta.timestamp_ns = 500;
+        let mut download = schema::fixtures::exec();
+        download.meta.pid = 200;
+        download.meta.ppid = 100;
+        download.meta.comm = "sh".into();
+        download.meta.parent_process_generation = Some(1);
+        download.meta.timestamp_ns = 1_000;
+        download.image_path = "/tmp/dl".into();
+        download.signature = None;
+        let Event::Exec(mut decode) = base64_exec(201, 100, "sh", 5_000_000_000) else {
+            unreachable!("base64_exec builds an exec")
+        };
+        decode.meta.parent_process_generation = Some(2);
+
+        let dir = tempfile::tempdir().unwrap();
+        let lines = [
+            line(&Event::FileQuarantine(quarantine)),
+            line(&Event::Exec(download)),
+            line(&Event::Exec(decode)),
+        ];
+        let (summary, cases) = replay(dir.path(), &lines);
+        let ids: Vec<&str> = cases
+            .iter()
+            .map(|c| c["case_id"].as_str().unwrap())
+            .collect();
+        assert_eq!(ids, ["100:sh@1", "100:sh@2"], "{cases:?}");
         assert_eq!(summary.cases, 2);
     }
 
