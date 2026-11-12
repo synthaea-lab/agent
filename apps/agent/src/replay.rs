@@ -15,10 +15,16 @@
 //!   names the capture host's process or file, not this one's.
 //! - **No event is shed.** The enrichment queue is drained every [`FLUSH_EVERY`] events,
 //!   and a run that still dropped one fails instead of writing incomplete cases.
+//! - **No case is lost to a newer one.** Verdict fusion keeps one state per `(ppid, comm)`
+//!   and replaces it when the parent pid is recycled, and it evicts the least recently
+//!   used entity past its cap. A live run has already emitted the replaced verdict by
+//!   then; the replay keeps a snapshot of every case after each of its events instead of
+//!   reading the engine once at the end.
 //!
 //! Known limits: a recorded trace is already redacted, so a rule that matched on a
-//! redacted value does not fire again; and an exec recorded without a hash (the live hash
-//! failed) is hashed from this host's file at that path, if one exists.
+//! redacted value does not fire again; an exec recorded without a hash (the live hash
+//! failed) is hashed from this host's file at that path, if one exists; and the image
+//! rarity evidence reads this host's wall clock for the age of its snapshot.
 
 use std::{
     collections::HashMap,
@@ -104,6 +110,7 @@ pub(crate) fn cmd_replay(
 
     let mut summary = ReplaySummary::default();
     let mut entities: HashMap<String, schema::EventMeta> = HashMap::new();
+    let mut cases_seen: HashMap<String, Case> = HashMap::new();
     let mut clock_ns = 0_u64;
     for line in BufReader::new(input).lines() {
         let line = line.with_context(|| format!("cannot read {}", events.display()))?;
@@ -118,18 +125,73 @@ pub(crate) fn cmd_replay(
         clock_ns = clock_ns.max(meta.timestamp_ns);
         sink.on_event(event);
         sink.advance_correlation_time(clock_ns);
-        entities.insert(case_key(&meta), meta);
+        let key = case_key(&meta);
+        snapshot(&sink, &mut cases_seen, &key, &meta);
+        entities.insert(key, meta);
         summary.events += 1;
         if summary.events % FLUSH_EVERY == 0 {
             drain(&sink)?;
+            snapshot_all(&sink, &mut cases_seen, &entities);
         }
     }
     drain(&sink)?;
     sink.advance_correlation_time(clock_ns.saturating_add(DRAIN_HORIZON_NS));
     drain(&sink)?;
+    snapshot_all(&sink, &mut cases_seen, &entities);
 
-    summary.cases = write_cases(&sink, &entities, cases)?;
+    summary.cases = write_cases(cases_seen, cases)?;
     Ok(summary)
+}
+
+/// One case as last seen: the entity's verdict, and when its first finding was made.
+struct Case {
+    first_finding_ns: u64,
+    verdict: verdict::Verdict,
+}
+
+/// Records the current verdict of the entity `meta` belongs to, if it has one. The first
+/// snapshot of a case fixes its first-finding time: the verdict keeps only its most recent
+/// detections, so a later snapshot may no longer hold the first one.
+fn snapshot(
+    sink: &DetectionSink,
+    cases: &mut HashMap<String, Case>,
+    key: &str,
+    meta: &schema::EventMeta,
+) {
+    let Some(verdict) = sink.verdict_for(meta) else {
+        return;
+    };
+    match cases.get_mut(key) {
+        Some(case) => case.verdict = verdict,
+        None => {
+            let first_finding_ns = verdict
+                .detections
+                .iter()
+                .map(|d| d.timestamp_ns)
+                .min()
+                .unwrap_or(meta.timestamp_ns);
+            cases.insert(
+                key.to_owned(),
+                Case {
+                    first_finding_ns,
+                    verdict,
+                },
+            );
+        }
+    }
+}
+
+/// Snapshots every entity seen so far: picks up the findings the enrichment worker
+/// recorded after the entity's own last event. An entity whose state the engine has
+/// since replaced or evicted keeps its earlier snapshot.
+fn snapshot_all(
+    sink: &DetectionSink,
+    cases: &mut HashMap<String, Case>,
+    entities: &HashMap<String, schema::EventMeta>,
+) {
+    for (key, meta) in entities {
+        snapshot(sink, cases, key, meta);
+    }
 }
 
 /// The entity key as the case id the agent reports for it.
@@ -154,26 +216,20 @@ fn drain(sink: &DetectionSink) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Writes the verdict of every entity that has one, ordered by first finding then case id
-/// so two replays of one file write the same bytes. Returns the number of cases.
-fn write_cases(
-    sink: &DetectionSink,
-    entities: &HashMap<String, schema::EventMeta>,
-    cases: &Path,
-) -> anyhow::Result<usize> {
-    let mut verdicts: Vec<(String, verdict::Verdict)> = entities
-        .iter()
-        .filter_map(|(case_id, meta)| Some((case_id.clone(), sink.verdict_for(meta)?)))
-        .collect();
+/// Writes every case, ordered by first finding then case id so two replays of one file
+/// write the same bytes. Returns the number of cases.
+fn write_cases(cases_seen: HashMap<String, Case>, cases: &Path) -> anyhow::Result<usize> {
+    let mut verdicts: Vec<(String, Case)> = cases_seen.into_iter().collect();
     verdicts.sort_by(|(a_id, a), (b_id, b)| {
-        let first = |v: &verdict::Verdict| v.detections.iter().map(|d| d.timestamp_ns).min();
-        first(a).cmp(&first(b)).then_with(|| a_id.cmp(b_id))
+        a.first_finding_ns
+            .cmp(&b.first_finding_ns)
+            .then_with(|| a_id.cmp(b_id))
     });
 
     let file = std::fs::File::create(cases)
         .with_context(|| format!("cannot create the cases file {}", cases.display()))?;
     let mut out = BufWriter::new(file);
-    for (case_id, verdict) in &verdicts {
+    for (case_id, Case { verdict, .. }) in &verdicts {
         let record = CaseRecord {
             case_id: case_id.clone(),
             ppid: verdict.entity.ppid,
@@ -266,6 +322,32 @@ mod tests {
                 .is_empty(),
             "a case keeps the events its findings were raised on: {cases:?}"
         );
+    }
+
+    #[test]
+    fn both_incarnations_of_a_recycled_parent_keep_their_case() {
+        // Same ppid and comm, two parent incarnations: verdict fusion replaces the first
+        // state when the second one records a finding, as a live run does after it has
+        // already emitted the first verdict. The replay must still write both cases.
+        let stamped = |pid, generation, timestamp_ns| {
+            let Event::Exec(mut exec) = base64_exec(pid, 100, "sh", timestamp_ns) else {
+                unreachable!("base64_exec builds an exec")
+            };
+            exec.meta.parent_process_generation = Some(generation);
+            Event::Exec(exec)
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let lines = [
+            line(&stamped(200, 1, 1_000)),
+            line(&stamped(201, 2, 5_000_000_000)),
+        ];
+        let (summary, cases) = replay(dir.path(), &lines);
+        let ids: Vec<&str> = cases
+            .iter()
+            .map(|c| c["case_id"].as_str().unwrap())
+            .collect();
+        assert_eq!(ids, ["100:sh@1", "100:sh@2"]);
+        assert_eq!(summary.cases, 2);
     }
 
     #[test]
