@@ -134,6 +134,9 @@ pub(crate) enum WmiOperation {
 }
 
 impl WmiOperation {
+    /// Every id [`Self::from_id`] reads: the provider's event-id filter.
+    pub(crate) const EVENT_IDS: [u16; 2] = [23, 24];
+
     pub(crate) fn from_id(event_id: u16) -> Option<Self> {
         match event_id {
             23 => Some(Self::ExecQuery),
@@ -210,6 +213,9 @@ pub(crate) fn ldap_search(fields: &impl PayloadFields, meta: EventMeta) -> LdapS
         attributes: normalize::split_ldap_attributes(&fields.text_or_empty("AttributeList")),
     }
 }
+
+/// Every id [`ntlm_direction`] reads: the provider's event-id filter.
+pub(crate) const NTLM_EVENT_IDS: [u16; 6] = [4020, 4021, 4022, 4023, 4026, 4027];
 
 /// The direction of an NTLM record: 4020/4021/4026/4027 this host authenticated out,
 /// 4022/4023 a client authenticated in.

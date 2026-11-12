@@ -44,24 +44,29 @@ Named ETW sessions are kernel objects. They outlive the process that created the
 
 ## Providers
 
-All providers are enabled on the one session. "Keywords" is the match-any mask passed to `ferrisetw`; when it is not set, `ferrisetw` enables every keyword of the provider.
+All providers are enabled on the one session, each for the event ids its callback handles ([`enabled_for`](../../../crates/sensors/windows/etw/src/providers.rs)), in two layers:
+
+- **Event-id filter** ("Event IDs kept"): ETW drops every other id before delivery (`EVENT_FILTER_TYPE_EVENT_ID`, Windows 8.1+). It is the same list the callback checks, so it changes no output; a filter the OS ignores only costs the delivery it was meant to save.
+- **Keyword mask** ("Keywords", match-any): where the manifest has a keyword that isolates the kept ids, the provider is not asked for anything else, so it does not even write the rest. This matters most for DotNETRuntime, whose other keywords (GC, JIT, stacks) make every .NET process on the host do work. "none isolates" means the kept ids carry only their channel's keyword bit, so all keywords stay enabled and the id filter does the work.
+
+Keyword values come from the installed manifests (`Get-WinEvent -ListProvider <name>`, Windows 11 26300, 2026-11-12). The `#[ignore]` real-session tests under [Testing](#testing) check them against a live session.
 
 | Provider | Keywords | Event IDs kept | Emits | Volume control |
 | --- | --- | --- | --- | --- |
-| Kernel-Process | `0x4070` (process, thread, image, job/silo) | 1 start, 2 end, 3 thread start, 5 image load, 23-26 silo | `Exec`, `ImageLoad`, `RemoteThread` | 4 (thread stop) dropped on its id; image loads only for tracked pids |
+| Kernel-Process | `0x4070` (process, thread, image, job/silo) | 1 start, 2 end, 3 thread start, 5 image load, 23-26 silo | `Exec`, `ImageLoad`, `RemoteThread` | 4 (thread stop) filtered out by id; image loads only for tracked pids |
 | Kernel-Audit-API-Calls | none declared by the manifest | 5 `PsOpenProcess` | `ProcessAccess` | only opens of LSASS with a memory-reaching right; dedup |
-| Kernel-Network | all | 42/12 TCP v4, 58/26 TCP v6, 14 UDP send v4 | `Connect`, `UdpSend` | `ConnectDedup` per flow |
+| Kernel-Network | `0x30` (IPv4, IPv6) | 42/12 TCP v4, 58/26 TCP v6, 14 UDP send v4 | `Connect`, `UdpSend` | `ConnectDedup` per flow |
 | Kernel-File | `0x80 \| 0x400 \| 0x1000` | 12 create, 30 create-new, 26 delete-path | `FileOpen`, `FileDelete`, `FileQuarantine` (via worker) | tracked pids only, read-only opens dropped, deletes only for Zone.Identifier |
-| DNS-Client | all | 3008 query completed | `DnsQuery` | none |
+| DNS-Client | none isolates | 3008 query completed | `DnsQuery` | none |
 | Kernel-Registry | `0x100` (`SetValueKey`) | 5 `SetValueKey` | `RegistrySet` | value writes only |
-| PowerShell | all | 4104 script block | `ScriptBlock` | none (each fragment is one event) |
-| AMSI | all | 1101 scan | `AmsiContent` | `AmsiGate` |
-| LDAP-Client | all | 30 search | `LdapSearch` | `PidBudget` 128 per 10 s |
-| NTLM | all | 4020-4023, 4026, 4027 | `NtlmAuth` | `KeyDedup` 60 s |
-| WMI-Activity | all | 23 `ExecQuery`, 24 `ExecMethod` | `WmiActivity` | none |
-| DotNETRuntime | all | 154 `AssemblyLoad`, dynamic only | `AssemblyLoad` | file-backed loads dropped |
-| SMBClient | all | 30704 connected | `SmbConnect` | none |
-| Bits-Client | all | 16403, 4, 5, 61 | `BitsJob` | Microsoft update hosts dropped |
+| PowerShell | `0x1` (`Runspace`) | 4104 script block | `ScriptBlock` | none (each fragment is one event) |
+| AMSI | `0x1` (`Event1`) | 1101 scan | `AmsiContent` | `AmsiGate` |
+| LDAP-Client | `0x1` (`search`) | 30 search | `LdapSearch` | `PidBudget` 128 per 10 s |
+| NTLM | none isolates | 4020-4023, 4026, 4027 | `NtlmAuth` | `KeyDedup` 60 s |
+| WMI-Activity | none isolates | 23 `ExecQuery`, 24 `ExecMethod` | `WmiActivity` | none |
+| DotNETRuntime | `0x8` (`LoaderKeyword`) | 154 `AssemblyLoad`, dynamic only | `AssemblyLoad` | file-backed loads dropped |
+| SMBClient | none isolates | 30704 connected | `SmbConnect` | none |
+| Bits-Client | none isolates | 16403, 4, 5, 61 | `BitsJob` | Microsoft update hosts dropped |
 
 GUIDs, keyword constants and per-provider field notes (field names and types as observed on specific Windows builds) are in [`providers.rs`](../../../crates/sensors/windows/etw/src/providers.rs). [`ALL_PROVIDERS`](../../../crates/sensors/windows/etw/src/providers.rs) lists them by name for the blind-session diagnosis.
 
@@ -164,12 +169,11 @@ Everything else (provider set, keyword masks, budgets, windows) is a constant in
 
 - **Unit tests on every OS** for the pure modules: `normalize`, `payload`, `budget`, `amsi`, `cross_process`, `bits`, `zone_identifier`, `silo`, `pid_cache`, `long_path`, and the identity helpers in `lib.rs`.
 - **Never-panic suite** [`tests/robustness.rs`](../../../crates/sensors/windows/etw/tests/robustness.rs): seeded pseudo-random bytes into `zone_identifier::parse` and `bits::is_microsoft_update_url`, both of which read attacker-chosen input on the consumer thread.
-- **Real-session tests**, `#[ignore]` because they need an elevated Windows process: [`kernel_process_keyword_mask.rs`](../../../crates/sensors/windows/etw/tests/kernel_process_keyword_mask.rs) and [`kernel_file_keyword_mask.rs`](../../../crates/sensors/windows/etw/tests/kernel_file_keyword_mask.rs) check that the providers honor the keyword masks the sensor relies on; [`kernel_registry_set_value.rs`](../../../crates/sensors/windows/etw/tests/kernel_registry_set_value.rs) that a value write arrives as EID 5 under the `SetValueKey` keyword, with its key path, value name and data.
+- **Real-session tests**, `#[ignore]` because they need an elevated Windows process: [`kernel_process_keyword_mask.rs`](../../../crates/sensors/windows/etw/tests/kernel_process_keyword_mask.rs) and [`kernel_file_keyword_mask.rs`](../../../crates/sensors/windows/etw/tests/kernel_file_keyword_mask.rs) check that the providers honor the keyword masks the sensor relies on; [`kernel_registry_set_value.rs`](../../../crates/sensors/windows/etw/tests/kernel_registry_set_value.rs) that a value write arrives as EID 5 under the `SetValueKey` keyword, with its key path, value name and data; [`dotnet_event_filter.rs`](../../../crates/sensors/windows/etw/tests/dotnet_event_filter.rs) that a user-mode provider honors both layers (`LoaderKeyword` plus the filter on 154 deliver an in-memory assembly load and nothing else).
 - **Payload decoding** of the DNS, registry, PowerShell, WMI, .NET, SMB, LDAP and NTLM records is tested in [`payload`](../../../crates/sensors/windows/etw/src/payload.rs) against an in-memory `PayloadFields`, including a property test that arbitrary field values of any type never panic. What those tests cannot check is that a provider really writes the field names and types they assume: those come from lab captures, recorded as field notes in `providers.rs`.
 - Clippy for this crate must be run with `--target x86_64-pc-windows-msvc`; host-only clippy does not compile the Windows-gated modules.
 
 ## Known gaps
 
-- Kernel-Network, DNS-Client, PowerShell, WMI, DotNETRuntime and the other user-mode providers are enabled with every keyword. Filtering happens on the event id in the callback, after the record has been delivered.
 - Injection without a new thread (APC, thread hijack), handle duplication into LSASS and kernel-mode activity are not visible to ETW from a non-PPL session. They need the driver work tracked in [#32](https://github.com/synthaea-lab/agent/issues/32) and [#27](https://github.com/synthaea-lab/agent/issues/27).
 - The image file identity is taken in the `ProcessStart` callback, so a rename-and-replace faster than ETW delivery still wins: [#46](https://github.com/synthaea-lab/agent/issues/46).

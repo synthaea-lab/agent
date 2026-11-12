@@ -223,6 +223,17 @@ mod wmi {
     }
 
     #[test]
+    fn the_event_id_filter_is_exactly_the_ids_read() {
+        for event_id in 0..=u16::MAX {
+            assert_eq!(
+                WmiOperation::EVENT_IDS.contains(&event_id),
+                WmiOperation::from_id(event_id).is_some(),
+                "EID {event_id}"
+            );
+        }
+    }
+
+    #[test]
     fn a_query_carries_its_namespace_and_wql() {
         let fields = Fields::of(&[
             ("NamespaceName", text_value(r"root\cimv2")),
@@ -354,6 +365,17 @@ mod ldap {
 
 mod ntlm {
     use super::*;
+
+    #[test]
+    fn the_event_id_filter_is_exactly_the_ids_read() {
+        for event_id in 0..=u16::MAX {
+            assert_eq!(
+                NTLM_EVENT_IDS.contains(&event_id),
+                ntlm_direction(event_id).is_some(),
+                "EID {event_id}"
+            );
+        }
+    }
 
     #[test]
     fn the_direction_follows_the_event_id() {
