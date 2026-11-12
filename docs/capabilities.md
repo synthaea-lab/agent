@@ -360,7 +360,7 @@ Totals: 273 capabilities, 151 built, 81 partial, 41 planned.
 | T0 command-line scorer on-device | partial | CmdlineScorer exists and is parity-tested (crates/ml/tests/scorer.rs) but nothing in apps/agent/src constructs or calls it | [#94](https://github.com/synthaea-lab/agent/issues/94) | [detection/ml.md#tiers](detection/ml.md#tiers) |
 | T1 17-feature behaviour scorer on-device | partial | BehaviorScorer exists with strict metadata (crates/ml/tests/t1_scorer.rs); not wired into the agent; waits for a model trained on a real capture | [#94](https://github.com/synthaea-lab/agent/issues/94) | [detection/ml.md#tiers](detection/ml.md#tiers) |
 | Per-feature attribution of a score from the ONNX tree structure | partial | crates/ml/src/forest/mod.rs, forest/onnx.rs, proto.rs; crates/ml/tests/attribution_golden.rs. score_explained is not called by the agent, so detections carry no attributions yet | [#94](https://github.com/synthaea-lab/agent/issues/94) | [detection/ml.md#attribution](detection/ml.md#attribution) |
-| Fleet common-set rarity as capped correlator evidence | partial | apps/agent/src/sink/mod.rs load_common_set, note_image_rarity, rarity_evidence with sink tests; ml::features::rarity. K, minimum coverage (10), max age (3 days) and filter FP rate are provisional. Note: the doc comments in crates/ml/src/features/rarity.rs and apps/agent/src/sink/mod.rs field `common_set` still say nothing in the agent reads the snapshot, which the code contradicts | [#94](https://github.com/synthaea-lab/agent/issues/94) | [detection/ml.md#rarity-and-the-common-set](detection/ml.md#rarity-and-the-common-set) |
+| Fleet common-set rarity as capped correlator evidence | partial | apps/agent/src/sink/content.rs load_common_set; apps/agent/src/sink/rarity.rs note_image_rarity, rarity_evidence; sink tests; ml::features::rarity. K, minimum coverage (10), max age (3 days) and filter FP rate are provisional. Note: the doc comment in crates/ml/src/features/rarity.rs still says nothing in the agent reads the snapshot, which the code contradicts | [#94](https://github.com/synthaea-lab/agent/issues/94) | [detection/ml.md#rarity-and-the-common-set](detection/ml.md#rarity-and-the-common-set) |
 | Static onnxruntime release build; dev build portability | partial | crates/ml/Cargo.toml dynamic-onnx default feature; prebuilt runtime fails to link on Debian 12 / Ubuntu 22.04 | [#53](https://github.com/synthaea-lab/agent/issues/53) | [detection/ml.md#build](detection/ml.md#build) |
 
 ### Deception
@@ -519,7 +519,7 @@ Totals: 273 capabilities, 151 built, 81 partial, 41 planned.
 
 | Capability | Status | Evidence | Tracking issue | Docs |
 | --- | --- | --- | --- | --- |
-| Hot reload of Sigma/YARA/common-set content after apply-content-manifest | partial | apps/agent/src/content.rs cmd_apply_content_manifest notifies over IPC; apps/agent/src/ipc_handler.rs reload_content -&gt; apps/agent/src/sink/mod.rs reload_content; no periodic trigger | [#44](https://github.com/synthaea-lab/agent/issues/44) | [lifecycle.md#hot-content-reload](lifecycle.md#hot-content-reload) |
+| Hot reload of Sigma/YARA/common-set content after apply-content-manifest | partial | apps/agent/src/content.rs cmd_apply_content_manifest notifies over IPC; apps/agent/src/ipc_handler.rs reload_content -&gt; apps/agent/src/sink/content.rs reload_content; no periodic trigger | [#44](https://github.com/synthaea-lab/agent/issues/44) | [lifecycle.md#hot-content-reload](lifecycle.md#hot-content-reload) |
 
 ### Updates
 

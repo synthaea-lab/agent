@@ -28,12 +28,17 @@ use crate::{
 
 mod baseline;
 mod canary;
+mod content;
 mod correlation;
+mod rarity;
 mod recording;
 mod response;
 
 pub(crate) use baseline::BaselineSink;
+pub(crate) use content::MAX_COMMON_SET_BYTES;
+use content::{Load, load_common_set, load_sigma_rules, resolve_content_root};
 pub(crate) use correlation::model_root;
+use rarity::{RarityStats, note_image_rarity, unix_now_secs};
 use recording::{Finding, record_ioc_hit, record_rule_alert, spool_on_worker};
 use response::{DAMAGE_MANIFEST_MAX, ResponseCell};
 
@@ -60,7 +65,7 @@ pub(crate) struct DetectionSink {
     /// `<content_root>/snapshots/common-set.bin`, or `None` while there is none: the
     /// "not in the common set" evidence is withheld without one. Swapped whole on
     /// `reload_content`, like the engines above, so a reader never sees a half-loaded
-    /// filter; nothing reads it on the capture path yet (the lookup is the next slice).
+    /// filter. Read by the enrichment worker for the rarity evidence ([`rarity`]).
     common_set: Arc<Mutex<Option<Arc<ml::features::common_set::CommonSetSnapshot>>>>,
     /// On-device IOC matching (#60, ADR-0038) over `<content_root>/ioc/`: exec image hashes on the
     /// enrichment worker, connect destinations on the capture thread. Shared with the worker,
@@ -334,84 +339,6 @@ impl DetectionSink {
             canary: canary::CanaryGate::new(),
             ransomware_join: Mutex::new(crate::ransomware_join::RansomwareJoin::new()),
         })
-    }
-
-    /// Re-reads Sigma/YARA content from [`Self::content_root`] and swaps it
-    /// into the running pipeline (issue #30, IPC `ReloadContent`) — the way
-    /// content `agent apply-content-manifest` just downloaded and verified
-    /// takes effect without restarting the agent.
-    ///
-    /// An *absent* content subdirectory unloads that engine (same "not an
-    /// error" posture startup has always had). A present-but-*broken* one
-    /// keeps the previous engine running and is reported as failed: a bad
-    /// rule file must never leave a live agent without that engine, which
-    /// startup can afford (nothing was protecting yet) and a reload cannot.
-    /// Note the asymmetry in the engines' own loaders: YARA fails the whole
-    /// set on one bad rule, while Sigma skips (and warns about) an individual
-    /// bad rule, so a partly broken Sigma set loads *fewer* rules and is only
-    /// visible through the reported count.
-    pub(crate) fn reload_content(&self) -> ReloadReport {
-        // Parse/compile first, lock only for the swap: `on_event` takes these
-        // locks on the capture thread for every exec and write-open, so loading
-        // under them would stall capture for the whole load, which grows with
-        // the rule set (PR #531 review).
-        let sigma_loaded = load_sigma_rules(&self.content_root);
-        let yara_loaded = start_yara(
-            &self.content_root,
-            self.alert_log.clone(),
-            self.response.clone(),
-            self.verdict.clone(),
-        );
-        let memscan_loaded = start_memscan(
-            &self.content_root,
-            self.alert_log.clone(),
-            self.verdict.clone(),
-        );
-
-        let common_set_loaded = load_common_set(&self.content_root);
-
-        // The replaced engines are dropped after the locks are released: a
-        // `ScanQueue` joins its worker on drop, which must not stall capture.
-        let mut sigma_slot = self.sigma.lock_recovering();
-        let (sigma_reload_failed, old_sigma) = match sigma_loaded {
-            Load::Loaded(engine) => (false, sigma_slot.replace(engine)),
-            Load::Absent => (false, sigma_slot.take()),
-            Load::Failed => (true, None),
-        };
-        let sigma_rule_count = sigma_slot.as_ref().map(sigma::SigmaEngine::rule_count);
-        drop(sigma_slot);
-        drop(old_sigma);
-
-        let mut yara_slot = self.yara.lock_recovering();
-        let (yara_reload_failed, old_yara) = match yara_loaded {
-            Load::Loaded(loaded) => (false, yara_slot.replace(loaded)),
-            Load::Absent => (false, yara_slot.take()),
-            Load::Failed => (true, None),
-        };
-        let yara_rule_count = yara_slot.as_ref().map(|(_, count)| *count);
-        drop(yara_slot);
-        drop(old_yara);
-
-        self.swap_common_set(common_set_loaded);
-        self.ioc.reload(&self.content_root);
-
-        // Same rules, same posture as the file scanner: absent unloads, broken keeps
-        // the previous queue (its failure is already reported through `yara`).
-        let mut memscan_slot = self.memscan.lock_recovering();
-        let old_memscan = match memscan_loaded {
-            Load::Loaded(queue) => memscan_slot.replace(queue),
-            Load::Absent => memscan_slot.take(),
-            Load::Failed => None,
-        };
-        drop(memscan_slot);
-        drop(old_memscan);
-
-        ReloadReport {
-            sigma_rule_count,
-            yara_rule_count,
-            sigma_reload_failed,
-            yara_reload_failed,
-        }
     }
 
     /// Returns a reference to the enrichment queue for health telemetry.
@@ -946,33 +873,6 @@ impl DetectionSink {
             .collect()
     }
 
-    /// Same posture as the rule directories for the snapshot: absent unloads (the evidence is
-    /// withheld), broken keeps the previous one (its failure is logged by the loader).
-    fn swap_common_set(&self, loaded: Load<ml::features::common_set::CommonSetSnapshot>) {
-        let mut slot = self.common_set.lock_recovering();
-        let old = match loaded {
-            Load::Loaded(snapshot) => slot.replace(Arc::new(snapshot)),
-            Load::Absent => slot.take(),
-            Load::Failed => None,
-        };
-        drop(slot);
-        drop(old);
-    }
-
-    /// Re-reads only the snapshot file, after the fetch loop wrote a new one (ADR-0033): the
-    /// rule directories and models are untouched, so a daily snapshot does not rebuild the
-    /// detection engines.
-    pub(crate) fn reload_common_set(&self) {
-        self.swap_common_set(load_common_set(&self.content_root));
-    }
-
-    /// The snapshot in force. Tests read it until the evidence lookup does (next slice of
-    /// #76), which is why it is not compiled otherwise.
-    #[cfg(test)]
-    fn common_set(&self) -> Option<Arc<ml::features::common_set::CommonSetSnapshot>> {
-        self.common_set.lock_recovering().clone()
-    }
-
     /// The rarity evidence counters, for the health beacon (ADR-0020, #76).
     pub(crate) fn rarity_stats(&self) -> Arc<RarityStats> {
         Arc::clone(&self.rarity_stats)
@@ -982,257 +882,6 @@ impl DetectionSink {
     /// endpoint (issue #388).
     pub(crate) fn alert_log(&self) -> Arc<AlertLog> {
         Arc::clone(&self.alert_log)
-    }
-}
-
-/// What [`DetectionSink::reload_content`] (and, indirectly, [`DetectionSink::new`])
-/// reports about what's loaded after a (re)load.
-pub(crate) struct ReloadReport {
-    /// Rules loaded *after* the reload (the previous set if the reload failed).
-    pub(crate) sigma_rule_count: Option<usize>,
-    pub(crate) yara_rule_count: Option<usize>,
-    /// The content was present but failed to load; the previous engine kept running.
-    pub(crate) sigma_reload_failed: bool,
-    pub(crate) yara_reload_failed: bool,
-}
-
-/// Outcome of loading one content directory.
-enum Load<T> {
-    /// The directory does not exist — not an error.
-    Absent,
-    Loaded(T),
-    /// The directory exists but its content did not load (already logged).
-    Failed,
-}
-
-impl<T> Load<T> {
-    /// Startup posture: a broken directory leaves the engine unloaded.
-    fn into_option(self) -> Option<T> {
-        match self {
-            Self::Loaded(value) => Some(value),
-            Self::Absent | Self::Failed => None,
-        }
-    }
-}
-
-/// Resolves `content_dir` to an actual directory to load content from: next
-/// to the agent executable first, then the current working directory, same
-/// fallback order the old hardcoded `rules/sigma`/`rules/yara` convention
-/// used. A cwd-relative path alone breaks under service managers (systemd
-/// runs with cwd=/, Windows services in System32), which silently disabled
-/// Sigma and YARA exactly in production deployments (review finding this
-/// preserves). An absolute `content_dir` is used as-is — no fallback search
-/// needed when the caller already gave an unambiguous path.
-fn resolve_content_root(content_dir: &Path) -> PathBuf {
-    if content_dir.is_absolute() {
-        return content_dir.to_path_buf();
-    }
-    if let Ok(exe) = std::env::current_exe()
-        && let Some(dir) = exe.parent()
-    {
-        let candidate = dir.join(content_dir);
-        if candidate.is_dir() {
-            return candidate;
-        }
-    }
-    content_dir.to_path_buf()
-}
-
-/// Loads the Sigma content of the platform this agent is built for, if the content directory
-/// is present under `content_root`: only `rules/sigma/<platform>/`, so a rule written for
-/// another platform never runs on this host (#980).
-fn load_sigma_rules(content_root: &Path) -> Load<sigma::SigmaEngine> {
-    let rules_dir = content_root.join("rules/sigma");
-    if !rules_dir.is_dir() {
-        return Load::Absent;
-    }
-    let Some(platform) = sigma::Platform::host() else {
-        tracing::warn!("sigma: no rules directory for this operating system, none loaded");
-        return Load::Absent;
-    };
-    match sigma::SigmaEngine::load_dir_for(&rules_dir, platform) {
-        Ok(engine) => {
-            tracing::info!(
-                rules = engine.rule_count(),
-                platform = platform.dir_name(),
-                "sigma: rules loaded"
-            );
-            Load::Loaded(engine)
-        }
-        Err(e) => {
-            tracing::error!(error = %e, "sigma: load error");
-            Load::Failed
-        }
-    }
-}
-
-/// How many hosts a snapshot must cover before "not in the common set" counts as evidence
-/// (ADR-0020): on a fleet that has just enrolled the snapshot is empty or thin, and every
-/// binary would look rare. **Provisional**: ADR-0020 leaves it to calibration on lab data
-/// (slice 6 of `docs/detection/fleet-prevalence-snapshot-plan.md`).
-const RARITY_MIN_HOSTS_COVERED: u64 = 10;
-
-/// How old a snapshot may be before it is treated as absent. **Provisional**, see
-/// [`updater::snapshot::DEFAULT_MAX_AGE_SECS`].
-const MAX_SNAPSHOT_AGE_SECS: u64 = updater::snapshot::DEFAULT_MAX_AGE_SECS;
-
-fn unix_now_secs() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| d.as_secs())
-}
-
-/// What became of the rarity judgements since start, for the health beacon (ADR-0020, #76).
-/// Plain atomics: bumped on the enrichment worker, read by the beacon thread.
-#[derive(Default)]
-pub(crate) struct RarityStats {
-    applied: AtomicU64,
-    withheld: AtomicU64,
-    unapplied: AtomicU64,
-}
-
-impl crate::health::RarityStatsSource for RarityStats {
-    fn rarity_counts(&self) -> crate::health::RarityCounts {
-        crate::health::RarityCounts {
-            applied: self.applied.load(Ordering::Relaxed),
-            withheld: self.withheld.load(Ordering::Relaxed),
-            unapplied: self.unapplied.load(Ordering::Relaxed),
-        }
-    }
-}
-
-/// What the fleet's common set says about one executed image.
-#[derive(Debug, PartialEq, Eq)]
-enum Rarity {
-    /// The snapshot covers enough hosts and does not contain the image's hash.
-    NotInCommonSet,
-    /// The snapshot covers enough hosts and contains the hash.
-    InCommonSet,
-    /// No basis to say: no snapshot, too few hosts covered, or no usable hash. Never read as
-    /// "rare" (the `rarity_known` of the ML feature, `ml::features::rarity`).
-    Withheld,
-}
-
-/// The rarity of an image given the snapshot in force, the exec's hash and the minimum
-/// coverage. A pure function over the same inputs as the ML rarity feature, so the two
-/// cannot disagree about what is known.
-fn rarity_evidence(
-    sha256: Option<&str>,
-    snapshot: Option<&ml::features::common_set::CommonSetSnapshot>,
-    min_hosts: u64,
-) -> Rarity {
-    use ml::features::rarity::{CommonSet, extract_features};
-
-    let [known, in_common_set] =
-        extract_features(sha256, snapshot.map(|s| s as &dyn CommonSet), min_hosts);
-    if known < 0.5 {
-        Rarity::Withheld
-    } else if in_common_set > 0.5 {
-        Rarity::InCommonSet
-    } else {
-        Rarity::NotInCommonSet
-    }
-}
-
-/// Feeds "this exec's image is not in the fleet's common set" to the correlator, when that is
-/// what the snapshot in force says. Runs on the enrichment worker, off the capture path,
-/// because only the worker knows the hash, and after the capture thread already correlated the
-/// exec (so the process has a belief to add to). The snapshot lock is released before the
-/// correlator lock is taken: no nested locking.
-fn note_image_rarity(
-    correlator: &Mutex<correlator::CorrelationEngine>,
-    common_set: &Mutex<Option<Arc<ml::features::common_set::CommonSetSnapshot>>>,
-    stats: &RarityStats,
-    exec: &schema::ExecEvent,
-    now_secs: u64,
-) {
-    // A snapshot past its maximum age counts as absent: the evidence is withheld, so a server
-    // that stopped publishing cannot keep a stale set in force (ADR-0033 decision 3).
-    let snapshot = common_set.lock_recovering().clone().filter(|s| {
-        !updater::snapshot::is_expired(s.header().built_at, now_secs, MAX_SNAPSHOT_AGE_SECS)
-    });
-    match rarity_evidence(
-        exec.sha256.as_deref(),
-        snapshot.as_deref(),
-        RARITY_MIN_HOSTS_COVERED,
-    ) {
-        Rarity::InCommonSet => {}
-        Rarity::Withheld => {
-            stats.withheld.fetch_add(1, Ordering::Relaxed);
-        }
-        Rarity::NotInCommonSet => {
-            let applied = correlator
-                .lock_recovering()
-                .apply_rarity_evidence(exec.meta.pid, exec.meta.process_generation);
-            let counter = if applied {
-                &stats.applied
-            } else {
-                &stats.unapplied
-            };
-            counter.fetch_add(1, Ordering::Relaxed);
-            tracing::debug!(
-                pid = exec.meta.pid,
-                applied,
-                "rarity: image not in the common set"
-            );
-        }
-    }
-}
-
-/// The largest snapshot file the agent reads. The content manifest allows an artifact of up to
-/// 100 MiB; a snapshot is a Bloom filter whose size the server caps when it builds it, so
-/// anything near this is a malformed or hostile file, refused before it is read.
-pub(crate) const MAX_COMMON_SET_BYTES: u64 = 64 * 1024 * 1024;
-
-/// Loads `<content_root>/snapshots/common-set.bin`, the file the signed content manifest
-/// delivers (ADR-0020). Absent is "no snapshot yet", not an error; unreadable, too large or
-/// not a snapshot is [`Load::Failed`] (logged with the reason, never the bytes).
-fn load_common_set(content_root: &Path) -> Load<ml::features::common_set::CommonSetSnapshot> {
-    load_common_set_capped(content_root, MAX_COMMON_SET_BYTES)
-}
-
-fn load_common_set_capped(
-    content_root: &Path,
-    max_bytes: u64,
-) -> Load<ml::features::common_set::CommonSetSnapshot> {
-    use std::io::Read as _;
-
-    let path = content_root.join("snapshots").join("common-set.bin");
-    let file = match std::fs::File::open(&path) {
-        Ok(file) => file,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Load::Absent,
-        Err(e) => {
-            tracing::error!(error = %e, "common set: cannot open the snapshot file");
-            return Load::Failed;
-        }
-    };
-    // Read at most one byte past the cap: a file that grows between a size check and the read
-    // still cannot make this allocate more than the cap.
-    let mut bytes = Vec::new();
-    if let Err(e) = file.take(max_bytes + 1).read_to_end(&mut bytes) {
-        tracing::error!(error = %e, "common set: cannot read the snapshot file");
-        return Load::Failed;
-    }
-    if bytes.len() as u64 > max_bytes {
-        tracing::error!(max_bytes, "common set: snapshot file is over the size cap");
-        return Load::Failed;
-    }
-    match ml::features::common_set::CommonSetSnapshot::parse(&bytes) {
-        Ok(snapshot) => {
-            let header = snapshot.header();
-            tracing::info!(
-                entries = header.entry_count,
-                hosts_covered = header.hosts_covered,
-                min_hosts = header.min_hosts,
-                built_at = header.built_at,
-                "common set: snapshot loaded"
-            );
-            Load::Loaded(snapshot)
-        }
-        Err(e) => {
-            tracing::error!(error = %e, "common set: not a usable snapshot");
-            Load::Failed
-        }
     }
 }
 

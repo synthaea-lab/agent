@@ -119,7 +119,7 @@ With a control plane configured, [`upload::start`](../apps/agent/src/upload.rs) 
 
 ### Hot content reload
 
-`agent apply-content-manifest` downloads, verifies and writes content under `<state_dir>/content`. It then notifies the running agent over IPC. The [`AgentHandler::reload_content`](../apps/agent/src/ipc_handler.rs) handler calls [`DetectionSink::reload_content`](../apps/agent/src/sink/mod.rs), which swaps in new Sigma and YARA engines and a new common-set snapshot under their mutexes. A missing content directory unloads that engine. A broken one keeps the previous engine running and is reported as failed. If the notification fails, the command still succeeds, and the content is loaded at the next start.
+`agent apply-content-manifest` downloads, verifies and writes content under `<state_dir>/content`. It then notifies the running agent over IPC. The [`AgentHandler::reload_content`](../apps/agent/src/ipc_handler.rs) handler calls [`DetectionSink::reload_content`](../apps/agent/src/sink/content.rs), which swaps in new Sigma and YARA engines and a new common-set snapshot under their mutexes. A missing content directory unloads that engine. A broken one keeps the previous engine running and is reported as failed. If the notification fails, the command still succeeds, and the content is loaded at the next start.
 
 ## Threads in `agent run`
 
