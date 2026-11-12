@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc e7be76e6e818b073522959e0053cf62eb9a29c49b9b9e4b96c4ba1361f5ab595 # shrinks to fields = Fields({"KeyName": Text("  0  𐗀  𐭸AaΣ")}), data = []
