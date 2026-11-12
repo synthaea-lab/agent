@@ -90,12 +90,14 @@ impl AvcReader {
             return Ok((0, false));
         }
 
-        let mut buf = [0u8; 8192];
+        let mut buf = vec![0u8; crate::socket::RECV_BUFFER_LEN];
         let mut forwarded = 0;
         let mut overran = false;
         for _ in 0..DRAIN_BUDGET {
             match self.socket.recv(&mut buf) {
-                Ok(n) => match classify_raw_record(&buf[..n], sink) {
+                // A cut record is still classified: its head carries the AVC fields
+                // (#237); `AuditSensor` counts the cut, this supplementary reader doesn't.
+                Ok(received) => match classify_raw_record(&buf[..received.len], sink) {
                     ForwardOutcome::Forwarded => forwarded += 1,
                     ForwardOutcome::NotPolicyDenial => {}
                     ForwardOutcome::Unparseable => {
