@@ -245,30 +245,233 @@ fn benign_freezes_and_limits_do_not_alert() {
     }
 }
 
+/// A pid no process holds (above `pid_max`), so `/proc` cannot resolve it on the test host.
+const NO_SUCH_PID: u32 = 3_999_999_999;
+
+/// The T1562.001 alerts of `command` through `RuleState::on_exec`, after `state` saw the execs
+/// that make the pids it names known.
+fn prlimit_alerts(state: &mut RuleState, command: &str) -> Vec<crate::Alert> {
+    let comm = command.split_whitespace().next().unwrap();
+    state
+        .on_exec(&exec_event_full(2000, 600, comm, command, 0))
+        .into_iter()
+        .filter(|a| a.technique == "T1562.001")
+        .collect()
+}
+
+/// `state` after it saw `pid` exec as `comm` from `image_path`.
+fn state_knowing(pid: u32, comm: &str, image_path: &str) -> RuleState {
+    let mut state = RuleState::new();
+    let mut exec = exec_event_full(pid, 1, comm, comm, 0);
+    exec.image_path = image_path.to_string();
+    state.on_exec(&exec);
+    state
+}
+
 #[test]
-fn prlimit_setting_cpu_or_as_on_a_pid_is_low_and_names_no_tool() {
+fn prlimit_setting_cpu_or_as_on_an_unresolved_pid_is_low_and_names_no_tool() {
     for command in [
-        "prlimit --pid 744 --a=1",
-        "prlimit --pid 744 --cpu=1:1",
-        "prlimit --cpu=1:1 --pid=744",
-        "prlimit -p 744 --cp=1",
-        "prlimit -p 744 -t1:1",
-        "prlimit --pid 744 --as=1000000",
+        "prlimit --pid 3999999999 --a=1",
+        "prlimit --pid 3999999999 --cpu=1:1",
+        "prlimit --cpu=1:1 --pid=3999999999",
+        "prlimit -p 3999999999 --cp=1",
+        "prlimit -p 3999999999 -t1:1",
+        "prlimit --pid 3999999999 --as=1000000",
+        "prlimit --pi=3999999999 --cpu=1:1",
     ] {
-        let alerts = throttle_alerts(command);
+        let alerts = prlimit_alerts(&mut RuleState::new(), command);
         assert_eq!(alerts.len(), 1, "{command}: {alerts:?}");
         assert_eq!(alerts[0].severity, Severity::Low, "{command}");
+        assert!(alerts[0].message.contains("not resolved"), "{command}");
     }
+}
+
+#[test]
+fn prlimit_on_a_listed_tool_the_rules_know_is_medium_and_names_it() {
+    // agent#49, the lab runs of 2026-11-10: a real /opt/osquery/bin/osqueryd and a real auditd
+    // were reported as "target not resolved to a tool".
+    for (comm, image, tool) in [
+        ("osqueryd", "/opt/osquery/bin/osqueryd", "osqueryd"),
+        ("auditd", "/usr/sbin/auditd", "auditd"),
+        // a comm is cut to 15 bytes: the image basename carries the name
+        (
+            "falco-modern-bp",
+            "/usr/bin/falco-modern-bpf",
+            "falco-modern-bpf",
+        ),
+    ] {
+        for flag in ["--cpu=1:1", "--as=1000000"] {
+            let mut state = state_knowing(NO_SUCH_PID, comm, image);
+            let command = format!("prlimit --pid {NO_SUCH_PID} {flag}");
+            let alerts = prlimit_alerts(&mut state, &command);
+            assert_eq!(alerts.len(), 1, "{command}: {alerts:?}");
+            assert_eq!(alerts[0].severity, Severity::Medium, "{command}");
+            assert!(alerts[0].message.contains(tool), "{command}: {alerts:?}");
+            assert!(!alerts[0].message.contains("not resolved"), "{command}");
+        }
+    }
+}
+
+#[test]
+fn prlimit_reads_every_form_of_the_pid_option() {
+    for command in [
+        format!("prlimit --pid {NO_SUCH_PID} --cpu=1"),
+        format!("prlimit --pid={NO_SUCH_PID} --cpu=1"),
+        format!("prlimit --cpu=1 -p {NO_SUCH_PID}"),
+        format!("prlimit --cpu=1 -p{NO_SUCH_PID}"),
+        format!("prlimit --cpu=1 -p={NO_SUCH_PID}"),
+        // getopt_long takes any unambiguous prefix of `--pid` (live: `--pi=N` sets the limit)
+        format!("prlimit --pi={NO_SUCH_PID} --cpu=100000:100000"),
+        format!("prlimit --p {NO_SUCH_PID} --as=1000000"),
+        format!("prlimit --pi {NO_SUCH_PID} --cpu=1"),
+        format!("prlimit --p={NO_SUCH_PID} --cpu=1"),
+    ] {
+        let mut state = state_knowing(NO_SUCH_PID, "auditd", "/usr/sbin/auditd");
+        let alerts = prlimit_alerts(&mut state, &command);
+        assert_eq!(alerts.len(), 1, "{command}: {alerts:?}");
+        assert_eq!(alerts[0].severity, Severity::Medium, "{command}");
+    }
+}
+
+#[test]
+fn a_long_option_that_is_not_a_prefix_of_pid_names_no_pid() {
+    // `--pidx` and `--pd` are not prefixes of `--pid`: no pid is named, so no alert at all.
+    for command in [
+        format!("prlimit --pidx {NO_SUCH_PID} --cpu=1"),
+        format!("prlimit --pd={NO_SUCH_PID} --cpu=1"),
+        format!("prlimit --pids={NO_SUCH_PID} --cpu=1"),
+    ] {
+        let mut state = state_knowing(NO_SUCH_PID, "auditd", "/usr/sbin/auditd");
+        assert!(prlimit_alerts(&mut state, &command).is_empty(), "{command}");
+    }
+}
+
+#[test]
+fn prlimit_on_a_tool_known_only_by_its_comm_is_medium() {
+    // The image path of the exec is empty (an event without one): the comm alone names the tool.
+    let mut state = state_knowing(NO_SUCH_PID, "auditd", "");
+    let command = format!("prlimit --pid {NO_SUCH_PID} --cpu=1");
+    let alerts = prlimit_alerts(&mut state, &command);
+    assert_eq!(alerts.len(), 1, "{alerts:?}");
+    assert_eq!(alerts[0].severity, Severity::Medium);
+    assert!(alerts[0].message.contains("auditd"), "{alerts:?}");
+}
+
+#[test]
+fn prlimit_on_a_tool_known_only_by_its_image_is_medium() {
+    // A comm that is not the tool's name (a wrapper's thread name) while the image is.
+    let mut state = state_knowing(NO_SUCH_PID, "worker", "/usr/sbin/auditd");
+    let command = format!("prlimit --pid {NO_SUCH_PID} --cpu=1");
+    let alerts = prlimit_alerts(&mut state, &command);
+    assert_eq!(alerts.len(), 1, "{alerts:?}");
+    assert_eq!(alerts[0].severity, Severity::Medium);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn the_names_of_a_pid_are_the_cached_ones_and_the_live_ones() {
+    // The cache says `auditd`; `/proc` says what this test process really is. Both answer, so a
+    // pid reused by a process that never exec'd cannot hide behind the old name, and the old name
+    // cannot hide a listed tool the live process carries.
+    let pid = std::process::id();
+    let live = std::fs::read_to_string("/proc/self/comm")
+        .unwrap()
+        .trim_end()
+        .to_owned();
+    let state = state_knowing(pid, "auditd", "/usr/sbin/auditd");
+    let names = state.names_of_pid(pid);
+    assert!(names.contains(&"auditd".to_owned()), "{names:?}");
+    assert!(
+        names.contains(&live),
+        "{names:?} lacks the live comm {live}"
+    );
+    assert_eq!(
+        names.len(),
+        names.iter().collect::<std::collections::HashSet<_>>().len(),
+        "duplicates in {names:?}"
+    );
+}
+
+#[test]
+fn prlimit_on_a_process_that_is_not_a_listed_tool_stays_low() {
+    let mut state = state_knowing(NO_SUCH_PID, "nginx", "/usr/sbin/nginx");
+    let command = format!("prlimit --pid {NO_SUCH_PID} --cpu=1");
+    let alerts = prlimit_alerts(&mut state, &command);
+    assert_eq!(alerts.len(), 1, "{alerts:?}");
+    assert_eq!(alerts[0].severity, Severity::Low);
+    assert!(alerts[0].message.contains("not resolved"));
 }
 
 #[test]
 fn prlimit_that_only_reads_or_runs_a_command_does_not_alert() {
     for command in [
-        "prlimit --pid 744 --cpu",
-        "prlimit --pid 744",
+        "prlimit --pid 3999999999 --cpu",
+        "prlimit --pid 3999999999",
         "prlimit --cpu=60 sleep 1",
-        "prlimit --pid 744 --nofile=1024",
-        "prlimit --pid 744 --core=0",
+        "prlimit --pid 3999999999 --nofile=1024",
+        "prlimit --pid 3999999999 --core=0",
+    ] {
+        let mut state = state_knowing(3_999_999_999, "auditd", "/usr/sbin/auditd");
+        assert!(prlimit_alerts(&mut state, command).is_empty(), "{command}");
+    }
+}
+
+#[test]
+fn the_stateless_dispatcher_no_longer_reads_prlimit() {
+    // The pid-to-tool table is `RuleState`'s: one alert per exec, not one from each.
+    assert!(stops("prlimit --pid 3999999999 --cpu=1:1").is_empty());
+}
+
+#[test]
+fn a_cpu_quota_that_starves_a_listed_tool_alerts_medium() {
+    for (command, tool) in [
+        ("systemctl set-property auditd CPUQuota=1%", "auditd"),
+        ("systemctl set-property osqueryd CPUQuota=9.5%", "osqueryd"),
+        ("systemctl set-property osqueryd CPUQuota=0%", "osqueryd"),
+        (
+            "systemctl set-property --runtime falco.service CPUQuota=5%",
+            "falco",
+        ),
+        (
+            "systemctl set-property auditd CPUQuota=1% CPUWeight=1",
+            "auditd",
+        ),
+        // systemd reads `%`, per mille and per ten thousand alike: all three are a 5% quota
+        (
+            "systemctl set-property --runtime auditd CPUQuota=50\u{2030}",
+            "auditd",
+        ),
+        (
+            "systemctl set-property --runtime auditd CPUQuota=500\u{2031}",
+            "auditd",
+        ),
+        (
+            "systemctl set-property osqueryd CPUQuota=5\u{2030}",
+            "osqueryd",
+        ),
+    ] {
+        let alerts = throttle_alerts(command);
+        assert_eq!(alerts.len(), 1, "{command}: {alerts:?}");
+        assert_eq!(alerts[0].severity, Severity::Medium, "{command}");
+        assert!(alerts[0].message.contains(tool), "{command}");
+    }
+}
+
+#[test]
+fn a_cpu_quota_that_only_tunes_a_tool_or_lifts_one_does_not_alert() {
+    for command in [
+        "systemctl set-property auditd CPUQuota=10%",
+        "systemctl set-property auditd CPUQuota=50%",
+        "systemctl set-property auditd CPUQuota=200%",
+        "systemctl set-property auditd CPUQuota=",
+        "systemctl set-property auditd CPUQuota=1",
+        "systemctl set-property auditd CPUQuota=abc%",
+        // 100 per mille and 1000 per ten thousand are a 10% quota: the threshold, not below it
+        "systemctl set-property auditd CPUQuota=100\u{2030}",
+        "systemctl set-property auditd CPUQuota=1000\u{2031}",
+        "systemctl set-property auditd CPUQuota=500\u{2030}",
+        "systemctl set-property auditd CPUQuota=abc\u{2030}",
+        "systemctl set-property nginx CPUQuota=1%",
     ] {
         assert!(throttle_alerts(command).is_empty(), "{command}");
     }

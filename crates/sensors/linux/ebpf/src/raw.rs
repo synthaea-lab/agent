@@ -56,9 +56,12 @@ use crate::{
         socket::{sys_enter_socket, sys_exit_socket},
         udp_send::sys_enter_sendto,
     },
-    sys_enter_kill, sys_enter_memfd_create, sys_enter_mount, sys_enter_process_vm_readv,
-    sys_enter_process_vm_writev, sys_enter_ptrace, sys_enter_tgkill, sys_enter_umount,
-    sys_exit_memfd_create, watched_tool_sigcgt,
+    procmem::{
+        memfd::{sys_enter_memfd_create, sys_exit_memfd_create},
+        process_vm::{sys_enter_process_vm_readv, sys_enter_process_vm_writev},
+        ptrace::sys_enter_ptrace,
+    },
+    sys_enter_kill, sys_enter_mount, sys_enter_tgkill, sys_enter_umount, watched_tool_sigcgt,
 };
 
 const MAX_SYSCALL_ID: u32 = 1024;

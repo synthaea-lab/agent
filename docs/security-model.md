@@ -116,7 +116,7 @@ files hold four different keys.
 ```mermaid
 flowchart TD
   B{How was the updater built?} -->|cfg test or feature test-key| T[Test set: keys derived<br/>from public seeds in the source]
-  B -->|no test-key, keys/*.pub = unprovisioned| U[No key: statics are None]
+  B -->|no test-key, a keys/*.pub says unprovisioned| U[No key for that role: static is None]
   B -->|no test-key, keys/*.pub = hex| P[Production keys]
   T --> TA[Commands that act on a manifest refuse<br/>unless --allow-test-key is passed]
   U --> UA[Every verify returns SigningKeyUnprovisioned:<br/>fail closed]
@@ -128,15 +128,24 @@ flowchart TD
   `test-key` cargo feature. A build without either cannot ship them by accident. In the
   test set, `release` and `content` share one key, while `recovery` and `snapshot` each
   have their own.
-- **Unprovisioned.** `crates/updater/keys/*.pub` currently hold `unprovisioned`, so a
-  production build embeds no key and every verify returns
-  `UpdaterError::SigningKeyUnprovisioned`. The agent does not fall back to anything.
-  Production keys are tracked in
-  [#43](https://github.com/synthaea-lab/agent/issues/43).
+- **Temporary keys (2026-11-12).** `crates/updater/keys/*.pub` hold three **temporary** keys
+  (`release`, `content`, `recovery`), generated on a developer machine outside the
+  ADR-0027 ceremony. They have no custody and no named holders; the private halves are plain files
+  on that machine, and `release-tool --key-file` refuses them (it takes only the public test
+  keys), so signing with them needs a PKCS#11 token holding the key. They are replaced when the
+  real keys exist ([#43](https://github.com/synthaea-lab/agent/issues/43)); do not ship a build
+  that embeds them to a customer. `snapshot.pub` stays `unprovisioned` on purpose: a snapshot key
+  turns the agent's snapshot fetch loop on (ADR-0033), which waits on tenant binding and on a
+  custody decision.
+- **Unprovisioned.** A key file that says `unprovisioned` makes its static `None`, so a build
+  embeds no key for that role and every verify returns
+  `UpdaterError::SigningKeyUnprovisioned`. The agent does not fall back to anything. This is how
+  a file is put back to the fail-closed state.
 - **Provisioned.** Each key file holds 64 hex characters after optional `#` comments
   ([`parse_key_file`](../crates/updater/src/key.rs)). A typo or a truncated key parses to
   `None`. The test `every_committed_key_file_is_unprovisioned_or_a_valid_key` catches it
-  at commit time, so it never shows up later as a confusing "no key" error at run time.
+  at commit time (and `a_committed_key_file_is_a_valid_key_and_never_the_public_test_key` that
+  no file holds a public test key), so it never shows up later as a confusing "no key" error at run time.
 
 `SYNTHAEA_UPDATER_TEST_KEY` follows the feature flag (`cfg!(any(test, feature =
 "test-key"))`), so nobody can set it by hand.
@@ -170,7 +179,7 @@ crate in the build enables `updater/test-key`, every crate gets it. The guards a
 | --- | --- |
 | [`tools/check-no-test-key.sh`](../tools/check-no-test-key.sh) (CI) | `cargo tree` for the packaged set (`agent`, `watchdog`, `cli`, `--no-default-features`) on Linux, Windows and macOS targets does not enable `test-key`, and the default build still does (positive control). The packaging scripts still build without default features and still scan their output. The updater rlib built without the feature lacks the marker, and with the feature has it |
 | [`tools/assert-no-test-key.sh`](../tools/assert-no-test-key.sh) | Scans a built binary for the marker `SYNTHAEA-PUBLIC-TEST-KEY-SET-V1`, which the `test-key` build links in deliberately (`TEST_KEY_MARKER` in [`key.rs`](../crates/updater/src/key.rs)). Run by the deb/rpm build scripts, the Windows `build.ps1`, and the static-agent workflows |
-| [`tests/unprovisioned_build.rs`](../crates/updater/tests/unprovisioned_build.rs) (`cargo test -p updater --no-default-features`) | What a packaged build really embeds. Unit tests cannot show this because they always compile with `cfg(test)`, which turns the test set on |
+| [`tests/unprovisioned_build.rs`](../crates/updater/tests/unprovisioned_build.rs) (`cargo test -p updater --no-default-features`) | What a packaged build really embeds (exactly the committed keys; the public test seed is refused). Unit tests cannot show this because they always compile with `cfg(test)`, which turns the test set on |
 | [`tests/test_key_build.rs`](../crates/updater/tests/test_key_build.rs) | The lab variant embeds the test set and reports it |
 
 Each check also proves it can fail: it confirms the marker *is* found in a test-key build.
@@ -415,8 +424,13 @@ They must fail closed when the target is wrong.
 - **Admin or root uninstall.** A legitimate uninstall and a malicious one look the same.
   What tells them apart is the recorded actor and the timing, not the act.
 - **A kernel stop through resource limits** (prlimit CPU limit, `memory.max` OOM kill,
-  `cgroup.freeze`) aimed at a security tool raises no alert on Linux
-  ([#49](https://github.com/synthaea-lab/agent/issues/49)).
+  `cgroup.freeze`) aimed at a security tool is only partly covered on Linux
+  ([#49](https://github.com/synthaea-lab/agent/issues/49)). The rules read the command that sets
+  the limit: `systemctl set-property` (a memory or task limit, or a `CPUQuota` below 10 %),
+  `systemctl freeze`, and `prlimit --pid` on a listed tool. A write to a cgroup control file
+  and the OOM kill that a memory limit then causes raise no alert: no event reaches the rules
+  for them. A command line the rules cannot read (an option cluster such as `prlimit -tp`, an
+  empty argv, `systemctl -M host`) is not seen either.
 - **Local-only deployments** have no server-side silence detection, and their evidence
   never leaves the host.
 - **Unsigned updates on Windows and macOS.** Self-update is Linux-only today
