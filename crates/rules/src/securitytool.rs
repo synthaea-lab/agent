@@ -317,8 +317,8 @@ fn cgroup_unit_and_file(path: &str) -> Option<(&str, &str)> {
 ///
 /// The Linux open probe passes a write-intent open of such a file under `/sys/fs/cgroup/`
 /// (`is_cgroup_limit_write` in `sensor-linux-wire`: a tail match, a little wider than this list,
-/// since the probe cannot know the listed units); the filter is unit-tested, **not yet run on
-/// a VM**. A relative path or one written `//sys/...` also reaches the rule
+/// since the probe cannot know the listed units); the filter is unit-tested and was run on Fedora
+/// 43 (kernel 7.2.9), **not on kernel 5.14**. A relative path or one written `//sys/...` also reaches the rule
 /// ([`cgroup_unit_and_file`]). The rule fires for any source that reports such an open. Pid 1 is skipped: the manager writes these files when
 /// it starts a unit that has a configured limit, and when it carries out `systemctl
 /// set-property` and `freeze`, which `check_security_tool_throttle` reads from the exec.
