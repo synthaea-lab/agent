@@ -94,9 +94,11 @@ pub(crate) const MAIL_CLIENT_QUARANTINE_AGENTS: &[&str] = &["Mail"];
 /// place to add a browser: one line per image.
 ///
 /// Only what a lab capture showed (2026-11-10, Fedora 43 lab VM, vendor packages: Chromium
-/// 156, Firefox 159, Chrome 157, Edge, Brave 1.99, Opera, Vivaldi 8.3). Firefox ESR (a tarball
-/// path that depends on where it is unpacked), other distributions' paths and the
-/// Flatpak/Snap paths are not here until a capture reports their image. `comm` is useless as the key: the rename
+/// 156, Firefox 159, Chrome 157, Edge, Brave 1.99, Opera, Vivaldi 8.3; 2026-11-12, Debian 13
+/// firefox-esr 140.15, read from the renaming process's `/proc` exe under `strace`, not from the
+/// sensor). Firefox from a tarball (a path that depends on where it is unpacked), other
+/// distributions' paths and the Flatpak/Snap paths are not here until a capture reports their
+/// image. `comm` is useless as the key: the rename
 /// runs on a thread-pool worker (`ThreadPoolForeg`, `BgIOThr~Pool #N`).
 pub(crate) const BROWSER_DOWNLOAD_IMAGES: &[&str] = &[
     "/usr/lib64/chromium-browser/chromium-browser",
@@ -106,6 +108,9 @@ pub(crate) const BROWSER_DOWNLOAD_IMAGES: &[&str] = &[
     "/opt/brave.com/brave/brave",
     "/usr/lib64/opera-stable/opera",
     "/opt/vivaldi/vivaldi-bin",
+    // Debian's firefox-esr package: the process that renames is `firefox-esr`, not `firefox-bin`
+    // (the other ELF file of `/usr/lib/firefox-esr/`), which marks nothing.
+    "/usr/lib/firefox-esr/firefox-esr",
 ];
 
 /// Suffixes of a browser's partial download file. A rename out of one of these, to a name

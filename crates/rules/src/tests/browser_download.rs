@@ -10,6 +10,7 @@ use crate::{Alert, ImageSignature, RuleState, exclusions::QUARANTINE_EXEC_WINDOW
 const CHROMIUM: &str = "/usr/lib64/chromium-browser/chromium-browser";
 const FIREFOX: &str = "/usr/lib64/firefox/firefox";
 const OPERA: &str = "/usr/lib64/opera-stable/opera";
+const DEBIAN_FIREFOX_ESR: &str = "/usr/lib/firefox-esr/firefox-esr";
 const FINAL: &str = "/home/u/Downloads/test.bin";
 
 fn rename(old: &str, new: &str, image: Option<&str>, timestamp_ns: u64) -> FileRenameEvent {
@@ -97,6 +98,8 @@ fn every_captured_browser_image_marks_a_finished_download() {
         ("/opt/brave.com/brave/brave", ".crdownload"),
         (OPERA, ".opdownload"),
         ("/opt/vivaldi/vivaldi-bin", ".crdownload"),
+        // Debian 13 firefox-esr, read from /proc under strace (the sensor did not run there)
+        (DEBIAN_FIREFOX_ESR, ".part"),
     ] {
         let mut state = RuleState::new();
         state.on_file_rename(&rename(
@@ -197,4 +200,18 @@ fn exec_past_the_window_stays_silent() {
     let mut state = RuleState::new();
     state.on_file_rename(&rename("/d/x.bin.part", FINAL, Some(FIREFOX), 0));
     assert!(exec(&mut state, &run(FINAL, QUARANTINE_EXEC_WINDOW_NS + 1)).is_empty());
+}
+
+#[test]
+fn debians_firefox_bin_is_not_the_renaming_process_and_marks_nothing() {
+    // The package has two ELF files; the 2026-11-12 capture showed the rename done by
+    // `firefox-esr`. A rename reported with the other one is not the captured image.
+    let mut state = RuleState::new();
+    state.on_file_rename(&rename(
+        "/home/u/Downloads/test.bin.part",
+        FINAL,
+        Some("/usr/lib/firefox-esr/firefox-bin"),
+        0,
+    ));
+    assert!(exec(&mut state, &run(FINAL, 1)).is_empty());
 }

@@ -226,7 +226,9 @@ same signature gate applies.
   showed (2026-11-10, Fedora 43 lab VM): Chromium and Firefox from the distribution packages,
   and the vendor packages of Chrome (`/opt/google/chrome/chrome`), Edge
   (`/opt/microsoft/msedge/msedge`), Brave (`/opt/brave.com/brave/brave`), Opera
-  (`/usr/lib64/opera-stable/opera`) and Vivaldi (`/opt/vivaldi/vivaldi-bin`).
+  (`/usr/lib64/opera-stable/opera`) and Vivaldi (`/opt/vivaldi/vivaldi-bin`); and, from a
+  Debian 13 VM on 2026-11-12, `firefox-esr` (`/usr/lib/firefox-esr/firefox-esr`, the process
+  read from `/proc` under `strace`: the sensor did not run on that VM).
 - An empty or absent `executable_path` marks nothing. What is still unchecked is listed under
   "Not verified" in [attack-coverage.md](../attack-coverage.md).
 
