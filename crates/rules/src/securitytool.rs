@@ -74,14 +74,42 @@ pub(crate) fn check_security_tool_stop(event: &ExecEvent) -> Option<Alert> {
 
 /// `systemctl set-property` keys that make the kernel end or starve a unit's cgroup: the
 /// memcg OOM kill (`MemoryMax`), reclaim pressure (`MemoryHigh`) and a fork limit (`TasksMax`).
-/// Lowercase, as [`args`] gives them. `CPUQuota` throttles without ending anything and is left
-/// out on purpose.
+/// Lowercase, as [`args`] gives them. `CPUQuota` is judged on its value, by [`cpu_quota_starves`].
 const LIMIT_PROPERTIES: &[&str] = &["memorymax", "memoryhigh", "tasksmax"];
+
+/// A `CPUQuota=` below this many percent of one CPU starves a daemon (a 1% quota leaves an
+/// `osqueryd` or `auditd` no time to run) rather than tuning it. An administrator who caps a
+/// tool sets 20% to 50% or more; the threshold is a judgement, not a measured one (agent#49),
+/// and a quota just above it starves the tool as well.
+const CPU_QUOTA_STARVE_BELOW_PERCENT: f64 = 10.0;
+
+/// Whether the value of `CPUQuota=` is below [`CPU_QUOTA_STARVE_BELOW_PERCENT`] percent of one
+/// CPU. systemd reads the value as a per-myriad number, so `%`, `‰` (per mille, a tenth of a
+/// percent) and `‱` (per ten thousand, a hundredth) all set the same quota: `5%`, `50‰` and
+/// `500‱` are one 5% quota. An empty value lifts the quota, and a value with none of these
+/// suffixes is not one systemd accepts: neither alerts. `0%` is read by systemd as an invalid
+/// quota too, but a zero is still a starving one.
+fn cpu_quota_starves(value: &str) -> bool {
+    let (number, divisor) = if let Some(number) = value.strip_suffix('%') {
+        (number, 1.0)
+    } else if let Some(number) = value.strip_suffix('\u{2030}') {
+        (number, 10.0)
+    } else if let Some(number) = value.strip_suffix('\u{2031}') {
+        (number, 100.0)
+    } else {
+        return false;
+    };
+    number
+        .parse::<f64>()
+        .ok()
+        .is_some_and(|quota| quota / divisor < CPU_QUOTA_STARVE_BELOW_PERCENT)
+}
 
 /// What a `systemctl` exec does to the cgroups of units besides stopping them, and the units:
 /// `freeze` (the cgroup freezer, the effect of a `SIGSTOP` without the signal; it takes several
 /// units, `systemctl freeze nginx auditd`, so every positional one is returned) or
-/// `set-property` of one of [`LIMIT_PROPERTIES`] (not `infinity` or empty, which lifts a limit).
+/// `set-property` of one of [`LIMIT_PROPERTIES`] (not `infinity` or empty, which lifts a limit)
+/// or a `CPUQuota` that [`cpu_quota_starves`].
 /// Lowercase unit names, without `.service`.
 fn cgroup_squeeze(args: &[String]) -> Option<(&'static str, Vec<String>)> {
     let mut positional = args.iter().filter(|a| !a.starts_with('-'));
@@ -96,6 +124,7 @@ fn cgroup_squeeze(args: &[String]) -> Option<(&'static str, Vec<String>)> {
             let limits = rest.iter().any(|a| {
                 a.split_once('=').is_some_and(|(key, value)| {
                     LIMIT_PROPERTIES.contains(&key) && !value.is_empty() && value != "infinity"
+                        || key == "cpuquota" && cpu_quota_starves(value)
                 })
             });
             let unit = rest.iter().find(|a| !a.contains('='))?;
@@ -207,14 +236,13 @@ fn bracket_class(pattern: &[char], open: usize, c: char) -> Option<(bool, usize)
 /// Not covered, by choice (ADR-0046): the **ancestor slice** (`systemctl freeze system.slice`,
 /// `set-property system.slice MemoryMax=...`, a write to `system.slice/cgroup.freeze`), which
 /// acts on every service of the host and is ordinary administration far more often than an
-/// attack on a tool; `CPUQuota`, which has no threshold this rule can judge without reading the
-/// value; and moving the tool's pid into a cgroup the attacker froze or limited
-/// (`cgroup.procs`).
+/// attack on a tool; and moving the tool's pid into a cgroup the attacker froze or limited
+/// (`cgroup.procs`). `CPUQuota` is read on its value (below
+/// [`CPU_QUOTA_STARVE_BELOW_PERCENT`] percent), since the quota a tool is capped at is the
+/// only thing that tells a starved tool from a tuned one.
 ///
-/// `prlimit --pid <pid> --cpu=...` (or `--as=...`) is the third path. The target is a pid and
-/// the exec says nothing of what runs there, so the alert is Low and names no tool: a
-/// `RLIMIT_CPU` set on another process is rare enough to be worth a line, not a verdict. The
-/// resolved form needs the `prlimit64` syscall and a pid-to-tool map (ADR-0046).
+/// `prlimit --pid <pid> --cpu=...` (or `--as=...`) is the third path, read by
+/// [`check_security_tool_prlimit`], which needs the pid-to-process table of `RuleState`.
 #[must_use]
 pub(crate) fn check_security_tool_throttle(event: &ExecEvent) -> Option<Alert> {
     let args = args(event);
@@ -231,16 +259,93 @@ pub(crate) fn check_security_tool_throttle(event: &ExecEvent) -> Option<Alert> {
                 ),
             })
         }
-        "prlimit" if prlimit_sets_cpu_or_as_on_a_pid(&args) => Some(Alert {
+        _ => None,
+    }
+}
+
+/// T1562.001 — `prlimit --pid <pid> --cpu=...` (or `--as=...`): the third kernel-mediated stop
+/// of agent#49. At the next CPU tick the kernel ends the tool with a `SEND_SIG_PRIV` `SIGKILL`
+/// the signal probe drops, so the command is the only trace. The exec names a pid, not a tool,
+/// so `resolve` gives what the rules know of that pid: its comm and image path, as
+/// [`crate::RuleState`] holds them (falling back to `/proc`).
+///
+/// - the pid is a listed security tool: **Medium**, naming it, like `systemctl set-property`;
+/// - it is not, or it cannot be resolved (the process exited, never exec'd under the agent and
+///   has no `/proc` entry): **Low**, as before, with "target not resolved to a tool". A
+///   `RLIMIT_CPU` set on another process is rare enough to be worth a line, not a verdict.
+///
+/// The target is matched by comm and by image basename (a comm is cut to 15 bytes, so
+/// `falco-modern-bpf` reads `falco-modern-bp`). A tool renamed or run from a copy with another
+/// name is not matched.
+#[must_use]
+pub(crate) fn check_security_tool_prlimit(
+    event: &ExecEvent,
+    resolve: impl Fn(u32) -> Vec<String>,
+) -> Option<Alert> {
+    if program(event) != "prlimit" {
+        return None;
+    }
+    let args = args(event);
+    if !prlimit_sets_cpu_or_as_on_a_pid(&args) {
+        return None;
+    }
+    let tool = prlimit_target_pid(&args).and_then(|pid| {
+        resolve(pid)
+            .into_iter()
+            .map(|name| name.to_ascii_lowercase())
+            .find(|name| is_security_tool(name))
+    });
+    Some(match tool {
+        Some(tool) => Alert {
+            technique: "T1562.001",
+            severity: Severity::Medium,
+            message: format!(
+                "pid={} comm={}: prlimit sets RLIMIT_CPU or RLIMIT_AS on the security tool {tool}",
+                event.meta.pid, event.meta.comm,
+            ),
+        },
+        None => Alert {
             technique: "T1562.001",
             severity: Severity::Low,
             message: format!(
                 "pid={} comm={}: prlimit sets RLIMIT_CPU or RLIMIT_AS on another pid (target not resolved to a tool)",
                 event.meta.pid, event.meta.comm,
             ),
-        }),
-        _ => None,
+        },
+    })
+}
+
+/// Whether `name` (the part of a long option after `--` and before any `=`) is the `pid` option
+/// of `prlimit`: `getopt_long` accepts any non-empty prefix of a long option that no other one
+/// shares, and `pid` is the only long option of util-linux `prlimit` starting with `p`, so `--p`,
+/// `--pi` and `--pid` all name it (live, on util-linux 2.38: `prlimit --pi=N --cpu=…` sets the
+/// limit).
+fn is_pid_long_option(name: &str) -> bool {
+    !name.is_empty() && "pid".starts_with(name)
+}
+
+/// The pid `prlimit` is told to act on: `--pid N`, `--pid=N` (or any prefix of `--pid`:
+/// `--p N`, `--pi=N`), `-p N`, `-pN` or `-p=N`. `None` when it is not a number (`prlimit`
+/// accepts none other).
+fn prlimit_target_pid(args: &[String]) -> Option<u32> {
+    let mut iter = args.iter();
+    while let Some(arg) = iter.next() {
+        let value = if let Some(long) = arg.strip_prefix("--") {
+            match long.split_once('=') {
+                Some((name, value)) if is_pid_long_option(name) => Some(value),
+                None if is_pid_long_option(long) => iter.next().map(String::as_str),
+                _ => continue,
+            }
+        } else if arg == "-p" {
+            iter.next().map(String::as_str)
+        } else if let Some(value) = arg.strip_prefix("-p") {
+            Some(value.trim_start_matches('='))
+        } else {
+            continue;
+        };
+        return value.and_then(|v| v.parse().ok());
     }
+    None
 }
 
 /// `prlimit --pid N --cpu=1:1`: a pid is named and a CPU or address-space limit is **set**
@@ -251,8 +356,9 @@ pub(crate) fn check_security_tool_throttle(event: &ExecEvent) -> Option<Alert> {
 /// read. That is the
 /// argv-reading limit of ADR-0006.
 fn prlimit_sets_cpu_or_as_on_a_pid(args: &[String]) -> bool {
-    let names_pid = args.iter().any(|a| {
-        a == "--pid" || a.starts_with("--pid=") || (a.starts_with("-p") && !a.starts_with("--"))
+    let names_pid = args.iter().any(|a| match a.strip_prefix("--") {
+        Some(long) => is_pid_long_option(long.split_once('=').map_or(long, |(name, _)| name)),
+        None => a.starts_with("-p"),
     });
     let sets = args.iter().any(|a| {
         if let Some(long) = a.strip_prefix("--") {
