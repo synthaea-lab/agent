@@ -56,7 +56,9 @@ sequenceDiagram
 ### Trigger
 
 [`DetectionSink::detect_file_open`](../../apps/agent/src/sink/mod.rs) queues a scan for every
-`FileOpen` whose flags include `O_WRONLY | O_RDWR | O_CREAT` (`0o103`). The request carries a
+`FileOpen` with write intent, as [`rules::has_write_intent`](../../crates/schema/src/lib.rs)
+defines it: `O_WRONLY`, `O_RDWR`, `O_CREAT` or `O_TRUNC`. A read-only truncating open
+(`O_RDONLY | O_TRUNC`) is scanned, and the invalid mode `0o3` alone is not. The request carries a
 [`ScanContext`](../../crates/yara/src/queue.rs): the writer's `(ppid, comm)`, the parent's
 incarnation, the event time and the requester's uid/gid. A match is attributed to that
 process, not to whoever is running when the scan finishes.

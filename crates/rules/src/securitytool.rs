@@ -13,7 +13,7 @@
 //! no exec, restart or host shutdown explains. A stop this rule alerted on is among the ones it
 //! treats as explained, so one `systemctl stop falco` is one finding.
 
-use schema::{ExecEvent, FileOpenEvent, SECURITY_SERVICES, detection::Severity};
+use schema::{ExecEvent, FileOpenEvent, SECURITY_SERVICES, detection::Severity, has_write_intent};
 
 use crate::{
     Alert,
@@ -540,9 +540,6 @@ const THROTTLE_FILES: &[&str] = &[
     "freezer.state",
 ];
 
-/// Open flags that make an open a write: `O_ACCMODE` (`O_WRONLY`, `O_RDWR`) or `O_TRUNC`.
-const OPEN_WRITE_INTENT: u32 = 0o3 | 0o1000;
-
 /// The unit and the control file a cgroup path names, read the way the kernel does for the
 /// forms that reach the rule: empty and `.` segments are dropped (`//sys/fs//cgroup/x/./y`) and
 /// `..` pops the segment before it (`/sys/fs/../fs/cgroup/x/y`), then the path is read on its
@@ -583,7 +580,7 @@ fn cgroup_unit_and_file(path: &str) -> Option<(&str, &str)> {
 /// Medium.
 #[must_use]
 pub(crate) fn check_security_tool_cgroup_write(event: &FileOpenEvent) -> Option<Alert> {
-    if event.flags & OPEN_WRITE_INTENT == 0 || event.meta.pid == 1 {
+    if !has_write_intent(event.flags) || event.meta.pid == 1 {
         return None;
     }
     let (unit, file) = cgroup_unit_and_file(&event.path)?;

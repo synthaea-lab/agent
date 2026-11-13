@@ -160,16 +160,20 @@ carries several fields with specific rules:
 ### `FileOpenEvent::flags` and synthetic flags
 
 `FileOpenEvent::flags` holds the platform's native open flags. On Linux those are
-`open(2)` flags. The crate defines the four POSIX constants it needs
-(`O_ACCMODE`, `O_WRONLY`, `O_RDWR`, `O_CREAT`) instead of depending on `libc`,
+`open(2)` flags. The crate defines the five POSIX constants it needs
+(`O_ACCMODE`, `O_WRONLY`, `O_RDWR`, `O_CREAT`, `O_TRUNC`) instead of depending on `libc`,
 which would drag platform differences into a crate that must compile everywhere.
 
 [`has_write_intent`](../crates/schema/src/lib.rs) is the only write-intent
-predicate in the workspace. It treats the access mode as a 2-bit field, as the
-kernel does: `O_WRONLY` or `O_RDWR`, or `O_CREAT` with any mode. `0o3` is not
+predicate in the workspace outside the `no_std` eBPF filter, which keeps its own copy
+(`sensors/linux/wire/src/path_filter.rs`, it cannot depend on this crate). It treats the access mode as a 2-bit field, as the
+kernel does: `O_WRONLY` or `O_RDWR`, or `O_CREAT` or `O_TRUNC` with any mode
+(`O_RDONLY | O_TRUNC` empties the file on Linux,
+[#233](https://github.com/synthaea-lab/agent/issues/233)). `0o3` is not
 write intent, because `open(2)` refuses it with `EINVAL`. Counting it would let
 deliberately failing opens inflate write counters. The Python feature code
-mirrors this predicate and is tested against the same fixtures.
+mirrors this predicate; [ml#52](https://github.com/synthaea-lab/ml/pull/52)
+adds the `O_TRUNC` case to it and the shared fixtures both sides test against.
 
 The high bits of `flags` carry **synthetic flags**. Some userspace sensors report
 an OS record as a `FileOpenEvent` instead of adding a new variant. The Windows

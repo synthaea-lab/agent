@@ -639,7 +639,8 @@ fn a_write_to_a_listed_units_throttle_file_alerts() {
         "/sys/fs/cgroup/memory/system.slice/auditd.service/memory.limit_in_bytes",
         "/sys/fs/cgroup/freezer/system.slice/auditd.service/freezer.state",
     ] {
-        for flags in [O_WRONLY, O_WRONLY | O_TRUNC, 0o2] {
+        // `O_TRUNC` alone too: `open(O_RDONLY | O_TRUNC)` empties the file (#233).
+        for flags in [O_WRONLY, O_WRONLY | O_TRUNC, 0o2, O_TRUNC] {
             let alerts = all_file_open_alerts(&cgroup_open(path, flags, 4242));
             assert_eq!(alerts.len(), 1, "{path} {flags:o}: {alerts:?}");
             assert_eq!(alerts[0].technique, "T1562.001");
