@@ -138,16 +138,17 @@ fn poll_and_emit(monitor: &Mutex<SilenceMonitor>, sink: &DetectionSink, now_ns: 
 /// finding (issue #71's "Done when: stopping a sensor... produces a local alert").
 /// Runs until the process exits, same as every other background worker in
 /// `commands::linux` (no `Sensor::stop`-style shutdown exists for `agent run` today).
-pub(crate) fn spawn_monitor(monitor: Arc<Mutex<SilenceMonitor>>, sink: Arc<DetectionSink>) {
-    std::thread::Builder::new()
-        .name("sensor-silence".into())
-        .spawn(move || {
-            loop {
-                std::thread::sleep(POLL_INTERVAL);
-                poll_and_emit(&monitor, &sink, schema::time::now_ns());
-            }
-        })
-        .expect("spawning the sensor-silence monitor thread");
+pub(crate) fn spawn_monitor(
+    monitor: Arc<Mutex<SilenceMonitor>>,
+    sink: Arc<DetectionSink>,
+) -> std::io::Result<()> {
+    crate::spawn::spawn_named("sensor-silence", move || {
+        loop {
+            std::thread::sleep(POLL_INTERVAL);
+            poll_and_emit(&monitor, &sink, schema::time::now_ns());
+        }
+    })?;
+    Ok(())
 }
 
 #[cfg(test)]

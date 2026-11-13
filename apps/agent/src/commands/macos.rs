@@ -70,32 +70,33 @@ const SOCKET_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs
 /// [`SOCKET_POLL_INTERVAL`] and pushes listening sockets into the sink
 /// (`sensor-macos-sockets`, issue #358 — the entitlement-free source).
 /// Supplementary and non-fatal, same posture as the unified-log tail.
-fn spawn_socket_poller(sink: Arc<dyn EventSink>, stop: Arc<std::sync::atomic::AtomicBool>) {
-    std::thread::Builder::new()
-        .name("socket-poller".into())
-        .spawn(move || {
-            while !stop.load(std::sync::atomic::Ordering::SeqCst) {
-                let now_ns = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map_or(0, |d| u64::try_from(d.as_nanos()).unwrap_or(u64::MAX));
-                match sensor_macos_sockets::listen_port_events(now_ns) {
-                    Ok(events) => {
-                        for event in events {
-                            sink.on_event(event);
-                        }
+fn spawn_socket_poller(
+    sink: Arc<dyn EventSink>,
+    stop: Arc<std::sync::atomic::AtomicBool>,
+) -> std::io::Result<()> {
+    crate::spawn::spawn_named("socket-poller", move || {
+        while !stop.load(std::sync::atomic::Ordering::SeqCst) {
+            let now_ns = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| u64::try_from(d.as_nanos()).unwrap_or(u64::MAX));
+            match sensor_macos_sockets::listen_port_events(now_ns) {
+                Ok(events) => {
+                    for event in events {
+                        sink.on_event(event);
                     }
-                    Err(e) => tracing::warn!(error = %e, "socket-table poll failed"),
                 }
-                // Sleep in short slices so Ctrl-C never waits a full interval.
-                let deadline = std::time::Instant::now() + SOCKET_POLL_INTERVAL;
-                while std::time::Instant::now() < deadline
-                    && !stop.load(std::sync::atomic::Ordering::SeqCst)
-                {
-                    std::thread::sleep(std::time::Duration::from_millis(250));
-                }
+                Err(e) => tracing::warn!(error = %e, "socket-table poll failed"),
             }
-        })
-        .expect("spawning the socket poller thread");
+            // Sleep in short slices so Ctrl-C never waits a full interval.
+            let deadline = std::time::Instant::now() + SOCKET_POLL_INTERVAL;
+            while std::time::Instant::now() < deadline
+                && !stop.load(std::sync::atomic::Ordering::SeqCst)
+            {
+                std::thread::sleep(std::time::Duration::from_millis(250));
+            }
+        }
+    })?;
+    Ok(())
 }
 
 /// Spawns the background thread that tails the unified log (sudo → `Auth`,
@@ -104,37 +105,40 @@ fn spawn_socket_poller(sink: Arc<dyn EventSink>, stop: Arc<std::sync::atomic::At
 /// Event Log sensor: its failure is logged, never fatal — `EndpointSecurity`
 /// is the sensor that must work. Returns the `log stream` child so shutdown
 /// can kill it (which ends the tail thread's stream and thus the thread).
-fn spawn_unifiedlog_tail(sink: Arc<dyn EventSink>) -> Option<std::process::Child> {
+fn spawn_unifiedlog_tail(sink: Arc<dyn EventSink>) -> std::io::Result<Option<std::process::Child>> {
     let mut child = match sensor_macos_unifiedlog::spawn_stream() {
         Ok(child) => child,
         Err(e) => {
             tracing::warn!(error = %e, "unified-log tail: `log stream` unavailable, skipping");
-            return None;
+            return Ok(None);
         }
     };
     let Some(stdout) = child.stdout.take() else {
         tracing::warn!("unified-log tail: `log stream` spawned without a piped stdout");
-        return None;
+        return Ok(None);
     };
-    std::thread::Builder::new()
-        .name("unifiedlog-tail".into())
-        .spawn(move || {
-            let stream =
-                sensor_macos_unifiedlog::NormalizedLogStream::new(std::io::BufReader::new(stdout));
-            for item in stream {
-                match item {
-                    Ok((_, event)) => sink.on_event(event),
-                    Err(e) => {
-                        // A hard I/O error ends the stream — nothing left to
-                        // iterate (killing the child on shutdown lands here too).
-                        tracing::warn!(error = %e, "unified-log tail: stream ended");
-                        break;
-                    }
+    let spawned = crate::spawn::spawn_named("unifiedlog-tail", move || {
+        let stream =
+            sensor_macos_unifiedlog::NormalizedLogStream::new(std::io::BufReader::new(stdout));
+        for item in stream {
+            match item {
+                Ok((_, event)) => sink.on_event(event),
+                Err(e) => {
+                    // A hard I/O error ends the stream — nothing left to
+                    // iterate (killing the child on shutdown lands here too).
+                    tracing::warn!(error = %e, "unified-log tail: stream ended");
+                    break;
                 }
             }
-        })
-        .expect("spawning the unified-log tail thread");
-    Some(child)
+        }
+    });
+    if let Err(e) = spawned {
+        // No thread will read the child's pipe: do not leave `log stream` running.
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(e);
+    }
+    Ok(Some(child))
 }
 
 /// Where the `NetworkExtension` providers' event pipe lives (issue #33). The
@@ -150,7 +154,7 @@ const NE_SOCKET_PATH: &str = config::identity::MACOS_NE_SOCKET;
 /// packaged system extension nothing ever connects, and binding may fail
 /// unprivileged — both are logged, never fatal. The accept loop lives for
 /// the process (torn down at exit with everything else).
-fn spawn_network_extension_receiver(sink: Arc<dyn EventSink>) {
+fn spawn_network_extension_receiver(sink: Arc<dyn EventSink>) -> std::io::Result<()> {
     let listener =
         match sensor_macos_network_extension::listen(std::path::Path::new(NE_SOCKET_PATH)) {
             Ok(listener) => listener,
@@ -161,33 +165,31 @@ fn spawn_network_extension_receiver(sink: Arc<dyn EventSink>) {
                     "network-extension receiver: cannot bind, skipping (flow/DNS \
                      telemetry off)"
                 );
-                return;
+                return Ok(());
             }
         };
-    std::thread::Builder::new()
-        .name("ne-receiver".into())
-        .spawn(move || {
-            let result = sensor_macos_network_extension::accept_loop(&listener, |conn| {
-                let stream = sensor_macos_network_extension::NormalizedNeStream::new(
-                    std::io::BufReader::new(conn),
-                );
-                for item in stream {
-                    match item {
-                        Ok(event) => sink.on_event(event),
-                        Err(e) => {
-                            // One connection ended (extension restarted by
-                            // the OS) — back to accept for the reconnect.
-                            tracing::debug!(error = %e, "network-extension connection ended");
-                            break;
-                        }
+    crate::spawn::spawn_named("ne-receiver", move || {
+        let result = sensor_macos_network_extension::accept_loop(&listener, |conn| {
+            let stream = sensor_macos_network_extension::NormalizedNeStream::new(
+                std::io::BufReader::new(conn),
+            );
+            for item in stream {
+                match item {
+                    Ok(event) => sink.on_event(event),
+                    Err(e) => {
+                        // One connection ended (extension restarted by
+                        // the OS) — back to accept for the reconnect.
+                        tracing::debug!(error = %e, "network-extension connection ended");
+                        break;
                     }
                 }
-            });
-            if let Err(e) = result {
-                tracing::warn!(error = %e, "network-extension receiver stopped");
             }
-        })
-        .expect("spawning the network-extension receiver thread");
+        });
+        if let Err(e) = result {
+            tracing::warn!(error = %e, "network-extension receiver stopped");
+        }
+    })?;
+    Ok(())
 }
 
 /// Runs the ES sensor (blocking, on the calling thread), the unified-log
@@ -201,10 +203,10 @@ fn run_macos_sensors(sink: Box<dyn EventSink>, redact_commands: bool) -> anyhow:
     let mut sensor = sensor_macos::MacosSensor::new();
     let stop = sensor.stop_handle();
 
-    spawn_network_extension_receiver(Arc::clone(&sink));
+    spawn_network_extension_receiver(Arc::clone(&sink))?;
     let poll_stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    spawn_socket_poller(Arc::clone(&sink), Arc::clone(&poll_stop));
-    let log_child = spawn_unifiedlog_tail(Arc::clone(&sink));
+    spawn_socket_poller(Arc::clone(&sink), Arc::clone(&poll_stop))?;
+    let log_child = spawn_unifiedlog_tail(Arc::clone(&sink))?;
     let log_child = std::sync::Mutex::new(log_child);
 
     ctrlc::set_handler(move || {

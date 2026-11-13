@@ -295,10 +295,7 @@ pub(crate) fn start(
     let uploader = EventUploader::new(upload_client, SpoolDrain(Arc::clone(&spool)));
     let mut upload_loop = UploadLoop::new(uploader, UPLOAD_POLL_INTERVAL);
     let upload_stop = upload_loop.stop_handle();
-    let upload_thread = std::thread::Builder::new()
-        .name("transport-upload".into())
-        .spawn(move || upload_loop.run())
-        .expect("spawning the transport upload thread");
+    let upload_thread = crate::spawn::spawn_named("transport-upload", move || upload_loop.run())?;
 
     let detection_uploader = DetectionUploader::new(
         detection_client,
@@ -306,10 +303,8 @@ pub(crate) fn start(
     );
     let mut detection_loop = UploadLoop::new(detection_uploader, UPLOAD_POLL_INTERVAL);
     let detection_upload_stop = detection_loop.stop_handle();
-    let detection_upload_thread = std::thread::Builder::new()
-        .name("detection-upload".into())
-        .spawn(move || detection_loop.run())
-        .expect("spawning the detection upload thread");
+    let detection_upload_thread =
+        crate::spawn::spawn_named("detection-upload", move || detection_loop.run())?;
 
     Ok(TransportHandle {
         spool,

@@ -292,7 +292,7 @@ pub(crate) fn cmd_run(opts: super::RunOptions) -> anyhow::Result<()> {
     // masking has to precede every other thread. Started here (not right after the
     // masking call) so it can hold a clone of the sink's enrich queue for #341's
     // bounded shutdown drain.
-    crate::kill_loudness::spawn_watcher(alerts.to_path_buf(), sink.enrich_queue().clone());
+    crate::kill_loudness::spawn_watcher(alerts.to_path_buf(), sink.enrich_queue().clone())?;
 
     // Select the primary sensor (eBPF or audit fallback) before creating heartbeats
     // so telemetry reports the correct sensor type.
@@ -395,19 +395,19 @@ pub(crate) fn cmd_run(opts: super::RunOptions) -> anyhow::Result<()> {
             mon.register(avc_heartbeat.clone(), AVC_SILENCE_DEADLINE_NS, now_ns);
         }
     }
-    crate::silence::spawn_monitor(silence_monitor.clone(), sink.clone());
+    crate::silence::spawn_monitor(silence_monitor.clone(), sink.clone())?;
 
     // Self-integrity verification (#71/#30): periodic re-check of the installed
     // binaries against the signed release manifest `updater` persisted at promote
     // time — the real root of trust the heartbeat above cannot provide (silence
     // proves a sensor stopped producing, not that the binary producing it is the
     // one that was actually shipped).
-    crate::integrity::spawn_monitor(storage.state_dir.clone(), sink.clone());
+    crate::integrity::spawn_monitor(storage.state_dir.clone(), sink.clone())?;
 
     // Diffed package inventory (#87): periodic dpkg-status diff, turned into a
     // real case-attachable Detection through the normal sink path (not a
     // local-only alert like the two monitors above).
-    crate::inventory::spawn_monitor(storage.state_dir.clone(), sink.clone());
+    crate::inventory::spawn_monitor(storage.state_dir.clone(), sink.clone())?;
 
     // Health beacon (#134): periodic self-diagnostics to the control plane, over
     // the silence monitor above.
@@ -423,14 +423,14 @@ pub(crate) fn cmd_run(opts: super::RunOptions) -> anyhow::Result<()> {
     );
     // Workers wound down after `sensor.run` returns (#316).
     let mut shutdown = ShutdownPlan::default();
-    let (health_handle, health_stop) = health.spawn();
+    let (health_handle, health_stop) = health.spawn()?;
     shutdown.register("health-beacon", move || health_stop.stop(), health_handle);
     if let Some(transport) = pipeline.transport {
         transport.register_shutdown(&mut shutdown);
     }
 
-    spawn_netlink_poller(sink.clone(), netlink_heartbeat, &mut shutdown);
-    spawn_journal_tail(sink.clone(), journal_heartbeat, alerts);
+    spawn_netlink_poller(sink.clone(), netlink_heartbeat, &mut shutdown)?;
+    spawn_journal_tail(sink.clone(), journal_heartbeat, alerts)?;
     if runs_avc_worker {
         spawn_avc_reader(
             sink.clone(),
@@ -439,15 +439,15 @@ pub(crate) fn cmd_run(opts: super::RunOptions) -> anyhow::Result<()> {
             selinux,
             avc_reader,
             &mut shutdown,
-        );
+        )?;
     }
-    crate::log_sources::spawn(sink.clone(), log_sources, alerts, &mut shutdown);
+    crate::log_sources::spawn(sink.clone(), log_sources, alerts, &mut shutdown)?;
     spawn_uprobes_supervisor(
         sink.clone(),
         uprobes_heartbeat,
         uprobes_monitor,
         capture_set,
-    );
+    )?;
 
     // Observation-only BPF-LSM coverage (issue #91/#313): best-effort, never
     // fails `cmd_run`. `_lsm_ebpf` must stay bound for the rest of this function
@@ -490,18 +490,16 @@ fn spawn_netlink_poller(
     sink: Arc<DetectionSink>,
     heartbeat: SensorHeartbeat,
     shutdown: &mut ShutdownPlan,
-) {
+) -> std::io::Result<()> {
     let mut sensor = sensor_linux_netlink::NetlinkPollSensor::new(move || heartbeat.pulse());
     let stop = sensor.stop_handle();
-    let handle = std::thread::Builder::new()
-        .name("netlink-poll".into())
-        .spawn(move || {
-            if let Err(e) = sensor.run(Box::new(sink)) {
-                tracing::warn!(error = %e, "netlink poller stopped");
-            }
-        })
-        .expect("spawning the netlink poll thread");
+    let handle = crate::spawn::spawn_named("netlink-poll", move || {
+        if let Err(e) = sensor.run(Box::new(sink)) {
+            tracing::warn!(error = %e, "netlink poller stopped");
+        }
+    })?;
     shutdown.register("netlink-poll", move || stop.stop(), handle);
+    Ok(())
 }
 
 /// How long `sensor_linux_audit::AvcReader::drain` blocks waiting for the socket
@@ -550,33 +548,31 @@ fn spawn_avc_reader(
     report_down: bool,
     reader: Option<sensor_linux_audit::AvcReader>,
     shutdown: &mut ShutdownPlan,
-) {
+) -> std::io::Result<()> {
     let stop = Arc::new(AtomicBool::new(false));
     let worker_stop = Arc::clone(&stop);
-    let handle = std::thread::Builder::new()
-        .name("avc-reader".into())
-        .spawn(move || {
-            run_avc_worker(
-                &worker_stop,
-                &status,
-                report_down,
-                reader,
-                |reader| {
-                    reader
-                        .drain(sink.as_ref(), AVC_POLL_TIMEOUT_MS)
-                        .map(|(_, overran)| overran)
-                },
-                sensor_linux_audit::AvcReader::open,
-                |delay| pause_pulsing(&worker_stop, &heartbeat, delay),
-                || heartbeat.pulse(),
-            );
-        })
-        .expect("spawning the avc-reader thread");
+    let handle = crate::spawn::spawn_named("avc-reader", move || {
+        run_avc_worker(
+            &worker_stop,
+            &status,
+            report_down,
+            reader,
+            |reader| {
+                reader
+                    .drain(sink.as_ref(), AVC_POLL_TIMEOUT_MS)
+                    .map(|(_, overran)| overran)
+            },
+            sensor_linux_audit::AvcReader::open,
+            |delay| pause_pulsing(&worker_stop, &heartbeat, delay),
+            || heartbeat.pulse(),
+        );
+    })?;
     shutdown.register(
         "avc-reader",
         move || stop.store(true, Ordering::SeqCst),
         handle,
     );
+    Ok(())
 }
 
 /// First wait before [`run_avc_worker`] reopens a failed socket, doubled after each failure
@@ -755,66 +751,67 @@ fn spawn_journal_tail(
     sink: Arc<DetectionSink>,
     heartbeat: SensorHeartbeat,
     alerts: &std::path::Path,
-) {
+) -> std::io::Result<()> {
     let cursor_path = crate::journal_cursor::cursor_path_for(alerts);
-    std::thread::Builder::new()
-        .name("journal-tail".into())
-        .spawn(move || {
-            let cursor = crate::journal_cursor::read(&cursor_path)
-                .or_else(|| sensor_linux_journal::current_cursor().ok());
-            let mut child = match sensor_linux_journal::spawn_follow(cursor.as_deref()) {
-                Ok(child) => child,
-                Err(e) => {
-                    tracing::warn!(error = %e, "journal tail: journalctl unavailable, skipping");
-                    return;
-                }
-            };
-            let Some(stdout) = child.stdout.take() else {
-                tracing::warn!("journal tail: journalctl spawned without a piped stdout");
+    crate::spawn::spawn_named("journal-tail", move || {
+        let cursor = crate::journal_cursor::read(&cursor_path)
+            .or_else(|| sensor_linux_journal::current_cursor().ok());
+        let mut child = match sensor_linux_journal::spawn_follow(cursor.as_deref()) {
+            Ok(child) => child,
+            Err(e) => {
+                tracing::warn!(error = %e, "journal tail: journalctl unavailable, skipping");
                 return;
-            };
-            // Pulse on every line `journalctl` delivers, allowlisted or not (#71, #83):
-            // `ClassifiedJournal` only yields allowlisted records, so a pulse in the
-            // loop below would fire on auth and unit events alone and an idle host
-            // would read as a silent sensor.
-            let hook_heartbeat = heartbeat.clone();
-            let journal =
-                sensor_linux_journal::ClassifiedJournal::new(std::io::BufReader::new(stdout))
-                    .with_line_hook(move || hook_heartbeat.pulse());
-            // Our own line into journald at a fixed interval, so there is always
-            // something to read back: the pulse then proves journald -> journalctl
-            // -> agent delivery on a host with nothing else to log.
-            spawn_journal_canary();
-            let mut unit_persistence = sensor_linux_journal::UnitPersistenceTracker::new();
-            for item in journal {
-                // The heartbeat is pulsed per line by the hook above, not here: this
-                // loop only sees the allowlisted records.
-                match item {
-                    Ok((record, event)) => {
-                        crate::journal_cursor::write(&cursor_path, &record.cursor);
-                        if let Some(auth) = sensor_linux_journal::to_auth_event(&record, &event) {
-                            sink.on_event(schema::Event::Auth(auth));
-                        }
-                        if let Some(persistence_event) = unit_persistence.observe(&record, &event) {
-                            sink.on_event(persistence_event);
-                        }
-                        if let Some(stop_event) =
-                            sensor_linux_journal::to_unit_stop_event(&record, &event)
-                        {
-                            sink.on_event(stop_event);
-                        }
+            }
+        };
+        let Some(stdout) = child.stdout.take() else {
+            tracing::warn!("journal tail: journalctl spawned without a piped stdout");
+            return;
+        };
+        // Pulse on every line `journalctl` delivers, allowlisted or not (#71, #83):
+        // `ClassifiedJournal` only yields allowlisted records, so a pulse in the
+        // loop below would fire on auth and unit events alone and an idle host
+        // would read as a silent sensor.
+        let hook_heartbeat = heartbeat.clone();
+        let journal = sensor_linux_journal::ClassifiedJournal::new(std::io::BufReader::new(stdout))
+            .with_line_hook(move || hook_heartbeat.pulse());
+        // Our own line into journald at a fixed interval, so there is always
+        // something to read back: the pulse then proves journald -> journalctl
+        // -> agent delivery on a host with nothing else to log.
+        if let Err(e) = spawn_journal_canary() {
+            // Started from the tail's own thread, long after start-up: log it, the silence
+            // monitor reports the missing canary.
+            tracing::warn!(error = %e, "journal canary not started");
+        }
+        let mut unit_persistence = sensor_linux_journal::UnitPersistenceTracker::new();
+        for item in journal {
+            // The heartbeat is pulsed per line by the hook above, not here: this
+            // loop only sees the allowlisted records.
+            match item {
+                Ok((record, event)) => {
+                    crate::journal_cursor::write(&cursor_path, &record.cursor);
+                    if let Some(auth) = sensor_linux_journal::to_auth_event(&record, &event) {
+                        sink.on_event(schema::Event::Auth(auth));
                     }
-                    Err(e) => {
-                        // A hard I/O error ends `ClassifiedJournal`'s stream (see its
-                        // doc) — nothing left to iterate, so this thread exits. No
-                        // reconnect logic yet (matches the crate doc's Status section).
-                        tracing::warn!(error = %e, "journal tail: stream ended");
-                        break;
+                    if let Some(persistence_event) = unit_persistence.observe(&record, &event) {
+                        sink.on_event(persistence_event);
                     }
+                    if let Some(stop_event) =
+                        sensor_linux_journal::to_unit_stop_event(&record, &event)
+                    {
+                        sink.on_event(stop_event);
+                    }
+                }
+                Err(e) => {
+                    // A hard I/O error ends `ClassifiedJournal`'s stream (see its
+                    // doc) — nothing left to iterate, so this thread exits. No
+                    // reconnect logic yet (matches the crate doc's Status section).
+                    tracing::warn!(error = %e, "journal tail: stream ended");
+                    break;
                 }
             }
-        })
-        .expect("spawning the journal tail thread");
+        }
+    })?;
+    Ok(())
 }
 
 /// How often the agent writes its liveness line into journald. Four of these fit in
@@ -826,28 +823,26 @@ const JOURNAL_CANARY_INTERVAL: std::time::Duration = std::time::Duration::from_s
 /// every [`JOURNAL_CANARY_INTERVAL`] (see that crate's `canary` module for why).
 /// A failed write is logged once per failure streak and retried; it is the
 /// signal itself when journald is down, so it never stops the thread.
-fn spawn_journal_canary() {
-    std::thread::Builder::new()
-        .name("journal-canary".into())
-        .spawn(|| {
-            let socket = std::path::Path::new(sensor_linux_journal::JOURNAL_SOCKET);
-            let mut warned = false;
-            loop {
-                match sensor_linux_journal::send_canary(socket) {
-                    Ok(()) => warned = false,
-                    Err(e) if !warned => {
-                        warned = true;
-                        tracing::warn!(
-                            error = %e,
-                            "journal canary: cannot write to journald; the journal sensor will read as silent until it can"
-                        );
-                    }
-                    Err(_) => {}
+fn spawn_journal_canary() -> std::io::Result<()> {
+    crate::spawn::spawn_named("journal-canary", || {
+        let socket = std::path::Path::new(sensor_linux_journal::JOURNAL_SOCKET);
+        let mut warned = false;
+        loop {
+            match sensor_linux_journal::send_canary(socket) {
+                Ok(()) => warned = false,
+                Err(e) if !warned => {
+                    warned = true;
+                    tracing::warn!(
+                        error = %e,
+                        "journal canary: cannot write to journald; the journal sensor will read as silent until it can"
+                    );
                 }
-                std::thread::sleep(JOURNAL_CANARY_INTERVAL);
+                Err(_) => {}
             }
-        })
-        .expect("spawning the journal canary thread");
+            std::thread::sleep(JOURNAL_CANARY_INTERVAL);
+        }
+    })?;
+    Ok(())
 }
 
 /// The uprobes thread that is running, and the captures it was started with.
@@ -876,7 +871,7 @@ fn start_uprobes(
     sink: Arc<DetectionSink>,
     heartbeat: SensorHeartbeat,
     captures: Captures,
-) -> RunningUprobes {
+) -> std::io::Result<RunningUprobes> {
     let mut config = sensor_linux_uprobes::UprobesConfig::new();
     if captures.tls {
         config = config.with_tls_enabled();
@@ -889,18 +884,32 @@ fn start_uprobes(
     }
     let mut sensor = sensor_linux_uprobes::UprobesSensor::with_config(config);
     let stop = sensor.stop_handle();
-    let thread = std::thread::Builder::new()
-        .name("uprobes".into())
-        .spawn(move || {
-            if let Err(e) = sensor.run(Box::new(PulsingSink::new(sink, heartbeat))) {
-                tracing::warn!(error = %e, "uprobes sensor failed");
-            }
-        })
-        .expect("spawning the uprobes sensor thread");
-    RunningUprobes {
+    let thread = crate::spawn::spawn_named("uprobes", move || {
+        if let Err(e) = sensor.run(Box::new(PulsingSink::new(sink, heartbeat))) {
+            tracing::warn!(error = %e, "uprobes sensor failed");
+        }
+    })?;
+    Ok(RunningUprobes {
         captures,
         stop,
         thread,
+    })
+}
+
+/// [`start_uprobes`] for the supervisor, which runs long after start-up and so cannot fail
+/// `cmd_run`: a thread the OS refuses is logged and the sensor stays off (the silence monitor
+/// watches its heartbeat from the moment the supervisor registered it, so the gap is reported).
+fn start_uprobes_or_log(
+    sink: &Arc<DetectionSink>,
+    heartbeat: &SensorHeartbeat,
+    captures: Captures,
+) -> Option<RunningUprobes> {
+    match start_uprobes(sink.clone(), heartbeat.clone(), captures) {
+        Ok(running) => Some(running),
+        Err(e) => {
+            tracing::error!(error = %e, "uprobes sensor not started");
+            None
+        }
     }
 }
 
@@ -918,44 +927,45 @@ fn spawn_uprobes_supervisor(
     heartbeat: SensorHeartbeat,
     monitor: Arc<Mutex<SilenceMonitor>>,
     captures: CaptureSet,
-) {
-    std::thread::Builder::new()
-        .name("uprobes-supervisor".into())
-        .spawn(move || {
-            let mut running: Option<RunningUprobes> = None;
-            let mut wanted = captures.effective();
-            loop {
-                let current = running.as_ref().map_or(Captures::NONE, |r| r.captures);
-                match plan(current, wanted) {
-                    UprobesAction::Idle => {}
-                    UprobesAction::Start(set) => {
-                        tracing::info!(?set, "starting the uprobes sensor");
-                        monitor.lock().unwrap().register(
-                            heartbeat.clone(),
-                            NO_CANARY_SILENCE_DEADLINE_NS,
-                            schema::time::now_ns(),
-                        );
-                        running = Some(start_uprobes(sink.clone(), heartbeat.clone(), set));
-                    }
-                    UprobesAction::Restart(set) => {
-                        tracing::info!(?set, "restarting the uprobes sensor with other captures: capture has a gap while it reloads");
-                        if let Some(old) = running.take() {
-                            old.stop();
-                        }
-                        running = Some(start_uprobes(sink.clone(), heartbeat.clone(), set));
-                    }
-                    UprobesAction::Stop => {
-                        tracing::info!("stopping the uprobes sensor: no capture is wanted any more");
-                        if let Some(old) = running.take() {
-                            old.stop();
-                        }
-                        monitor.lock().unwrap().unregister(heartbeat.name());
-                    }
+) -> std::io::Result<()> {
+    crate::spawn::spawn_named("uprobes-supervisor", move || {
+        let mut running: Option<RunningUprobes> = None;
+        let mut wanted = captures.effective();
+        loop {
+            let current = running.as_ref().map_or(Captures::NONE, |r| r.captures);
+            match plan(current, wanted) {
+                UprobesAction::Idle => {}
+                UprobesAction::Start(set) => {
+                    tracing::info!(?set, "starting the uprobes sensor");
+                    monitor.lock().unwrap().register(
+                        heartbeat.clone(),
+                        NO_CANARY_SILENCE_DEADLINE_NS,
+                        schema::time::now_ns(),
+                    );
+                    running = start_uprobes_or_log(&sink, &heartbeat, set);
                 }
-                wanted = captures.wait_until_differs(wanted);
+                UprobesAction::Restart(set) => {
+                    tracing::info!(
+                        ?set,
+                        "restarting the uprobes sensor with other captures: capture has a gap while it reloads"
+                    );
+                    if let Some(old) = running.take() {
+                        old.stop();
+                    }
+                    running = start_uprobes_or_log(&sink, &heartbeat, set);
+                }
+                UprobesAction::Stop => {
+                    tracing::info!("stopping the uprobes sensor: no capture is wanted any more");
+                    if let Some(old) = running.take() {
+                        old.stop();
+                    }
+                    monitor.lock().unwrap().unregister(heartbeat.name());
+                }
             }
-        })
-        .expect("spawning the uprobes supervisor thread");
+            wanted = captures.wait_until_differs(wanted);
+        }
+    })?;
+    Ok(())
 }
 
 /// Attaches the observation-only `file_open` BPF-LSM hook (issue #91/#313) and

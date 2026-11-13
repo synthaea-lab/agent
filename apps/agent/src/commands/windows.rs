@@ -516,7 +516,7 @@ pub(crate) fn cmd_run(opts: super::RunOptions) -> anyhow::Result<()> {
     // once the sensors are built (`run_windows_sensors`); the monitor thread
     // polls an empty list until then, which is harmless.
     let silence_monitor = Arc::new(Mutex::new(SilenceMonitor::new()));
-    crate::silence::spawn_monitor(Arc::clone(&silence_monitor), Arc::clone(&pipeline.sink));
+    crate::silence::spawn_monitor(Arc::clone(&silence_monitor), Arc::clone(&pipeline.sink))?;
 
     // Health beacon (#134/#317): without it the control plane never hears from
     // a Windows agent, and its silent-agent detection flags every one of them.
@@ -531,7 +531,7 @@ pub(crate) fn cmd_run(opts: super::RunOptions) -> anyhow::Result<()> {
             None,
         )),
     );
-    let (_health_handle, _health_stop) = health.spawn();
+    let (_health_handle, _health_stop) = health.spawn()?;
 
     run_windows_sensors(
         Box::new(SharedSink(pipeline.sink)),
