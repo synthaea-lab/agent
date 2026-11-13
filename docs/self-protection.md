@@ -247,11 +247,14 @@ at the agent, and the restarted agent reports the sender through a rule. Under t
 audit fallback sensor that gap remains. Kernel-mediated stops that involve no signal
 from a process (a CPU rlimit, a cgroup memory limit, `cgroup.freeze`) are read from how
 they are set: the command (`systemctl freeze|set-property`, a memory or task limit, or a
-`CPUQuota` below 10 %, in `%`, `‰` or `‱`, on a listed tool is Medium; `prlimit --pid <pid>
---cpu|--as`, with `--pid` abbreviated to `--p` or `--pi`, is Medium when the pid is a listed tool,
-from its comm or image name, and Low otherwise), or a write to a cgroup limit file of a listed
-unit. The kill that a memory limit then causes is not reported
-([#49](https://github.com/synthaea-lab/agent/issues/49)). The full
+`CPUQuota` below 10 %, in `%`, `‰` or `‱`, on a listed tool is Medium, also after any `systemctl` option that takes a separate value
+(`-M`, `-H`, `-t`, `-p`, `--job-mode`, `--what` and the others, alone or last in a cluster such as
+`-qM`, and by any unambiguous long prefix) and that value: the value is not the verb. A command
+that names a machine or host is read, not skipped, because `-M .host` and `-H localhost` reach
+this host; `prlimit --pid <pid> --cpu|--as`, with `--pid` abbreviated
+to `--p` or `--pi`, is Medium when the pid is a listed tool, from its comm or image name, and Low
+otherwise), or a write to a cgroup limit file of a listed unit. The kill that a memory limit then
+causes is not reported ([#49](https://github.com/synthaea-lab/agent/issues/49)). The full
 mask-wait-exit flow is not unit-tested because it terminates the test runner; only the
 pure helpers are.
 

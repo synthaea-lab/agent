@@ -34,17 +34,21 @@ pub(super) const CANARY_RULE_ID: &str = "DECEPTION-CANARY";
 /// predecessor.
 type CanaryKey = (PathBuf, u32, Option<u64>);
 
-/// Open flags that mean write intent on Linux (`O_WRONLY | O_RDWR | O_CREAT`), the same
-/// mask the YARA trigger uses. On a platform whose flags mean something else the mask can
-/// only let more opens through, never absorb more.
-const WRITE_INTENT_FLAGS: u32 = 0o103;
-
 /// Whether a repeat of this touch may be absorbed by the cooldown. Only a read open may: a
-/// delete, a rename or a write-intent open is the destructive touch an encryptor makes after
-/// reading, and absorbing it behind the first open would hide the one finding an analyst
-/// needs. Those always raise a detection (bounded by the number of canaries).
+/// delete, a rename or a write-intent open ([`rules::has_write_intent`], which counts
+/// `O_TRUNC`: `O_RDONLY | O_TRUNC` empties the file) is the destructive touch an encryptor
+/// makes after reading, and absorbing it behind the first open would hide the one finding an
+/// analyst needs. Those always raise a detection (bounded by the number of canaries).
+///
+/// The access mode must also be `O_RDONLY`: the invalid `O_ACCMODE` value, which the
+/// predicate does not count as a write, stays unabsorbed as it was before the predicate
+/// was shared, so a platform whose flags mean something else is never absorbed more.
 fn absorbable(touch: &deception::Touch) -> bool {
-    matches!(touch, deception::Touch::Open { flags } if flags & WRITE_INTENT_FLAGS == 0)
+    matches!(
+        touch,
+        deception::Touch::Open { flags }
+            if !rules::has_write_intent(*flags) && flags & schema::O_ACCMODE == 0
+    )
 }
 
 /// How long one process's repeat touches of one canary are absorbed after a detection.
