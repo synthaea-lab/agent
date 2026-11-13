@@ -22,7 +22,7 @@ Live status and ordering are on the [project board](https://github.com/orgs/synt
 - Signed production delivery of IOC feeds (partial, IOC matching). See [detection/ioc.md#loading](detection/ioc.md#loading).
 - Role-separated embedded Ed25519 keys (release, content, snapshot, recovery) with fail-closed unprovisioned state (partial, Security model). See [security-model.md#signing-keys-and-the-test-key-guard](security-model.md#signing-keys-and-the-test-key-guard).
 - Fleet common-set snapshot fetch (partial, Updates). See [updates-and-releases.md#common-set-snapshot](updates-and-releases.md#common-set-snapshot).
-- Production signing keys embedded in packaged builds (planned, Updates). See [updates-and-releases.md#the-trust-set](updates-and-releases.md#the-trust-set).
+- Production signing keys embedded in packaged builds (partial, Updates). See [updates-and-releases.md#the-trust-set](updates-and-releases.md#the-trust-set).
 - Offline manifest build and signing (key file, test key, PKCS#11) (partial, Release signing). See [architecture.md#binaries](architecture.md#binaries).
 
 ### [#54](https://github.com/synthaea-lab/agent/issues/54) Release pipeline: build and publish signed per-OS artifacts on tag
@@ -81,7 +81,7 @@ Live status and ordering are on the [project board](https://github.com/orgs/synt
 - Hot reload of Sigma/YARA/common-set content after apply-content-manifest (partial, Content). See [lifecycle.md#hot-content-reload](lifecycle.md#hot-content-reload).
 - Periodic update trigger (timer for apply-release and apply-content-manifest) (planned, Updates). See [updates-and-releases.md#what-is-delivered-and-how](updates-and-releases.md#what-is-delivered-and-how).
 
-### [#51](https://github.com/synthaea-lab/agent/issues/51) audit: an exec with an argument over ~8 KiB is dropped on the auditd path
+### [#51](https://github.com/synthaea-lab/agent/issues/51) audit: an exec with an argument over ~8 KiB is dropped on the auditd path (closed)
 
 - Audit-netlink fallback sensor (exec, connect) when eBPF is unavailable (partial, Audit fallback). See [sensors/linux/audit-fallback.md#limits](sensors/linux/audit-fallback.md#limits).
 

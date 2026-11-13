@@ -435,7 +435,15 @@ They must fail closed when the target is wrong.
   OOM victim, which is not built. Not verified: whether such a probe is usable on every supported
   kernel. A command line the rules cannot read (an option cluster such as `prlimit -tp`, an empty
   argv) and a limit set by a means no rule reads (a process that writes the file through a path
-  the rule cannot map to a unit, an unlisted tool) are not seen either.
+  the rule cannot map to a unit, an unlisted tool) are not seen either. The path case includes a
+  bare file name after a `cd` into the unit's cgroup (`cd <cgroup> && echo 1 > cgroup.freeze`): the
+  open reaches the event stream but carries no unit, and the event has no working directory
+  (lab-run on kernels 5.14 and 7.2). These limits stay documented rather than built away: closing
+  the path case means capturing the working directory or the resolved path in the probe, a
+  schema and verifier change for a tripwire that reads how a limit is set, not a barrier; the
+  OOM kill has no sender to attribute, and a probe on its victim is unverified across the
+  supported kernels. A lab capture that shows either is usable on all supported kernels is the
+  reason to reopen them.
 - **Local-only deployments** have no server-side silence detection, and their evidence
   never leaves the host.
 - **Unsigned updates on Windows and macOS.** Self-update is Linux-only today
