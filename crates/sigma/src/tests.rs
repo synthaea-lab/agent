@@ -1020,3 +1020,74 @@ fn a_rule_file_over_the_size_cap_is_refused_before_it_is_read() {
         "{error}"
     );
 }
+
+// Each refusal of `validate_field_map` names what is wrong (#171 pins them before the split).
+
+fn selection_refused_with(selection: &str, needle: &str) {
+    let yaml = rule_with_detection(&format!(
+        "  selection:\n{selection}  condition: selection\n"
+    ));
+    let rule = parse_rule_yaml(&yaml).expect("the YAML itself is valid");
+    let error = validate(&rule, "<test>/linux/rule.yml").expect_err("must be refused");
+    assert!(
+        error.to_string().contains(needle),
+        "expected {needle:?} in: {error}"
+    );
+}
+
+#[test]
+fn an_empty_selection_is_refused_because_it_would_match_everything() {
+    selection_refused_with("    {}\n", "would match everything");
+}
+
+#[test]
+fn an_unknown_field_is_refused_with_the_supported_list() {
+    selection_refused_with("    NoSuchField: a\n", "field `NoSuchField` (supported:");
+}
+
+#[test]
+fn an_unknown_modifier_is_refused_by_name() {
+    selection_refused_with("    Image|base64: a\n", "modifier `base64`");
+}
+
+#[test]
+fn a_repeated_all_is_refused_as_a_duplicate() {
+    selection_refused_with(
+        "    Image|contains|all|all: [a, b]\n",
+        "duplicate `all` modifier",
+    );
+}
+
+#[test]
+fn two_matching_modifiers_are_refused() {
+    selection_refused_with(
+        "    Image|contains|startswith: a\n",
+        "multiple matching modifiers",
+    );
+}
+
+#[test]
+fn all_before_a_matching_modifier_is_refused_as_not_last() {
+    selection_refused_with("    Image|all|contains: [a, b]\n", "must be last");
+}
+
+#[test]
+fn all_without_a_matching_modifier_is_refused() {
+    selection_refused_with(
+        "    Image|all: [a, b]\n",
+        "must follow one matching modifier",
+    );
+}
+
+#[test]
+fn an_empty_value_list_is_refused() {
+    selection_refused_with("    Image: []\n", "empty value list for `Image`");
+}
+
+#[test]
+fn an_interior_wildcard_is_allowed_under_a_matching_modifier() {
+    let yaml =
+        rule_with_detection("  selection:\n    Image|contains: 'a*b'\n  condition: selection\n");
+    let rule = parse_rule_yaml(&yaml).unwrap();
+    assert!(validate(&rule, "<test>/linux/rule.yml").is_ok());
+}
