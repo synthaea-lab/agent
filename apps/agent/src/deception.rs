@@ -1094,7 +1094,16 @@ mod tests {
 
     #[test]
     fn a_process_running_an_allowed_system_executable_is_allowed() {
-        let allow = allow_of(&["/usr/bin/updatedb"], |_| Some("/usr/bin/updatedb".into()));
+        // The resolver stands in for `/proc/<pid>/exe`, which the kernel resolves, so it
+        // canonicalizes like the allow list does: on Debian with plocate `/usr/bin/updatedb`
+        // is a symlink chain to `/usr/sbin/updatedb.plocate` (#255). Where the file does
+        // not exist both sides keep the literal path.
+        let allow = allow_of(&["/usr/bin/updatedb"], |_| {
+            Some(
+                fs::canonicalize("/usr/bin/updatedb")
+                    .unwrap_or_else(|_| PathBuf::from("/usr/bin/updatedb")),
+            )
+        });
         assert!(allow.allows(10, None));
     }
 
