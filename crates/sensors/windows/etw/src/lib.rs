@@ -26,6 +26,8 @@ pub mod normalize;
 #[cfg(any(windows, test))]
 mod path_normalizer;
 #[cfg(any(windows, test))]
+mod payload;
+#[cfg(any(windows, test))]
 mod pid_cache;
 #[cfg(windows)]
 mod providers;
