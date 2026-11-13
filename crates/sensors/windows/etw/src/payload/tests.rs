@@ -504,9 +504,11 @@ mod ntlm {
         let fields = Fields::of(&[
             ("Username", text_value("alice")),
             ("TargetService", text_value("cifs/srv")),
+            ("ClientIP", text_value("10.0.0.9")),
             ("NtlmVersion", text_value("NTLMv2")),
+            ("Status", Value::U32(0xc000_006d)),
         ]);
-        let auth = ntlm_auth(NtlmDirection::Outgoing, &fields);
+        let auth = ntlm_auth(NtlmDirection::Incoming, &fields);
 
         let event = auth.clone().into_event(meta());
 
@@ -516,9 +518,22 @@ mod ntlm {
                 event.direction,
                 event.user,
                 event.target,
-                event.ntlm_version
+                event.remote_address,
+                event.ntlm_version,
+                event.status
             ),
-            (auth.direction, auth.user, auth.target, auth.ntlm_version)
+            (
+                auth.direction,
+                auth.user,
+                auth.target,
+                auth.remote_address,
+                auth.ntlm_version,
+                auth.status
+            )
+        );
+        assert!(
+            event.remote_address.is_some(),
+            "the fixture carries an address"
         );
     }
 
@@ -535,6 +550,19 @@ mod ntlm {
         assert_ne!(failure.dedup_key(4023), success.dedup_key(4022));
         assert_ne!(failure.dedup_key(4023), failure.dedup_key(4022));
         assert_eq!(failure.dedup_key(4023), failure.clone().dedup_key(4023));
+    }
+
+    #[test]
+    fn records_that_differ_only_in_status_are_two_dedup_keys() {
+        let failure = Fields::of(&[
+            ("Username", text_value("alice")),
+            ("Status", Value::U32(0xc000_006d)),
+        ]);
+        let success = Fields::of(&[("Username", text_value("alice")), ("Status", Value::U32(0))]);
+        let failure = ntlm_auth(NtlmDirection::Incoming, &failure);
+        let success = ntlm_auth(NtlmDirection::Incoming, &success);
+
+        assert_ne!(failure.dedup_key(4022), success.dedup_key(4022));
     }
 
     #[test]
