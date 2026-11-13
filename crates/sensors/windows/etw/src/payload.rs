@@ -68,16 +68,17 @@ pub(crate) fn dns_query(fields: &impl PayloadFields, meta: EventMeta) -> Option<
     })
 }
 
-/// Kernel-Registry EID 4 (`RegSetValueKey`); `None` when the kernel did not resolve the key
-/// name. Only string data is decoded: raw DWORD or binary bytes have no text form for rules.
+/// Kernel-Registry EID 5 (`SetValueKey`); `None` when the kernel did not resolve the key
+/// name (the record then names the key only by its `KeyObject` handle). Only string data is
+/// decoded: raw DWORD or binary bytes have no text form for rules.
 pub(crate) fn registry_set(
     fields: &impl PayloadFields,
     meta: EventMeta,
 ) -> Option<RegistrySetEvent> {
     let raw_key = non_empty(fields.text_or_empty("KeyName"))?;
-    let data_type = fields.u32("DataType").unwrap_or(0);
+    let data_type = fields.u32("Type").unwrap_or(0);
     let data = match data_type {
-        REG_SZ | REG_EXPAND_SZ => decode_reg_string(&fields.bytes("Data").unwrap_or_default()),
+        REG_SZ | REG_EXPAND_SZ => decode_reg_string(&captured_text_bytes(fields)),
         _ => None,
     };
     Some(RegistrySetEvent {
@@ -87,6 +88,20 @@ pub(crate) fn registry_set(
         data_type,
         data,
     })
+}
+
+/// The value bytes to decode as text. `CapturedData` is the part of the value the kernel
+/// captured: when it is shorter than `DataSize` the data is a prefix, cut wherever the
+/// capture limit fell, so a half UTF-16 unit at its end is dropped rather than the value.
+fn captured_text_bytes(fields: &impl PayloadFields) -> Vec<u8> {
+    let mut captured = fields.bytes("CapturedData").unwrap_or_default();
+    let is_prefix = fields
+        .u32("DataSize")
+        .is_some_and(|size| captured.len() < usize::try_from(size).unwrap_or(usize::MAX));
+    if is_prefix {
+        captured.truncate(captured.len() & !1);
+    }
+    captured
 }
 
 /// A `REG_SZ` / `REG_EXPAND_SZ` value: UTF-16 LE, trailing NULs dropped. `None` for an
@@ -131,6 +146,9 @@ pub(crate) enum WmiOperation {
 }
 
 impl WmiOperation {
+    /// Every id [`Self::from_id`] reads: the provider's event-id filter.
+    pub(crate) const EVENT_IDS: [u16; 2] = [23, 24];
+
     pub(crate) fn from_id(event_id: u16) -> Option<Self> {
         match event_id {
             23 => Some(Self::ExecQuery),
@@ -207,6 +225,9 @@ pub(crate) fn ldap_search(fields: &impl PayloadFields, meta: EventMeta) -> LdapS
         attributes: normalize::split_ldap_attributes(&fields.text_or_empty("AttributeList")),
     }
 }
+
+/// Every id [`ntlm_direction`] reads: the provider's event-id filter.
+pub(crate) const NTLM_EVENT_IDS: [u16; 6] = [4020, 4021, 4022, 4023, 4026, 4027];
 
 /// The direction of an NTLM record: 4020/4021/4026/4027 this host authenticated out,
 /// 4022/4023 a client authenticated in.
