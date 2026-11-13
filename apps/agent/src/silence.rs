@@ -24,7 +24,7 @@ use std::{
 use schema::{Event, sensor::EventSink};
 use tamper::heartbeat::{SensorHeartbeat, SilenceMonitor};
 
-use crate::{health::SensorHealthSource, sink::DetectionSink};
+use crate::{health::SensorHealthSource, sink::DetectionSink, sync::LockExt};
 
 /// How often the dedicated monitor thread checks every registered heartbeat against
 /// its deadline. Independent of the health beacon's own (much longer) cadence —
@@ -106,7 +106,7 @@ impl SilenceHealthSource {
 
 impl SensorHealthSource for SilenceHealthSource {
     fn sensor_health(&self) -> Vec<schema::SensorHealth> {
-        let mut health = self.monitor.lock().unwrap().sensor_health();
+        let mut health = self.monitor.lock_recovering().sensor_health();
         for source in self.sources.iter().filter(|s| s.is_down()) {
             // A source that is registered with the monitor too (its thread is alive, working to
             // recover) keeps its one entry, now silent; one never started gets an entry of its own.
@@ -126,7 +126,7 @@ impl SensorHealthSource for SilenceHealthSource {
 /// One poll of the monitor: every newly confirmed silence becomes a tamper alert, which the health
 /// beacon counts (#863).
 fn poll_and_emit(monitor: &Mutex<SilenceMonitor>, sink: &DetectionSink, now_ns: u64) {
-    let verdicts = monitor.lock().unwrap().poll(now_ns);
+    let verdicts = monitor.lock_recovering().poll(now_ns);
     for verdict in verdicts {
         sink.emit_tamper("T1562", &verdict.message());
     }
@@ -301,5 +301,23 @@ mod tests {
 
         status.set_down(false);
         assert!(!source.sensor_health()[0].silent, "recovery clears it");
+    }
+
+    #[test]
+    fn a_monitor_poisoned_by_a_panicking_thread_still_reports_sensor_health() {
+        let mut monitor = SilenceMonitor::new();
+        monitor.register(SensorHeartbeat::new("test-sensor"), 1_000, 0);
+        let monitor = Arc::new(Mutex::new(monitor));
+        let held = Arc::clone(&monitor);
+        let _ = std::thread::spawn(move || {
+            let _guard = held.lock().unwrap();
+            panic!("poison the silence monitor while holding it");
+        })
+        .join();
+        assert!(monitor.is_poisoned());
+        let health = SilenceHealthSource::new(Arc::clone(&monitor), Vec::new()).sensor_health();
+        assert_eq!(health.len(), 1);
+        assert_eq!(health[0].name, "test-sensor");
+        assert!(!monitor.is_poisoned());
     }
 }

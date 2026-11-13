@@ -19,6 +19,7 @@ use crate::{
     shutdown::{SHUTDOWN_BUDGET, ShutdownPlan, sleep_unless_stopped},
     silence::{PulsingSink, SourceStatus},
     sink::DetectionSink,
+    sync::LockExt,
 };
 
 /// Silence deadlines (#71) fed to `SilenceMonitor::register`. The eBPF sensor and
@@ -375,7 +376,7 @@ pub(crate) fn cmd_run(opts: super::RunOptions) -> anyhow::Result<()> {
     let uprobes_monitor = Arc::clone(&silence_monitor);
     {
         let now_ns = schema::time::now_ns();
-        let mut mon = silence_monitor.lock().unwrap();
+        let mut mon = silence_monitor.lock_recovering();
         mon.register(
             primary_heartbeat.clone(),
             NO_CANARY_SILENCE_DEADLINE_NS,
@@ -930,7 +931,7 @@ fn spawn_uprobes_supervisor(
                     UprobesAction::Idle => {}
                     UprobesAction::Start(set) => {
                         tracing::info!(?set, "starting the uprobes sensor");
-                        monitor.lock().unwrap().register(
+                        monitor.lock_recovering().register(
                             heartbeat.clone(),
                             NO_CANARY_SILENCE_DEADLINE_NS,
                             schema::time::now_ns(),
@@ -949,7 +950,7 @@ fn spawn_uprobes_supervisor(
                         if let Some(old) = running.take() {
                             old.stop();
                         }
-                        monitor.lock().unwrap().unregister(heartbeat.name());
+                        monitor.lock_recovering().unregister(heartbeat.name());
                     }
                 }
                 wanted = captures.wait_until_differs(wanted);
