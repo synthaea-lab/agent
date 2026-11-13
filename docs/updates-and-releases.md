@@ -58,7 +58,9 @@ be replaced over the air by a rotation that only `recovery` can sign.
 that says `unprovisioned` makes its static `None` and every verification of that role fails with
 [`SigningKeyUnprovisioned`](../crates/updater/src/error.rs): the build fails closed instead of
 trusting a public seed. A build that embeds the temporary keys refuses anything signed by the
-public test seed. Real provisioning is tracked in
+public test seed. A release refuses to build while a key file is still marked `TEMPORARY`
+(`tools/check-no-temporary-keys.sh`, release job `temporary-key-guard`; see
+[packaging.md](packaging.md)). Real provisioning is tracked in
 [#43](https://github.com/synthaea-lab/agent/issues/43).
 
 **Test keys.** With the `test-key` feature (on by default for development) or under `cfg(test)`,

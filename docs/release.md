@@ -86,6 +86,11 @@ If a release run fails, fix the cause on `main` and run `release.yml` by hand
 same name and replaces the notes above the changelog. The `draft` input leaves the release
 unpublished for a manual check.
 
+While `crates/updater/keys/*.pub` holds the temporary keys of 2026-11-12 (no custody, ADR-0027),
+the `temporary-key-guard` job fails every release. Only a manual run with the
+`allow-temporary-keys` input passes (with a warning), for a lab build that must not reach a
+customer. The ceremony replaces the keys and removes the need for the input.
+
 ### The first release: v0.0.1
 
 1. Make sure Actions are enabled for the repository, and that the `release` environment exists
