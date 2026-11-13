@@ -97,6 +97,8 @@ pub(crate) const MAIL_CLIENT_QUARANTINE_AGENTS: &[&str] = &["Mail"];
 /// 156, Firefox 159, Chrome 157, Edge, Brave 1.99, Opera, Vivaldi 8.3). The Firefox family is
 /// also matched by shape, see [`is_browser_download_image`]: its installs (a tarball unpacked
 /// anywhere, the Snap with a revision in the path, Debian's `firefox-esr`) have no fixed path.
+/// Debian 13 `firefox-esr` 140.15 (2026-11-12) was read from `/proc` under `strace`, then confirmed from
+/// the sensor's own `file_rename` event on kernel 6.12 (same `executable_path`, comm `BgIOThr~Pool #1`).
 /// Other browsers' other installs are not here until a capture reports their image. `comm` is useless as the key: the rename
 /// runs on a thread-pool worker (`ThreadPoolForeg`, `BgIOThr~Pool #N`).
 pub(crate) const BROWSER_DOWNLOAD_IMAGES: &[&str] = &[
