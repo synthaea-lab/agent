@@ -153,6 +153,7 @@ therefore always use `--no-default-features`, and several independent checks kee
 | --- | --- | --- |
 | [`check-no-test-key.sh`](../tools/check-no-test-key.sh) | CI `lint`, release `test-key-guard` | `cargo tree` feature resolution for the packaged flag sets on Linux, Windows and macOS targets (with a positive control on the default build), that each packaging script still builds without default features and scans its output, and that the binary scan can see the marker. |
 | [`assert-no-test-key.sh`](../tools/assert-no-test-key.sh) | `build-deb.sh`, `build-rpm.sh`, static workflows, release `publish` | the marker string in the actual binaries. |
+| [`check-no-temporary-keys.sh`](../tools/check-no-temporary-keys.sh) | release `temporary-key-guard` | any `crates/updater/keys/*.pub` still marked `TEMPORARY` (the keys of 2026-11-12, no custody). Fails the release; only a manual dispatch with `allow-temporary-keys` passes, with a warning, for a lab build. It does not run in CI: `main` holds those keys until the ceremony. |
 | marker scan in [`build.ps1`](../packaging/windows/build.ps1) | MSI build | `agent.exe`, `watchdog.exe`. |
 
 Feature unification is how the key would sneak back in (any crate in the build asking for
