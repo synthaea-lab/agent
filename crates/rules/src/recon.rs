@@ -146,16 +146,25 @@ pub(crate) fn program(event: &ExecEvent) -> String {
 /// The arguments after the program, lowercase: `argv[1..]` where the platform gives one,
 /// the whitespace-split command line otherwise (Windows). Quotes are dropped.
 pub(crate) fn args(event: &ExecEvent) -> Vec<String> {
-    let lower = |s: &str| s.trim_matches('"').to_ascii_lowercase();
+    args_cased(event)
+        .into_iter()
+        .map(|a| a.to_ascii_lowercase())
+        .collect()
+}
+
+/// [`args`] with the case kept, for a tool whose short options differ by case
+/// (`systemctl -T` takes no value, `-t` does).
+pub(crate) fn args_cased(event: &ExecEvent) -> Vec<String> {
+    let unquote = |s: &str| s.trim_matches('"').to_owned();
     if event.argv.is_empty() {
         event
             .cmdline
             .split_whitespace()
             .skip(1)
-            .map(lower)
+            .map(unquote)
             .collect()
     } else {
-        event.argv.iter().skip(1).map(|a| lower(a)).collect()
+        event.argv.iter().skip(1).map(|a| unquote(a)).collect()
     }
 }
 

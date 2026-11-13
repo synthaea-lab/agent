@@ -17,7 +17,7 @@ use schema::{ExecEvent, FileOpenEvent, SECURITY_SERVICES, detection::Severity};
 
 use crate::{
     Alert,
-    recon::{args, program},
+    recon::{args, args_cased, program},
     servicestop::services_stopped,
 };
 
@@ -111,16 +111,26 @@ fn cpu_quota_starves(value: &str) -> bool {
 /// `set-property` of one of [`LIMIT_PROPERTIES`] (not `infinity` or empty, which lifts a limit)
 /// or a `CPUQuota` that [`cpu_quota_starves`].
 /// Lowercase unit names, without `.service`.
+///
+/// `args` keep their case, because systemctl's short options do (see [`positional_arguments`]);
+/// the verb, the units and the properties are lowercased here. A command that names another
+/// machine (`-M`, `-H`) is read like a local one, not skipped: `-M .host` and `-H localhost`
+/// reach this host, so a command line that names a target cannot be told from a local one, and
+/// an alert on a remote host's tool is the safer error (#246).
 fn cgroup_squeeze(args: &[String]) -> Option<(&'static str, Vec<String>)> {
-    let mut positional = args.iter().filter(|a| !a.starts_with('-'));
+    let positional: Vec<String> = positional_arguments(args)
+        .into_iter()
+        .map(|arg| arg.to_ascii_lowercase())
+        .collect();
+    let mut positional = positional.into_iter();
     let verb = positional.next()?;
     match verb.as_str() {
         "freeze" => Some((
             "freeze",
-            positional.flat_map(|unit| freeze_targets(unit)).collect(),
+            positional.flat_map(|unit| freeze_targets(&unit)).collect(),
         )),
         "set-property" => {
-            let rest: Vec<&String> = positional.collect();
+            let rest: Vec<String> = positional.collect();
             let limits = rest.iter().any(|a| {
                 a.split_once('=').is_some_and(|(key, value)| {
                     LIMIT_PROPERTIES.contains(&key) && !value.is_empty() && value != "infinity"
@@ -132,6 +142,144 @@ fn cgroup_squeeze(args: &[String]) -> Option<(&'static str, Vec<String>)> {
         }
         _ => None,
     }
+}
+
+/// `systemctl`'s short options that take a value, case-sensitive (`-T`, `--show-transaction`,
+/// takes none; `-h` is `--help`, `-H` takes a host).
+const SYSTEMCTL_SHORT_WITH_VALUE: &str = "CHMPnopst";
+
+/// Every long option of `systemctl` (systemd 258, `systemctl --help` and the manual, plus the
+/// legacy and hidden ones its `getopt_long` table still accepts) and whether it takes a value.
+/// All take it as `--name=value` or as the next argument; the next-argument form is the one
+/// that hides the verb. The whole table is needed, not the value-taking part: a prefix is
+/// resolved against every name, as `getopt_long` does.
+const SYSTEMCTL_LONG_OPTIONS: &[(&str, bool)] = &[
+    ("after", false),
+    ("all", false),
+    ("boot-loader-entry", true),
+    ("boot-loader-menu", true),
+    ("before", false),
+    ("capsule", true),
+    ("check-inhibitors", true),
+    ("drop-in", true),
+    ("dry-run", false),
+    ("fail", false),
+    ("failed", false),
+    ("firmware-setup", false),
+    ("force", false),
+    ("full", false),
+    ("global", false),
+    ("help", false),
+    ("host", true),
+    ("ignore-dependencies", false),
+    ("ignore-inhibitors", false),
+    ("image", true),
+    ("image-policy", true),
+    ("irreversible", false),
+    ("job-mode", true),
+    ("kill-subgroup", true),
+    ("kill-value", true),
+    ("kill-who", true),
+    ("kill-whom", true),
+    ("legend", true),
+    ("lines", true),
+    ("machine", true),
+    ("marked", false),
+    ("message", true),
+    ("mkdir", false),
+    ("no-ask-password", false),
+    ("no-block", false),
+    ("no-legend", false),
+    ("no-pager", false),
+    ("no-reload", false),
+    ("no-wall", false),
+    ("no-warn", false),
+    ("now", false),
+    ("output", true),
+    ("plain", false),
+    ("preset-mode", true),
+    ("property", true),
+    ("quiet", false),
+    ("read-only", false),
+    ("reboot-argument", true),
+    ("recursive", false),
+    ("reverse", false),
+    ("root", true),
+    ("runtime", false),
+    ("show-transaction", false),
+    ("show-types", false),
+    ("signal", true),
+    ("state", true),
+    ("stdin", false),
+    ("system", false),
+    ("timestamp", true),
+    ("type", true),
+    ("user", false),
+    ("value", false),
+    ("verbose", false),
+    ("version", false),
+    ("wait", false),
+    ("what", true),
+    ("when", true),
+    ("with-dependencies", false),
+];
+
+/// Whether the long option `name` (after `--`, before any `=`) takes a value, read as
+/// `getopt_long` does: an exact name, else the one option it is a prefix of. A prefix that
+/// fits several options with different needs (`--ma`: machine and marked; `--h`: help and
+/// host) is rejected by `systemctl`, so it is read as taking none: the command never ran, and
+/// the next argument stays the verb.
+fn systemctl_long_takes_value(name: &str) -> bool {
+    if let Some(&(_, takes)) = SYSTEMCTL_LONG_OPTIONS
+        .iter()
+        .find(|(long, _)| *long == name)
+    {
+        return takes;
+    }
+    let mut fits = SYSTEMCTL_LONG_OPTIONS
+        .iter()
+        .filter(|(long, _)| !name.is_empty() && long.starts_with(name))
+        .map(|&(_, takes)| takes);
+    match fits.next() {
+        Some(first) => fits.all(|takes| takes == first) && first,
+        None => false,
+    }
+}
+
+/// Whether the next argument is the value of `arg`, a `systemctl` option: a long option that takes
+/// one and has no `=`, or a short cluster whose **last** letter takes one and that has no
+/// attached value. In `-qM host` the `q` is a flag and the next argument is `M`'s value; in
+/// `-Mhost` the value is attached, and in `-qMhost` too (`getopt` stops reading letters at the
+/// first one that takes a value).
+fn takes_separate_value(arg: &str) -> bool {
+    if let Some(name) = arg.strip_prefix("--") {
+        return !name.contains('=') && systemctl_long_takes_value(name);
+    }
+    let Some(letters) = arg.strip_prefix('-') else {
+        return false;
+    };
+    for (at, letter) in letters.char_indices() {
+        if SYSTEMCTL_SHORT_WITH_VALUE.contains(letter) {
+            return at + letter.len_utf8() == letters.len();
+        }
+    }
+    false
+}
+
+/// The arguments of a `systemctl` exec that are not options, in order, with their case. An
+/// option's value, given as the next argument (`systemctl -M host set-property ...`, `-t service`,
+/// `--job-mode fail`), is not the verb; see [`takes_separate_value`].
+fn positional_arguments(args: &[String]) -> Vec<&String> {
+    let mut out = Vec::new();
+    let mut iter = args.iter();
+    while let Some(arg) = iter.next() {
+        if !arg.starts_with('-') {
+            out.push(arg);
+        } else if takes_separate_value(arg) {
+            iter.next();
+        }
+    }
+    out
 }
 
 fn unit_base(unit: &str) -> String {
@@ -245,10 +393,9 @@ fn bracket_class(pattern: &[char], open: usize, c: char) -> Option<(bool, usize)
 /// [`check_security_tool_prlimit`], which needs the pid-to-process table of `RuleState`.
 #[must_use]
 pub(crate) fn check_security_tool_throttle(event: &ExecEvent) -> Option<Alert> {
-    let args = args(event);
     match program(event).as_str() {
         "systemctl" => {
-            let (how, units) = cgroup_squeeze(&args)?;
+            let (how, units) = cgroup_squeeze(&args_cased(event))?;
             let tool = units.iter().find(|unit| is_security_tool(unit))?;
             Some(Alert {
                 technique: "T1562.001",
