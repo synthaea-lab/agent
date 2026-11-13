@@ -2117,6 +2117,11 @@ pub struct HealthBeacon {
     /// beacon.
     #[serde(default)]
     pub ioc_sibling_skipped: u64,
+    /// Cumulative alerts that could not be written to `alerts.ndjson` (a full disk, a
+    /// serialization failure) since the agent started: the audit trail's loss, counted. The
+    /// alert still reached stderr and `cli detections`. Zero in an older beacon (#167).
+    #[serde(default)]
+    pub alerts_dropped: u64,
 }
 
 /// A logon/authentication outcome, or a privileged-session assignment — shared

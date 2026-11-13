@@ -124,6 +124,11 @@ impl AlertLog {
         });
     }
 
+    /// Alerts `alerts.ndjson` did not get since the agent started, for the health beacon.
+    pub(crate) fn dropped_writes(&self) -> u64 {
+        self.file.dropped()
+    }
+
     pub(crate) fn latest(&self, limit: usize) -> Vec<RecentAlert> {
         self.recent.latest(limit)
     }
