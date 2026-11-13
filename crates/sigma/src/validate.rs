@@ -269,6 +269,8 @@ fn validate_condition<'a>(
     Ok(compiled)
 }
 
+/// One selection map: not empty, no two keys that differ only by case, and every field spec
+/// and value list supported.
 fn validate_field_map(
     fields: &std::collections::HashMap<String, ValueList>,
     path: &str,
@@ -282,8 +284,22 @@ fn validate_field_map(
             "empty selection (would match everything)".into(),
         ));
     }
-    // Two keys that differ only by case are different keys to the parser, and evaluation ANDs
-    // them. Keep the original spelling so the error can name both keys.
+    refuse_keys_differing_only_by_case(fields, path)?;
+    for (spec, values) in fields {
+        let parsed = parse_field_spec(spec);
+        validate_field_name(parsed.field, path, platform)?;
+        let matching = validate_modifiers(spec, parsed.modifiers, path)?;
+        validate_values(spec, values, matching, path)?;
+    }
+    Ok(())
+}
+
+/// Two keys that differ only by case are different keys to the parser, and evaluation ANDs
+/// them. Keeps the original spelling so the error can name both keys.
+fn refuse_keys_differing_only_by_case(
+    fields: &std::collections::HashMap<String, ValueList>,
+    path: &str,
+) -> Result<(), SigmaError> {
     let mut seen = std::collections::HashMap::new();
     for spec in fields.keys() {
         if let Some(previous) = seen.insert(spec.to_lowercase(), spec) {
@@ -293,83 +309,106 @@ fn validate_field_map(
             ));
         }
     }
-    for (spec, values) in fields {
-        let parsed = parse_field_spec(spec);
-        let field = parsed.field;
-        let field_lower = field.to_lowercase();
-        if !SUPPORTED_FIELDS.contains(&field_lower.as_str()) {
-            return Err(unsupported(
-                path,
-                format!("field `{field}` (supported: {SUPPORTED_FIELD_NAMES})"),
-            ));
-        }
-        if WINDOWS_ONLY_FIELDS.contains(&field_lower.as_str()) && platform != Some("windows") {
-            return Err(unsupported(
-                path,
-                format!(
-                    "field `{field}` is Windows-only (PE version-resource metadata, issue #983); \
-                     this rule is not under a `windows/` directory and would never match there"
-                ),
-            ));
-        }
-        let mut match_modifier = None;
-        let mut seen_all = false;
-        for modifier in parsed.modifiers.clone() {
-            if modifier.eq_ignore_ascii_case("all") {
-                if seen_all {
-                    return Err(unsupported(
-                        path,
-                        format!("duplicate `all` modifier in `{spec}`"),
-                    ));
-                }
-                seen_all = true;
-            } else {
-                if !SUPPORTED_MODIFIERS.contains(&modifier.to_lowercase().as_str()) {
-                    return Err(unsupported(
-                        path,
-                        format!(
-                            "modifier `{modifier}` (supported: contains, startswith, endswith, all)"
-                        ),
-                    ));
-                }
-                if match_modifier.replace(modifier).is_some() {
-                    return Err(unsupported(
-                        path,
-                        format!(
-                            "multiple matching modifiers in `{spec}`; only one of contains, startswith, endswith is supported"
-                        ),
-                    ));
-                }
+    Ok(())
+}
+
+/// A field this engine reads, and a Windows-only one only in a rule under `windows/`.
+fn validate_field_name(
+    field: &str,
+    path: &str,
+    platform: Option<&'static str>,
+) -> Result<(), SigmaError> {
+    let field_lower = field.to_lowercase();
+    if !SUPPORTED_FIELDS.contains(&field_lower.as_str()) {
+        return Err(unsupported(
+            path,
+            format!("field `{field}` (supported: {SUPPORTED_FIELD_NAMES})"),
+        ));
+    }
+    if WINDOWS_ONLY_FIELDS.contains(&field_lower.as_str()) && platform != Some("windows") {
+        return Err(unsupported(
+            path,
+            format!(
+                "field `{field}` is Windows-only (PE version-resource metadata, issue #983);                  this rule is not under a `windows/` directory and would never match there"
+            ),
+        ));
+    }
+    Ok(())
+}
+
+/// At most one supported matching modifier, optionally followed by one `all`; returns the
+/// matching modifier. The evaluator's `parse_modifiers` accepts the same shapes (a test keeps
+/// them in agreement); this one says which rule a refused spec breaks.
+fn validate_modifiers<'a>(
+    spec: &str,
+    mut modifiers: std::str::Split<'a, char>,
+    path: &str,
+) -> Result<Option<&'a str>, SigmaError> {
+    let mut matching = None;
+    let mut seen_all = false;
+    for modifier in modifiers.clone() {
+        if modifier.eq_ignore_ascii_case("all") {
+            if seen_all {
+                return Err(unsupported(
+                    path,
+                    format!("duplicate `all` modifier in `{spec}`"),
+                ));
+            }
+            seen_all = true;
+        } else {
+            if !SUPPORTED_MODIFIERS.contains(&modifier.to_lowercase().as_str()) {
+                return Err(unsupported(
+                    path,
+                    format!(
+                        "modifier `{modifier}` (supported: contains, startswith, endswith, all)"
+                    ),
+                ));
+            }
+            if matching.replace(modifier).is_some() {
+                return Err(unsupported(
+                    path,
+                    format!(
+                        "multiple matching modifiers in `{spec}`; only one of contains, startswith, endswith is supported"
+                    ),
+                ));
             }
         }
-        if seen_all
-            && parsed
-                .modifiers
-                .clone()
-                .next_back()
-                .is_some_and(|modifier| !modifier.eq_ignore_ascii_case("all"))
-        {
+    }
+    if seen_all {
+        let last_is_all = modifiers
+            .next_back()
+            .is_some_and(|modifier| modifier.eq_ignore_ascii_case("all"));
+        if !last_is_all {
             return Err(unsupported(
                 path,
                 format!("modifier `all` must be last in `{spec}`"),
             ));
         }
-        if seen_all && match_modifier.is_none() {
+        if matching.is_none() {
             return Err(unsupported(
                 path,
                 format!("modifier `all` in `{spec}` must follow one matching modifier"),
             ));
         }
-        if values.as_slice().is_empty() {
-            return Err(unsupported(path, format!("empty value list for `{spec}`")));
-        }
-        // Interior wildcards are standard Sigma but outside the edge-only
-        // subset — an accepted-but-never-matching rule is the silent-death
-        // failure mode this validator exists to kill.
-        if match_modifier.is_none() {
-            for value in values.as_slice() {
-                validate_edge_only_wildcard(value, path, "")?;
-            }
+    }
+    Ok(matching)
+}
+
+/// A non-empty value list, and without a matching modifier only edge wildcards: interior
+/// wildcards are standard Sigma but outside the edge-only subset, and an accepted-but-never-
+/// matching rule is the silent-death failure mode this validator exists to kill.
+fn validate_values(
+    spec: &str,
+    values: &ValueList,
+    matching: Option<&str>,
+    path: &str,
+) -> Result<(), SigmaError> {
+    if values.as_slice().is_empty() {
+        return Err(unsupported(path, format!("empty value list for `{spec}`")));
+    }
+    if matching.is_none() {
+        for value in values.as_slice() {
+            validate_edge_only_wildcard(value, path, "")?;
         }
     }
     Ok(())
