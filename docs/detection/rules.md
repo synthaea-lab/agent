@@ -237,7 +237,9 @@ same signature gate applies.
   (`/opt/microsoft/msedge/msedge`), Brave (`/opt/brave.com/brave/brave`), Opera
   (`/usr/lib64/opera-stable/opera`) and Vivaldi (`/opt/vivaldi/vivaldi-bin`); and, from a
   Debian 13 VM on 2026-11-12, `firefox-esr` (`/usr/lib/firefox-esr/firefox-esr`, read from
-  `/proc` under `strace` and confirmed in the sensor's `file_rename` event, kernel 6.12).
+  `/proc` under `strace` and confirmed in the sensor's `file_rename` event, kernel 6.12; an end-to-end run there, headless
+  `firefox-esr` downloading an ELF that was then run, raised T1204.002 `marked by firefox-esr` in 2 of
+  2 runs, and nothing for a `curl` plus `mv` control).
 - An empty or absent `executable_path` marks nothing. What is still unchecked is listed under
   "Not verified" in [attack-coverage.md](../attack-coverage.md).
 

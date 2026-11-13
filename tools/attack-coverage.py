@@ -262,7 +262,7 @@ UNVERIFIED_NOTES = [
     "tarball (`firefox-bin`, captured), Debian's `firefox-esr` (captured on a Debian 13 VM, "
     "with the sensor, kernel 6.12, where the `file_rename` event carries that "
     "`executable_path` with comm `BgIOThr~Pool #1` and the main process's pid, and under "
-    "strace) and the Snap path "
+    "strace; an end-to-end run of the shape-match build there, with headless firefox-esr downloading an ELF that was then run, raised T1204.002 `marked by firefox-esr` in 2 of 2 runs, and nothing for a `curl` plus `mv` control) and the Snap path "
     "(`/snap/firefox/<rev>/usr/lib/firefox/firefox`). **Not verified:** the Snap was never "
     "run (its path is read from the snap launcher), the Flatpak's real path is unknown "
     "(a Flatpak-shaped path matches), and Firefox forks under another directory name "
