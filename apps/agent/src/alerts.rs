@@ -19,6 +19,8 @@ use std::{
 
 use sinks::{AlertRecord, JsonlWriter};
 
+use crate::sync::LockExt;
+
 /// How many recent alerts the agent keeps in memory for `cli detections`.
 /// Equal to `ipc::RECENT_DETECTIONS_HARD_LIMIT`, the most a client can ask
 /// for in one call (asserted by a test in `ipc_handler`).
@@ -54,10 +56,7 @@ impl RecentAlerts {
         if self.capacity == 0 {
             return;
         }
-        let mut buf = self
-            .inner
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut buf = self.inner.lock_recovering();
         if buf.len() == self.capacity {
             buf.pop_front();
         }
@@ -67,10 +66,7 @@ impl RecentAlerts {
     /// The `limit` most recent alerts, oldest first (the order the IPC
     /// protocol documents for `RecentDetectionsResponse`).
     pub(crate) fn latest(&self, limit: usize) -> Vec<RecentAlert> {
-        let buf = self
-            .inner
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let buf = self.inner.lock_recovering();
         let skip = buf.len().saturating_sub(limit);
         buf.iter().skip(skip).cloned().collect()
     }
@@ -318,5 +314,23 @@ mod tests {
         assert_eq!(on_disk.matches("base64 -d payload.b64").count(), 2);
         assert!(log.latest(8).iter().all(|alert| alert.message == message));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_buffer_poisoned_by_a_panicking_thread_still_takes_and_returns_alerts() {
+        let buf = RecentAlerts::new(3);
+        buf.push(alert(1));
+        std::thread::scope(|s| {
+            let _ = s
+                .spawn(|| {
+                    let _guard = buf.inner.lock().unwrap();
+                    panic!("poison the alert buffer while holding it");
+                })
+                .join();
+        });
+        assert!(buf.inner.is_poisoned());
+        buf.push(alert(2));
+        let got: Vec<u64> = buf.latest(10).iter().map(|a| a.emitted_at_ns).collect();
+        assert_eq!(got, vec![1, 2]);
     }
 }

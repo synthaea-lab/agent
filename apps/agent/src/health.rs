@@ -23,6 +23,8 @@ use std::{
 
 use schema::{HealthBeacon, SensorHealth};
 
+use crate::sync::{CondvarExt, LockExt};
+
 /// Default beacon interval (30 seconds).
 pub const DEFAULT_INTERVAL: Duration = Duration::from_secs(30);
 
@@ -97,11 +99,11 @@ impl BeaconInterval {
     }
 
     fn attach(&self, stop: Arc<StopFlag>) {
-        *self.0.waker.lock().unwrap() = Some(stop);
+        *self.0.waker.lock_recovering() = Some(stop);
     }
 
     fn wake(&self) {
-        if let Some(stop) = self.0.waker.lock().unwrap().clone() {
+        if let Some(stop) = self.0.waker.lock_recovering().clone() {
             stop.wake();
         }
     }
@@ -243,7 +245,7 @@ impl StopFlag {
         // mutex before waiting, so the notification can't fall between its
         // check and its wait (lost wakeup → full-interval sleep).
         {
-            let _guard = self.mutex.lock().unwrap();
+            let _guard = self.mutex.lock_recovering();
             self.flag.store(true, Ordering::SeqCst);
         }
         self.condvar.notify_all();
@@ -256,14 +258,14 @@ impl StopFlag {
     #[cfg_attr(not(test), allow(dead_code))]
     /// Wakes a sleeper so it recomputes how long it still has to wait (the interval changed).
     fn wake(&self) {
-        let _guard = self.mutex.lock().unwrap();
+        let _guard = self.mutex.lock_recovering();
         self.condvar.notify_all();
     }
 
     /// Sleeps until `started` plus the interval in force, however it changes meanwhile, and
     /// returns early if `stop()` is called, including just before the sleep started.
     fn sleep_until_due(&self, started: Instant, interval: &BeaconInterval) {
-        let mut guard = self.mutex.lock().unwrap();
+        let mut guard = self.mutex.lock_recovering();
         loop {
             if self.is_stopped() {
                 return;
@@ -273,7 +275,7 @@ impl StopFlag {
             if now >= due {
                 return;
             }
-            guard = self.condvar.wait_timeout(guard, due - now).unwrap().0;
+            guard = self.condvar.wait_timeout_recovering(guard, due - now);
         }
     }
 }
@@ -745,5 +747,39 @@ mod tests {
         stop.stop();
         join.join().unwrap();
         assert!(start.elapsed() < Duration::from_secs(1));
+    }
+
+    #[test]
+    fn a_poisoned_waker_still_attaches_and_wakes() {
+        let interval = BeaconInterval::new(Duration::from_secs(60));
+        let interval_for_thread = interval.clone();
+        let _ = std::thread::spawn(move || {
+            let _guard = interval_for_thread.0.waker.lock().unwrap();
+            panic!("poison the waker while holding it");
+        })
+        .join();
+        assert!(interval.0.waker.is_poisoned());
+        interval.attach(Arc::new(StopFlag::new()));
+        interval.wake();
+        interval.reset();
+        assert!(!interval.0.waker.is_poisoned());
+    }
+
+    #[test]
+    fn a_stop_flag_whose_mutex_was_poisoned_still_stops_and_wakes_a_sleeper() {
+        let stop = Arc::new(StopFlag::new());
+        let held = Arc::clone(&stop);
+        let _ = std::thread::spawn(move || {
+            let _guard = held.mutex.lock().unwrap();
+            panic!("poison the stop flag mutex while holding it");
+        })
+        .join();
+        assert!(stop.mutex.is_poisoned());
+        stop.wake();
+        stop.stop();
+        let interval = BeaconInterval::new(Duration::from_secs(3600));
+        // The flag is set, so the sleep returns at once instead of panicking on the poison.
+        stop.sleep_until_due(Instant::now(), &interval);
+        assert!(stop.is_stopped());
     }
 }

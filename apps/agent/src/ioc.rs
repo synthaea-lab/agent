@@ -26,7 +26,7 @@ use std::{
 use intel::{DEFAULT_MEMORY_BUDGET_BYTES, FeedId, IndicatorKind, IndicatorSet, SetBuilder};
 use schema::detection::{IocKind, Severity};
 
-use crate::own_traffic::AgentOrigin;
+use crate::{own_traffic::AgentOrigin, sync::LockExt};
 
 /// The label an IOC finding carries where other engines carry an ATT&CK technique. Not a
 /// technique: an indicator says a thing is known bad, not which tactic it served.
@@ -145,7 +145,7 @@ impl IocMatcher {
             Ok(None) => (None, LoadOutcome::Absent),
             Err(()) => return LoadOutcome::Failed,
         };
-        let old = std::mem::replace(&mut *self.current.lock().unwrap(), loaded);
+        let old = std::mem::replace(&mut *self.current.lock_recovering(), loaded);
         drop(old);
         count
     }
@@ -153,8 +153,7 @@ impl IocMatcher {
     /// Indicators in force, `0` while none is loaded.
     pub(crate) fn indicator_count(&self) -> usize {
         self.current
-            .lock()
-            .unwrap()
+            .lock_recovering()
             .as_ref()
             .map_or(0, |loaded| loaded.set.len())
     }
@@ -167,7 +166,7 @@ impl IocMatcher {
     /// An executed image's hash, as enrichment reports it, against the hash indicators.
     pub(crate) fn check_exec_image(&self, sha256: Option<&str>, now_ns: u64) -> Option<IocHit> {
         let sha256 = sha256?.to_ascii_lowercase();
-        let loaded = self.current.lock().unwrap().clone()?;
+        let loaded = self.current.lock_recovering().clone()?;
         let found = loaded.set.lookup_sha256_hex(&sha256)?;
         self.hit(&loaded, found, IocKind::Sha256, sha256, now_ns, || None)
     }
@@ -181,7 +180,7 @@ impl IocMatcher {
         now_ns: u64,
         own: impl FnOnce() -> OwnMatch,
     ) -> Option<IocHit> {
-        let loaded = self.current.lock().unwrap().clone()?;
+        let loaded = self.current.lock_recovering().clone()?;
         // One lookup rejects almost every name; the suffix walk below runs on a hit only.
         loaded.set.lookup_domain(name)?;
         let (indicator, found) = listed_domain(&loaded.set, &intel::normalize_domain(name).ok()?)?;
@@ -202,7 +201,7 @@ impl IocMatcher {
         now_ns: u64,
         own: impl FnOnce() -> OwnMatch,
     ) -> Option<IocHit> {
-        let loaded = self.current.lock().unwrap().clone()?;
+        let loaded = self.current.lock_recovering().clone()?;
         let found = loaded.set.lookup_ip(address)?;
         let indicator = address.to_canonical().to_string();
         self.hit(&loaded, found, IocKind::Ip, indicator, now_ns, own)
@@ -254,10 +253,7 @@ impl IocMatcher {
             AgentOrigin::Sibling => &self.stats.sibling_skipped,
         };
         counter.fetch_add(1, Ordering::Relaxed);
-        let mut logged = self
-            .skips_logged
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut logged = self.skips_logged.lock_recovering();
         let key = (origin, indicator.to_string());
         if logged.get(&key).is_none() {
             logged.insert(key, ());
@@ -274,7 +270,7 @@ impl IocMatcher {
 
     /// True when `key` raised a finding within the cooldown; otherwise records this one.
     fn in_cooldown(&self, key: String, now_ns: u64) -> bool {
-        let mut last = self.cooldown.lock().unwrap();
+        let mut last = self.cooldown.lock_recovering();
         if let Some(&at) = last.peek(&key)
             && now_ns.saturating_sub(at) < COOLDOWN_NS
         {
@@ -710,5 +706,25 @@ mod tests {
         let message = hit.message("evil");
         assert!(message.contains(HASH) && message.contains("abuse.ch") && message.contains("(v1)"));
         assert!(message.starts_with("comm=evil "));
+    }
+
+    #[test]
+    fn matcher_locks_poisoned_by_a_panicking_thread_are_recovered() {
+        let dir = tempfile_dir::Dir::new();
+        let matcher = IocMatcher::new(dir.path());
+        std::thread::scope(|s| {
+            let _ = s
+                .spawn(|| {
+                    let _current = matcher.current.lock().unwrap();
+                    let _cooldown = matcher.cooldown.lock().unwrap();
+                    panic!("poison the matcher locks while holding them");
+                })
+                .join();
+        });
+        assert!(matcher.current.is_poisoned() && matcher.cooldown.is_poisoned());
+        assert_eq!(matcher.indicator_count(), 0);
+        assert!(matcher.check_exec_image(Some(HASH), 0).is_none());
+        assert!(!matcher.in_cooldown("k".into(), 1));
+        assert!(matcher.in_cooldown("k".into(), 2));
     }
 }

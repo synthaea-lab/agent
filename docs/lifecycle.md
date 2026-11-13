@@ -253,6 +253,30 @@ On Windows and macOS, Ctrl-C sets the sensors' stop flags. The primary sensor re
 | ETW fails (Windows) | The run continues on the Event Log, socket and minifilter sources, and a silence alert is raised. |
 | A uprobes capture set changes | The uprobes sensor restarts with the new set. Capture has a gap while it reloads. |
 
+## Poisoned locks
+
+A `std::sync::Mutex` is poisoned when a thread panics while holding it. With `lock().unwrap()` every
+later `lock()` panics too, so one panic in a rule evaluation or an upload step would spread to every
+thread touching the same state, the capture thread included: the sensor kills itself. The agent takes
+the guard back instead, logs the recovery once with its call site, and clears the poison
+([`sync.rs`](../apps/agent/src/sync.rs)). The state a panicking thread left may be half updated; for
+in-memory detection state that costs at most a missed or repeated alert, which is cheaper than a dead
+sensor. This is a decision, not an accident: the alternative (let the panic spread and rely on the
+watchdog's hang detection to restart the agent) loses every event in flight and the state built so far.
+
+- `LockExt::lock_recovering` for `Mutex`, `RwLockExt::{read,write}_recovering` for `RwLock`, and
+  `CondvarExt::{wait_while,wait_timeout}_recovering` for the two condvar waits the agent has.
+- `apps/agent` denies `clippy::unwrap_used` outside tests at the crate root, so a bare `unwrap` on a
+  lock cannot come back; the same lint used to be set on the sink module alone.
+- Out of scope, and why: counting recoveries in the health beacon (a schema change, a separate issue);
+  the `unwrap`s on `serde_json::to_string` of a string in `crates/policy` (infallible); `Mutex::get_mut`
+  in a `Drop` (no lock is taken); the container sensor's Docker cache (`crates/sensors/linux/container`,
+  its own crate, no lint there yet); the YARA memory-scan gate, which cannot depend on the agent's helper
+  and takes the guard back with `PoisonError::into_inner` in place.
+- Tested: each module that holds such a lock has a test that panics while holding it and checks the
+  next caller still works (`sync`, `alerts`, `captures`, `health`, `ioc`, `own_traffic`, `silence`,
+  `upload`); the `commands/linux.rs` sites share the `silence` monitor's lock and are covered by its test.
+
 ## Configuration knobs that shape the lifecycle
 
 | Knob | Effect |

@@ -13,7 +13,7 @@ use schema::{
 };
 use tamper::heartbeat::{SensorHeartbeat, SilenceMonitor};
 
-use crate::silence::PulsingSink;
+use crate::{silence::PulsingSink, sync::LockExt};
 
 /// Silence deadline (#71/#388) for the ETW sensor, pulsed on every event it
 /// forwards. ETW is the high-volume sensor (process, file, registry, DNS...),
@@ -388,14 +388,11 @@ fn spawn_minifilter(
     }
     let heartbeat = SensorHeartbeat::new("windows-minifilter");
     if let Some(monitor) = silence {
-        monitor
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .register(
-                heartbeat.clone(),
-                MINIFILTER_SILENCE_DEADLINE_NS,
-                schema::time::now_ns(),
-            );
+        monitor.lock_recovering().register(
+            heartbeat.clone(),
+            MINIFILTER_SILENCE_DEADLINE_NS,
+            schema::time::now_ns(),
+        );
     }
     let stats = Arc::new(Mutex::new(ChannelStats::default()));
     std::thread::Builder::new()
@@ -431,9 +428,7 @@ fn register_heartbeats(
         sockets: SensorHeartbeat::new("windows-sockets"),
     };
     let now_ns = schema::time::now_ns();
-    let mut monitor = monitor
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut monitor = monitor.lock_recovering();
     monitor.register(heartbeats.etw.clone(), ETW_SILENCE_DEADLINE_NS, now_ns);
     monitor.register(
         heartbeats.sockets.clone(),

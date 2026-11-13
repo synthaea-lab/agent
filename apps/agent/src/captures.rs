@@ -22,6 +22,8 @@
 
 use std::sync::{Arc, Condvar, Mutex};
 
+use crate::sync::{CondvarExt, LockExt};
+
 /// Which of the three optional captures are on.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct Captures {
@@ -93,7 +95,7 @@ impl CaptureSet {
 
     /// The captures that should be running now: the configured ones plus the widened ones.
     pub(crate) fn effective(&self) -> Captures {
-        self.shared.state.lock().unwrap().effective()
+        self.shared.state.lock_recovering().effective()
     }
 
     /// Adds `extra` to what is widened. Returns whether the effective set changed.
@@ -111,7 +113,7 @@ impl CaptureSet {
     }
 
     fn change(&self, edit: impl FnOnce(&mut State)) -> bool {
-        let mut state = self.shared.state.lock().unwrap();
+        let mut state = self.shared.state.lock_recovering();
         let before = state.effective();
         edit(&mut state);
         let changed = state.effective() != before;
@@ -125,12 +127,11 @@ impl CaptureSet {
     /// when it already differs. A widening that is reset before the caller looks does not wake
     /// it: only the set it would act on counts.
     pub(crate) fn wait_until_differs(&self, current: Captures) -> Captures {
-        let guard = self.shared.state.lock().unwrap();
+        let guard = self.shared.state.lock_recovering();
         let guard = self
             .shared
             .changed
-            .wait_while(guard, |state| state.effective() == current)
-            .unwrap();
+            .wait_while_recovering(guard, |state| state.effective() == current);
         guard.effective()
     }
 }
@@ -418,5 +419,23 @@ mod tests {
                 assert_eq!(after, wanted, "{running:?} -> {wanted:?}");
             }
         }
+    }
+
+    #[test]
+    fn a_capture_set_poisoned_by_a_panicking_thread_still_widens_and_reads() {
+        let set = CaptureSet::new(Captures::NONE);
+        thread::scope(|s| {
+            let _ = s
+                .spawn(|| {
+                    let _guard = set.shared.state.lock().unwrap();
+                    panic!("poison the capture state while holding it");
+                })
+                .join();
+        });
+        assert!(set.shared.state.is_poisoned());
+        assert!(set.widen(TLS));
+        assert_eq!(set.effective(), TLS);
+        // A waiter on a differing set returns at once with the recovered state.
+        assert_eq!(set.wait_until_differs(Captures::NONE), TLS);
     }
 }
