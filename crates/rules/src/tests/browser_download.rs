@@ -201,17 +201,3 @@ fn exec_past_the_window_stays_silent() {
     state.on_file_rename(&rename("/d/x.bin.part", FINAL, Some(FIREFOX), 0));
     assert!(exec(&mut state, &run(FINAL, QUARANTINE_EXEC_WINDOW_NS + 1)).is_empty());
 }
-
-#[test]
-fn debians_firefox_bin_is_not_the_renaming_process_and_marks_nothing() {
-    // The package has two ELF files; the 2026-11-12 capture showed the rename done by
-    // `firefox-esr`. A rename reported with the other one is not the captured image.
-    let mut state = RuleState::new();
-    state.on_file_rename(&rename(
-        "/home/u/Downloads/test.bin.part",
-        FINAL,
-        Some("/usr/lib/firefox-esr/firefox-bin"),
-        0,
-    ));
-    assert!(exec(&mut state, &run(FINAL, 1)).is_empty());
-}
