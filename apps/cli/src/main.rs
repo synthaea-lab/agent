@@ -24,7 +24,7 @@
 
 use std::path::PathBuf;
 
-use clap::{Parser, Subcommand};
+use clap::{Args, Parser, Subcommand};
 
 #[derive(Parser)]
 #[command(
@@ -40,7 +40,8 @@ struct Cli {
 
     /// Emit output as one line of JSON instead of the human-readable
     /// default. Applies to every IPC subcommand (`status`, `health`,
-    /// `detections`, `policy`); `config check` / `config path` ignore it.
+    /// `detections`, `policy`, `suppress`, `unsuppress`); `config check` /
+    /// `config path` ignore it.
     #[arg(long, global = true)]
     json: bool,
 
@@ -85,24 +86,50 @@ enum Command {
     /// every finding; `unsuppress` reverses this, and `status` lists what is
     /// suppressed. The entity is `<ppid>:<comm>` as printed in
     /// `RESPONSE-ESCALATE` lines.
-    Suppress {
-        /// Parent pid of the entity.
-        ppid: u32,
-        /// Command name of the entity.
-        comm: String,
-        /// Technique to silence, e.g. `T1059.004`.
-        technique: String,
-    },
+    Suppress(SuppressionTarget),
 
     /// Lift a suppression made with `suppress`.
-    Unsuppress {
-        /// Parent pid of the entity.
-        ppid: u32,
-        /// Command name of the entity.
-        comm: String,
-        /// Technique to restore.
-        technique: String,
-    },
+    Unsuppress(SuppressionTarget),
+}
+
+/// One technique on one entity: what `suppress` silences and `unsuppress` restores.
+#[derive(Args, Debug, PartialEq, Eq)]
+struct SuppressionTarget {
+    /// Parent pid of the entity.
+    ppid: u32,
+    /// Command name of the entity.
+    comm: String,
+    /// Technique, e.g. `T1059.004`.
+    technique: String,
+}
+
+/// Whether a suppression is being made or lifted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SuppressionChange {
+    Suppress,
+    Lift,
+}
+
+impl SuppressionChange {
+    /// The human-readable answer: the agent says whether anything changed, so re-running
+    /// either command is safe and says so.
+    fn outcome_line(self, target: &SuppressionTarget, changed: bool) -> String {
+        let SuppressionTarget {
+            ppid,
+            comm,
+            technique,
+        } = target;
+        match (self, changed) {
+            (Self::Suppress, true) => format!("suppressed {technique} on {ppid}:{comm}"),
+            (Self::Suppress, false) => {
+                format!("{technique} on {ppid}:{comm} already suppressed; nothing changed")
+            }
+            (Self::Lift, true) => format!("lifted suppression of {technique} on {ppid}:{comm}"),
+            (Self::Lift, false) => {
+                format!("{technique} on {ppid}:{comm} was not suppressed; nothing changed")
+            }
+        }
+    }
 }
 
 #[derive(Subcommand)]
@@ -147,33 +174,21 @@ async fn main() -> anyhow::Result<()> {
             cmd_detections(cli.config.as_deref(), cli.json, limit).await
         }
         Command::Policy => cmd_policy(cli.config.as_deref(), cli.json).await,
-        Command::Suppress {
-            ppid,
-            comm,
-            technique,
-        } => {
-            cmd_suppress(
+        Command::Suppress(target) => {
+            cmd_suppression(
                 cli.config.as_deref(),
                 cli.json,
-                ppid,
-                &comm,
-                &technique,
-                true,
+                SuppressionChange::Suppress,
+                &target,
             )
             .await
         }
-        Command::Unsuppress {
-            ppid,
-            comm,
-            technique,
-        } => {
-            cmd_suppress(
+        Command::Unsuppress(target) => {
+            cmd_suppression(
                 cli.config.as_deref(),
                 cli.json,
-                ppid,
-                &comm,
-                &technique,
-                false,
+                SuppressionChange::Lift,
+                &target,
             )
             .await
         }
@@ -262,36 +277,28 @@ async fn cmd_status(cli_arg: Option<&std::path::Path>, json: bool) -> anyhow::Re
     Ok(())
 }
 
-/// `suppress` (`suppress == true`) and `unsuppress`: one request, one answer
-/// that says whether anything changed, so re-running either is safe.
-async fn cmd_suppress(
+/// `suppress` and `unsuppress`: one request, one answer that says whether anything changed.
+async fn cmd_suppression(
     cli_arg: Option<&std::path::Path>,
     json: bool,
-    ppid: u32,
-    comm: &str,
-    technique: &str,
-    suppress: bool,
+    change: SuppressionChange,
+    target: &SuppressionTarget,
 ) -> anyhow::Result<()> {
     let mut client = ipc_client(cli_arg).await?;
-    let r = if suppress {
-        client.suppress_verdict(ppid, comm, technique).await
-    } else {
-        client.unsuppress_verdict(ppid, comm, technique).await
+    let SuppressionTarget {
+        ppid,
+        comm,
+        technique,
+    } = target;
+    let reply = match change {
+        SuppressionChange::Suppress => client.suppress_verdict(*ppid, comm, technique).await,
+        SuppressionChange::Lift => client.unsuppress_verdict(*ppid, comm, technique).await,
     }
     .map_err(anyhow::Error::new)?;
     if json {
-        println!("{}", serde_json::to_string(&r)?);
+        println!("{}", serde_json::to_string(&reply)?);
     } else {
-        let (done, noop) = if suppress {
-            ("suppressed", "already suppressed")
-        } else {
-            ("lifted suppression of", "was not suppressed")
-        };
-        if r.changed {
-            println!("{done} {technique} on {ppid}:{comm}");
-        } else {
-            println!("{technique} on {ppid}:{comm} {noop}; nothing changed");
-        }
+        println!("{}", change.outcome_line(target, reply.changed));
     }
     Ok(())
 }
@@ -376,3 +383,6 @@ async fn cmd_policy(cli_arg: Option<&std::path::Path>, json: bool) -> anyhow::Re
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod tests;
