@@ -425,7 +425,8 @@ They must fail closed when the target is wrong.
   What tells them apart is the recorded actor and the timing, not the act.
 - **A kernel stop through resource limits** (prlimit CPU limit, `memory.max` OOM kill,
   `cgroup.freeze`) aimed at a security tool is only partly covered on Linux
-  ([#49](https://github.com/synthaea-lab/agent/issues/49)). The rules read the command that sets
+  ([#49](https://github.com/synthaea-lab/agent/issues/49), what is left is in
+  [#260](https://github.com/synthaea-lab/agent/issues/260)). The rules read the command that sets
   the limit: `systemctl set-property` (a memory or task limit, or a `CPUQuota` below 10 %),
   `systemctl freeze`, and `prlimit --pid` on a listed tool, and a write to a limit file
   (`memory.max`, `memory.high`, `pids.max`, `cpu.max`, `cgroup.freeze`, and the cgroup v1

@@ -251,7 +251,7 @@ they are set: the command (`systemctl freeze|set-property`, a memory or task lim
 --cpu|--as`, with `--pid` abbreviated to `--p` or `--pi`, is Medium when the pid is a listed tool,
 from its comm or image name, and Low otherwise), or a write to a cgroup limit file of a listed
 unit. The kill that a memory limit then causes is not reported
-([#49](https://github.com/synthaea-lab/agent/issues/49)). The full
+([#260](https://github.com/synthaea-lab/agent/issues/260)). The full
 mask-wait-exit flow is not unit-tested because it terminates the test runner; only the
 pure helpers are.
 

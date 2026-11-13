@@ -22,7 +22,7 @@ Live status and ordering are on the [project board](https://github.com/orgs/synt
 - Signed production delivery of IOC feeds (partial, IOC matching). See [detection/ioc.md#loading](detection/ioc.md#loading).
 - Role-separated embedded Ed25519 keys (release, content, snapshot, recovery) with fail-closed unprovisioned state (partial, Security model). See [security-model.md#signing-keys-and-the-test-key-guard](security-model.md#signing-keys-and-the-test-key-guard).
 - Fleet common-set snapshot fetch (partial, Updates). See [updates-and-releases.md#common-set-snapshot](updates-and-releases.md#common-set-snapshot).
-- Production signing keys embedded in packaged builds (planned, Updates). See [updates-and-releases.md#the-trust-set](updates-and-releases.md#the-trust-set).
+- Production signing keys embedded in packaged builds (partial, Updates). See [updates-and-releases.md#the-trust-set](updates-and-releases.md#the-trust-set).
 - Offline manifest build and signing (key file, test key, PKCS#11) (partial, Release signing). See [architecture.md#binaries](architecture.md#binaries).
 
 ### [#54](https://github.com/synthaea-lab/agent/issues/54) Release pipeline: build and publish signed per-OS artifacts on tag
@@ -81,7 +81,7 @@ Live status and ordering are on the [project board](https://github.com/orgs/synt
 - Hot reload of Sigma/YARA/common-set content after apply-content-manifest (partial, Content). See [lifecycle.md#hot-content-reload](lifecycle.md#hot-content-reload).
 - Periodic update trigger (timer for apply-release and apply-content-manifest) (planned, Updates). See [updates-and-releases.md#what-is-delivered-and-how](updates-and-releases.md#what-is-delivered-and-how).
 
-### [#51](https://github.com/synthaea-lab/agent/issues/51) audit: an exec with an argument over ~8 KiB is dropped on the auditd path
+### [#51](https://github.com/synthaea-lab/agent/issues/51) audit: an exec with an argument over ~8 KiB is dropped on the auditd path (closed)
 
 - Audit-netlink fallback sensor (exec, connect) when eBPF is unavailable (partial, Audit fallback). See [sensors/linux/audit-fallback.md#limits](sensors/linux/audit-fallback.md#limits).
 
@@ -230,12 +230,6 @@ Live status and ordering are on the [project board](https://github.com/orgs/synt
 - Executed image file identity for the T1204.002 rename-and-replace gate (partial, ETW). See [sensors/windows/etw-enrichment.md#image-file-identity](sensors/windows/etw-enrichment.md#image-file-identity).
 - Signature-gated T1204.002 (downloaded file run) silenced only by a chain-verified signature on the image that ran (partial, Rule engine). See [detection/rules.md#signature-gated-findings](detection/rules.md#signature-gated-findings).
 
-### [#49](https://github.com/synthaea-lab/agent/issues/49) Linux: a security tool stopped through the kernel (prlimit CPU limit, memory.max OOM kill, cgroup.freeze) raises no alert
-
-- Signals to listed security tools (signal_generate, unit cgroup membership, reload filtering, drop counter) (partial, Signal tamper telemetry). See [sensors/linux/signals.md#signals-to-security-tools](sensors/linux/signals.md#signals-to-security-tools).
-- Kill loudness: record the sender of a termination signal before exit (partial, Self-protection). See [self-protection.md#kill-loudness](self-protection.md#kill-loudness).
-- Detection of a security tool stopped through kernel resource limits (prlimit, memory.max, cgroup.freeze) (partial, Security model). See [security-model.md#what-is-not-defended](security-model.md#what-is-not-defended).
-
 ### [#62](https://github.com/synthaea-lab/agent/issues/62) arm64 builds (Linux aarch64, Windows ARM64)
 
 - aarch64 support (partial, eBPF probes). See [sensors/linux/README.md#requirements-and-platform-differences](sensors/linux/README.md#requirements-and-platform-differences).
@@ -286,3 +280,9 @@ Live status and ordering are on the [project board](https://github.com/orgs/synt
 ### [#15](https://github.com/synthaea-lab/agent/issues/15) ODD-HOUR-LOGON: platform time zone verified per OS, and calibration of the working window
 
 - ODD-HOUR-LOGON with operator-configured offset, work hours and exempt accounts (partial, Rule engine). See [detection/rules.md#configuration](detection/rules.md#configuration).
+
+### [#260](https://github.com/synthaea-lab/agent/issues/260) Linux: the OOM kill of a security tool raises no alert, and the lab cases #49 left unverified
+
+- Signals to listed security tools (signal_generate, unit cgroup membership, reload filtering, drop counter) (partial, Signal tamper telemetry). See [sensors/linux/signals.md#signals-to-security-tools](sensors/linux/signals.md#signals-to-security-tools).
+- Kill loudness: record the sender of a termination signal before exit (partial, Self-protection). See [self-protection.md#kill-loudness](self-protection.md#kill-loudness).
+- Detection of a security tool stopped through kernel resource limits (prlimit, memory.max, cgroup.freeze) (partial, Security model). See [security-model.md#what-is-not-defended](security-model.md#what-is-not-defended).
