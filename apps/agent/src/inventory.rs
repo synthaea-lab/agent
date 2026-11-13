@@ -45,17 +45,15 @@ const SNAPSHOT_FILE: &str = "packages.json";
 /// before the first pass costs nothing), this check establishes the baseline
 /// every later diff is computed against, so delaying it only delays the point
 /// where the feature starts working, for no benefit.
-pub(crate) fn spawn_monitor(state_dir: PathBuf, sink: Arc<DetectionSink>) {
-    std::thread::Builder::new()
-        .name("inventory".into())
-        .spawn(move || {
-            let snapshot_path = snapshot_path_for(&state_dir);
-            loop {
-                check_once(Path::new(DPKG_STATUS_PATH), &snapshot_path, &sink);
-                std::thread::sleep(CHECK_INTERVAL);
-            }
-        })
-        .expect("spawning the inventory monitor thread");
+pub(crate) fn spawn_monitor(state_dir: PathBuf, sink: Arc<DetectionSink>) -> std::io::Result<()> {
+    crate::spawn::spawn_named("inventory", move || {
+        let snapshot_path = snapshot_path_for(&state_dir);
+        loop {
+            check_once(Path::new(DPKG_STATUS_PATH), &snapshot_path, &sink);
+            std::thread::sleep(CHECK_INTERVAL);
+        }
+    })?;
+    Ok(())
 }
 
 fn snapshot_path_for(state_dir: &Path) -> PathBuf {

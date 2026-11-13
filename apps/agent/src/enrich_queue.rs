@@ -83,6 +83,7 @@ impl EnrichQueue {
         on_enriched: impl Fn(Event, Option<SignatureGatedAlert>) + Send + 'static,
     ) -> Self {
         Self::start_with_detections(enricher, on_enriched, |_| {})
+            .expect("spawning the enrichment worker thread in a test")
     }
 
     /// Starts the event worker with a second callback for structured detections.
@@ -91,59 +92,56 @@ impl EnrichQueue {
         mut enricher: Enricher,
         on_enriched: impl Fn(Event, Option<SignatureGatedAlert>) + Send + 'static,
         on_detection: impl Fn(Detection) + Send + 'static,
-    ) -> Self {
+    ) -> std::io::Result<Self> {
         let (tx, rx) = mpsc::sync_channel::<QueueItem>(QUEUE_CAP);
         let dropped = Arc::new(AtomicU64::new(0));
-        std::thread::Builder::new()
-            .name("enrich".into())
-            .spawn(move || {
-                while let Ok(item) = rx.recv() {
-                    match item {
-                        QueueItem::Event(mut event, gated) => {
-                            let verified = enrich_event(&mut enricher, &mut event, gated.is_some());
-                            // #688: a `Valid` only silences the alert when the file verified is
-                            // the image that ran. No identity on either side (not Windows, or
-                            // the sensor could not open the image) never confirms it.
-                            let gated = gated.map(|gated| {
-                                let ran = match &*event {
-                                    Event::Exec(e) => e.image_file_id.as_deref(),
-                                    _ => None,
-                                };
-                                if image_confirmed(ran, verified.as_deref(), IDENTITY_CAPTURED) {
-                                    gated
-                                } else {
-                                    gated.unconfirmed_image()
-                                }
-                            });
-                            on_enriched(*event, gated);
-                        }
-                        QueueItem::Detection(mut detection) => {
-                            // The rules ran before the event itself was queued, so the detection
-                            // was built from an exec with no hash yet. Give it the hash here,
-                            // where hashing already happens: the event that follows in the queue
-                            // is then a cache hit, and the detection the control plane receives
-                            // carries the `sha256` it can join hosts on (#62). A file that
-                            // cannot be read leaves the event as it was: a finding is never
-                            // dropped for want of a hash.
-                            for event in &mut detection.events {
-                                enrich_event(&mut enricher, event, false);
+        crate::spawn::spawn_named("enrich", move || {
+            while let Ok(item) = rx.recv() {
+                match item {
+                    QueueItem::Event(mut event, gated) => {
+                        let verified = enrich_event(&mut enricher, &mut event, gated.is_some());
+                        // #688: a `Valid` only silences the alert when the file verified is
+                        // the image that ran. No identity on either side (not Windows, or
+                        // the sensor could not open the image) never confirms it.
+                        let gated = gated.map(|gated| {
+                            let ran = match &*event {
+                                Event::Exec(e) => e.image_file_id.as_deref(),
+                                _ => None,
+                            };
+                            if image_confirmed(ran, verified.as_deref(), IDENTITY_CAPTURED) {
+                                gated
+                            } else {
+                                gated.unconfirmed_image()
                             }
-                            on_detection(*detection);
+                        });
+                        on_enriched(*event, gated);
+                    }
+                    QueueItem::Detection(mut detection) => {
+                        // The rules ran before the event itself was queued, so the detection
+                        // was built from an exec with no hash yet. Give it the hash here,
+                        // where hashing already happens: the event that follows in the queue
+                        // is then a cache hit, and the detection the control plane receives
+                        // carries the `sha256` it can join hosts on (#62). A file that
+                        // cannot be read leaves the event as it was: a finding is never
+                        // dropped for want of a hash.
+                        for event in &mut detection.events {
+                            enrich_event(&mut enricher, event, false);
                         }
-                        // Nothing to do but signal back — arriving here at all means
-                        // every `Event` sent before it has already been enriched and
-                        // handed to `on_enriched`, since this is a single-consumer
-                        // FIFO channel. The receiver going away (flush() timed out
-                        // and stopped waiting) makes `send` fail — fine, nobody's
-                        // listening any more.
-                        QueueItem::Flush(done) => {
-                            let _ = done.send(());
-                        }
+                        on_detection(*detection);
+                    }
+                    // Nothing to do but signal back — arriving here at all means
+                    // every `Event` sent before it has already been enriched and
+                    // handed to `on_enriched`, since this is a single-consumer
+                    // FIFO channel. The receiver going away (flush() timed out
+                    // and stopped waiting) makes `send` fail — fine, nobody's
+                    // listening any more.
+                    QueueItem::Flush(done) => {
+                        let _ = done.send(());
                     }
                 }
-            })
-            .expect("spawning the enrichment worker thread");
-        Self { tx, dropped }
+            }
+        })?;
+        Ok(Self { tx, dropped })
     }
 
     /// Hands an event to the worker; sheds (and counts) when the queue is full so
@@ -382,7 +380,8 @@ mod tests {
             Enricher::new(),
             |_, _| {},
             move |d| seen_w.lock().unwrap().push(d),
-        );
+        )
+        .unwrap();
         queue
             .enqueue_detection(detection_over(exec(&path.to_string_lossy())))
             .unwrap();
@@ -406,7 +405,8 @@ mod tests {
             Enricher::new(),
             |_, _| {},
             move |d| seen_w.lock().unwrap().push(d),
-        );
+        )
+        .unwrap();
         queue
             .enqueue_detection(detection_over(exec("/nonexistent/payload")))
             .unwrap();

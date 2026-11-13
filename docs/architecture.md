@@ -109,6 +109,7 @@ The detection sink ([`sink/mod.rs`](../apps/agent/src/sink/mod.rs)) has no platf
 | [`health`](../apps/agent/src/health.rs) | Health-beacon collector, sent every 30 s by default. |
 | [`heartbeat`](../apps/agent/src/heartbeat.rs) | Progress-counter file for the watchdog. |
 | [`ipc_handler`](../apps/agent/src/ipc_handler.rs) | IPC server thread answering `cli` requests and content reloads. |
+| [`spawn`](../apps/agent/src/spawn.rs) | `spawn_named`, which starts a named background thread and returns the OS error, with the thread's name, instead of panicking. |
 | [`shutdown`](../apps/agent/src/shutdown.rs) | `ShutdownPlan`, a bounded join of the registered workers. |
 | [`kill_loudness`](../apps/agent/src/kill_loudness.rs) | Attributes SIGTERM/SIGHUP/SIGQUIT to their sender before exiting (Linux). |
 | [`redact`](../apps/agent/src/redact.rs) | `RedactingSink` and `redact_event`, which redact data at the point where events leave the process. |

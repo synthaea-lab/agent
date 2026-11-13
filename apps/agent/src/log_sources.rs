@@ -239,7 +239,7 @@ pub(crate) fn spawn(
     sources: &[LogSourceConfig],
     alerts: &Path,
     shutdown: &mut ShutdownPlan,
-) {
+) -> std::io::Result<()> {
     let mut active = Vec::new();
     for source in sources {
         let access = match source.kind {
@@ -262,27 +262,25 @@ pub(crate) fn spawn(
         });
     }
     if active.is_empty() {
-        return;
+        return Ok(());
     }
 
     let stop = Arc::new(AtomicBool::new(false));
     let worker_stop = Arc::clone(&stop);
-    let handle = std::thread::Builder::new()
-        .name("log-sources".into())
-        .spawn(move || {
-            while !worker_stop.load(Ordering::SeqCst) {
-                for source in &mut active {
-                    poll_source(source, &sink);
-                }
-                sleep_unless_stopped(&worker_stop, POLL_INTERVAL);
+    let handle = crate::spawn::spawn_named("log-sources", move || {
+        while !worker_stop.load(Ordering::SeqCst) {
+            for source in &mut active {
+                poll_source(source, &sink);
             }
-        })
-        .expect("spawning the log sources thread");
+            sleep_unless_stopped(&worker_stop, POLL_INTERVAL);
+        }
+    })?;
     shutdown.register(
         "log-sources",
         move || stop.store(true, Ordering::SeqCst),
         handle,
     );
+    Ok(())
 }
 
 /// The one place an event leaves this module for the sink. ADR-0018's credential

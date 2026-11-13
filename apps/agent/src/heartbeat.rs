@@ -45,16 +45,18 @@ pub(crate) fn heartbeat_path_for(alerts: &Path) -> PathBuf {
 /// shutdown handshake needed: the file simply stops advancing). `counter` is
 /// the same `Arc` [`crate::sink::DetectionSink`] increments per event
 /// (`DetectionSink::progress_handle`).
-pub(crate) fn start(path: PathBuf, counter: Arc<AtomicU64>, interval: Duration) {
-    std::thread::Builder::new()
-        .name("heartbeat".into())
-        .spawn(move || {
-            loop {
-                write_once(&path, counter.load(Ordering::Relaxed));
-                std::thread::sleep(interval);
-            }
-        })
-        .expect("spawning the heartbeat writer thread");
+pub(crate) fn start(
+    path: PathBuf,
+    counter: Arc<AtomicU64>,
+    interval: Duration,
+) -> std::io::Result<()> {
+    crate::spawn::spawn_named("heartbeat", move || {
+        loop {
+            write_once(&path, counter.load(Ordering::Relaxed));
+            std::thread::sleep(interval);
+        }
+    })?;
+    Ok(())
 }
 
 /// Writes `count` to `path` via a same-directory temp file + rename, so a
@@ -101,7 +103,8 @@ mod tests {
             path.clone(),
             Arc::clone(&counter),
             Duration::from_millis(20),
-        );
+        )
+        .unwrap();
         counter.store(42, Ordering::Relaxed);
 
         let mut seen = None;
@@ -132,7 +135,7 @@ mod tests {
             line!()
         ));
         let counter = Arc::new(AtomicU64::new(0));
-        start(path.clone(), Arc::clone(&counter), Duration::from_millis(5));
+        start(path.clone(), Arc::clone(&counter), Duration::from_millis(5)).unwrap();
         for i in 1..=50u64 {
             counter.store(i, Ordering::Relaxed);
             if let Ok(content) = std::fs::read_to_string(&path) {

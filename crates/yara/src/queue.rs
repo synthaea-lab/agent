@@ -11,7 +11,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use crate::{RuleSet, YaraMatch, access::Requester};
+use crate::{RuleSet, YaraError, YaraMatch, access::Requester};
 
 /// Queue capacity: a burst of file writes beyond this sheds scan requests (counted).
 const QUEUE_CAP: usize = 512;
@@ -78,11 +78,14 @@ impl ScanQueue {
     /// Starts the worker. `on_match` runs on the worker thread for every scan with
     /// at least one matching rule.
     ///
-    /// # Panics
+    /// # Errors
     ///
-    /// Panics when the OS refuses to spawn the worker thread — at agent startup,
-    /// on a host that cannot spawn one thread, there is nothing to degrade to.
-    pub fn start(rules: RuleSet, on_match: impl Fn(ScanOutcome) + Send + 'static) -> Self {
+    /// [`YaraError::Spawn`] when the OS refuses the worker thread; the caller decides whether
+    /// the host can run without file scanning.
+    pub fn start(
+        rules: RuleSet,
+        on_match: impl Fn(ScanOutcome) + Send + 'static,
+    ) -> Result<Self, YaraError> {
         let (tx, rx) = mpsc::sync_channel::<ScanRequest>(QUEUE_CAP);
         let scanned = Arc::new(AtomicU64::new(0));
         let dropped = Arc::new(AtomicU64::new(0));
@@ -130,12 +133,15 @@ impl ScanQueue {
                     }
                 }
             })
-            .expect("spawning the yara worker thread");
-        Self {
+            .map_err(|source| YaraError::Spawn {
+                thread: "yara-scan",
+                source,
+            })?;
+        Ok(Self {
             tx,
             scanned,
             dropped,
-        }
+        })
     }
 
     /// Enqueues a path for scanning; sheds (and counts) when the queue is full.
@@ -198,7 +204,7 @@ rule q {
         let rules = RuleSet::from_compiled(compiler.build()).unwrap();
         let hits: Arc<Mutex<Vec<ScanOutcome>>> = Arc::new(Mutex::new(Vec::new()));
         let hits_w = hits.clone();
-        let queue = ScanQueue::start(rules, move |o| hits_w.lock().unwrap().push(o));
+        let queue = ScanQueue::start(rules, move |o| hits_w.lock().unwrap().push(o)).unwrap();
 
         let dir = std::env::temp_dir();
         let hit = dir.join(format!("yara-q-hit-{}", std::process::id()));
@@ -246,7 +252,7 @@ rule ctx {
         let rules = RuleSet::from_compiled(compiler.build()).unwrap();
         let hits: Arc<Mutex<Vec<ScanOutcome>>> = Arc::new(Mutex::new(Vec::new()));
         let hits_w = hits.clone();
-        let queue = ScanQueue::start(rules, move |o| hits_w.lock().unwrap().push(o));
+        let queue = ScanQueue::start(rules, move |o| hits_w.lock().unwrap().push(o)).unwrap();
 
         let path = std::env::temp_dir().join(format!("yara-q-ctx-{}", std::process::id()));
         std::fs::write(&path, b"CONTEXT-MARKER").unwrap();
@@ -295,7 +301,7 @@ rule as_user_q {
         let rules = RuleSet::from_compiled(compiler.build()).unwrap();
         let hits: Arc<Mutex<Vec<ScanOutcome>>> = Arc::new(Mutex::new(Vec::new()));
         let hits_w = hits.clone();
-        let queue = ScanQueue::start(rules, move |o| hits_w.lock().unwrap().push(o));
+        let queue = ScanQueue::start(rules, move |o| hits_w.lock().unwrap().push(o)).unwrap();
 
         let path = std::env::temp_dir().join(format!("yara-q-as-{}", std::process::id()));
         std::fs::write(&path, b"AS-USER-QUEUE-MARKER").unwrap();

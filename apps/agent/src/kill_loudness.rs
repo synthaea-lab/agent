@@ -81,38 +81,39 @@ pub(crate) fn block_termination_signals() {
 /// who sent it, gives `enrich_queue` a bounded chance to drain (issue #341) before
 /// actually terminating the process (blocking suppressed the signal's own default
 /// disposition, so nothing else will end it).
-pub(crate) fn spawn_watcher(alerts_path: PathBuf, enrich_queue: EnrichQueue) {
-    std::thread::Builder::new()
-        .name("kill-loudness".into())
-        .spawn(move || {
-            let set = watched_signal_set();
-            // SAFETY: `set` watches only the signals blocked by
-            // `block_termination_signals`; `info` is an output-only `siginfo_t` the
-            // kernel fills in on a successful return, read only after that return.
-            let (signo, sender_pid) = unsafe {
-                let mut info: libc::siginfo_t = std::mem::zeroed();
-                let signo = libc::sigwaitinfo(&set, &mut info);
-                (signo, info.si_pid())
-            };
-            if signo < 0 {
-                // `sigwaitinfo` failed (e.g. interrupted by an unwatched signal) —
-                // nothing to attribute, and the process is not terminating.
-                return;
-            }
-            report_kill_attempt(&alerts_path, signo, sender_pid);
-            // Bounded, not unconditional (see `enrich_queue`'s module doc): the
-            // worst case here is the exact same immediate exit as before this
-            // issue was fixed, just after up to `SHUTDOWN_FLUSH_BUDGET` instead of
-            // none — #71's hard-exit guarantee against a wedged/compromised
-            // process outlasting a termination signal is unchanged.
-            if !enrich_queue.flush(SHUTDOWN_FLUSH_BUDGET) {
-                tracing::warn!(
-                    "kill-loudness: enrich queue did not fully drain within the shutdown budget"
-                );
-            }
-            std::process::exit(128 + signo);
-        })
-        .expect("spawning the kill-loudness watcher thread");
+pub(crate) fn spawn_watcher(
+    alerts_path: PathBuf,
+    enrich_queue: EnrichQueue,
+) -> std::io::Result<()> {
+    crate::spawn::spawn_named("kill-loudness", move || {
+        let set = watched_signal_set();
+        // SAFETY: `set` watches only the signals blocked by
+        // `block_termination_signals`; `info` is an output-only `siginfo_t` the
+        // kernel fills in on a successful return, read only after that return.
+        let (signo, sender_pid) = unsafe {
+            let mut info: libc::siginfo_t = std::mem::zeroed();
+            let signo = libc::sigwaitinfo(&set, &mut info);
+            (signo, info.si_pid())
+        };
+        if signo < 0 {
+            // `sigwaitinfo` failed (e.g. interrupted by an unwatched signal) —
+            // nothing to attribute, and the process is not terminating.
+            return;
+        }
+        report_kill_attempt(&alerts_path, signo, sender_pid);
+        // Bounded, not unconditional (see `enrich_queue`'s module doc): the
+        // worst case here is the exact same immediate exit as before this
+        // issue was fixed, just after up to `SHUTDOWN_FLUSH_BUDGET` instead of
+        // none — #71's hard-exit guarantee against a wedged/compromised
+        // process outlasting a termination signal is unchanged.
+        if !enrich_queue.flush(SHUTDOWN_FLUSH_BUDGET) {
+            tracing::warn!(
+                "kill-loudness: enrich queue did not fully drain within the shutdown budget"
+            );
+        }
+        std::process::exit(128 + signo);
+    })?;
+    Ok(())
 }
 
 fn signal_name(signo: i32) -> &'static str {

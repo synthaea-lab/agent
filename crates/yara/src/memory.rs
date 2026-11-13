@@ -31,7 +31,7 @@ use std::{
 
 use store::BoundedMap;
 
-use crate::{RuleSet, ScanContext, YaraMatch};
+use crate::{RuleSet, ScanContext, YaraError, YaraMatch};
 
 /// Permissions of a mapped region.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -301,16 +301,16 @@ pub struct MemoryScanQueue {
 impl MemoryScanQueue {
     /// Starts the worker. `on_match` runs on it for every scan that found a rule.
     ///
-    /// # Panics
+    /// # Errors
     ///
-    /// Panics when the OS refuses to spawn the worker thread, at agent startup, with
-    /// nothing to degrade to (same stance as [`crate::ScanQueue::start`]).
+    /// [`YaraError::Spawn`] when the OS refuses the worker thread (same contract as
+    /// [`crate::ScanQueue::start`]).
     pub fn start(
         rules: RuleSet,
         source: Arc<dyn MemorySource>,
         budget: MemoryBudget,
         on_match: impl Fn(MemoryScanOutcome) + Send + 'static,
-    ) -> Self {
+    ) -> Result<Self, YaraError> {
         let (tx, rx) = mpsc::sync_channel::<Request>(QUEUE_CAP);
         let scanned = Arc::new(AtomicU64::new(0));
         let unreadable = Arc::new(AtomicU64::new(0));
@@ -346,8 +346,11 @@ impl MemoryScanQueue {
                     }
                 }
             })
-            .expect("spawning the yara memory-scan worker thread");
-        Self {
+            .map_err(|source| YaraError::Spawn {
+                thread: "yara-memscan",
+                source,
+            })?;
+        Ok(Self {
             tx,
             gate: Mutex::new(Gate {
                 last_scan: BoundedMap::new(COOLDOWN_ENTRIES),
@@ -358,7 +361,7 @@ impl MemoryScanQueue {
             shed_queue_full: AtomicU64::new(0),
             shed_cooldown: AtomicU64::new(0),
             shed_rate: AtomicU64::new(0),
-        }
+        })
     }
 
     /// Asks for a scan of `pid`, subject to the cooldown, the global cap and the queue.
@@ -689,7 +692,8 @@ rule mem_marker {
         let queue =
             MemoryScanQueue::start(rules(), Arc::new(fake), MemoryBudget::default(), move |o| {
                 hits_w.lock().unwrap().push(o);
-            });
+            })
+            .unwrap();
         (queue, hits)
     }
 
@@ -825,7 +829,8 @@ rule mem_marker {
             Arc::new(Gated { open: open.clone() }),
             MemoryBudget::default(),
             |_| {},
-        );
+        )
+        .unwrap();
         // Event times a minute apart so the global rate cap never bites: only the
         // queue's own capacity can refuse. The worker takes the first request and
         // blocks on it; the channel then holds QUEUE_CAP more.
