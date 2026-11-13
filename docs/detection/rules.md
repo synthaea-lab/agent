@@ -70,7 +70,8 @@ sequenceDiagram
 must be `Send + Sync`. On Linux almost all events arrive on one thread, so the lock is
 uncontended. The DNS uprobe, conntrack and log-source threads take it too. **Never hold the
 lock while calling `record_rule_alerts`**: that path takes it again (for the damage manifest).
-The sink binds the alerts to a local first, then records them.
+Stateful steps go through `DetectionSink::rule_alerts(event, |state| state.on_x(e))`, which
+evaluates under the lock, drops the guard, then records, so the hazard cannot be written.
 
 ## `RuleState` internals
 
