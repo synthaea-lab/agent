@@ -33,7 +33,7 @@ mod recording;
 mod response;
 
 pub(crate) use baseline::BaselineSink;
-pub(crate) use correlation::model_root;
+pub(crate) use correlation::{correlator_case_id, model_root};
 use recording::{Finding, record_ioc_hit, record_rule_alert, spool_on_worker};
 use response::{DAMAGE_MANIFEST_MAX, ResponseCell};
 
@@ -418,6 +418,22 @@ impl DetectionSink {
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     pub(crate) fn enrich_queue(&self) -> &EnrichQueue {
         &self.enrich_queue
+    }
+
+    /// The fused verdict of the entity `meta` belongs to, or `None` while no finding was
+    /// recorded for it. `agent replay` reads it to write one case per entity.
+    pub(crate) fn verdict_for(&self, meta: &schema::EventMeta) -> Option<verdict::Verdict> {
+        self.verdict.lock_recovering().peek(&entity_key(meta))
+    }
+
+    /// Stops the YARA file and memory scanners. A replay must not scan anything: the pids
+    /// and paths in a recorded trace name processes and files of the host that captured
+    /// it, not of the one replaying it.
+    pub(crate) fn stop_host_scans(&self) {
+        let yara = self.yara.lock_recovering().take();
+        let memscan = self.memscan.lock_recovering().take();
+        // Dropped after the locks are released, like `reload_content` does.
+        drop((yara, memscan));
     }
 
     /// Hands out the shared progress counter for `agent::heartbeat::start` to

@@ -68,6 +68,7 @@ mod quarantine_cmd;
 mod ransomware_join;
 mod redact;
 mod release;
+mod replay;
 mod rotation;
 mod shutdown;
 mod silence;
@@ -341,6 +342,29 @@ enum Command {
         #[arg(long)]
         allow_test_key: bool,
     },
+    /// Replays a recorded `events.jsonl` through the detection pipeline offline and
+    /// writes one case per entity: the fused verdict, with its techniques, engines and
+    /// findings (ml#3). Event time drives the clocks, nothing is scanned or killed, and
+    /// two replays of one file write the same cases.
+    Replay {
+        /// JSON-Lines events, as `run --events` records them.
+        #[arg(long)]
+        events: std::path::PathBuf,
+        /// JSON-Lines file the replay's alerts are appended to.
+        #[arg(long, default_value = "replay-alerts.ndjson")]
+        alerts: std::path::PathBuf,
+        /// JSON-Lines file the cases are written to (replaced).
+        #[arg(long, default_value = "cases.jsonl")]
+        cases: std::path::PathBuf,
+        /// Content the replay loads Sigma rules from (`<content-dir>/rules/sigma`). YARA
+        /// content is never used: a replay does not scan.
+        #[arg(long, default_value = ".")]
+        content_dir: std::path::PathBuf,
+        /// Where the ML correlation model family is looked up, as `run` looks it up
+        /// under the state directory. Without a model the belief is the hand-calibrated one.
+        #[arg(long, default_value = "ml/registry")]
+        model_root: std::path::PathBuf,
+    },
     /// Lists or restores payloads automated quarantine moved aside (issue #25).
     /// The quarantine directory is derived from `--alerts` exactly as `run`
     /// derives it, so pass the same path the running agent was given.
@@ -537,6 +561,23 @@ fn try_main() -> anyhow::Result<std::process::ExitCode> {
             };
             rotation::cmd_apply_key_rotation(&source, &cfg.storage.state_dir, allow_test_key)
                 .map(|_| ())
+        }
+        Command::Replay {
+            events,
+            alerts,
+            cases,
+            content_dir,
+            model_root,
+        } => {
+            replay::cmd_replay(&events, &alerts, &cases, &content_dir, &model_root).map(|summary| {
+                eprintln!(
+                    "replay: {} events ({} lines skipped), {} cases written to {}",
+                    summary.events,
+                    summary.skipped_lines,
+                    summary.cases,
+                    cases.display()
+                );
+            })
         }
         Command::Quarantine { alerts, action } => match action {
             QuarantineAction::List => {
