@@ -674,10 +674,15 @@ fn event_by(
         ..schema::fixtures::meta()
     };
     match kind {
-        "read" | "write" => {
+        "read" | "write" | "truncate" => {
             let mut e = schema::fixtures::file_open();
             e.path = canary.into();
-            e.flags = if kind == "write" { 0o102 } else { 0 };
+            e.flags = match kind {
+                "write" => 0o102,
+                // O_RDONLY | O_TRUNC: no write access mode, yet the kernel empties the file (#233).
+                "truncate" => schema::O_TRUNC,
+                _ => 0,
+            };
             e.meta = meta;
             Event::FileOpen(e)
         }
@@ -698,8 +703,8 @@ fn event_by(
 }
 
 #[test]
-fn a_delete_rename_or_write_open_after_a_read_open_is_not_absorbed() {
-    for destructive in ["delete", "rename", "write"] {
+fn a_delete_rename_write_or_truncating_open_after_a_read_open_is_not_absorbed() {
+    for destructive in ["delete", "rename", "write", "truncate"] {
         let dir = tmp(&format!("canary-destructive-{destructive}"));
         let (sink, canary) = sink_watching_canary(&dir);
         let pid = std::process::id() + 1;
@@ -2646,6 +2651,32 @@ fn a_scanned_payloads_match_reaches_the_verdict_of_the_process_that_wrote_it() {
         .peek(&verdict::EntityKey::new(777, "dropper"))
         .expect("the match is folded into the writer's verdict");
     assert_eq!(fused.techniques, vec!["T1105"]);
+}
+
+/// The YARA trigger is the shared write-intent predicate, so a truncating open
+/// queues a scan even without a write access mode (#233). It used to test
+/// `O_WRONLY | O_RDWR | O_CREAT` on its own and miss `O_TRUNC`.
+#[test]
+fn a_truncating_read_only_open_queues_a_yara_scan() {
+    let dir = tmp("yara-trunc-trigger");
+    let yara_dir = dir.join("content").join("rules").join("yara");
+    std::fs::create_dir_all(&yara_dir).unwrap();
+    std::fs::write(yara_dir.join("marker.yar"), RESPONSE_MARKER_RULE).unwrap();
+    let payload = dir.join("payload.bin");
+    std::fs::write(&payload, b"dropped payload RESPONSE-SCENARIO-MARKER").unwrap();
+    let sink = sink_in(&dir);
+    assert_eq!(sink.reload_content().yara_rule_count, Some(1));
+
+    sink.on_event(Event::FileOpen(schema::FileOpenEvent {
+        meta: EventMeta {
+            // Root: unrestricted, the payload is the test's own file (#594).
+            user: schema::User::Unix { uid: 0, gid: 0 },
+            ..schema::fixtures::meta()
+        },
+        path: payload.display().to_string(),
+        flags: schema::O_TRUNC,
+    }));
+    wait_for_alert(&dir, "YARA");
 }
 
 #[test]
