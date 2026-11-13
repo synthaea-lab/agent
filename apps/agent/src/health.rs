@@ -152,6 +152,8 @@ pub struct HostCounters {
     pub ioc_own_skipped: u64,
     /// The same, by a second process on the agent's executable.
     pub ioc_sibling_skipped: u64,
+    /// Alerts that could not be written to `alerts.ndjson`.
+    pub alerts_dropped: u64,
 }
 
 /// Reads the [`HostCounters`].
@@ -361,6 +363,7 @@ impl HealthCollector {
             ioc_cooled_down: host.ioc_cooled_down,
             ioc_own_skipped: host.ioc_own_skipped,
             ioc_sibling_skipped: host.ioc_sibling_skipped,
+            alerts_dropped: host.alerts_dropped,
         }
     }
 }
@@ -457,6 +460,7 @@ mod tests {
             ioc_cooled_down: 31,
             ioc_own_skipped: 6,
             ioc_sibling_skipped: 2,
+            alerts_dropped: 8,
         }));
 
         let (tx, rx) = mpsc::channel();
@@ -527,6 +531,10 @@ mod tests {
             (beacon.ioc_own_skipped, beacon.ioc_sibling_skipped),
             (6, 2),
             "the own-traffic skips ride the beacon (#1061)"
+        );
+        assert_eq!(
+            beacon.alerts_dropped, 8,
+            "the alerts the log file refused ride the beacon (#167)"
         );
     }
 
