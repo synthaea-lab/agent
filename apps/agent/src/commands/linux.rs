@@ -16,7 +16,7 @@ use tamper::heartbeat::{SensorHeartbeat, SilenceMonitor};
 use crate::{
     captures::{CaptureSet, Captures, UprobesAction, plan},
     protected::ProtectedResourceGuard,
-    shutdown::{SHUTDOWN_BUDGET, ShutdownPlan, sleep_unless_stopped},
+    shutdown::{ShutdownPlan, sleep_unless_stopped},
     silence::{PulsingSink, SourceStatus},
     sink::DetectionSink,
 };
@@ -462,25 +462,11 @@ pub(crate) fn cmd_run(opts: super::RunOptions) -> anyhow::Result<()> {
     let guarded = ProtectedResourceGuard::new(sink.clone(), protected, sink.clone());
     let result = sensor.run(Box::new(PulsingSink::new(guarded, primary_heartbeat)));
 
-    // Persist findings already accepted by the in-memory queue before the
-    // uploader makes its final drain. A bounded wait preserves shutdown's
-    // overall deadline if enrichment is stalled on a slow file.
-    if !sink.enrich_queue().flush(std::time::Duration::from_secs(1)) {
-        tracing::warn!("pending detection/event queue did not flush before shutdown");
-    }
-
-    // `sensor.run` returned (Ctrl-C or a sensor failure): wind the workers down —
-    // the upload loop gets one last spool drain — within one bounded budget. What
-    // is still spooled after that is redelivered on the next start (at-least-once).
-    // SIGTERM/SIGHUP/SIGQUIT do not come through here: `kill_loudness`'s watcher
-    // ends the process itself (after the enrich-queue flush, #341).
-    let stragglers = shutdown.execute(SHUTDOWN_BUDGET);
-    if !stragglers.is_empty() {
-        tracing::warn!(
-            ?stragglers,
-            "workers still running at the shutdown deadline"
-        );
-    }
+    // `sensor.run` returned (Ctrl-C or a sensor failure): flush the enrichment queue, then
+    // wind the workers down, the upload loop getting one last spool drain (`finish_run`,
+    // shared with Windows and macOS). SIGTERM/SIGHUP/SIGQUIT do not come through here:
+    // `kill_loudness`'s watcher ends the process itself (after the enrich-queue flush, #341).
+    super::common::finish_run(&sink, shutdown);
     result.map_err(|e| anyhow::anyhow!("sensor failed: {e}"))
 }
 

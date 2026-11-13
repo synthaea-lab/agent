@@ -129,12 +129,12 @@ With a control plane configured, [`upload::start`](../apps/agent/src/upload.rs) 
 | `enrich` | all | `DetectionSink::new` | When the queue is dropped, i.e. with the process |
 | `correlator-tick` | all | [`start_correlator_ticker`](../apps/agent/src/sink/correlation.rs). Advances the correlator clock every second so window-expiry alerts fire without new events. Holds only a `Weak` reference to the sink. | When the sink is dropped |
 | `yara-scan`, `yara-memscan` | all (memscan Linux only) | `start_yara` / `start_memscan` when `rules/yara` exists | With the process |
-| `transport-upload`, `detection-upload` | all, with a control plane | [`upload::start`](../apps/agent/src/upload.rs) | `ShutdownPlan` on Linux (with a 3 s final drain), otherwise with the process |
+| `transport-upload`, `detection-upload` | all, with a control plane | [`upload::start`](../apps/agent/src/upload.rs) | `ShutdownPlan` through `finish_run`, with a 3 s final drain (all platforms, #147) |
 | `heartbeat` | all | `wire_run_pipeline` | With the process |
 | `ipc-server` | all | [`ipc_handler::spawn`](../apps/agent/src/ipc_handler.rs) (current-thread tokio) | With the process. A failure there is logged and never stops detection. |
 | `snapshot-fetch`, `ioc-control-plane`, `decoy-register`, `deception-refresh` | all, when enabled | `wire_run_pipeline` / `plant_canaries` | With the process |
 | `sensor-silence` | Linux, Windows | [`silence::spawn_monitor`](../apps/agent/src/silence.rs). Polls every 10 s and turns each confirmed stall into a T1562 alert. | With the process |
-| `health-beacon` | Linux, Windows | `health_collector(...).spawn()` | `ShutdownPlan` on Linux, otherwise with the process |
+| `health-beacon` | Linux, Windows | `health_collector(...).spawn()` | `ShutdownPlan` through `finish_run` (Linux, Windows) |
 | `kill-loudness` | Linux | [`kill_loudness::spawn_watcher`](../apps/agent/src/kill_loudness.rs) | Ends the process itself |
 | `netlink-poll` | Linux | [`spawn_netlink_poller`](../apps/agent/src/commands/linux.rs), every 10 s | `ShutdownPlan` |
 | `journal-tail`, `journal-canary` | Linux | [`spawn_journal_tail`](../apps/agent/src/commands/linux.rs) | With the process |
@@ -225,9 +225,9 @@ sequenceDiagram
   KL->>Op: exit(128 + signo)
 ```
 
-Linux has two shutdown paths:
+The end of `agent run` is one shared function, [`commands::common::finish_run`](../apps/agent/src/commands/common.rs) (#147), called by `cmd_run` on Linux, Windows and macOS. Linux has two shutdown paths:
 
-- **SIGINT.** `LinuxSensor::run` returns on its own Ctrl-C handler. `cmd_run` then flushes the enrichment queue (with a 1 s bound) so that accepted findings reach the spool. Then it calls [`ShutdownPlan::execute`](../apps/agent/src/shutdown.rs):
+- **SIGINT.** `LinuxSensor::run` returns on its own Ctrl-C handler. `cmd_run` then calls `finish_run`, which flushes the enrichment queue (with a 1 s bound) so that accepted findings reach the spool. Then it calls [`ShutdownPlan::execute`](../apps/agent/src/shutdown.rs):
   - every registered worker is signalled first;
   - each one is then joined against a single shared 6 s deadline (`SHUTDOWN_BUDGET`), which covers the upload loop's 3 s final drain plus margin;
   - a worker still running at the deadline is logged and detached;
@@ -236,7 +236,7 @@ Linux has two shutdown paths:
 
 SIGKILL cannot be caught or attributed by the agent itself. The eBPF sensor records SIGKILLs aimed at the agent from the kernel side, and the restarted agent reports the sender. Under the audit fallback this gap remains. The watchdog stops its child with `Child::kill`, which is SIGKILL on Unix.
 
-On Windows and macOS, Ctrl-C sets the sensors' stop flags. The primary sensor returns, the supplementary threads are joined (Windows) or end with the process (macOS). Upload, health and enrichment threads end with the process: there is no `ShutdownPlan` and no enrichment flush. This loses no spooled data, since the spool redelivers, but it does skip the final upload drain.
+On Windows and macOS, Ctrl-C sets the sensors' stop flags. The primary sensor returns and the supplementary threads are joined (Windows) or end with the process (macOS). `cmd_run` then calls the same `finish_run` as Linux, with a `ShutdownPlan` holding the two upload threads (and, on Windows, the health beacon): the enrichment queue is flushed (1 s bound) and the upload loops make their final drain within the 6 s `SHUTDOWN_BUDGET`. Before #147 these two platforms skipped both, which lost no spooled data (the spool redelivers) but skipped the final drain. Their `cmd_run` is built and tested only in CI, not in a local run: the shared function is covered on every platform by `finish_run_signals_and_joins_every_registered_worker`. The workers that still end with the process (the silence monitor, `heartbeat`, `ipc-server`) are not in the plan.
 
 ## Degraded modes
 

@@ -8,9 +8,7 @@
 //! deadline — a wedged worker (an upload stuck in a slow HTTP call) is logged
 //! and detached instead of holding the exit hostage.
 
-// Only wired on Linux (commands/linux.rs) — same first-platform precedent as
-// `health`; the other `cmd_run`s still end with the process.
-#![cfg_attr(not(target_os = "linux"), allow(dead_code))]
+// Wired into all three `cmd_run`s through `commands::common::finish_run` (#147).
 
 use std::{
     sync::atomic::{AtomicBool, Ordering},
@@ -46,6 +44,7 @@ pub fn join_bounded(handle: JoinHandle<()>, deadline: Instant) -> bool {
 
 /// `thread::sleep` that returns early (within [`SLEEP_SLICE`]) once `stop` is
 /// set — for poll loops whose only shutdown signal is a flag.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))] // only Linux workers poll on a flag
 pub fn sleep_unless_stopped(stop: &AtomicBool, total: Duration) {
     let deadline = Instant::now() + total;
     while !stop.load(Ordering::SeqCst) {
