@@ -21,7 +21,7 @@ use aya_ebpf::{
 use aya_log_ebpf::warn;
 use sensor_linux_wire::{SocketAcceptEvent, TASK_COMM_LEN};
 
-use crate::{AF_INET, AF_INET6, SYS_EXIT_RET_OFFSET, fill_lineage};
+use crate::{AF_INET, AF_INET6, SYS_EXIT_RET_OFFSET, fill_lineage, into_ret};
 
 /// Ring buffer shared with userspace for `accept`/`accept4` events.
 #[map]
@@ -63,17 +63,11 @@ const ACCEPT_FD_OFFSET: usize = 12;
 const ACCEPT_ADDR_PTR_OFFSET: usize = 16;
 
 pub fn sys_enter_accept(ctx: TracePointContext) -> u32 {
-    match stash_accept_args(&ctx) {
-        Ok(ret) => ret,
-        Err(ret) => ret,
-    }
+    into_ret(stash_accept_args(&ctx))
 }
 
 pub fn sys_enter_accept4(ctx: TracePointContext) -> u32 {
-    match stash_accept_args(&ctx) {
-        Ok(ret) => ret,
-        Err(ret) => ret,
-    }
+    into_ret(stash_accept_args(&ctx))
 }
 
 /// Shared by `sys_enter_accept` and `sys_enter_accept4` — both have the same
@@ -107,17 +101,11 @@ fn stash_accept_args(ctx: &TracePointContext) -> Result<u32, u32> {
 }
 
 pub fn sys_exit_accept(ctx: TracePointContext) -> u32 {
-    match try_sys_exit_accept(ctx) {
-        Ok(ret) => ret,
-        Err(ret) => ret,
-    }
+    into_ret(try_sys_exit_accept(ctx))
 }
 
 pub fn sys_exit_accept4(ctx: TracePointContext) -> u32 {
-    match try_sys_exit_accept(ctx) {
-        Ok(ret) => ret,
-        Err(ret) => ret,
-    }
+    into_ret(try_sys_exit_accept(ctx))
 }
 
 /// Shared by `sys_exit_accept` and `sys_exit_accept4`. No-ops (returns `Ok(0)`

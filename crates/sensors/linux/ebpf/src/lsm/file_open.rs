@@ -7,6 +7,8 @@ use aya_ebpf::{
 };
 use aya_log_ebpf::info;
 
+use crate::into_ret;
+
 /// Per-CPU hit counter for the `file_open` LSM hook below — issue #91's foundation
 /// slice, observation only. Exists so userspace (`sensor-linux-lsm`) has something
 /// concrete to point at proving the hook actually fires, without yet deciding how an
@@ -24,10 +26,7 @@ static LSM_FILE_OPEN_HITS: PerCpuArray<u64> = PerCpuArray::with_max_entries(1, 0
 /// and no per-kernel offset table — same discipline as the rest of this probe.
 #[lsm(hook = "file_open")]
 pub fn file_open(ctx: LsmContext) -> i32 {
-    match try_file_open(ctx) {
-        Ok(ret) => ret,
-        Err(ret) => ret,
-    }
+    into_ret(try_file_open(ctx))
 }
 
 fn try_file_open(ctx: LsmContext) -> Result<i32, i32> {
