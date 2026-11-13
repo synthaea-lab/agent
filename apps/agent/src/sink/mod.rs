@@ -567,12 +567,26 @@ impl DetectionSink {
         }
     }
 
+    /// Runs one stateful rule step under the rule-state lock, **releases the lock**, then
+    /// records what it returned. Recording can take the lock again (the ransomware damage
+    /// manifest reads `touched_files`), and `std::sync::Mutex` is not reentrant, so a guard
+    /// kept across that call would deadlock. Writing `record_rule_alerts(e, lock().on_x())`
+    /// by hand keeps the guard until the end of the statement; go through this instead.
+    fn rule_alerts(
+        &self,
+        event: &Event,
+        step: impl FnOnce(&mut rules::RuleState) -> Vec<rules::Alert>,
+    ) {
+        let alerts = step(&mut self.rule_state.lock_recovering());
+        self.record_rule_alerts(event, alerts);
+    }
+
     /// Exec events: stateless rules, stateful rules, then Sigma.
     fn detect_exec(&self, wrapped: &Event, event: &schema::ExecEvent) {
         self.own_traffic.record_exec(event);
         self.canary.on_exec(event);
         self.record_rule_alerts(wrapped, rules::evaluate_exec(event));
-        self.record_rule_alerts(wrapped, self.rule_state.lock_recovering().on_exec(event));
+        self.rule_alerts(wrapped, |state| state.on_exec(event));
         // This exec moved the stream clock: identity requests waiting for it may be due (#1041).
         self.record_due_identity_alerts(
             self.rule_state.lock_recovering().take_due_identity_alerts(),
@@ -673,7 +687,7 @@ impl DetectionSink {
             self.record_ioc(wrapped, hit);
         }
         self.record_rule_alerts(wrapped, rules::evaluate_connect(event));
-        self.record_rule_alerts(wrapped, self.rule_state.lock_recovering().on_connect(event));
+        self.rule_alerts(wrapped, |state| state.on_connect(event));
     }
 
     /// `DnsQuery` events: the egress-domain join (it never alerts) and, on a listed domain or
@@ -704,38 +718,29 @@ impl DetectionSink {
         {
             self.record_ioc(wrapped, hit);
         }
-        self.record_rule_alerts(
-            wrapped,
-            self.rule_state.lock_recovering().on_network_flow(event),
-        );
+        self.rule_alerts(wrapped, |state| state.on_network_flow(event));
     }
 
     /// `ListenPort` events (`sock_diag` polling, issue #92): LISTENER-DRIFT.
     fn detect_listen_port(&self, wrapped: &Event, event: &schema::ListenPortEvent) {
-        self.record_rule_alerts(
-            wrapped,
-            self.rule_state.lock_recovering().on_listen_port(event),
-        );
+        self.rule_alerts(wrapped, |state| state.on_listen_port(event));
     }
 
     /// `PolicyDenial` events (`SELinux` AVC #297, AppLocker/WDAC #283):
     /// POLICY-DENIAL-DRIFT (issue #774).
     fn detect_policy_denial(&self, wrapped: &Event, event: &schema::PolicyDenialEvent) {
-        self.record_rule_alerts(
-            wrapped,
-            self.rule_state.lock_recovering().on_policy_denial(event),
-        );
+        self.rule_alerts(wrapped, |state| state.on_policy_denial(event));
     }
 
     /// `Auth` events: brute-force/spray burst detection (T1110, pack #377).
     fn detect_auth(&self, wrapped: &Event, event: &schema::AuthEvent) {
-        self.record_rule_alerts(wrapped, self.rule_state.lock_recovering().on_auth(event));
+        self.rule_alerts(wrapped, |state| state.on_auth(event));
     }
 
     /// `Session` events: a disconnected session reconnected from another client
     /// (T1563.002, #285).
     fn detect_session(&self, wrapped: &Event, event: &schema::SessionEvent) {
-        self.record_rule_alerts(wrapped, self.rule_state.lock_recovering().on_session(event));
+        self.rule_alerts(wrapped, |state| state.on_session(event));
     }
 
     /// `FileDelete` events: log-tamper detection (T1070.001/.002, pack #379), then the
@@ -743,8 +748,7 @@ impl DetectionSink {
     /// the creation history `on_file_open` keeps.
     fn detect_file_delete(&self, wrapped: &Event, event: &schema::FileDeleteEvent) {
         self.record_rule_alerts(wrapped, rules::evaluate_file_delete(event));
-        let alerts = self.rule_state.lock_recovering().on_file_delete(event);
-        self.record_rule_alerts(wrapped, alerts);
+        self.rule_alerts(wrapped, |state| state.on_file_delete(event));
     }
 
     /// `Signal` events: security-process tampering (T1562.001, issue #362).
@@ -779,9 +783,7 @@ impl DetectionSink {
     /// `FileRename` events: mass-rename ransomware detection (T1486, issue #262) +
     /// write-volume corroboration (issue #82).
     fn detect_file_rename(&self, wrapped: &Event, event: &schema::FileRenameEvent) {
-        // Bound first: `record_rule_alerts` takes the lock again for the damage manifest.
-        let alerts = self.rule_state.lock_recovering().on_file_rename(event);
-        self.record_rule_alerts(wrapped, alerts);
+        self.rule_alerts(wrapped, |state| state.on_file_rename(event));
     }
 
     /// `FileWrite` events: no alert on their own — tracks per-pid write volume for
@@ -815,10 +817,7 @@ impl DetectionSink {
     /// stored-password searches, then the enumeration-sweep burst.
     fn detect_ldap_search(&self, wrapped: &Event, event: &schema::LdapSearchEvent) {
         self.record_rule_alerts(wrapped, rules::evaluate_ldap_search(event));
-        self.record_rule_alerts(
-            wrapped,
-            self.rule_state.lock_recovering().on_ldap_search(event),
-        );
+        self.rule_alerts(wrapped, |state| state.on_ldap_search(event));
     }
 
     /// Writes one alert to the shared log and highlighted stderr. `pub(crate)`
@@ -1487,9 +1486,7 @@ impl EventSink for DetectionSink {
             Event::BitsJob(e) => self.detect_bits_job(e),
             Event::FileRename(e) => self.detect_file_rename(&event, e),
             Event::FileSetTime(e) => {
-                // Bound first: `record_rule_alerts` takes the lock again.
-                let alerts = self.rule_state.lock_recovering().on_file_set_time(e);
-                self.record_rule_alerts(&event, alerts);
+                self.rule_alerts(&event, |state| state.on_file_set_time(e));
             }
             Event::RawVolumeOpen(e) => {
                 self.record_rule_alerts(&event, rules::evaluate_raw_volume_open(e));
@@ -1513,14 +1510,10 @@ impl EventSink for DetectionSink {
                 self.record_rule_alerts(&event, rules::evaluate_package_change(e));
             }
             Event::ProcessAccess(e) => {
-                // Bound first: `record_rule_alerts` takes the lock again.
-                let alerts = self.rule_state.lock_recovering().on_process_access(e);
-                self.record_rule_alerts(&event, alerts);
+                self.rule_alerts(&event, |state| state.on_process_access(e));
             }
             Event::RemoteThread(e) => {
-                // Bound first: `record_rule_alerts` takes the lock again.
-                let alerts = self.rule_state.lock_recovering().on_remote_thread(e);
-                self.record_rule_alerts(&event, alerts);
+                self.rule_alerts(&event, |state| state.on_remote_thread(e));
             }
             // New telemetry categories reach the engines as they land; until a rule
             // consumes them, logging below is the whole treatment.

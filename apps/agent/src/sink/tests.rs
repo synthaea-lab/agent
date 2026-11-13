@@ -166,6 +166,32 @@ fn set_time_event_reaches_the_timestomp_rule_through_the_real_sink() {
     assert!(alerts.contains("invoice.docx"), "{alerts}");
 }
 
+/// `record_rule_alerts` re-locks `rule_state` for a ransomware alert's damage manifest. A guard
+/// still held by the step that produced the alert would deadlock there (agent#144), so a step
+/// returning a T1486 alert must finish. The channel timeout turns a deadlock into a failure.
+#[test]
+fn a_stateful_step_returning_a_ransomware_alert_does_not_deadlock_the_manifest_lookup() {
+    let dir = tmp("rule-alerts-relock");
+    let sink = sink_in(&dir);
+    let event = Event::FileRename(schema::fixtures::file_rename());
+    let (done, finished) = std::sync::mpsc::channel();
+    let worker = Arc::clone(&sink);
+    thread::spawn(move || {
+        worker.rule_alerts(&event, |_| {
+            vec![rules::Alert {
+                technique: "T1486",
+                severity: schema::detection::Severity::High,
+                message: "mass rename".into(),
+            }]
+        });
+        let _ = done.send(());
+    });
+    assert!(
+        finished.recv_timeout(Duration::from_secs(10)).is_ok(),
+        "rule_alerts held the rule-state lock while recording a ransomware alert"
+    );
+}
+
 #[test]
 fn a_panic_inside_rule_evaluation_does_not_stop_later_events_from_being_processed() {
     let dir = tmp("poisoned-rule-state");

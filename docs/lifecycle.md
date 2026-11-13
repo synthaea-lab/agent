@@ -145,7 +145,7 @@ With a control plane configured, [`upload::start`](../apps/agent/src/upload.rs) 
 | `socket-poller`, `minifilter`, Event Log thread | Windows | [`run_windows_sensors`](../apps/agent/src/commands/windows.rs) | Shutdown flag, then joined |
 | `socket-poller`, `unifiedlog-tail`, `ne-receiver` | macOS | [`run_macos_sensors`](../apps/agent/src/commands/macos.rs) | Stop flag, or the `log stream` child being killed |
 
-Shared mutable state in `DetectionSink` is behind `Mutex`es (`RuleState`, correlator, Sigma, YARA, verdict), because several producer threads call `on_event` at once. Code takes a lock, collects alerts, and releases the lock before recording them. `record_rule_alerts` takes the rule-state lock again, so callers bind the alerts first (see the `FileSetTime` and `ProcessAccess` arms of `on_event`).
+Shared mutable state in `DetectionSink` is behind `Mutex`es (`RuleState`, correlator, Sigma, YARA, verdict), because several producer threads call `on_event` at once. Code takes a lock, collects alerts, and releases the lock before recording them. `record_rule_alerts` takes the rule-state lock again, so stateful rule steps go through `DetectionSink::rule_alerts`, which releases the lock before recording.
 
 ## Startup
 
