@@ -151,7 +151,8 @@ impl DetectionSink {
     /// change: the control plane keeps events after the first as the detection's further
     /// triggering events, and a restoration tool reads the scope from them.
     ///
-    /// Takes the rule-state lock: callers must not hold it (see `detect_file_rename`).
+    /// Takes the rule-state lock. Reached from `record_rule_alerts`, which
+    /// `DetectionSink::rule_alerts` only calls after releasing its own guard.
     pub(super) fn damage_manifest(&self, trigger: &Event) -> Vec<Event> {
         let meta = trigger.meta();
         let mut touched = self
