@@ -109,9 +109,6 @@ pub(crate) const BROWSER_DOWNLOAD_IMAGES: &[&str] = &[
     "/opt/brave.com/brave/brave",
     "/usr/lib64/opera-stable/opera",
     "/opt/vivaldi/vivaldi-bin",
-    // Debian's firefox-esr package: the process that renames is `firefox-esr`, not `firefox-bin`
-    // (the other ELF file of `/usr/lib/firefox-esr/`), which marks nothing.
-    "/usr/lib/firefox-esr/firefox-esr",
 ];
 
 /// File names of the Firefox family's main executable: the launcher or the binary the launcher
