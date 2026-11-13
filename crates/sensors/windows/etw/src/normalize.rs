@@ -44,19 +44,26 @@ pub fn disposition_to_flags(disposition: u32) -> u32 {
 /// devices keep the raw path (honest, greppable) rather than a fabricated drive.
 #[must_use]
 pub fn normalize_nt_path(path: &str, volume_map: &HashMap<String, String>) -> String {
-    let mut best: Option<(&str, &str)> = None;
+    let mut best: Option<(&str, &str, &str)> = None;
     for (device, drive) in volume_map {
-        if path.len() >= device.len()
-            && path[..device.len()].eq_ignore_ascii_case(device)
-            && best.is_none_or(|(d, _)| device.len() > d.len())
+        if let Some(rest) = strip_prefix_ignore_ascii_case(path, device)
+            && best.is_none_or(|(longest, _, _)| device.len() > longest.len())
         {
-            best = Some((device.as_str(), drive.as_str()));
+            best = Some((device.as_str(), drive.as_str(), rest));
         }
     }
     match best {
-        Some((device, drive)) => format!("{drive}{}", &path[device.len()..]),
+        Some((_, drive, rest)) => format!("{drive}{rest}"),
         None => path.to_string(),
     }
+}
+
+/// `text` without `prefix`, compared ASCII-case-insensitively; `None` when `text` does not
+/// start with it. Splits only on a character boundary: a path or key carries whatever
+/// characters a user named the file or key with, and slicing inside one panics the callback.
+fn strip_prefix_ignore_ascii_case<'a>(text: &'a str, prefix: &str) -> Option<&'a str> {
+    let (head, rest) = text.split_at_checked(prefix.len())?;
+    head.eq_ignore_ascii_case(prefix).then_some(rest)
 }
 
 /// Normalizes an NT registry key path to the familiar Win32 hive prefix.
@@ -72,13 +79,13 @@ pub fn normalize_registry_key(raw: &str) -> String {
     const MACHINE: &str = r"\REGISTRY\MACHINE\";
     const USER: &str = r"\REGISTRY\USER\";
 
-    if raw.len() >= MACHINE.len() && raw[..MACHINE.len()].eq_ignore_ascii_case(MACHINE) {
-        return format!(r"HKLM\{}", &raw[MACHINE.len()..]);
+    if let Some(rest) = strip_prefix_ignore_ascii_case(raw, MACHINE) {
+        return format!(r"HKLM\{rest}");
     }
-    if raw.len() >= USER.len() && raw[..USER.len()].eq_ignore_ascii_case(USER) {
+    if let Some(rest) = strip_prefix_ignore_ascii_case(raw, USER) {
         // Includes SID-prefixed HKCU paths (e.g. HKU\S-1-5-21-...\...) and
         // the machine-wide .DEFAULT hive — left with SID rather than guessing HKCU.
-        return format!(r"HKU\{}", &raw[USER.len()..]);
+        return format!(r"HKU\{rest}");
     }
     raw.to_string()
 }
@@ -634,6 +641,34 @@ mod tests {
         assert_eq!(
             normalize_registry_key(r"\REGISTRY\A\something"),
             r"\REGISTRY\A\something"
+        );
+    }
+
+    #[test]
+    fn a_registry_key_with_a_multibyte_character_across_the_root_length_is_kept() {
+        // `\REGISTRY\USER\` is 15 bytes: `Σ` at 17..19 straddles the 18-byte
+        // `\REGISTRY\MACHINE\` boundary.
+        let key = r"\REGISTRY\USER\abΣ\Run";
+
+        assert_eq!(normalize_registry_key(key), r"HKU\abΣ\Run");
+    }
+
+    #[test]
+    fn a_path_with_a_multibyte_character_across_a_longer_device_name_is_kept() {
+        let mut map = HashMap::new();
+        map.insert(r"\Device\HarddiskVolume3".to_string(), "C:".to_string());
+        map.insert(
+            r"\Device\HarddiskVolumeShadowCopy12".to_string(),
+            r"\\?\GLOBALROOT\Device\HarddiskVolumeShadowCopy12".to_string(),
+        );
+        // `é` straddles a device name's length: bytes 33..35 against the 34-byte
+        // shadow-copy device, 22..24 against the 23-byte volume.
+        let path = r"\Device\HarddiskVolume3\Users\abcé\x.exe";
+
+        assert_eq!(normalize_nt_path(path, &map), r"C:\Users\abcé\x.exe");
+        assert_eq!(
+            normalize_nt_path(r"\Device\Mup\server\shaé\x", &map),
+            r"\Device\Mup\server\shaé\x"
         );
     }
 

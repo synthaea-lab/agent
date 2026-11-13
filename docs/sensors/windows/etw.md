@@ -7,7 +7,8 @@
 | Module | Responsibility |
 | --- | --- |
 | [`sensor.rs`](../../../crates/sensors/windows/etw/src/sensor.rs) | `WindowsSensor`: builds `SharedState`, cleans up orphaned sessions, starts the trace, runs the liveness loop |
-| [`providers.rs`](../../../crates/sensors/windows/etw/src/providers.rs) | One builder per provider (GUID, keyword mask, callback). The callbacks filter, parse and emit. |
+| [`providers.rs`](../../../crates/sensors/windows/etw/src/providers.rs) | One builder per provider (GUID, keyword mask, callback). The callbacks filter, spend budgets and emit. |
+| [`payload.rs`](../../../crates/sensors/windows/etw/src/payload.rs) | How the DNS, registry, PowerShell, WMI, .NET, SMB, LDAP and NTLM records become events, decided on their named fields alone (`PayloadFields`) |
 | [`normalize.rs`](../../../crates/sensors/windows/etw/src/normalize.rs) | Pure helpers: FILETIME conversion, NT and registry path rewriting, session-name generation, orphan selection, diagnosis text |
 | [`etw_sessions.rs`](../../../crates/sensors/windows/etw/src/etw_sessions.rs) | Native session enumeration (`QueryAllTracesW`) and provider-enablement lookup (`EnumerateTraceGuidsEx`) |
 | [`budget.rs`](../../../crates/sensors/windows/etw/src/budget.rs) | `PidBudget` (N events per process per window) and `KeyDedup` (one event per key per window) |
@@ -72,7 +73,7 @@ Provider-specific behavior worth knowing:
 - **Mark-of-the-web.** A create on `file:Zone.Identifier` is queued for a background read-back ([`MarkQueue`](../../../crates/sensors/windows/etw/src/zone_identifier.rs)); a delete of that stream (`Unblock-File`, T1553.005) becomes a `FileDelete` of the stream path ([`forward_mark_removal`](../../../crates/sensors/windows/etw/src/providers.rs)). The stream check runs on the raw path first, so the expensive path normalization and token lookup only run for the rare match. Details in [etw-enrichment.md](etw-enrichment.md#mark-of-the-web).
 - **PowerShell 4104.** Long scripts are split by the provider into fragments sharing a `ScriptBlockId`. Each fragment is its own `ScriptBlock` event; consumers reassemble on `script_block_id` + `message_number`.
 - **AMSI 1101.** The buffer is decoded as UTF-16LE text ([`decode_text`](../../../crates/sensors/windows/etw/src/amsi.rs)), capped at 16 Ki characters with a `text_truncated` flag. Buffers with more than 10 % control characters (assemblies, VBA p-code) are not reported as text.
-- **Registry 4.** Only `REG_SZ` and `REG_EXPAND_SZ` data is decoded ([`decode_reg_string`](../../../crates/sensors/windows/etw/src/providers.rs)); other types carry no value. Key paths are rewritten to `HKLM\...`/`HKU\...` by [`normalize_registry_key`](../../../crates/sensors/windows/etw/src/normalize.rs).
+- **Registry 4.** Only `REG_SZ` and `REG_EXPAND_SZ` data is decoded ([`registry_set`](../../../crates/sensors/windows/etw/src/payload.rs)); other types carry no value. Key paths are rewritten to `HKLM\...`/`HKU\...` by [`normalize_registry_key`](../../../crates/sensors/windows/etw/src/normalize.rs).
 - **BITS.** The BITS service does the network I/O, so the job's *client* process is reported as the actor. See [etw-enrichment.md](etw-enrichment.md#bits-jobs).
 
 ## Threading
@@ -161,10 +162,10 @@ Everything else (provider set, keyword masks, budgets, windows) is a constant in
 
 ## Testing
 
-- **Unit tests on every OS** for the pure modules: `normalize`, `budget`, `amsi`, `cross_process`, `bits`, `zone_identifier`, `silo`, `pid_cache`, `long_path`, and the identity helpers in `lib.rs`.
+- **Unit tests on every OS** for the pure modules: `normalize`, `payload`, `budget`, `amsi`, `cross_process`, `bits`, `zone_identifier`, `silo`, `pid_cache`, `long_path`, and the identity helpers in `lib.rs`.
 - **Never-panic suite** [`tests/robustness.rs`](../../../crates/sensors/windows/etw/tests/robustness.rs): seeded pseudo-random bytes into `zone_identifier::parse` and `bits::is_microsoft_update_url`, both of which read attacker-chosen input on the consumer thread.
 - **Real-session tests**, `#[ignore]` because they need an elevated Windows process: [`kernel_process_keyword_mask.rs`](../../../crates/sensors/windows/etw/tests/kernel_process_keyword_mask.rs) and [`kernel_file_keyword_mask.rs`](../../../crates/sensors/windows/etw/tests/kernel_file_keyword_mask.rs) check that the providers honor the keyword masks the sensor relies on.
-- The provider callbacks themselves (DNS, registry, PowerShell, WMI, .NET, SMB, LDAP, NTLM parsing) have no automated test; their field notes come from lab captures.
+- **Payload decoding** of the DNS, registry, PowerShell, WMI, .NET, SMB, LDAP and NTLM records is tested in [`payload`](../../../crates/sensors/windows/etw/src/payload.rs) against an in-memory `PayloadFields`, including a property test that arbitrary field values of any type never panic. What those tests cannot check is that a provider really writes the field names and types they assume: those come from lab captures, recorded as field notes in `providers.rs`.
 - Clippy for this crate must be run with `--target x86_64-pc-windows-msvc`; host-only clippy does not compile the Windows-gated modules.
 
 ## Known gaps
