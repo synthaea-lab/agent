@@ -17,7 +17,7 @@ use aya_ebpf::{
 use aya_log_ebpf::warn;
 use sensor_linux_wire::{GetAddrInfoEvent, MAX_DNS_ANSWERS, TASK_COMM_LEN};
 
-use crate::{AF_INET, AF_INET6, fill_lineage};
+use crate::{AF_INET, AF_INET6, fill_lineage, into_ret};
 
 /// Ring buffer for DNS query events.
 #[map]
@@ -75,10 +75,7 @@ pub fn getaddrinfo_entry(ctx: ProbeContext) -> u32 {
 /// answer set on success.
 #[uretprobe]
 pub fn getaddrinfo_exit(ctx: RetProbeContext) -> u32 {
-    match try_getaddrinfo_exit(ctx) {
-        Ok(ret) => ret,
-        Err(ret) => ret,
-    }
+    into_ret(try_getaddrinfo_exit(ctx))
 }
 
 fn try_getaddrinfo_exit(ctx: RetProbeContext) -> Result<u32, u32> {

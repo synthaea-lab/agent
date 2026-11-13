@@ -9,7 +9,7 @@ use aya_ebpf::{
 use aya_log_ebpf::warn;
 use sensor_linux_wire::{FileOpenEvent, TASK_COMM_LEN, is_filtered_path};
 
-use crate::{fill_lineage, mount_signal::signal::is_agent_own_pid};
+use crate::{fill_lineage, into_ret, mount_signal::signal::is_agent_own_pid};
 
 /// Ring buffer shared with userspace for `open` events.
 #[map]
@@ -66,10 +66,7 @@ const OPEN_FILENAME_PTR_OFFSET: usize = 12;
 const OPEN_FLAGS_OFFSET: usize = 16;
 
 pub fn sys_enter_openat(ctx: TracePointContext) -> u32 {
-    match try_sys_enter_openat(ctx) {
-        Ok(ret) => ret,
-        Err(ret) => ret,
-    }
+    into_ret(try_sys_enter_openat(ctx))
 }
 
 fn try_sys_enter_openat(ctx: TracePointContext) -> Result<u32, u32> {
@@ -90,10 +87,7 @@ fn try_sys_enter_openat(ctx: TracePointContext) -> Result<u32, u32> {
 }
 
 pub fn sys_enter_open(ctx: TracePointContext) -> u32 {
-    match try_sys_enter_open(ctx) {
-        Ok(ret) => ret,
-        Err(ret) => ret,
-    }
+    into_ret(try_sys_enter_open(ctx))
 }
 
 fn try_sys_enter_open(ctx: TracePointContext) -> Result<u32, u32> {

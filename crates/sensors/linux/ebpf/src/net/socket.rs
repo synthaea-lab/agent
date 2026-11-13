@@ -16,7 +16,7 @@ use aya_ebpf::{
 use aya_log_ebpf::warn;
 use sensor_linux_wire::{SocketCreateEvent, TASK_COMM_LEN};
 
-use crate::{SYS_EXIT_RET_OFFSET, fill_lineage};
+use crate::{SYS_EXIT_RET_OFFSET, fill_lineage, into_ret};
 
 /// Ring buffer shared with userspace for `socket` events.
 #[map]
@@ -80,10 +80,7 @@ const SOCKET_TYPE_OFFSET: usize = 16;
 const SOCKET_PROTOCOL_OFFSET: usize = 20;
 
 pub fn sys_enter_socket(ctx: TracePointContext) -> u32 {
-    match try_sys_enter_socket(&ctx) {
-        Ok(ret) => ret,
-        Err(ret) => ret,
-    }
+    into_ret(try_sys_enter_socket(&ctx))
 }
 
 fn try_sys_enter_socket(ctx: &TracePointContext) -> Result<u32, u32> {
@@ -117,10 +114,7 @@ fn try_sys_enter_socket(ctx: &TracePointContext) -> Result<u32, u32> {
 }
 
 pub fn sys_exit_socket(ctx: TracePointContext) -> u32 {
-    match try_sys_exit_socket(ctx) {
-        Ok(ret) => ret,
-        Err(ret) => ret,
-    }
+    into_ret(try_sys_exit_socket(ctx))
 }
 
 fn try_sys_exit_socket(ctx: TracePointContext) -> Result<u32, u32> {

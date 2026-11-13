@@ -28,7 +28,7 @@ use sensor_linux_wire::{
     SET_TIME_TRUNCATED, TASK_COMM_LEN,
 };
 
-use crate::fill_lineage;
+use crate::{fill_lineage, into_ret};
 
 /// 1 when the offsets below were resolved. Patched by the loader.
 #[unsafe(no_mangle)]
@@ -71,10 +71,7 @@ fn read_timespec(base: *const u8, offset: u32) -> Option<(i64, i64)> {
 
 #[lsm(hook = "inode_setattr")]
 pub fn inode_setattr(ctx: LsmContext) -> i32 {
-    match try_inode_setattr(ctx) {
-        Ok(ret) => ret,
-        Err(ret) => ret,
-    }
+    into_ret(try_inode_setattr(ctx))
 }
 
 fn try_inode_setattr(ctx: LsmContext) -> Result<i32, i32> {

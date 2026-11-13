@@ -9,7 +9,7 @@ use aya_ebpf::{
 use aya_log_ebpf::warn;
 use sensor_linux_wire::{ProcessVmReadEvent, ProcessVmWriteEvent, TASK_COMM_LEN};
 
-use crate::fill_lineage;
+use crate::{fill_lineage, into_ret};
 
 /// Ring buffer shared with userspace for `process_vm_readv` events (issue #265).
 #[map]
@@ -77,10 +77,7 @@ fn read_first_iovec_len(iov_ptr: u64, count: u64) -> u64 {
 }
 
 pub fn sys_enter_process_vm_readv(ctx: TracePointContext) -> u32 {
-    match try_sys_enter_process_vm_readv(ctx) {
-        Ok(ret) => ret,
-        Err(ret) => ret,
-    }
+    into_ret(try_sys_enter_process_vm_readv(ctx))
 }
 
 fn try_sys_enter_process_vm_readv(ctx: TracePointContext) -> Result<u32, u32> {
@@ -155,10 +152,7 @@ fn try_sys_enter_process_vm_readv(ctx: TracePointContext) -> Result<u32, u32> {
 }
 
 pub fn sys_enter_process_vm_writev(ctx: TracePointContext) -> u32 {
-    match try_sys_enter_process_vm_writev(ctx) {
-        Ok(ret) => ret,
-        Err(ret) => ret,
-    }
+    into_ret(try_sys_enter_process_vm_writev(ctx))
 }
 
 fn try_sys_enter_process_vm_writev(ctx: TracePointContext) -> Result<u32, u32> {

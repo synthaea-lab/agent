@@ -9,7 +9,7 @@ use aya_ebpf::{
 use aya_log_ebpf::warn;
 use sensor_linux_wire::{FileRemovexattrEvent, FileSetxattrEvent, TASK_COMM_LEN, is_filtered_path};
 
-use crate::fill_lineage;
+use crate::{fill_lineage, into_ret};
 
 /// Ring buffer shared with userspace for `setxattr` events.
 #[map]
@@ -42,10 +42,7 @@ const SETXATTR_PATHNAME_PTR_OFFSET: usize = 12;
 const SETXATTR_NAME_PTR_OFFSET: usize = 16;
 
 pub fn sys_enter_setxattr(ctx: TracePointContext) -> u32 {
-    match try_sys_enter_setxattr(ctx) {
-        Ok(ret) => ret,
-        Err(ret) => ret,
-    }
+    into_ret(try_sys_enter_setxattr(ctx))
 }
 
 fn try_sys_enter_setxattr(ctx: TracePointContext) -> Result<u32, u32> {
@@ -131,10 +128,7 @@ const REMOVEXATTR_PATHNAME_PTR_OFFSET: usize = 12;
 const REMOVEXATTR_NAME_PTR_OFFSET: usize = 16;
 
 pub fn sys_enter_removexattr(ctx: TracePointContext) -> u32 {
-    match try_sys_enter_removexattr(ctx) {
-        Ok(ret) => ret,
-        Err(ret) => ret,
-    }
+    into_ret(try_sys_enter_removexattr(ctx))
 }
 
 fn try_sys_enter_removexattr(ctx: TracePointContext) -> Result<u32, u32> {

@@ -9,7 +9,7 @@ use aya_ebpf::{
 use aya_log_ebpf::{info, warn};
 use sensor_linux_wire::{ConnectEvent, TASK_COMM_LEN};
 
-use crate::{AF_INET, AF_INET6, fill_lineage};
+use crate::{AF_INET, AF_INET6, fill_lineage, into_ret};
 
 /// Ring buffer shared with userspace for `connect` events.
 #[map]
@@ -41,10 +41,7 @@ pub(crate) const CONNECT_FD_OFFSET: usize = 12;
 pub(crate) const CONNECT_USERVADDR_PTR_OFFSET: usize = 16;
 
 pub fn sys_enter_connect(ctx: TracePointContext) -> u32 {
-    match try_sys_enter_connect(ctx) {
-        Ok(ret) => ret,
-        Err(ret) => ret,
-    }
+    into_ret(try_sys_enter_connect(ctx))
 }
 
 fn try_sys_enter_connect(ctx: TracePointContext) -> Result<u32, u32> {
