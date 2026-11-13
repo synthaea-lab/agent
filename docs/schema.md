@@ -165,7 +165,8 @@ carries several fields with specific rules:
 which would drag platform differences into a crate that must compile everywhere.
 
 [`has_write_intent`](../crates/schema/src/lib.rs) is the only write-intent
-predicate in the workspace. It treats the access mode as a 2-bit field, as the
+predicate in the workspace outside the `no_std` eBPF filter, which keeps its own copy
+(`sensors/linux/wire/src/path_filter.rs`, it cannot depend on this crate). It treats the access mode as a 2-bit field, as the
 kernel does: `O_WRONLY` or `O_RDWR`, or `O_CREAT` or `O_TRUNC` with any mode
 (`O_RDONLY | O_TRUNC` empties the file on Linux,
 [#233](https://github.com/synthaea-lab/agent/issues/233)). `0o3` is not
