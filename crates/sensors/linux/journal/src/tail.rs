@@ -621,6 +621,57 @@ mod tests {
         assert!(it.next().is_none());
     }
 
+    #[test]
+    fn a_held_pam_sss_failure_comes_out_before_the_unrelated_record_that_follows_it() {
+        let input = [
+            r#"{"__CURSOR":"c1","__REALTIME_TIMESTAMP":"1","SYSLOG_IDENTIFIER":"sudo","_PID":"100","MESSAGE":"pam_sss(sudo:auth): authentication failure; logname=omss uid=1000 euid=0 tty=/dev/pts/2 ruser=omss rhost=  user=omss"}"#,
+            r#"{"__CURSOR":"c2","__REALTIME_TIMESTAMP":"2","_PID":"1","JOB_TYPE":"stop","JOB_RESULT":"done","UNIT":"x.service","MESSAGE":"Stopped x.service."}"#,
+        ]
+        .join("
+");
+
+        let mut it = ClassifiedJournal::new(Cursor::new(input));
+        let (first, first_event) = it.next().unwrap().unwrap();
+        assert_eq!(first.cursor, "c1");
+        assert!(matches!(first_event, JournalEvent::PamAuthFailure { .. }));
+        let (second, second_event) = it.next().unwrap().unwrap();
+        assert_eq!(second.cursor, "c2");
+        assert!(matches!(second_event, JournalEvent::UnitStopped { .. }));
+        assert!(it.next().is_none());
+    }
+
+    #[test]
+    fn two_pam_sss_failures_in_a_row_both_stand_and_keep_their_order() {
+        let input = [
+            r#"{"__CURSOR":"c1","__REALTIME_TIMESTAMP":"1","SYSLOG_IDENTIFIER":"sudo","_PID":"100","MESSAGE":"pam_sss(sudo:auth): authentication failure; logname=omss uid=1000 euid=0 tty=/dev/pts/2 ruser=omss rhost=  user=omss"}"#,
+            r#"{"__CURSOR":"c2","__REALTIME_TIMESTAMP":"9000000","SYSLOG_IDENTIFIER":"sudo","_PID":"101","MESSAGE":"pam_sss(sudo:auth): authentication failure; logname=lab uid=1001 euid=0 tty=/dev/pts/3 ruser=lab rhost=  user=lab"}"#,
+        ]
+        .join("
+");
+
+        let mut it = ClassifiedJournal::new(Cursor::new(input));
+        let cursors: Vec<_> = it.by_ref().map(|item| item.unwrap().0.cursor).collect();
+        assert_eq!(cursors, ["c1", "c2"]);
+    }
+
+    #[test]
+    fn a_pam_sss_failure_still_pending_at_the_end_is_deduplicated_like_any_other() {
+        let input = [
+            r#"{"__CURSOR":"c1","__REALTIME_TIMESTAMP":"1000000","SYSLOG_IDENTIFIER":"sudo","_PID":"100","MESSAGE":"pam_unix(sudo:auth): authentication failure; logname=omss uid=1000 euid=0 tty=/dev/pts/2 ruser=omss rhost=  user=omss"}"#,
+            r#"{"__CURSOR":"c2","__REALTIME_TIMESTAMP":"1500000","SYSLOG_IDENTIFIER":"sudo","_PID":"100","MESSAGE":"pam_sss(sudo:auth): authentication failure; logname=omss uid=1000 euid=0 tty=/dev/pts/2 ruser=omss rhost=  user=omss"}"#,
+        ]
+        .join("
+");
+
+        let mut it = ClassifiedJournal::new(Cursor::new(input));
+        let cursors: Vec<_> = it.by_ref().map(|item| item.unwrap().0.cursor).collect();
+        assert_eq!(
+            cursors,
+            ["c1"],
+            "the held pam_sss line is the double-log of c1, flushed at the end of the stream"
+        );
+    }
+
     // --- double-logged PamAuthFailure dedup (#881 review) -----------------------
 
     #[test]
