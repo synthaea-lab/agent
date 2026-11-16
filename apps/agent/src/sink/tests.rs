@@ -1663,8 +1663,13 @@ fn enable_response_refuses_a_crossing_of_the_agents_real_pid() {
     let own = std::process::id();
     drive_bayes_crossing(&sink, own);
     let alerts = alerts_in(&dir);
+    // The own-pid reason, not just the shared prefix: the service-main and login-session
+    // shields write `refused to kill pid ...` too.
     assert!(
-        alerts.contains(&format!("refused to kill pid {own}")),
+        alerts.lines().any(|line| {
+            line.contains(&format!("refused to kill pid {own} on "))
+                && line.contains(": the agent's own pid")
+        }),
         "{alerts}"
     );
     assert!(killed.lock().unwrap().is_empty(), "{alerts}");
