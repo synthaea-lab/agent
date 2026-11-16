@@ -490,8 +490,7 @@ mod tests {
             r#"{"__CURSOR":"c1","__REALTIME_TIMESTAMP":"1","SYSLOG_IDENTIFIER":"sudo","_PID":"100","MESSAGE":"pam_sss(sudo:auth): authentication failure; logname=omss uid=1000 euid=0 tty=/dev/pts/2 ruser=omss rhost=  user=omss"}"#,
             r#"{"__CURSOR":"c2","__REALTIME_TIMESTAMP":"2","_PID":"1","JOB_TYPE":"stop","JOB_RESULT":"done","UNIT":"x.service","MESSAGE":"Stopped x.service."}"#,
         ]
-        .join("
-");
+        .join("\n");
 
         let mut it = ClassifiedJournal::new(Cursor::new(input));
         let (first, first_event) = it.next().unwrap().unwrap();
@@ -509,8 +508,7 @@ mod tests {
             r#"{"__CURSOR":"c1","__REALTIME_TIMESTAMP":"1","SYSLOG_IDENTIFIER":"sudo","_PID":"100","MESSAGE":"pam_sss(sudo:auth): authentication failure; logname=omss uid=1000 euid=0 tty=/dev/pts/2 ruser=omss rhost=  user=omss"}"#,
             r#"{"__CURSOR":"c2","__REALTIME_TIMESTAMP":"9000000","SYSLOG_IDENTIFIER":"sudo","_PID":"101","MESSAGE":"pam_sss(sudo:auth): authentication failure; logname=lab uid=1001 euid=0 tty=/dev/pts/3 ruser=lab rhost=  user=lab"}"#,
         ]
-        .join("
-");
+        .join("\n");
 
         let mut it = ClassifiedJournal::new(Cursor::new(input));
         let cursors: Vec<_> = it.by_ref().map(|item| item.unwrap().0.cursor).collect();
@@ -523,8 +521,7 @@ mod tests {
             r#"{"__CURSOR":"c1","__REALTIME_TIMESTAMP":"1000000","SYSLOG_IDENTIFIER":"sudo","_PID":"100","MESSAGE":"pam_unix(sudo:auth): authentication failure; logname=omss uid=1000 euid=0 tty=/dev/pts/2 ruser=omss rhost=  user=omss"}"#,
             r#"{"__CURSOR":"c2","__REALTIME_TIMESTAMP":"1500000","SYSLOG_IDENTIFIER":"sudo","_PID":"100","MESSAGE":"pam_sss(sudo:auth): authentication failure; logname=omss uid=1000 euid=0 tty=/dev/pts/2 ruser=omss rhost=  user=omss"}"#,
         ]
-        .join("
-");
+        .join("\n");
 
         let mut it = ClassifiedJournal::new(Cursor::new(input));
         let cursors: Vec<_> = it.by_ref().map(|item| item.unwrap().0.cursor).collect();
