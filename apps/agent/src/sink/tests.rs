@@ -454,6 +454,7 @@ fn quarantine_fixture(
         },
         terminate: Box::new(|_| panic!("quarantine never terminates")),
         quarantine_dir: dir.join("quarantine"),
+        own_pid: std::process::id(),
     };
     let log = crate::alerts::AlertLog::open(&dir.join("alerts.ndjson"), 8).unwrap();
     (
@@ -1596,10 +1597,17 @@ fn enable_response_twice_keeps_the_first_policy() {
     );
 }
 
+/// The pid the recording kill hook treats as the agent's own. Above Linux's `pid_max` (2^22) and
+/// below `i32::MAX`, so no test pid and no real process of the runner can equal it. The test
+/// process's real pid is arbitrary: with the real one, a test whose victim pid happened to be it
+/// was refused and recorded nothing (agent#247).
+const TEST_AGENT_PID: u32 = 2_000_000_000;
+
 fn enable_recording_kill(sink: &DetectionSink, dir: &std::path::Path) -> Arc<Mutex<Vec<u32>>> {
     let killed = Arc::new(Mutex::new(Vec::new()));
     let killed_rec = Arc::clone(&killed);
-    sink.enable_response(
+    sink.enable_response_as_pid(
+        TEST_AGENT_PID,
         policy::ResponsePolicy {
             kill_enabled: true,
             quarantine_enabled: false,
@@ -1612,6 +1620,22 @@ fn enable_recording_kill(sink: &DetectionSink, dir: &std::path::Path) -> Arc<Mut
         dir.join("quarantine"),
     );
     killed
+}
+
+/// The gate still refuses the agent's own pid: a Bayesian crossing of that pid is reported
+/// as refused and `terminate` never runs.
+#[test]
+fn a_crossing_of_the_agents_own_pid_is_refused_not_killed() {
+    let dir = tmp("bayes-own-pid");
+    let sink = sink_in(&dir);
+    let killed = enable_recording_kill(&sink, &dir);
+    drive_bayes_crossing(&sink, TEST_AGENT_PID);
+    let alerts = alerts_in(&dir);
+    assert!(
+        alerts.contains(&format!("refused to kill pid {TEST_AGENT_PID}")),
+        "{alerts}"
+    );
+    assert!(killed.lock().unwrap().is_empty(), "{alerts}");
 }
 
 /// Issue #652: `NetworkManager` crossed `BAYES` on a stock Fedora host with no rule or

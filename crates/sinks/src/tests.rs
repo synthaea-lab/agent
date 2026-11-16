@@ -129,3 +129,60 @@ fn torn_tail_is_repaired_on_reopen() {
     assert!(serde_json::from_str::<serde_json::Value>(lines[1]).is_ok());
     std::fs::remove_file(&path).ok();
 }
+
+fn temp_path(name: &str) -> std::path::PathBuf {
+    std::env::temp_dir().join(format!("sinks-{name}-{}.ndjson", std::process::id()))
+}
+
+/// A value `serde_json` refuses: a map whose keys are not strings.
+fn unserializable() -> std::collections::BTreeMap<(u8, u8), u8> {
+    std::collections::BTreeMap::from([((1, 2), 3)])
+}
+
+#[test]
+fn a_new_writer_has_dropped_nothing() {
+    let path = temp_path("fresh");
+    let w = JsonlWriter::open(&path).unwrap();
+    w.write(&serde_json::json!({"ok": 1}));
+    assert_eq!(w.dropped(), 0);
+    std::fs::remove_file(&path).ok();
+}
+
+#[test]
+fn a_value_that_cannot_be_serialized_is_counted_as_dropped() {
+    let path = temp_path("unserializable");
+    let w = JsonlWriter::open(&path).unwrap();
+    w.write(&unserializable());
+    assert_eq!(w.dropped(), 1);
+    assert!(read_lines(&path).is_empty(), "nothing reaches the file");
+    std::fs::remove_file(&path).ok();
+}
+
+#[test]
+fn a_line_the_file_refuses_is_counted_as_dropped() {
+    // A read-only handle stands in for a full disk: every write to it fails.
+    let path = temp_path("refused");
+    std::fs::write(&path, b"").unwrap();
+    let w = JsonlWriter::from_file(std::fs::File::open(&path).unwrap());
+    w.write(&serde_json::json!({"lost": 1}));
+    w.write(&serde_json::json!({"lost": 2}));
+    assert_eq!(w.dropped(), 2);
+    std::fs::remove_file(&path).ok();
+}
+
+#[test]
+fn a_writer_whose_lock_was_poisoned_still_writes() {
+    let path = temp_path("poisoned");
+    let w = std::sync::Arc::new(JsonlWriter::open(&path).unwrap());
+    let poisoner = std::sync::Arc::clone(&w);
+    std::thread::spawn(move || {
+        let _guard = poisoner.inner.lock().unwrap();
+        panic!("poison the writer's lock");
+    })
+    .join()
+    .unwrap_err();
+    w.write(&serde_json::json!({"after": "poison"}));
+    assert_eq!(w.dropped(), 0);
+    assert_eq!(read_lines(&path), [r#"{"after":"poison"}"#]);
+    std::fs::remove_file(&path).ok();
+}
