@@ -426,15 +426,16 @@ fn cgroup_unit_and_file(path: &str) -> Option<(&str, &str)> {
 /// the tool with no signal the probe reports (<https://github.com/synthaea-lab/agent/issues/49>).
 ///
 /// The Linux open probe passes a write-intent open of such a file under `/sys/`
-/// (`is_cgroup_limit_write` in `sensor-linux-wire`: a tail match with no `/sys/fs/cgroup/` prefix test,
-/// a little wider than this list,
-/// since the probe cannot know the listed units); the filter is unit-tested and was run on Fedora
-/// 43 (kernel 7.2.9) and Rocky 9.8 (5.14). A relative path that still holds the unit segment, or one written `//sys/...`, also reaches the rule
-/// ([`cgroup_unit_and_file`]); a bare file name after a `cd` into the unit's cgroup names no unit and
-/// is not read (the event carries no working directory; lab-run on both kernels, pinned by
-/// `a_bare_file_name_and_other_relative_paths_stay_silent`). The rule fires for any source that reports such an open. Pid 1 is skipped: the manager writes these files when
-/// it starts a unit that has a configured limit, and when it carries out `systemctl
-/// set-property` and `freeze`, which `check_security_tool_throttle` reads from the exec.
+/// (`is_cgroup_limit_write` in `sensor-linux-wire`: a tail match with no `/sys/fs/cgroup/`
+/// prefix test, a little wider than this list, since the probe cannot know the listed units);
+/// the filter is unit-tested and was run on Fedora 43 (kernel 7.2.9) and Rocky 9.8 (5.14). A
+/// relative path that still holds the unit segment, or one written `//sys/...`, also reaches the
+/// rule ([`cgroup_unit_and_file`]); a bare file name after a `cd` into the unit's cgroup names no
+/// unit and is not read (the event carries no working directory; lab-run on both kernels, pinned
+/// by `a_bare_file_name_and_other_relative_paths_stay_silent`). The rule fires for any source
+/// that reports such an open. Pid 1 is skipped: the manager writes these files when it starts a
+/// unit that has a configured limit, and when it carries out `systemctl set-property` and
+/// `freeze`, which `check_security_tool_throttle` reads from the exec.
 /// Medium.
 #[must_use]
 pub(crate) fn check_security_tool_cgroup_write(event: &FileOpenEvent) -> Option<Alert> {

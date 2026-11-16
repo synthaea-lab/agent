@@ -435,13 +435,19 @@ They must fail closed when the target is wrong.
   OOM victim, which is not built. Not verified: whether such a probe is usable on every supported
   kernel. A command line the rules cannot read (an option cluster such as `prlimit -tp`, an empty
   argv) and a limit set by a means no rule reads (a process that writes the file through a path
-  the rule cannot map to a unit, an unlisted tool) are not seen either. The path case includes a
+  the rule cannot map to a unit, or a binary that calls `prlimit64(2)` / `setrlimit` directly: there is no
+  `prlimit64` tracepoint) are not seen either. The path case includes a
   bare file name after a `cd` into the unit's cgroup (`cd <cgroup> && echo 1 > cgroup.freeze`): the
   open reaches the event stream but carries no unit, and the event has no working directory
   (lab-run on kernels 5.14 and 7.2). These limits stay documented rather than built away: closing
   the path case means capturing the working directory or the resolved path in the probe, a
-  schema and verifier change for a tripwire that reads how a limit is set, not a barrier; the
-  OOM kill has no sender to attribute, and a probe on its victim is unverified across the
+  wire-format and verifier change (a field in `sensor-linux-wire`'s `FileOpenEvent`, so a
+  `WIRE_VERSION` bump) for a tripwire that reads how a limit is set, not a barrier. A userspace
+  fallback that reads `/proc/<pid>/cwd` on the drain task, as `resolve_dirfd_path` does for
+  relative rename paths, was rejected: the open event has no `dfd`, so an `openat` relative to a
+  directory fd would resolve against the cwd into a wrong absolute path, which is worse than a
+  relative one by that function's own rule, and a short-lived `sh` exits before the readlink. The
+  kernel's own kill (OOM or CPU rlimit) has no sender to attribute, and a probe on its victim is unverified across the
   supported kernels. A lab capture that shows either is usable on all supported kernels is the
   reason to reopen them.
 - **Local-only deployments** have no server-side silence detection, and their evidence
