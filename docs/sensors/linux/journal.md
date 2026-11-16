@@ -73,8 +73,9 @@ journald stamps itself:
 
 ## PAM failure deduplication
 
-[`ClassifiedJournal`](../../../crates/sensors/linux/journal/src/tail.rs) adjusts two PAM cases
-before yielding:
+[`PamFailureFilter`](../../../crates/sensors/linux/journal/src/pam_filter.rs) sits between
+[`ClassifiedJournal`](../../../crates/sensors/linux/journal/src/tail.rs)'s classification and its
+caller, and adjusts two PAM cases before yielding:
 
 - A `pam_sss` failure is held for one more line in case the next line says the user is unknown to
   sssd (then it is not a real failure). A held failure still pending at end of stream is flushed.

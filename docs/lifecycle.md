@@ -113,7 +113,8 @@ With a control plane configured, [`upload::start`](../apps/agent/src/upload.rs) 
 | Enrichment queue, events | 4096 items | The event is dropped from enrichment, logging and upload, and `enrich_dropped` is incremented in the health beacon. A gated alert riding with it is handed back and raised **unverified** on the capture thread. Capture never blocks. |
 | Enrichment queue, detections | Same channel | The capture thread appends to the detection spool itself and logs a warning. A finding is never dropped. Under sustained overload this puts file I/O on the capture thread, by design. |
 | Event / detection spool | `storage.spool_max_mb` each | The oldest segments are dropped and counted. |
-| Alert recent buffer | 256 alerts | The oldest is dropped from the buffer. `alerts.ndjson` still has every alert. |
+| Alert recent buffer | 256 alerts | The oldest is dropped from the buffer. `alerts.ndjson` still has every alert it could write. |
+| `alerts.ndjson` | The disk | An alert the file refuses (a full disk) is not retried and does not stop the agent. It still reaches stderr and the recent buffer, and `alerts_dropped` is incremented in the health beacon. |
 | Verdict evidence | Bounded per entity in `verdict` | Duplicates within 30 s are absorbed, but still logged. |
 | YARA file and memory scans | Budgeted queues in `yara` | Requests are shed and counted. |
 

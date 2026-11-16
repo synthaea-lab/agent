@@ -42,13 +42,21 @@ pub fn disposition_to_flags(disposition: u32) -> u32 {
 /// guessed `C:` for every volume; a second disk or mounted VHDX — a common
 /// payload-staging spot — produced wrong paths). Longest-prefix match; unknown
 /// devices keep the raw path (honest, greppable) rather than a fabricated drive.
+///
+/// The device must end at a path component: a prefix matches only when the path
+/// ends there or the next character is `\`, as the minifilter's normalizer checks
+/// (#257). Otherwise `\Device\HarddiskVolume10\...` would match a `\Device\HarddiskVolume1`
+/// entry with no `...Volume10` entry and yield `C:0\...`, a wrong path that rules and
+/// exclusions would then judge.
 #[must_use]
 pub fn normalize_nt_path(path: &str, volume_map: &HashMap<String, String>) -> String {
     let mut best: Option<(&str, &str, &str)> = None;
     for (device, drive) in volume_map {
-        if let Some(rest) = strip_prefix_ignore_ascii_case(path, device)
-            && best.is_none_or(|(longest, _, _)| device.len() > longest.len())
-        {
+        let Some(rest) = strip_prefix_ignore_ascii_case(path, device) else {
+            continue;
+        };
+        let on_boundary = rest.is_empty() || rest.starts_with('\\');
+        if on_boundary && best.is_none_or(|(longest, _, _)| device.len() > longest.len()) {
             best = Some((device.as_str(), drive.as_str(), rest));
         }
     }
@@ -617,6 +625,24 @@ mod tests {
         assert_eq!(
             normalize_nt_path(r"\Device\Mup\share\x", &map),
             r"\Device\Mup\share\x"
+        );
+    }
+
+    #[test]
+    fn a_device_prefix_matches_only_at_a_path_component_boundary() {
+        let mut map = HashMap::new();
+        map.insert(r"\Device\HarddiskVolume1".to_string(), "C:".to_string());
+        // HarddiskVolume10 has no drive letter (a mounted VHDX, a recovery partition).
+        // It must not borrow HarddiskVolume1's.
+        assert_eq!(
+            normalize_nt_path(r"\Device\HarddiskVolume10\staging\payload.exe", &map),
+            r"\Device\HarddiskVolume10\staging\payload.exe"
+        );
+        // The exact volume, and a deeper path on it, still normalize.
+        assert_eq!(normalize_nt_path(r"\Device\HarddiskVolume1", &map), "C:");
+        assert_eq!(
+            normalize_nt_path(r"\Device\HarddiskVolume1\Windows\notepad.exe", &map),
+            r"C:\Windows\notepad.exe"
         );
     }
 
