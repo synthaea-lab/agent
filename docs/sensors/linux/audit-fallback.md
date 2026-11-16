@@ -48,8 +48,12 @@ leaves no record with `kill`, `tkill`, `tgkill` or `pidfd_send_signal`, and its 
 **Limits.** No rule, no attribution. Needs `/var/log/audit/audit.log` readable by the agent (root) and auditd writing
 to it (`write_logs = yes`, `log_format = ENRICHED` or `RAW`; the key is read from the kernel part of the line). The
 agent killed by SIGKILL and not restarted within 10 minutes is not reported. The volume of SIGKILL records on a real
-host is not measured. Tested on the captured line and on files; **not run end to end** (an agent without eBPF killed
-and restarted on a lab VM with the rule loaded).
+host is not measured. Tested on the captured line and on files, and run end to end on Rocky 9.8 (2026-11-16, agent built without
+eBPF probes, rule loaded, agent started as a systemd unit, killed, restarted on the same state directory): the restarted agent
+logged `the previous agent instance was sent SIGKILL, reporting it` and raised T1562.001 with the sender's pid and `comm`
+for `kill -KILL` from bash (`comm=bash`) and for `/usr/bin/kill` (`comm=kill`); after `systemctl kill -s KILL` it reported
+nothing (no record, as captured); after a clean stop and restart it reported nothing. Not run: other kernels, aarch64,
+an agent that is not root, the volume of SIGKILL records.
 
 Netlink multicast delivers one copy of each record to every subscribed socket, so `AvcReader` and
 `AuditSensor` do not steal records from each other or from `auditd`.
