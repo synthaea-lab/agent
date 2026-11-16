@@ -58,9 +58,7 @@ enum QueueItem {
     // signature it waits for (#441).
     Event(Box<Event>, Option<SignatureGatedAlert>),
     Detection(Box<Detection>),
-    // Only `kill_loudness` (Linux-gated) flushes today — the shutdown path on
-    // the other platforms doesn't exist yet, not a reason to lose the variant.
-    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    // Flushed by `kill_loudness` (Linux) and by `finish_run` on every platform (#147).
     Flush(mpsc::Sender<()>),
 }
 
@@ -204,7 +202,6 @@ impl EnrichQueue {
     /// or the worker didn't reach it in time) or if the worker thread is gone —
     /// the caller's own bounded budget is what actually protects it against this
     /// never resolving, not this function's internals.
-    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     pub(crate) fn flush(&self, timeout: Duration) -> bool {
         let deadline = Instant::now() + timeout;
         let (done_tx, done_rx) = mpsc::channel();

@@ -385,6 +385,31 @@ mod tests {
 
     use super::*;
 
+    /// #147: Windows and macOS never shut the uploaders down because they never registered them.
+    /// Both upload threads must be in the plan, and stopping the plan must join them.
+    #[test]
+    fn register_shutdown_registers_both_upload_threads_and_the_plan_joins_them() {
+        let dir = tempfile::tempdir().unwrap();
+        let handle = start(
+            &ControlPlane {
+                // Nothing listens: the loops only idle until they are told to stop.
+                url: "http://127.0.0.1:9",
+                ca_cert: None,
+                client_cert: None,
+                offline_fallback: true,
+            },
+            &dir.path().join("alerts.ndjson"),
+            1 << 20,
+        )
+        .unwrap();
+        let mut plan = ShutdownPlan::default();
+        handle.register_shutdown(&mut plan);
+
+        assert_eq!(plan.names(), ["transport-upload", "detection-upload"]);
+        let stragglers = plan.execute(std::time::Duration::from_secs(5));
+        assert!(stragglers.is_empty(), "{stragglers:?}");
+    }
+
     #[test]
     fn the_ca_and_the_client_certificate_reach_the_transport_config() {
         let ca = Path::new("/etc/synthaea/certs/ca.pem");

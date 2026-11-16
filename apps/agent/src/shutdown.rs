@@ -84,6 +84,12 @@ impl ShutdownPlan {
         });
     }
 
+    /// The registered workers' names, in registration order.
+    #[cfg(test)]
+    pub fn names(&self) -> Vec<&'static str> {
+        self.workers.iter().map(|w| w.name).collect()
+    }
+
     /// Signals every worker first (so they wind down in parallel, not one
     /// after another), then joins each within `budget` overall. Returns the
     /// names of the workers that were still running at the deadline.

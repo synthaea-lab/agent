@@ -357,16 +357,23 @@ const ENRICH_FLUSH_BOUND: std::time::Duration = std::time::Duration::from_secs(1
 /// Whatever is still spooled afterwards is redelivered on the next start (at-least-once).
 /// Returns the names of the workers that missed the deadline.
 pub(crate) fn finish_run(sink: &DetectionSink, shutdown: ShutdownPlan) -> Vec<&'static str> {
-    finish_run_within(sink, shutdown, SHUTDOWN_BUDGET)
+    finish_run_within(
+        || sink.enrich_queue().flush(ENRICH_FLUSH_BOUND),
+        shutdown,
+        SHUTDOWN_BUDGET,
+    )
 }
 
-/// [`finish_run`] with an explicit budget, so a test does not wait the production 6 s.
+/// [`finish_run`] with the flush and the budget given, so a test can hold the enrichment
+/// worker and does not wait the production 6 s. `flush` returns whether the queue emptied.
+/// The order is the point: the flush runs first, so the uploaders' last drain sees what it put
+/// in the spool.
 fn finish_run_within(
-    sink: &DetectionSink,
+    flush: impl FnOnce() -> bool,
     shutdown: ShutdownPlan,
     budget: std::time::Duration,
 ) -> Vec<&'static str> {
-    if !sink.enrich_queue().flush(ENRICH_FLUSH_BOUND) {
+    if !flush() {
         tracing::warn!("pending detection/event queue did not flush before shutdown");
     }
     let stragglers = shutdown.execute(budget);
@@ -520,7 +527,6 @@ mod tests {
     fn finish_run_names_a_stuck_worker_and_returns_within_the_budget() {
         use std::sync::atomic::{AtomicBool, Ordering};
 
-        let (sink, dir) = finish_run_sink("finish-stuck");
         let release = Arc::new(AtomicBool::new(false));
         let held = Arc::clone(&release);
         let handle = std::thread::spawn(move || {
@@ -533,17 +539,66 @@ mod tests {
 
         let budget = std::time::Duration::from_millis(300);
         let started = std::time::Instant::now();
-        let stragglers = finish_run_within(&sink, plan, budget);
+        let stragglers = finish_run_within(|| true, plan, budget);
         let took = started.elapsed();
         release.store(true, Ordering::SeqCst);
 
         assert_eq!(stragglers, ["stuck"]);
-        // Flush bound (1 s, only if the queue is stalled) is not part of this: the queue is empty.
-        assert!(
-            took < budget + std::time::Duration::from_secs(1),
-            "{took:?}"
+        assert!(took < budget * 3, "{took:?}");
+    }
+
+    /// #147: the queue must be empty when the uploaders are told to stop, or their last drain
+    /// misses the findings still in it. The detection's callback is slow, so a flush that ran
+    /// after the signal (or not at all) would see it undelivered.
+    #[test]
+    fn finish_run_empties_the_enrich_queue_before_it_signals_the_uploaders() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let delivered = Arc::new(AtomicUsize::new(0));
+        let on_detection = Arc::clone(&delivered);
+        let queue = crate::enrich_queue::EnrichQueue::start_with_detections(
+            enrich::Enricher::new(),
+            |_, _| {},
+            move |_| {
+                std::thread::sleep(std::time::Duration::from_millis(300));
+                on_detection.fetch_add(1, Ordering::SeqCst);
+            },
         );
-        drop(sink);
-        let _ = std::fs::remove_dir_all(&dir);
+        queue
+            .enqueue_detection(schema::detection::Detection {
+                timestamp_ns: 1,
+                severity: schema::detection::Severity::High,
+                title: "queued before the stop".into(),
+                source: schema::detection::DetectionSource::Rule {
+                    rule_id: "T1059".into(),
+                },
+                score: None,
+                attributions: Vec::new(),
+                techniques: Vec::new(),
+                events: Vec::new(),
+            })
+            .unwrap();
+
+        let seen_at_stop = Arc::new(AtomicUsize::new(usize::MAX));
+        let (observed, signalled) = (Arc::clone(&seen_at_stop), Arc::clone(&delivered));
+        let mut plan = ShutdownPlan::default();
+        plan.register(
+            "uploader",
+            move || observed.store(signalled.load(Ordering::SeqCst), Ordering::SeqCst),
+            std::thread::spawn(|| {}),
+        );
+
+        let stragglers = finish_run_within(
+            || queue.flush(ENRICH_FLUSH_BOUND),
+            plan,
+            std::time::Duration::from_secs(1),
+        );
+
+        assert!(stragglers.is_empty(), "{stragglers:?}");
+        assert_eq!(
+            seen_at_stop.load(Ordering::SeqCst),
+            1,
+            "the uploaders were told to stop before the queued finding was delivered"
+        );
     }
 }
