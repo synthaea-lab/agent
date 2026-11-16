@@ -245,8 +245,10 @@ same signature gate applies.
 - An empty or absent `executable_path` (the sensor lost the `/proc/<pid>/exe` race) is read from the
   lineage, in this order: the image of the exec the agent recorded for the renaming pid, if its
   incarnation stamp matches; otherwise the image recorded for the parent, if the parent's stamp matches
-  (a process forked without an exec, such as a Chromium zygote child). A pid the agent never saw exec,
-  with no known parent, marks nothing. A resolved image always wins, even when it is not a browser, and
+  (a process forked without an exec, such as a Chromium zygote child). A process already running when the
+  agent started has no exec event: `seed_from_proc` records its `/proc/<pid>/exe` at start-up (a link the
+  agent cannot read, or one ending in ` (deleted)` because the file was replaced, is left out). A pid with
+  no recorded image and no known parent marks nothing. A resolved image always wins, even when it is not a browser, and
   the pid's own non-browser exec wins over a browser parent (a helper such as `cp` run from the browser
   marks nothing). Unit-tested only: no lab run, and no capture shows the sensor losing the race on a
   browser rename. What is still unchecked is listed under

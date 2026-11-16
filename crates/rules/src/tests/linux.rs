@@ -674,6 +674,22 @@ fn seed_from_proc_finds_own_pid_comm() {
 }
 
 #[test]
+#[cfg(target_os = "linux")]
+fn seed_from_proc_finds_own_pid_image_path() {
+    let mut state = RuleState::new();
+    state.seed_from_proc();
+    let own_pid = std::process::id();
+    let expected = std::fs::read_link("/proc/self/exe").unwrap();
+    assert_eq!(
+        state
+            .pid_image_path
+            .peek(&own_pid)
+            .map(|f| f.value.as_str()),
+        Some(expected.to_string_lossy().as_ref())
+    );
+}
+
+#[test]
 fn shell_spawned_by_unrelated_parent_does_not_match_lineage() {
     let mut state = RuleState::new();
     state.on_exec(&exec_event_full(100, 1, "bash", "bash", 0));

@@ -100,8 +100,9 @@ pub struct RuleState {
     /// exclusions: `FileRenameEvent::executable_path` is read from `/proc/<pid>/exe`
     /// after the event crossed the ring buffer, so a short-lived process (real
     /// `sed -i.bak`, or an encryptor that exits right after its renames) is already
-    /// gone and it reads `None` (#513 review). LRU-bounded like `pid_comm`.
-    pid_image_path: BoundedMap<u32, PidFact>,
+    /// gone and it reads `None` (#513 review). LRU-bounded like `pid_comm`. `pub(crate)` for the
+    /// `seed_from_proc` test.
+    pub(crate) pid_image_path: BoundedMap<u32, PidFact>,
     /// SETUID-ROOT-REQUEST's queued requests, stream clock and exec history: see
     /// [`IdentityRequests`].
     identity: IdentityRequests,
@@ -276,8 +277,8 @@ impl RuleState {
         );
     }
 
-    /// Pre-fills `pid_comm` with the processes already running at startup (read from
-    /// `/proc`). Without this, only processes exec'd *after* the collector attaches are
+    /// Pre-fills `pid_comm`, and `pid_image_path` where `/proc/<pid>/exe` is readable, with the
+    /// processes already running at startup (read from `/proc`). Without this, only processes exec'd *after* the collector attaches are
     /// known — T1059 can then never resolve the comm of a web server started before the
     /// agent (the normal case: nginx/apache launched by systemd at boot, agent launched
     /// afterwards), blinding the rule to any service already in place. Found in real
@@ -299,6 +300,17 @@ impl RuleState {
             };
             self.pid_comm
                 .insert(pid, PidFact::seeded(comm.trim_end().to_string()));
+            // The image path too (#17): a browser started before the agent has no exec event, so
+            // its download's rename would find no image to join on. A link the agent cannot read
+            // (another user's process without root), a kernel thread (no link) and an image
+            // replaced since it started (`/proc/<pid>/exe` ends in " (deleted)": the path is no
+            // longer a file) are left unseeded, as they were.
+            if let Ok(exe) = std::fs::read_link(entry.path().join("exe")) {
+                let exe = exe.to_string_lossy().into_owned();
+                if !exe.is_empty() && !exe.ends_with(" (deleted)") {
+                    self.pid_image_path.insert(pid, PidFact::seeded(exe));
+                }
+            }
         }
     }
 
