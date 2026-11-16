@@ -588,9 +588,8 @@ impl DetectionSink {
         self.record_rule_alerts(wrapped, rules::evaluate_exec(event));
         self.rule_alerts(wrapped, |state| state.on_exec(event));
         // This exec moved the stream clock: identity requests waiting for it may be due (#1041).
-        self.record_due_identity_alerts(
-            self.rule_state.lock_recovering().take_due_identity_alerts(),
-        );
+        let due = self.rule_state.lock_recovering().take_due_identity_alerts();
+        self.record_due_identity_alerts(due);
         self.record_due_unit_stops();
         let sigma_guard = self.sigma.lock_recovering();
         if let Some(sigma) = sigma_guard.as_ref() {
