@@ -211,7 +211,7 @@ fn every_firefox_layout_is_marked_by_shape() {
     for image in [
         // a Mozilla tarball unpacked anywhere (captured: the process is firefox-bin)
         "/home/u/esr/x/firefox/firefox-bin",
-        // the Snap, a revision in the path (read in the snap launcher, never run)
+        // the Snap, a revision in the path (captured 2026-11-16 on Ubuntu 26.04.1: rev 9181, X11 and Wayland)
         "/snap/firefox/1234/usr/lib/firefox/firefox",
         // Debian's firefox-esr package (captured on Debian 13)
         "/usr/lib/firefox-esr/firefox-esr",
@@ -371,4 +371,99 @@ fn a_resolved_non_browser_image_is_not_overridden_by_the_lineage() {
     let mut event = lost_rename(900, Some(7), 1, None);
     event.executable_path = Some("/usr/bin/mv".into());
     assert!(!marked_by_lineage(&mut state, &event));
+}
+
+#[test]
+fn the_chromium_snap_is_marked() {
+    // Captured 2026-11-16 on Ubuntu 26.04.1 (Chromium 157, rev 3593), X11 and Wayland, #267.
+    assert!(marked(Some(
+        "/snap/chromium/3593/usr/lib/chromium-browser/chrome"
+    )));
+    assert!(marked(Some(
+        "/snap/chromium/1/usr/lib/chromium-browser/chrome"
+    )));
+}
+
+#[test]
+fn a_path_that_only_looks_like_the_chromium_snap_is_not_marked() {
+    for image in [
+        // not a revision number
+        "/snap/chromium/current/usr/lib/chromium-browser/chrome",
+        "/snap/chromium/x3593/usr/lib/chromium-browser/chrome",
+        "/snap/chromium//usr/lib/chromium-browser/chrome",
+        // another snap, or another layout under the same snap
+        "/snap/other/3593/usr/lib/chromium-browser/chrome",
+        "/snap/chromium/3593/usr/lib/chromium-browser/chromium-browser",
+        "/snap/chromium/3593/usr/lib/chromium-browser/chrome-sandbox",
+        "/snap/chromium/3593/usr/bin/chrome",
+        "/snap/chromium/3593/usr/lib/chromium-browser/chrome/x",
+        // extra leading component or relative
+        "/x/snap/chromium/3593/usr/lib/chromium-browser/chrome",
+        "snap/chromium/3593/usr/lib/chromium-browser/chrome",
+        // case-sensitive
+        "/snap/Chromium/3593/usr/lib/chromium-browser/chrome",
+    ] {
+        assert!(!marked(Some(image)), "{image:?}");
+    }
+}
+
+const CHROMIUM_SNAP: &str = "/snap/chromium/3593/usr/lib/chromium-browser/chrome";
+
+#[test]
+fn a_chromium_snap_download_is_joined_at_its_real_downloads_path() {
+    // Captured 2026-11-16 (#267): the rename is reported under the snap's home, the user runs
+    // the file from ~/Downloads, which the snap's Downloads symlink points to.
+    let snap_path = "/home/u/snap/chromium/3593/Downloads/test.bin";
+    for exec_path in [snap_path, "/home/u/Downloads/test.bin"] {
+        let mut state = RuleState::new();
+        state.on_file_rename(&rename(
+            "/home/u/snap/chromium/3593/Downloads/Unconfirmed 1.crdownload",
+            snap_path,
+            Some(CHROMIUM_SNAP),
+            0,
+        ));
+        let alerts = exec(&mut state, &run(exec_path, 1));
+        assert_eq!(alerts.len(), 1, "{exec_path}");
+        assert!(alerts[0].message.contains("marked by chrome"));
+    }
+}
+
+#[test]
+fn the_snap_alias_covers_nothing_else() {
+    // Another file in ~/Downloads, another directory under the snap, a non-numeric revision:
+    // no alias, so a run of an unrelated path stays silent.
+    for (renamed, executed) in [
+        (
+            "/home/u/snap/chromium/3593/Downloads/a.bin",
+            "/home/u/Downloads/b.bin",
+        ),
+        (
+            "/home/u/snap/chromium/3593/Documents/a.bin",
+            "/home/u/Downloads/a.bin",
+        ),
+        (
+            "/home/u/snap/chromium/current/Downloads/a.bin",
+            "/home/u/Downloads/a.bin",
+        ),
+        (
+            "/home/u/snap/chromium/3593/Downloads/",
+            "/home/u/Downloads/",
+        ),
+        (
+            "/home/u/snap/firefox/9181/Downloads/a.bin",
+            "/home/u/Downloads/a.bin",
+        ),
+    ] {
+        let mut state = RuleState::new();
+        let image = if renamed.contains("firefox") {
+            "/snap/firefox/9181/usr/lib/firefox/firefox"
+        } else {
+            CHROMIUM_SNAP
+        };
+        state.on_file_rename(&rename(&format!("{renamed}.part"), renamed, Some(image), 0));
+        assert!(
+            exec(&mut state, &run(executed, 1)).is_empty(),
+            "{renamed} -> {executed}"
+        );
+    }
 }

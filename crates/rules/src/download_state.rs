@@ -303,15 +303,19 @@ impl DownloadState {
         if !is_partial(&event.old_path) || is_partial(&event.new_path) {
             return;
         }
-        self.recent_quarantines.insert(
-            event.new_path.to_lowercase(),
-            RecentQuarantine {
-                timestamp_ns: event.meta.timestamp_ns,
-                agent: Some(image.rsplit('/').next().unwrap_or(image).to_string()),
-                origin_url: None,
-                alerted: false,
-            },
-        );
+        let mark = || RecentQuarantine {
+            timestamp_ns: event.meta.timestamp_ns,
+            agent: Some(image.rsplit('/').next().unwrap_or(image).to_string()),
+            origin_url: None,
+            alerted: false,
+        };
+        // The Chromium Snap reports the path it sees, through its own home; the file is at
+        // the real Downloads path, and that is the one a user runs. Mark both.
+        if let Some(real) = chromium_snap_real_download_path(&event.new_path) {
+            self.recent_quarantines.insert(real.to_lowercase(), mark());
+        }
+        self.recent_quarantines
+            .insert(event.new_path.to_lowercase(), mark());
     }
 
     /// Arms, re-arms or drops the path of a BITS job's file for
@@ -528,4 +532,24 @@ fn renaming_image<'a>(
             )
         })
         .filter(|image| !image.is_empty())
+}
+
+/// The real path of a file the Chromium Snap saved, from the path its rename reports:
+/// `<home>/snap/chromium/<revision>/Downloads/<file>` becomes `<home>/Downloads/<file>`.
+///
+/// Captured 2026-11-16 on Ubuntu 26.04.1 (Chromium 157 rev 3593, #267): the snap's
+/// `~/snap/chromium/<rev>/Downloads` is a symlink to `~/Downloads`, the sensor reports the
+/// rename under the snap path, and an exec of the file from `~/Downloads` (how a user runs
+/// it) never matched the mark. Only this layout, and only the default `Downloads` name: a
+/// user whose download directory has another name (or whose symlink points elsewhere) is not
+/// covered, and the alias is a guess about where the symlink leads, not a resolved path.
+fn chromium_snap_real_download_path(new_path: &str) -> Option<String> {
+    let (home, rest) = new_path.split_once("/snap/chromium/")?;
+    let (rev, tail) = rest.split_once('/')?;
+    let file = tail.strip_prefix("Downloads/")?;
+    (!home.is_empty()
+        && !rev.is_empty()
+        && rev.bytes().all(|b| b.is_ascii_digit())
+        && !file.is_empty())
+    .then(|| format!("{home}/Downloads/{file}"))
 }
