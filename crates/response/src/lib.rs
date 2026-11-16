@@ -24,7 +24,7 @@ pub mod live;
 pub mod quarantine;
 
 pub use escalate::{ESCALATION_THRESHOLD, should_escalate};
-pub use kill::{KillOutcome, kill_process};
+pub use kill::{KillOutcome, kill_process, kill_process_as};
 pub use quarantine::{
     QuarantineOutcome, QuarantinedFile, is_still_quarantined, list_quarantined, quarantine_file,
     unquarantine,

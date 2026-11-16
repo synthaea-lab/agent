@@ -198,3 +198,53 @@ fn exec_past_the_window_stays_silent() {
     state.on_file_rename(&rename("/d/x.bin.part", FINAL, Some(FIREFOX), 0));
     assert!(exec(&mut state, &run(FINAL, QUARANTINE_EXEC_WINDOW_NS + 1)).is_empty());
 }
+
+fn marked(image: Option<&str>) -> bool {
+    let mut state = RuleState::new();
+    state.on_file_rename(&rename("/home/u/Downloads/x.bin.part", FINAL, image, 0));
+    exec(&mut state, &run(FINAL, 1)).len() == 1
+}
+
+#[test]
+fn every_firefox_layout_is_marked_by_shape() {
+    // 2026-11-12 decision on #221: the Firefox family is matched by file name and parent directory.
+    for image in [
+        // a Mozilla tarball unpacked anywhere (captured: the process is firefox-bin)
+        "/home/u/esr/x/firefox/firefox-bin",
+        // the Snap, a revision in the path (read in the snap launcher, never run)
+        "/snap/firefox/1234/usr/lib/firefox/firefox",
+        // Debian's firefox-esr package (captured on Debian 13)
+        "/usr/lib/firefox-esr/firefox-esr",
+        // Fedora and Rocky packages (captured)
+        "/usr/lib64/firefox/firefox",
+        // Flatpak-shaped (the real path is not verified)
+        "/app/lib/firefox/firefox",
+    ] {
+        assert!(marked(Some(image)), "{image}");
+    }
+}
+
+#[test]
+fn a_path_that_only_looks_like_firefox_is_not_marked() {
+    for image in [
+        // the launcher script, parent `bin`
+        "/usr/bin/firefox",
+        // right file name, wrong parent
+        "/tmp/other/firefox",
+        "/home/u/firefox",
+        "/opt/x/firefox-esr",
+        // right parent, wrong file name (a directory named firefox is the parent, not the file)
+        "/usr/lib/firefox/firefox/readme",
+        "/usr/lib/firefox/crashreporter",
+        // a longer name is not the family
+        "/usr/lib/firefox/firefox-developer",
+        "/usr/lib/librewolf/librewolf",
+        // case-sensitive
+        "/usr/lib/Firefox/firefox",
+        "",
+        "firefox",
+    ] {
+        assert!(!marked(Some(image)), "{image:?}");
+    }
+    assert!(!marked(None));
+}

@@ -255,7 +255,6 @@ Live status and ordering are on the [project board](https://github.com/orgs/synt
 ### [#91](https://github.com/synthaea-lab/agent/issues/91) Windows ETW and Event Log sensor follow-ups (keyword masks, parser tests, push transport, policy toggles)
 
 - DNS, registry-write, PowerShell 4104, WMI, dynamic .NET assembly load and SMB connect telemetry (partial, ETW). See [sensors/windows/etw.md#providers](sensors/windows/etw.md#providers).
-- LDAP search and NTLM usage telemetry (budgeted / deduplicated) (partial, ETW). See [sensors/windows/etw.md#providers](sensors/windows/etw.md#providers).
 - Kerberos delegation failures (201/202) (partial, Event Log). See [sensors/windows/eventlog.md#disabled-channels](sensors/windows/eventlog.md#disabled-channels).
 - Automatic audit subcategory enablement via auditpol (partial, Event Log). See [sensors/windows/eventlog.md#audit-policy-enablement](sensors/windows/eventlog.md#audit-policy-enablement).
 - Push transport via EvtSubscribe (partial, Event Log). See [sensors/windows/eventlog.md#subscribe](sensors/windows/eventlog.md#subscribe).
