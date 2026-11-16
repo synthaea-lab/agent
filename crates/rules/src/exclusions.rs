@@ -94,9 +94,10 @@ pub(crate) const MAIL_CLIENT_QUARANTINE_AGENTS: &[&str] = &["Mail"];
 /// place to add a browser: one line per image.
 ///
 /// Only what a lab capture showed (2026-11-10, Fedora 43 lab VM, vendor packages: Chromium
-/// 156, Firefox 159, Chrome 157, Edge, Brave 1.99, Opera, Vivaldi 8.3). Firefox ESR (a tarball
-/// path that depends on where it is unpacked), other distributions' paths and the
-/// Flatpak/Snap paths are not here until a capture reports their image. `comm` is useless as the key: the rename
+/// 156, Firefox 159, Chrome 157, Edge, Brave 1.99, Opera, Vivaldi 8.3). The Firefox family is
+/// also matched by shape, see [`is_browser_download_image`]: its installs (a tarball unpacked
+/// anywhere, the Snap with a revision in the path, Debian's `firefox-esr`) have no fixed path.
+/// Other browsers' other installs are not here until a capture reports their image. `comm` is useless as the key: the rename
 /// runs on a thread-pool worker (`ThreadPoolForeg`, `BgIOThr~Pool #N`).
 pub(crate) const BROWSER_DOWNLOAD_IMAGES: &[&str] = &[
     "/usr/lib64/chromium-browser/chromium-browser",
@@ -107,6 +108,34 @@ pub(crate) const BROWSER_DOWNLOAD_IMAGES: &[&str] = &[
     "/usr/lib64/opera-stable/opera",
     "/opt/vivaldi/vivaldi-bin",
 ];
+
+/// File names of the Firefox family's main executable: the launcher or the binary the launcher
+/// execs (`firefox-bin` in a Mozilla tarball), and Debian's `firefox-esr`.
+const FIREFOX_FILE_NAMES: &[&str] = &["firefox", "firefox-bin", "firefox-esr"];
+/// Directory names a Firefox install keeps those files in.
+const FIREFOX_DIR_NAMES: &[&str] = &["firefox", "firefox-esr"];
+
+/// Whether `image` is a browser whose download is marked from its partial-file rename: one of
+/// [`BROWSER_DOWNLOAD_IMAGES`], or any path whose file name is `firefox`, `firefox-bin` or
+/// `firefox-esr` **and** whose parent directory is named `firefox` or `firefox-esr` (decision of
+/// 2026-11-12 on #221). That covers `/usr/lib64/firefox/firefox`, Debian's
+/// `/usr/lib/firefox-esr/firefox-esr`, a tarball's `<dir>/firefox/firefox-bin`, the Snap's
+/// `/snap/firefox/<rev>/usr/lib/firefox/firefox` and a Flatpak-shaped `/app/lib/firefox/firefox`
+/// (not verified). Not `/usr/bin/firefox` (the launcher script, parent `bin`).
+///
+/// A mark only arms the signature-gated T1204.002 on an exec of the renamed file, so a false
+/// match gives an extra alert on a file that something named like Firefox renamed from a
+/// partial name, and hides nothing; a miss hides a real download. Case-sensitive, like the list.
+pub(crate) fn is_browser_download_image(image: &str) -> bool {
+    if BROWSER_DOWNLOAD_IMAGES.contains(&image) {
+        return true;
+    }
+    let mut parts = image.rsplit('/');
+    let (Some(file), Some(parent)) = (parts.next(), parts.next()) else {
+        return false;
+    };
+    FIREFOX_FILE_NAMES.contains(&file) && FIREFOX_DIR_NAMES.contains(&parent)
+}
 
 /// Suffixes of a browser's partial download file. A rename out of one of these, to a name
 /// without one, is the browser finishing the download. `.opdownload` is Opera's (captured

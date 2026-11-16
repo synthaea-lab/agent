@@ -12,9 +12,8 @@ use store::BoundedMap;
 use crate::{
     Alert,
     exclusions::{
-        BITS_EXEC_WINDOW_NS, BROWSER_DOWNLOAD_IMAGES, BROWSER_PARTIAL_SUFFIXES,
-        DOWNLOAD_EXEC_WINDOW_NS, DOWNLOADER_COMMS, MAIL_CLIENT_QUARANTINE_AGENTS,
-        QUARANTINE_EXEC_WINDOW_NS,
+        BITS_EXEC_WINDOW_NS, BROWSER_PARTIAL_SUFFIXES, DOWNLOAD_EXEC_WINDOW_NS, DOWNLOADER_COMMS,
+        MAIL_CLIENT_QUARANTINE_AGENTS, QUARANTINE_EXEC_WINDOW_NS, is_browser_download_image,
     },
     has_write_intent,
     signature_gate::SignatureGatedAlert,
@@ -279,7 +278,7 @@ impl DownloadState {
     /// Linux browser downloads carry no usable xattr mark, so the finished download is
     /// marked from the browser's own rename of its partial file (#221): a `FileRename`
     /// whose `old_path` ends in `.crdownload`, `.opdownload` or `.part` and whose `new_path` does not,
-    /// by a process whose `executable_path` is in [`BROWSER_DOWNLOAD_IMAGES`]. The mark is
+    /// by a process whose `executable_path` is a browser image ([`is_browser_download_image`]). The mark is
     /// the same one [`Self::on_file_quarantine`] records, with the browser's file name as
     /// the agent and no origin URL, so [`Self::check_quarantined_exec`] joins it.
     ///
@@ -293,7 +292,7 @@ impl DownloadState {
         let Some(image) = event
             .executable_path
             .as_deref()
-            .filter(|image| BROWSER_DOWNLOAD_IMAGES.contains(image))
+            .filter(|image| is_browser_download_image(image))
         else {
             return;
         };

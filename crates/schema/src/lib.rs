@@ -862,9 +862,18 @@ pub const O_WRONLY: u32 = 0o1;
 pub const O_RDWR: u32 = 0o2;
 /// `open(2)` create-if-absent flag.
 pub const O_CREAT: u32 = 0o100;
+/// `open(2)` truncate-to-zero flag.
+pub const O_TRUNC: u32 = 0o1000;
 
-/// Write intent on [`FileOpenEvent::flags`]: a write access mode, or creation
-/// (`O_CREAT` — creating a file is write intent even with `O_RDONLY`).
+/// Write intent on [`FileOpenEvent::flags`]: a write access mode, creation
+/// (`O_CREAT` — creating a file is write intent even with `O_RDONLY`), or
+/// truncation (`O_TRUNC`).
+///
+/// `O_TRUNC` counts whatever the access mode: Linux adds `MAY_WRITE` for it in
+/// `build_open_flags`, and `open(path, O_RDONLY | O_TRUNC)` empties a regular file
+/// the caller may write (verified on Debian 12, kernel 6.1.0-17: a 12-byte file
+/// became 0 bytes, #233). Without it, a process could wipe a file through an open
+/// no write-side rule saw as a write.
 ///
 /// The ONE definition of this predicate. It used to exist five times (rules,
 /// correlator, `crates/ml`, and two Python mirrors) with two different
@@ -875,9 +884,8 @@ pub const O_CREAT: u32 = 0o100;
 /// (`O_ACCMODE`), not independent bits, and the `0o3` combination is invalid —
 /// `open(2)` refuses it with `EINVAL`, so no write can result and counting it
 /// would let crafted always-failing opens inflate behavioral write counts.
-/// The Python mirrors (`synthaea_ml.features.correlation._is_file_write`,
-/// `behavior._is_write`) must match this exactly — parity-tested against
-/// shared fixtures.
+/// The Python mirror (`synthaea_ml.features.posix.has_write_intent`) must match
+/// this exactly — parity-tested against shared fixtures.
 ///
 /// Lives in `schema` deliberately: a pure helper on a field this crate
 /// defines, additive to the semi-frozen surface (no serialization impact),
@@ -885,7 +893,7 @@ pub const O_CREAT: u32 = 0o100;
 #[must_use]
 pub fn has_write_intent(flags: u32) -> bool {
     let access_mode = flags & O_ACCMODE;
-    access_mode == O_WRONLY || access_mode == O_RDWR || (flags & O_CREAT) != 0
+    access_mode == O_WRONLY || access_mode == O_RDWR || (flags & (O_CREAT | O_TRUNC)) != 0
 }
 
 /// File open/create.
@@ -2991,6 +2999,19 @@ mod write_intent_tests {
     fn creat_is_write_intent_even_with_rdonly() {
         // Creating a file mutates the filesystem regardless of the access mode.
         assert!(has_write_intent(super::O_CREAT));
+    }
+
+    #[test]
+    fn trunc_is_write_intent_even_with_rdonly() {
+        // `open(O_RDONLY | O_TRUNC)` empties the file on Linux (#233).
+        assert!(has_write_intent(super::O_TRUNC));
+        assert!(has_write_intent(
+            super::O_TRUNC | 0o2000000 /* O_CLOEXEC */
+        ));
+        assert!(
+            has_write_intent(0o3 | super::O_TRUNC),
+            "truncation still counts"
+        );
     }
 
     #[test]

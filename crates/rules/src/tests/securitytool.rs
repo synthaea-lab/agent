@@ -458,6 +458,147 @@ fn a_cpu_quota_that_starves_a_listed_tool_alerts_medium() {
 }
 
 #[test]
+fn a_machine_or_host_option_before_the_verb_does_not_hide_the_command() {
+    // `-M host` and `-H host` take the next argument as a value: it is not the verb (#246).
+    // The command is still read, because `-M .host` and `-H localhost` reach this host.
+    for command in [
+        "systemctl -M host set-property auditd CPUQuota=1%",
+        "systemctl -H host set-property auditd CPUQuota=1%",
+        "systemctl --machine host set-property auditd CPUQuota=1%",
+        "systemctl --host host set-property auditd CPUQuota=1%",
+        "systemctl --mac host set-property auditd CPUQuota=1%",
+        "systemctl --ho host set-property auditd CPUQuota=1%",
+        "systemctl -M .host --runtime set-property auditd CPUQuota=1%",
+        // the attached forms were never read as a verb
+        "systemctl --machine=host set-property auditd CPUQuota=1%",
+        "systemctl -Mhost set-property auditd CPUQuota=1%",
+        "systemctl --host=host set-property auditd CPUQuota=1%",
+    ] {
+        let alerts = throttle_alerts(command);
+        assert_eq!(alerts.len(), 1, "{command}: {alerts:?}");
+        assert!(alerts[0].message.contains("auditd"), "{command}");
+    }
+    for command in [
+        "systemctl -M host freeze auditd",
+        "systemctl --host host set-property auditd MemoryMax=1M",
+    ] {
+        assert_eq!(throttle_alerts(command).len(), 1, "{command}");
+    }
+}
+
+#[test]
+fn a_short_cluster_ending_in_a_value_option_does_not_hide_the_command() {
+    // In `-qM host` the next argument is `M`'s value, as `getopt` reads it (#246 review).
+    for command in [
+        "systemctl -qM host set-property auditd CPUQuota=1%",
+        "systemctl -lqH host set-property auditd CPUQuota=1%",
+        "systemctl -qt service set-property auditd CPUQuota=1%",
+        // the value attached to the cluster: the next argument is the verb
+        "systemctl -qMhost set-property auditd CPUQuota=1%",
+        "systemctl -qM=host set-property auditd CPUQuota=1%",
+    ] {
+        let alerts = throttle_alerts(command);
+        assert_eq!(alerts.len(), 1, "{command}: {alerts:?}");
+        assert!(alerts[0].message.contains("auditd"), "{command}");
+    }
+}
+
+#[test]
+fn any_option_that_takes_a_separate_value_does_not_hide_the_command() {
+    // Each of these takes its value as the next argument, and `set-property` accepts and
+    // ignores them, so each was an evasion of the rule (#246 review).
+    for option in [
+        "-t service",
+        "-p x",
+        "-P x",
+        "-s TERM",
+        "-n 5",
+        "-o json",
+        "-C capsule",
+        "--type service",
+        "--property x",
+        "--signal TERM",
+        "--job-mode fail",
+        "--what all",
+        "--kill-whom main",
+        "--kill-value 1",
+        "--kill-subgroup x",
+        "--root /",
+        "--state active",
+        "--lines 5",
+        "--output json",
+        "--capsule c",
+        "--check-inhibitors yes",
+        "--message hi",
+        "--image x",
+        "--image-policy x",
+        "--preset-mode full",
+        "--timestamp utc",
+        "--legend no",
+        "--drop-in x",
+        "--when 1",
+        "--boot-loader-menu 1",
+        "--boot-loader-entry x",
+        "--reboot-argument x",
+        // unique prefixes, as `getopt_long` reads them
+        "--ty service",
+        "--prop x",
+        "--sig TERM",
+        "--job fail",
+        "--wh all",
+        "--ro /",
+        "--kill-wh main",
+    ] {
+        let command = format!("systemctl {option} set-property auditd CPUQuota=1%");
+        let alerts = throttle_alerts(&command);
+        assert_eq!(alerts.len(), 1, "{command}: {alerts:?}");
+        assert!(alerts[0].message.contains("auditd"), "{command}");
+    }
+}
+
+#[test]
+fn an_option_without_a_value_does_not_swallow_the_verb() {
+    // The arguments are not lowercased before the options are read: `-T`
+    // (`--show-transaction`) takes no value, `-t` does, and `-h` is `--help` while `-H` takes
+    // a host. Reading the case away would let `-T` swallow `set-property`.
+    for option in [
+        "-T",
+        "-h",
+        "-q",
+        "-qT",
+        "-l",
+        "-i",
+        "--show-transaction",
+        "--runtime",
+        "--no-block",
+        "--now",
+        "--no-pager",
+        "--value",
+        "--failed",
+        "--no-warn",
+        "--user",
+        "--ru",
+    ] {
+        let command = format!("systemctl {option} set-property auditd CPUQuota=1%");
+        let alerts = throttle_alerts(&command);
+        assert_eq!(alerts.len(), 1, "{command}: {alerts:?}");
+        assert!(alerts[0].message.contains("auditd"), "{command}");
+    }
+}
+
+#[test]
+fn an_ambiguous_long_option_prefix_does_not_swallow_the_verb() {
+    // `--ma` is ambiguous (machine, marked) and `--h` too (help, host): systemctl rejects
+    // them, so the next argument is not a value and the verb stays the first positional one.
+    for command in [
+        "systemctl --ma set-property auditd CPUQuota=1%",
+        "systemctl --h set-property auditd CPUQuota=1%",
+    ] {
+        assert_eq!(throttle_alerts(command).len(), 1, "{command}");
+    }
+}
+
+#[test]
 fn a_cpu_quota_that_only_tunes_a_tool_or_lifts_one_does_not_alert() {
     for command in [
         "systemctl set-property auditd CPUQuota=10%",
@@ -498,7 +639,8 @@ fn a_write_to_a_listed_units_throttle_file_alerts() {
         "/sys/fs/cgroup/memory/system.slice/auditd.service/memory.limit_in_bytes",
         "/sys/fs/cgroup/freezer/system.slice/auditd.service/freezer.state",
     ] {
-        for flags in [O_WRONLY, O_WRONLY | O_TRUNC, 0o2] {
+        // `O_TRUNC` alone too: `open(O_RDONLY | O_TRUNC)` empties the file (#233).
+        for flags in [O_WRONLY, O_WRONLY | O_TRUNC, 0o2, O_TRUNC] {
             let alerts = all_file_open_alerts(&cgroup_open(path, flags, 4242));
             assert_eq!(alerts.len(), 1, "{path} {flags:o}: {alerts:?}");
             assert_eq!(alerts[0].technique, "T1562.001");

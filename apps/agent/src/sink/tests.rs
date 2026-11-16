@@ -119,6 +119,22 @@ fn sink_in(dir: &std::path::Path) -> Arc<DetectionSink> {
     )
 }
 
+/// Asserts that the recording kill hook was called for exactly `pid`, once. On a mismatch it prints
+/// `context` and the alert log: `maybe_kill` refuses before it calls the hook (the agent's own pid,
+/// pid 1, a verdict shield), and that refusal is only in `RESPONSE-KILL` there. A bare `left: []`
+/// (agent#247, seen once on macOS CI) names none of those.
+#[track_caller]
+fn assert_killed_exactly(killed: &Mutex<Vec<u32>>, dir: &std::path::Path, pid: u32, context: &str) {
+    let got = killed.lock().unwrap().clone();
+    assert_eq!(
+        got,
+        vec![pid],
+        "{context}; test process pid {}; alert log:\n{}",
+        std::process::id(),
+        alerts_in(dir)
+    );
+}
+
 fn alerts_in(dir: &std::path::Path) -> String {
     std::fs::read_to_string(dir.join("alerts.ndjson")).unwrap_or_default()
 }
@@ -658,10 +674,15 @@ fn event_by(
         ..schema::fixtures::meta()
     };
     match kind {
-        "read" | "write" => {
+        "read" | "write" | "truncate" => {
             let mut e = schema::fixtures::file_open();
             e.path = canary.into();
-            e.flags = if kind == "write" { 0o102 } else { 0 };
+            e.flags = match kind {
+                "write" => 0o102,
+                // O_RDONLY | O_TRUNC: no write access mode, yet the kernel empties the file (#233).
+                "truncate" => schema::O_TRUNC,
+                _ => 0,
+            };
             e.meta = meta;
             Event::FileOpen(e)
         }
@@ -682,8 +703,8 @@ fn event_by(
 }
 
 #[test]
-fn a_delete_rename_or_write_open_after_a_read_open_is_not_absorbed() {
-    for destructive in ["delete", "rename", "write"] {
+fn a_delete_rename_write_or_truncating_open_after_a_read_open_is_not_absorbed() {
+    for destructive in ["delete", "rename", "write", "truncate"] {
         let dir = tmp(&format!("canary-destructive-{destructive}"));
         let (sink, canary) = sink_watching_canary(&dir);
         let pid = std::process::id() + 1;
@@ -1189,7 +1210,12 @@ fn a_beacon_with_a_dropped_payload_is_killed_and_quarantined_and_both_are_audite
     let alerts = wait_for_alert(&dir, "RESPONSE-QUARANTINE");
 
     // Killed, audited.
-    assert_eq!(*killed.lock().unwrap(), vec![6262]);
+    assert_killed_exactly(
+        &killed,
+        &dir,
+        6262,
+        "the injected terminate runs, exactly once",
+    );
     assert!(alerts.contains("RESPONSE-KILL"), "{alerts}");
     assert!(alerts.contains("killed pid 6262"), "{alerts}");
     // Quarantined, audited.
@@ -1536,10 +1562,11 @@ fn bayes_crossing_with_kill_enabled_calls_terminate_on_the_verdict_pid() {
         alerts.contains("killed pid 4244"),
         "kill outcome must be recorded in alerts: {alerts}"
     );
-    assert_eq!(
-        *killed.lock().unwrap(),
-        vec![4244],
-        "the injected terminate runs, exactly once"
+    assert_killed_exactly(
+        &killed,
+        &dir,
+        4244,
+        "the injected terminate runs, exactly once",
     );
 }
 
@@ -1619,7 +1646,12 @@ fn the_same_crossing_from_a_tmp_binary_is_still_killed() {
     let sink = sink_in(&dir);
     let killed = enable_recording_kill(&sink, &dir);
     drive_bayes_crossing_from(&sink, 6002, "/tmp/NetworkManager");
-    assert_eq!(*killed.lock().unwrap(), vec![6002]);
+    assert_killed_exactly(
+        &killed,
+        &dir,
+        6002,
+        "the injected terminate runs, exactly once",
+    );
 }
 
 /// Execs the `sshd-session` that holds one login under the `sshd` listener, as on
@@ -1709,7 +1741,12 @@ fn a_shell_inside_a_reexecd_sshd_login_crossing_bayes_is_still_killed() {
     shell.parent_image_path = Some("/usr/sbin/sshd".into());
     sink.on_event(Event::Exec(shell));
     drive_bayes_connects(&sink, 6132);
-    assert_eq!(*killed.lock().unwrap(), vec![6132]);
+    assert_killed_exactly(
+        &killed,
+        &dir,
+        6132,
+        "the injected terminate runs, exactly once",
+    );
 }
 
 /// The real `sshd` binary started from a user's shell is not a login session: it
@@ -1726,7 +1763,12 @@ fn an_sshd_started_from_a_shell_crossing_bayes_is_still_killed() {
     e.parent_image_path = Some("/bin/bash".into());
     sink.on_event(Event::Exec(e));
     drive_bayes_connects(&sink, 6142);
-    assert_eq!(*killed.lock().unwrap(), vec![6142]);
+    assert_killed_exactly(
+        &killed,
+        &dir,
+        6142,
+        "the injected terminate runs, exactly once",
+    );
 }
 
 /// The control: a shell inside that login session crossing BAYES is still killed.
@@ -1742,7 +1784,12 @@ fn a_shell_inside_an_ssh_login_crossing_bayes_is_still_killed() {
     shell.meta.ppid = 6111;
     sink.on_event(Event::Exec(shell));
     drive_bayes_connects(&sink, 6112);
-    assert_eq!(*killed.lock().unwrap(), vec![6112]);
+    assert_killed_exactly(
+        &killed,
+        &dir,
+        6112,
+        "the injected terminate runs, exactly once",
+    );
 }
 
 /// Observe-only mode says the truth too: a service is "refused", not "would have
@@ -1819,12 +1866,12 @@ fn a_siblings_weak_alert_never_triggers_kill_from_anothers_bayes_crossing() {
         alerts.contains("T1059/T1071"),
         "the sibling's weak co-occurrence finding must still alert: {alerts}"
     );
-    assert_eq!(
-        *killed.lock().unwrap(),
-        vec![5001],
-        "only the pid that actually crossed Bayes may be killed — the \
-         sibling's own weak finding must not ride the shared entity's \
-         sticky severity to a kill: {alerts}"
+    assert_killed_exactly(
+        &killed,
+        &dir,
+        5001,
+        "only the pid that actually crossed Bayes may be killed — the sibling's own weak \
+         finding must not ride the shared entity's sticky severity to a kill",
     );
 }
 
@@ -2040,7 +2087,12 @@ fn a_burst_then_a_canary_touch_by_the_same_process_kills_it() {
         "a burst alone never kills"
     );
     sink.on_event(canary_open_at(&canary, 900, BURST_END_NS + 1_000_000));
-    assert_eq!(*killed.lock().unwrap(), vec![900]);
+    assert_killed_exactly(
+        &killed,
+        &dir,
+        900,
+        "the injected terminate runs, exactly once",
+    );
     let alerts = alerts_in(&dir);
     assert!(
         alerts.contains("killed pid 900 on a corroborated ransomware signal"),
@@ -2062,10 +2114,11 @@ fn a_canary_touch_then_a_burst_by_the_same_process_kills_it_once() {
         "a canary touch alone never kills"
     );
     burst(&sink, 900);
-    assert_eq!(
-        *killed.lock().unwrap(),
-        vec![900],
-        "the burst keeps raising alerts but the process is killed once"
+    assert_killed_exactly(
+        &killed,
+        &dir,
+        900,
+        "the burst keeps raising alerts but the process is killed once",
     );
 }
 
@@ -2153,7 +2206,12 @@ fn a_process_that_is_not_on_the_allow_list_is_still_killed_when_a_list_exists() 
     ));
     burst(&sink, 900);
     sink.on_event(canary_open_at(&canary, 900, BURST_END_NS + 1_000_000));
-    assert_eq!(*killed.lock().unwrap(), vec![900]);
+    assert_killed_exactly(
+        &killed,
+        &dir,
+        900,
+        "the injected terminate runs, exactly once",
+    );
 }
 
 #[test]
@@ -2593,6 +2651,32 @@ fn a_scanned_payloads_match_reaches_the_verdict_of_the_process_that_wrote_it() {
         .peek(&verdict::EntityKey::new(777, "dropper"))
         .expect("the match is folded into the writer's verdict");
     assert_eq!(fused.techniques, vec!["T1105"]);
+}
+
+/// The YARA trigger is the shared write-intent predicate, so a truncating open
+/// queues a scan even without a write access mode (#233). It used to test
+/// `O_WRONLY | O_RDWR | O_CREAT` on its own and miss `O_TRUNC`.
+#[test]
+fn a_truncating_read_only_open_queues_a_yara_scan() {
+    let dir = tmp("yara-trunc-trigger");
+    let yara_dir = dir.join("content").join("rules").join("yara");
+    std::fs::create_dir_all(&yara_dir).unwrap();
+    std::fs::write(yara_dir.join("marker.yar"), RESPONSE_MARKER_RULE).unwrap();
+    let payload = dir.join("payload.bin");
+    std::fs::write(&payload, b"dropped payload RESPONSE-SCENARIO-MARKER").unwrap();
+    let sink = sink_in(&dir);
+    assert_eq!(sink.reload_content().yara_rule_count, Some(1));
+
+    sink.on_event(Event::FileOpen(schema::FileOpenEvent {
+        meta: EventMeta {
+            // Root: unrestricted, the payload is the test's own file (#594).
+            user: schema::User::Unix { uid: 0, gid: 0 },
+            ..schema::fixtures::meta()
+        },
+        path: payload.display().to_string(),
+        flags: schema::O_TRUNC,
+    }));
+    wait_for_alert(&dir, "YARA");
 }
 
 #[test]
