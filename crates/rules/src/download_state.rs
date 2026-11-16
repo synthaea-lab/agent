@@ -17,7 +17,7 @@ use crate::{
     },
     has_write_intent,
     signature_gate::SignatureGatedAlert,
-    state::written_file_is,
+    state::{PidFact, written_file_is},
 };
 
 /// Bound of each path table below.
@@ -278,21 +278,24 @@ impl DownloadState {
     /// Linux browser downloads carry no usable xattr mark, so the finished download is
     /// marked from the browser's own rename of its partial file (#221): a `FileRename`
     /// whose `old_path` ends in `.crdownload`, `.opdownload` or `.part` and whose `new_path` does not,
-    /// by a process whose `executable_path` is a browser image ([`is_browser_download_image`]). The mark is
+    /// by a process whose image is a browser image ([`is_browser_download_image`]). The mark is
     /// the same one [`Self::on_file_quarantine`] records, with the browser's file name as
     /// the agent and no origin URL, so [`Self::check_quarantined_exec`] joins it.
     ///
-    /// Keyed on the image, never on `comm` (a thread-pool worker name). An empty or absent
-    /// `executable_path` (the sensor lost the `/proc/<pid>/exe` race) marks nothing: the
-    /// process-lineage fallback is not implemented, the capture ran under `strace` so its
-    /// lineage was not real. Chromium's first rename (`/tmp/... -> .crdownload`, fails with
+    /// Keyed on the image, never on `comm` (a thread-pool worker name). The image is the
+    /// event's own `executable_path`; when the sensor lost the `/proc/<pid>/exe` race (it is
+    /// `None` or empty) the lineage fallback of [`renaming_image`] reads it from the exec the
+    /// agent recorded for the pid, or, for a process forked without an exec (a Chromium
+    /// zygote child), from its parent's. Chromium's first rename (`/tmp/... -> .crdownload`, fails with
     /// `EXDEV` across devices) and cache renames have no partial-suffix `old_path` and
     /// are ignored.
-    pub(crate) fn on_browser_download_rename(&mut self, event: &FileRenameEvent) {
-        let Some(image) = event
-            .executable_path
-            .as_deref()
-            .filter(|image| is_browser_download_image(image))
+    pub(crate) fn on_browser_download_rename(
+        &mut self,
+        event: &FileRenameEvent,
+        images: &BoundedMap<u32, PidFact>,
+    ) {
+        let Some(image) =
+            renaming_image(event, images).filter(|image| is_browser_download_image(image))
         else {
             return;
         };
@@ -500,4 +503,29 @@ fn strip_suffix_ignore_ascii_case<'a>(s: &'a str, suffix: &str) -> Option<&'a st
 
 fn format_delta(delta_ns: u64) -> String {
     format!("{:.1}s", delta_ns as f64 / 1_000_000_000.0)
+}
+
+/// The image of the process behind a `FileRename`: the event's own `executable_path` when the
+/// sensor resolved one (it wins even when it is not a browser, no fallback then), otherwise the
+/// image of the exec the agent recorded for this pid and incarnation, otherwise the one recorded
+/// for its parent and the parent's incarnation. The parent case is a process forked without an
+/// exec, which runs its parent's image (a Chromium zygote child); a pid the agent never saw exec
+/// and whose parent it never saw either gives `None`, so it marks nothing. A recycled pid is
+/// refused by the incarnation stamp, where the sensor gives one.
+fn renaming_image<'a>(
+    event: &'a FileRenameEvent,
+    images: &'a BoundedMap<u32, PidFact>,
+) -> Option<&'a str> {
+    if let Some(path) = event.executable_path.as_deref().filter(|p| !p.is_empty()) {
+        return Some(path);
+    }
+    PidFact::current(images, event.meta.pid, event.meta.process_generation)
+        .or_else(|| {
+            PidFact::current(
+                images,
+                event.meta.ppid,
+                event.meta.parent_process_generation,
+            )
+        })
+        .filter(|image| !image.is_empty())
 }

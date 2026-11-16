@@ -270,10 +270,11 @@ UNVERIFIED_NOTES = [
     "downloads were captured: Chrome resumes by itself, and after a browser kill and "
     "relaunch a manual Resume ends with the same single `.crdownload` -> final rename "
     "(same `executable_path`); Firefox's manual retry ends with the same `.part` -> "
-    "final rename. An empty `executable_path` marks nothing: the "
-    "process-lineage fallback is not implemented, and the capture ran under `strace` "
-    "so its lineage was not real "
-    "(https://github.com/synthaea-lab/agent/issues/221).",
+    "final rename. An empty `executable_path` (the sensor lost the `/proc/<pid>/exe` race) is read from the lineage: "
+    "the image of the exec the agent recorded for that pid and incarnation, otherwise its parent's (a process forked without an exec, "
+    "such as a Chromium zygote child); a pid nobody saw exec marks nothing. The fallback is unit-tested only: it was never run on a lab VM, "
+    "and no capture shows the sensor losing the race on a browser rename "
+    "(https://github.com/synthaea-lab/agent/issues/17, https://github.com/synthaea-lab/agent/issues/221).",
 ]
 
 

@@ -236,7 +236,14 @@ same signature gate applies.
   and the vendor packages of Chrome (`/opt/google/chrome/chrome`), Edge
   (`/opt/microsoft/msedge/msedge`), Brave (`/opt/brave.com/brave/brave`), Opera
   (`/usr/lib64/opera-stable/opera`) and Vivaldi (`/opt/vivaldi/vivaldi-bin`).
-- An empty or absent `executable_path` marks nothing. What is still unchecked is listed under
+- An empty or absent `executable_path` (the sensor lost the `/proc/<pid>/exe` race) is read from the
+  lineage, in this order: the image of the exec the agent recorded for the renaming pid, if its
+  incarnation stamp matches; otherwise the image recorded for the parent, if the parent's stamp matches
+  (a process forked without an exec, such as a Chromium zygote child). A pid the agent never saw exec,
+  with no known parent, marks nothing. A resolved image always wins, even when it is not a browser, and
+  the pid's own non-browser exec wins over a browser parent (a helper such as `cp` run from the browser
+  marks nothing). Unit-tested only: no lab run, and no capture shows the sensor losing the race on a
+  browser rename. What is still unchecked is listed under
   "Not verified" in [attack-coverage.md](../attack-coverage.md).
 
 ## Signature-gated findings
@@ -296,7 +303,7 @@ verification and window calibration are tracked in
 | A table reaches its cap | LRU eviction. A forgotten key can re-alert once; first-seen tables log each eviction rise |
 | Parent not in the cache and gone from `/proc` | parent-name rules cannot fire for that exec |
 | Linux `comm` truncated to 15 bytes | T1105 compares `comm` to the downloaded file's basename, so a longer name does not match |
-| Linux browser download, `executable_path` empty or not a browser image (`is_browser_download_image`) | no T1204.002 mark: the join is keyed on the renaming process's image, never `comm`, and there is no lineage fallback (not validated: the capture ran under `strace`) |
+| Linux browser download, resolved image not a browser image (`is_browser_download_image`), or no image anywhere in the lineage | no T1204.002 mark: the join is keyed on the renaming process's image, never `comm`. An empty image falls back to the lineage (the pid's own recorded exec, then its parent's); a pid nobody saw exec marks nothing |
 | A downloaded script run through an interpreter | image is the interpreter; T1204.002 and T1105 do not join |
 | Events out of order across sensor threads | windows tolerate it; deferred findings wait for the clock |
 | No generation stamp (macOS) | pid-only behaviour, recycled pids possible |
