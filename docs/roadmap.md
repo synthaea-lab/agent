@@ -149,7 +149,7 @@ Live status and ordering are on the [project board](https://github.com/orgs/synt
 
 ### [#97](https://github.com/synthaea-lab/agent/issues/97) Response and graceful-shutdown parity on Windows and macOS (kill, quarantine, final drain, kill loudness, protected files)
 
-- Bounded graceful shutdown with final upload drain (Linux SIGINT) (partial, Lifecycle). See [lifecycle.md#shutdown](lifecycle.md#shutdown).
+- Bounded graceful shutdown with final upload drain (SIGINT, all platforms) (partial, Lifecycle). See [lifecycle.md#shutdown](lifecycle.md#shutdown).
 - Termination-signal attribution before exit (kill-loudness) (partial, Lifecycle). See [lifecycle.md#shutdown](lifecycle.md#shutdown).
 - Quarantine of a YARA-matched file (partial, YARA). See [detection/yara.md#what-a-match-does](detection/yara.md#what-a-match-does).
 - Automated process kill on a correlator BAYES crossing, observe-only by default, with protected-pid refusal (partial, Response). See [response.md#the-kill-gate](response.md#the-kill-gate).

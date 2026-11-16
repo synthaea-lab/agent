@@ -116,18 +116,16 @@ impl EventDrain for SpoolDrain {
 /// What `run` keeps after starting the upload pipeline: the spool handle the
 /// sink appends to (and health reads), and a client for the health beacon's
 /// heartbeat POSTs, plus the upload thread's stop flag and join handle so a
-/// graceful shutdown (#316) can end it with one last drain. Platforms that do
-/// not shut down gracefully yet just let the thread die with the process —
-/// safe, the spool redelivers.
+/// graceful shutdown (#316) can end it with one last drain (`finish_run`, all
+/// platforms since #147). A kill the agent cannot intercept loses nothing: the
+/// spool redelivers.
 pub(crate) struct TransportHandle {
     pub(crate) spool: Arc<Mutex<EventSpool>>,
     pub(crate) detection_spool: Arc<Mutex<EventSpool>>,
     // Read by the health beacon, which macOS doesn't wire yet (#317).
     #[cfg_attr(not(any(target_os = "linux", windows)), allow(dead_code))]
     pub(crate) client: Arc<TransportClient>,
-    #[cfg_attr(not(target_os = "linux"), allow(dead_code))] // graceful shutdown is Linux-first
     upload_stop: Arc<AtomicBool>,
-    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     upload_thread: JoinHandle<()>,
     detection_upload_stop: Arc<AtomicBool>,
     detection_upload_thread: JoinHandle<()>,
@@ -136,7 +134,6 @@ pub(crate) struct TransportHandle {
 impl TransportHandle {
     /// Registers the upload thread with `plan`: stopping it makes the loop
     /// exit its poll/backoff sleep and attempt the final spool drain.
-    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     pub(crate) fn register_shutdown(self, plan: &mut ShutdownPlan) {
         let stop = self.upload_stop;
         plan.register(
@@ -387,6 +384,31 @@ mod tests {
     };
 
     use super::*;
+
+    /// #147: Windows and macOS never shut the uploaders down because they never registered them.
+    /// Both upload threads must be in the plan, and stopping the plan must join them.
+    #[test]
+    fn register_shutdown_registers_both_upload_threads_and_the_plan_joins_them() {
+        let dir = tempfile::tempdir().unwrap();
+        let handle = start(
+            &ControlPlane {
+                // Nothing listens: the loops only idle until they are told to stop.
+                url: "http://127.0.0.1:9",
+                ca_cert: None,
+                client_cert: None,
+                offline_fallback: true,
+            },
+            &dir.path().join("alerts.ndjson"),
+            1 << 20,
+        )
+        .unwrap();
+        let mut plan = ShutdownPlan::default();
+        handle.register_shutdown(&mut plan);
+
+        assert_eq!(plan.names(), ["transport-upload", "detection-upload"]);
+        let stragglers = plan.execute(std::time::Duration::from_secs(5));
+        assert!(stragglers.is_empty(), "{stragglers:?}");
+    }
 
     #[test]
     fn the_ca_and_the_client_certificate_reach_the_transport_config() {

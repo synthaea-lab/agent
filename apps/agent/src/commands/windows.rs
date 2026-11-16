@@ -13,7 +13,7 @@ use schema::{
 };
 use tamper::heartbeat::{SensorHeartbeat, SilenceMonitor};
 
-use crate::silence::PulsingSink;
+use crate::{shutdown::ShutdownPlan, silence::PulsingSink};
 
 /// Silence deadline (#71/#388) for the ETW sensor, pulsed on every event it
 /// forwards. ETW is the high-volume sensor (process, file, registry, DNS...),
@@ -520,7 +520,7 @@ pub(crate) fn cmd_run(opts: super::RunOptions) -> anyhow::Result<()> {
 
     // Health beacon (#134/#317): without it the control plane never hears from
     // a Windows agent, and its silent-agent detection flags every one of them.
-    // No shutdown hook yet: the thread ends with the process.
+    // Wound down by `finish_run` once the sensors return (#147).
     let health = super::common::health_collector(
         &pipeline,
         Arc::clone(&silence_monitor),
@@ -531,13 +531,22 @@ pub(crate) fn cmd_run(opts: super::RunOptions) -> anyhow::Result<()> {
             None,
         )),
     );
-    let (_health_handle, _health_stop) = health.spawn();
+    let (health_handle, health_stop) = health.spawn();
+    let mut shutdown = ShutdownPlan::default();
+    shutdown.register("health-beacon", move || health_stop.stop(), health_handle);
+    if let Some(transport) = pipeline.transport {
+        transport.register_shutdown(&mut shutdown);
+    }
 
-    run_windows_sensors(
+    let sink = Arc::clone(&pipeline.sink);
+    let result = run_windows_sensors(
         Box::new(SharedSink(pipeline.sink)),
         Some(&silence_monitor),
         false,
-    )
+    );
+    // The enrichment flush and the upload loops' last drain, as on Linux (#147).
+    super::common::finish_run(&sink, shutdown);
+    result
 }
 
 pub(crate) fn cmd_capture_events(output: &std::path::Path) -> anyhow::Result<()> {
