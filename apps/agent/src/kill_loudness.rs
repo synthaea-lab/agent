@@ -27,10 +27,13 @@
 //! real clean-shutdown path a compromised or wedged process could use to outlast the
 //! signal — see `SHUTDOWN_FLUSH_BUDGET` and `EnrichQueue::flush`'s own doc.
 //!
-//! Not unit-tested past the pure helpers below: the full mask-then-`sigwaitinfo`-then-
-//! `exit` flow deliberately terminates the process, which would kill the `cargo test`
-//! runner itself. Validated for real instead — see the issue/PR for a genuine `kill
-//! -TERM` against a running `agent run` on the lab VM.
+//! The pure helpers are unit-tested in place. The full mask-then-`sigwaitinfo`-then-
+//! `exit` flow terminates the process, so `termination_signal_flow_records_sender_and_exits`
+//! runs it in a child: the test re-executes its own binary, the child blocks the
+//! signals and spawns the watcher, and the parent sends each watched signal and checks
+//! the exit status (`128 + signo`) and the alert line (sender pid = the parent). The
+//! audit-fallback SIGKILL gap is not covered by any test: it needs a lab capture (see
+//! `docs/self-protection.md#kill-loudness`).
 
 #![cfg_attr(not(target_os = "linux"), allow(dead_code))]
 
@@ -220,5 +223,118 @@ mod tests {
             escape_json_string(r#"binary at "C:\agent.exe" was swapped"#),
             r#"binary at \"C:\\agent.exe\" was swapped"#
         );
+    }
+
+    /// Env var that turns [`termination_signal_flow_records_sender_and_exits`] into
+    /// its own child: the value is the alert log path the child must write.
+    const CHILD_ALERTS_ENV: &str = "KILL_LOUDNESS_FLOW_CHILD_ALERTS";
+    const CHILD_READY_ENV: &str = "KILL_LOUDNESS_FLOW_CHILD_READY";
+
+    /// Child side: the production sequence, then wait to be killed. It runs in a
+    /// forked grandchild whose only thread is the one that blocks the signals: under
+    /// libtest the main thread is a second, unmasked thread, and a process-directed
+    /// signal can land on it and kill the process with its default disposition. The
+    /// real agent has no such thread, because `block_termination_signals` runs on its
+    /// main thread before anything else. The grandchild records its pid in `ready`
+    /// for the parent, and the re-executed child relays its exit status.
+    fn run_flow_child(alerts: PathBuf, ready: PathBuf) -> ! {
+        // SAFETY: the re-executed child has only libtest's parked main thread besides
+        // this one, so no other thread can hold the allocator lock at fork time.
+        let pid = unsafe { libc::fork() };
+        assert!(pid >= 0, "fork failed");
+        if pid == 0 {
+            block_termination_signals();
+            let queue = EnrichQueue::start(enrich::Enricher::new(), |_, _| {});
+            spawn_watcher(alerts, queue);
+            std::fs::write(ready, std::process::id().to_string()).expect("ready marker");
+            // The watcher thread ends the process; reaching the end of this sleep
+            // means the signal was not taken, which the parent reports as a timeout.
+            std::thread::sleep(Duration::from_secs(30));
+            std::process::exit(0);
+        }
+        let mut status = 0;
+        // SAFETY: `pid` is the child forked above and `status` is a valid out pointer.
+        unsafe { libc::waitpid(pid, &mut status, 0) };
+        let code = if libc::WIFEXITED(status) {
+            libc::WEXITSTATUS(status)
+        } else {
+            // Died by a signal: not a clean exit, report it distinctly.
+            255
+        };
+        // SAFETY: `_exit` skips libtest teardown, which is wanted in this child.
+        unsafe { libc::_exit(code) }
+    }
+
+    #[test]
+    fn termination_signal_flow_records_sender_and_exits() {
+        if let Some(alerts) = std::env::var_os(CHILD_ALERTS_ENV) {
+            let ready = std::env::var_os(CHILD_READY_ENV).expect("ready path");
+            run_flow_child(alerts.into(), ready.into());
+        }
+
+        let exe = std::env::current_exe().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        for &signo in &WATCHED_SIGNALS {
+            let alerts = dir.path().join(format!("alerts-{signo}.ndjson"));
+            let ready = dir.path().join(format!("ready-{signo}"));
+            let mut child = std::process::Command::new(&exe)
+                .args([
+                    "kill_loudness::tests::termination_signal_flow_records_sender_and_exits",
+                    "--exact",
+                    "--test-threads=1",
+                    "--nocapture",
+                ])
+                .env(CHILD_ALERTS_ENV, &alerts)
+                .env(CHILD_READY_ENV, &ready)
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .unwrap();
+
+            let deadline = std::time::Instant::now() + Duration::from_secs(20);
+            while !ready.exists() {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "child never became ready"
+                );
+                std::thread::sleep(Duration::from_millis(20));
+            }
+
+            let target: i32 = std::fs::read_to_string(&ready)
+                .unwrap()
+                .trim()
+                .parse()
+                .unwrap();
+            // SAFETY: plain kill(2), process-directed like `systemctl stop`.
+            assert_eq!(unsafe { libc::kill(target, signo) }, 0);
+
+            let status = loop {
+                if let Some(status) = child.try_wait().unwrap() {
+                    break status;
+                }
+                if std::time::Instant::now() >= deadline {
+                    // SAFETY: cleanup of the stuck grandchild, then its relay.
+                    unsafe { libc::kill(target, libc::SIGKILL) };
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    panic!("child did not exit after {}", signal_name(signo));
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            };
+            assert_eq!(status.code(), Some(128 + signo), "exit code for {signo}");
+            assert_ne!(
+                status.code(),
+                Some(255),
+                "died by a signal instead of exiting"
+            );
+
+            let line = std::fs::read_to_string(&alerts).expect("alert line written");
+            assert!(line.contains("\"technique\":\"T1562\""), "{line}");
+            assert!(line.contains(signal_name(signo)), "{line}");
+            assert!(
+                line.contains(&format!("from pid {}", std::process::id())),
+                "sender must be this process: {line}"
+            );
+        }
     }
 }
