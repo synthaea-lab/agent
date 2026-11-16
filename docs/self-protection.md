@@ -241,10 +241,18 @@ from a catchable termination signal, it records who sent it.
    (`SHUTDOWN_FLUSH_BUDGET`) to drain. The bound keeps this from becoming a shutdown
    path a wedged process could use to outlast the signal.
 
+The flow is tested end to end by `termination_signal_flow_records_sender_and_exits`:
+the test re-executes its own binary, the child forks a process that runs steps 1 to 3,
+and the parent sends each of the three signals and checks the exit code
+(`128 + signo`) and an alert line naming the parent as the sender. The fork matters:
+libtest's main thread does not block the signals, which the real agent never has.
+
 `SIGKILL` and `SIGSTOP` cannot be caught or attributed by the dying process. The eBPF
 sensor covers that from the kernel side: its signal probes record a `SIGKILL` aimed
 at the agent, and the restarted agent reports the sender through a rule. Under the
-audit fallback sensor that gap remains. Kernel-mediated stops that involve no signal
+audit fallback sensor that gap remains: no test covers it, and whether it is a permanent
+limit is open until a lab capture (tracked by [#275](https://github.com/synthaea-lab/agent/issues/275)).
+Kernel-mediated stops that involve no signal
 from a process (a CPU rlimit, a cgroup memory limit, `cgroup.freeze`) are read from how
 they are set: the command (`systemctl freeze|set-property`, a memory or task limit, or a
 `CPUQuota` below 10 %, in `%`, `‰` or `‱`, on a listed tool is Medium, also after any `systemctl` option that takes a separate value
