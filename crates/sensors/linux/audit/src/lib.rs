@@ -21,6 +21,7 @@
 
 mod classify;
 mod execve;
+pub mod killrec;
 mod normalize;
 mod parse;
 
@@ -34,7 +35,7 @@ mod socket;
 #[cfg(target_os = "linux")]
 pub use avc::AvcReader;
 pub use classify::{AuditEvent, classify};
-pub use normalize::{connect_event, exec_event, policy_denial_event};
+pub use normalize::{connect_event, exec_event, policy_denial_event, sigkill_event};
 pub use parse::{AuditRecord, parse_audit_message};
 #[cfg(target_os = "linux")]
 pub use sensor::AuditSensor;

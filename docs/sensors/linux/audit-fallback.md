@@ -19,6 +19,38 @@ no file events.
 running `auditd` instead of displacing it, and it receives only what the host's audit configuration
 emits: exec and connect records appear only if audit rules generate them.
 
+## `SIGKILL` of the agent
+
+A `SIGKILL` aimed at the agent cannot be read live: the agent dies before it drains the record. The
+eBPF sensor keeps the event in a pinned map for the restarted agent; the fallback keeps it in
+auditd's log (#275):
+
+1. The operator loads [`synthaea-kill.rules`](../../../packaging/linux/audit/synthaea-kill.rules):
+   `-S kill -F a1=9` and `-S tgkill -F a2=9`, key `synthaea-kill`. The packages neither install nor load it
+   (it changes the host's audit configuration, and an immutable configuration refuses it). `tkill`
+   is left out, as in the eBPF probe: it takes a thread id.
+2. At start, `AuditSensor` (given the state directory) reads the marker `audit-agent.pid` (pid and start
+   time of the previous instance) and writes its own. A clean stop removes the marker, so only a
+   kill leaves one behind.
+3. It reads the tail of `/var/log/audit/audit.log` and `audit.log.1` ([`killrec`](../../../crates/sensors/linux/audit/src/killrec.rs),
+   at most 16 MiB each) for the latest `SYSCALL` record with that key, `success=yes`, signal 9, whose
+   target is the marker's pid, sent after that instance started and within 10 minutes of now. The
+   marker's pid equal to the current pid (a recycled pid) attributes nothing.
+4. It emits an `Event::Signal` (signal 9, sender in `meta`, target the old pid): the same event the eBPF
+   replay emits, so the T1562.001 rule attributes it, High unless the sender is pid 1.
+
+Captured on Rocky 9.8 (kernel 5.14, auditd 3.1.5, systemd 252, 2026-11-16): `kill -KILL` from a shell and
+`/usr/bin/kill` leave one record each with the sender's `pid`, `ppid`, `auid`, `comm` and `exe` and the target
+in `a0` (hex); a single record is in `audit.log` at once, without the 50-record flush the config suggests
+(`flush = INCREMENTAL_ASYNC`, `freq = 50`); `kill -0` and SIGTERM are not recorded by these rules; `systemctl kill`
+leaves no record with `kill`, `tkill`, `tgkill` or `pidfd_send_signal`, and its sender would be pid 1.
+
+**Limits.** No rule, no attribution. Needs `/var/log/audit/audit.log` readable by the agent (root) and auditd writing
+to it (`write_logs = yes`, `log_format = ENRICHED` or `RAW`; the key is read from the kernel part of the line). The
+agent killed by SIGKILL and not restarted within 10 minutes is not reported. The volume of SIGKILL records on a real
+host is not measured. Tested on the captured line and on files; **not run end to end** (an agent without eBPF killed
+and restarted on a lab VM with the rule loaded).
+
 Netlink multicast delivers one copy of each record to every subscribed socket, so `AvcReader` and
 `AuditSensor` do not steal records from each other or from `auditd`.
 

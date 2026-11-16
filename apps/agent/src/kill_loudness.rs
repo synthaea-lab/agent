@@ -6,7 +6,8 @@
 //! sensor closes that gap from the kernel side (issue #362): its `kill`/`tgkill`
 //! probes record a SIGKILL aimed at the agent in a pinned map before delivery, and
 //! the restarted agent reports the sender through the T1562.001 rule. Under the
-//! audit fallback sensor the gap remains.
+//! audit fallback sensor the same replay reads auditd's log, but only when the operator loaded
+//! `packaging/linux/audit/synthaea-kill.rules` (#275); a `systemctl kill` is not attributed.
 //!
 //! Mechanism: the catchable termination signals (SIGTERM/SIGHUP/SIGQUIT — **not**
 //! SIGINT, deliberately: `sensor_linux::LinuxSensor::run` already owns Ctrl-C via

@@ -174,6 +174,7 @@ fn has_bpf_capabilities() -> bool {
 /// beacon (#863); the audit fallback has no such cache.
 fn select_sensor(
     enable_dns_capture: bool,
+    state_dir: &std::path::Path,
 ) -> (
     Box<dyn schema::sensor::Sensor>,
     &'static str,
@@ -193,7 +194,7 @@ fn select_sensor(
 
     tracing::warn!("eBPF unavailable — using audit fallback (reduced fidelity)");
     (
-        Box::new(sensor_linux_audit::AuditSensor::new()),
+        Box::new(sensor_linux_audit::AuditSensor::new().with_state_dir(state_dir.to_path_buf())),
         "linux-audit",
         None,
     )
@@ -296,7 +297,8 @@ pub(crate) fn cmd_run(opts: super::RunOptions) -> anyhow::Result<()> {
 
     // Select the primary sensor (eBPF or audit fallback) before creating heartbeats
     // so telemetry reports the correct sensor type.
-    let (mut sensor, sensor_name, evictions) = select_sensor(enable_dns_capture);
+    let (mut sensor, sensor_name, evictions) =
+        select_sensor(enable_dns_capture, &storage.state_dir);
 
     // Automated response (#25): policy off by default (observe-only), opted into
     // per flag. Quarantine lands next to alerts.ndjson, the same "derived, no

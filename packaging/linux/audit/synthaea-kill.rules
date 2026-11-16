@@ -1,0 +1,20 @@
+## SIGKILL attribution for the agent's audit fallback (agent#275).
+##
+## The audit fallback sensor cannot see a SIGKILL aimed at the agent live: the agent dies
+## before it reads the record. With this rule loaded, auditd writes one SYSCALL record per
+## SIGKILL to /var/log/audit/audit.log; the restarted agent finds the one aimed at its
+## predecessor and reports the sender (see docs/sensors/linux/audit-fallback.md).
+##
+## The packages neither install nor load it: it changes the host's audit configuration, which the
+## agent never does by itself. Copy it from the repository deliberately:
+##   cp synthaea-kill.rules /etc/audit/rules.d/ && augenrules --load
+## It cannot be loaded when the audit configuration is immutable (-e 2). Only SIGKILL
+## is matched (a1=9 for kill, a2=9 for tgkill), so `kill -0` and ordinary SIGTERM do not
+## write a record. The volume of SIGKILLs on a real host is not measured. tkill is left
+## out: it takes a thread id, which cannot be compared with the agent's process id.
+## A `systemctl kill` leaves no record with these syscalls and stays unattributed.
+##
+## The lines are the same on x86_64 and aarch64 (`arch=b64`); the agent reads the syscall numbers of
+## both (62/234 and 129/131). Only x86_64 was captured.
+-a always,exit -F arch=b64 -S kill -F a1=9 -k synthaea-kill
+-a always,exit -F arch=b64 -S tgkill -F a2=9 -k synthaea-kill
