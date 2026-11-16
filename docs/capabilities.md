@@ -148,8 +148,8 @@ Totals: 273 capabilities, 151 built, 81 partial, 41 planned.
 
 | Capability | Status | Evidence | Tracking issue | Docs |
 | --- | --- | --- | --- | --- |
-| Timestomp detection via BPF-LSM inode_setattr (caller-chosen atime/mtime) | built | main.rs inode_setattr, userspace ebpf.rs attach_inode_setattr, btf.rs parse_inode_setattr_offsets tests, normalize file_set_time tests; requires kernel 6.3+ hook signature and lsm=bpf |  | [sensors/linux/lsm.md#inode_setattr](sensors/linux/lsm.md#inode_setattr) |
-| BPF-LSM file_open observation (fires for io_uring) | partial | main.rs file_open, crates/sensors/linux/lsm/src/attach.rs, apps/agent/tests/lsm_io_uring_evasion.rs; counter only, no event emitted | [#88](https://github.com/synthaea-lab/agent/issues/88) | [sensors/linux/lsm.md#file_open](sensors/linux/lsm.md#file_open) |
+| Timestomp detection via BPF-LSM inode_setattr (caller-chosen atime/mtime) | built | ebpf lsm/inode_setattr.rs inode_setattr, userspace ebpf.rs attach_inode_setattr, btf.rs parse_inode_setattr_offsets tests, normalize file_set_time tests; requires kernel 6.3+ hook signature and lsm=bpf |  | [sensors/linux/lsm.md#inode_setattr](sensors/linux/lsm.md#inode_setattr) |
+| BPF-LSM file_open observation (fires for io_uring) | partial | ebpf lsm/file_open.rs file_open, crates/sensors/linux/lsm/src/attach.rs, apps/agent/tests/lsm_io_uring_evasion.rs; counter only, no event emitted | [#88](https://github.com/synthaea-lab/agent/issues/88) | [sensors/linux/lsm.md#file_open](sensors/linux/lsm.md#file_open) |
 | Inline blocking (deny open/exec/connect on a verdict) via BPF-LSM | planned | Not built: file_open never denies on its own; no verdict source wired; bprm_check/socket_connect hooks absent | [#90](https://github.com/synthaea-lab/agent/issues/90) | [sensors/linux/lsm.md#not-built](sensors/linux/lsm.md#not-built) |
 
 ### Uprobes and DNS
