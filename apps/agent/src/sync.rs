@@ -185,46 +185,48 @@ mod tests {
         assert_eq!(*lock.read_recovering(), 3);
     }
 
-    #[test]
-    fn a_condvar_wait_survives_a_mutex_poisoned_while_waiting() {
-        let pair = Arc::new((Mutex::new(false), Condvar::new()));
-        let waiter = {
-            let pair = Arc::clone(&pair);
-            thread::spawn(move || {
-                let (lock, cv) = &*pair;
-                let guard = lock.lock_recovering();
-                *cv.wait_while_recovering(guard, |ready| !*ready)
-            })
-        };
-        // Poison the mutex while the waiter sleeps, then release it.
-        let poisoner = {
-            let pair = Arc::clone(&pair);
-            thread::spawn(move || {
-                let (lock, cv) = &*pair;
-                let mut guard = lock.lock().unwrap();
-                *guard = true;
-                cv.notify_all();
-                panic!("poison the mutex the waiter sleeps on");
-            })
-        };
-        assert!(poisoner.join().is_err());
-        assert!(waiter.join().unwrap());
+    /// Spawns a thread that blocks on `lock` until the caller's guard is released by a
+    /// condvar wait, then notifies and panics while holding the guard, which poisons the
+    /// mutex while the caller is inside the wait. The caller holds a plain `lock()` guard
+    /// taken before this call, so the poisoner cannot run before the wait begins.
+    fn poison_during_wait(lock: &Arc<Mutex<u32>>, cv: &Arc<Condvar>) -> thread::JoinHandle<()> {
+        let lock = Arc::clone(lock);
+        let cv = Arc::clone(cv);
+        thread::spawn(move || {
+            let mut guard = lock.lock().unwrap();
+            *guard = 1;
+            cv.notify_all();
+            panic!("poison the mutex the waiter sleeps on");
+        })
     }
 
     #[test]
-    fn a_timed_wait_on_a_poisoned_mutex_returns_the_guard() {
-        let lock = Arc::new(Mutex::new(5u32));
-        let cv = Condvar::new();
-        let poisoner = {
-            let lock = Arc::clone(&lock);
-            thread::spawn(move || {
-                let _guard = lock.lock().unwrap();
-                panic!("poison the mutex");
-            })
-        };
+    fn a_condvar_wait_survives_a_mutex_poisoned_while_waiting() {
+        let lock = Arc::new(Mutex::new(0u32));
+        let cv = Arc::new(Condvar::new());
+        let guard = lock.lock().unwrap();
+        let poisoner = poison_during_wait(&lock, &cv);
+        let guard = cv.wait_while_recovering(guard, |value| *value == 0);
+        // The wait returned through the poisoned branch: a plain `wait_while` would have
+        // handed back an `Err` here, and `.unwrap()` in the helper would panic.
+        assert!(lock.is_poisoned());
+        assert_eq!(*guard, 1);
+        drop(guard);
         assert!(poisoner.join().is_err());
-        let guard = lock.lock_recovering();
-        let guard = cv.wait_timeout_recovering(guard, Duration::from_millis(5));
-        assert_eq!(*guard, 5);
+    }
+
+    #[test]
+    fn a_timed_wait_on_a_mutex_poisoned_while_waiting_returns_the_guard() {
+        let lock = Arc::new(Mutex::new(0u32));
+        let cv = Arc::new(Condvar::new());
+        let guard = lock.lock().unwrap();
+        assert!(!lock.is_poisoned());
+        let poisoner = poison_during_wait(&lock, &cv);
+        // Long timeout: the poisoner's notify ends the wait, not the clock.
+        let guard = cv.wait_timeout_recovering(guard, Duration::from_secs(30));
+        assert!(lock.is_poisoned());
+        assert_eq!(*guard, 1);
+        drop(guard);
+        assert!(poisoner.join().is_err());
     }
 }
