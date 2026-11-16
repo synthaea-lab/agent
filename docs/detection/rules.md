@@ -226,7 +226,10 @@ same signature gate applies.
 - The Firefox family is also matched by shape (decision of 2026-11-12 on #221): the file name is
   `firefox`, `firefox-bin` or `firefox-esr` **and** the parent directory is named `firefox` or
   `firefox-esr`. That covers a Mozilla tarball (`<dir>/firefox/firefox-bin`), the Snap
-  (`/snap/firefox/<rev>/usr/lib/firefox/firefox`), Debian's `/usr/lib/firefox-esr/firefox-esr` and a
+  (`/snap/firefox/<rev>/usr/lib/firefox/firefox`), Debian's `/usr/lib/firefox-esr/firefox-esr` (Debian 13 VM, 2026-11-12: read from
+  `/proc` under `strace` and confirmed in the sensor's `file_rename` event, kernel 6.12; an end-to-end run there, headless
+  `firefox-esr` downloading an ELF that was then run, raised T1204.002 `marked by firefox-esr` in 2 of
+  2 runs, and nothing for a `curl` plus `mv` control) and a
   Flatpak-shaped `/app/lib/firefox/firefox`; not `/usr/bin/firefox` (the launcher, parent `bin`),
   not `/tmp/other/firefox`, not a fork under another directory name (`librewolf`, `firefox-developer-edition`).
   A false match only arms the signature-gated T1204.002 on an exec of the renamed file; a miss hides a
@@ -235,11 +238,7 @@ same signature gate applies.
   showed (2026-11-10, Fedora 43 lab VM): Chromium and Firefox from the distribution packages,
   and the vendor packages of Chrome (`/opt/google/chrome/chrome`), Edge
   (`/opt/microsoft/msedge/msedge`), Brave (`/opt/brave.com/brave/brave`), Opera
-  (`/usr/lib64/opera-stable/opera`) and Vivaldi (`/opt/vivaldi/vivaldi-bin`); and, from a
-  Debian 13 VM on 2026-11-12, `firefox-esr` (`/usr/lib/firefox-esr/firefox-esr`, read from
-  `/proc` under `strace` and confirmed in the sensor's `file_rename` event, kernel 6.12; an end-to-end run there, headless
-  `firefox-esr` downloading an ELF that was then run, raised T1204.002 `marked by firefox-esr` in 2 of
-  2 runs, and nothing for a `curl` plus `mv` control).
+  (`/usr/lib64/opera-stable/opera`) and Vivaldi (`/opt/vivaldi/vivaldi-bin`).
 - An empty or absent `executable_path` marks nothing. What is still unchecked is listed under
   "Not verified" in [attack-coverage.md](../attack-coverage.md).
 
