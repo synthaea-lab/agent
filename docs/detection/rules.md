@@ -231,6 +231,12 @@ same signature gate applies.
   not `/tmp/other/firefox`, not a fork under another directory name (`librewolf`, `firefox-developer-edition`).
   A false match only arms the signature-gated T1204.002 on an exec of the renamed file; a miss hides a
   real download. Case-sensitive.
+- The Chromium Snap is matched by its layout, not by the list: `/snap/chromium/<revision>/usr/lib/chromium-browser/chrome`,
+  the revision being digits only (captured 2026-11-16 on Ubuntu 26.04.1, #267). The file is `chrome` there, so the
+  distribution entry does not cover it. `current`, a non-numeric revision and any other file or depth do not match.
+  That Snap reports the rename under its own home, `<home>/snap/chromium/<revision>/Downloads/<file>`, a symlink to
+  `<home>/Downloads`; the mark is also recorded at `<home>/Downloads/<file>` so that a run from the real directory joins.
+  Only the default `Downloads` name, only Chromium: no path is resolved, the alias is a guess about the symlink.
 - Adding another browser is one line in `BROWSER_DOWNLOAD_IMAGES`. It holds only the images a capture
   showed (2026-11-10, Fedora 43 lab VM): Chromium and Firefox from the distribution packages,
   and the vendor packages of Chrome (`/opt/google/chrome/chrome`), Edge
