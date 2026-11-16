@@ -14,7 +14,7 @@ use schema::sensor::{EventSink as _, Sensor as _};
 use tamper::heartbeat::{SensorHeartbeat, SilenceMonitor};
 
 use crate::{
-    captures::{CaptureSet, Captures, UprobesAction, plan},
+    captures::{CaptureSet, Captures, HeartbeatWatch, UprobesAction, heartbeat_watch, plan},
     protected::ProtectedResourceGuard,
     shutdown::{SHUTDOWN_BUDGET, ShutdownPlan, sleep_unless_stopped},
     silence::{PulsingSink, SourceStatus},
@@ -779,7 +779,8 @@ fn spawn_journal_tail(
         // -> agent delivery on a host with nothing else to log.
         if let Err(e) = spawn_journal_canary() {
             // Started from the tail's own thread, long after start-up: log it, the silence
-            // monitor reports the missing canary.
+            // heartbeat keeps pulsing on other lines, so only an idle host reports the journal
+            // sensor silent.
             tracing::warn!(error = %e, "journal canary not started");
         }
         let mut unit_persistence = sensor_linux_journal::UnitPersistenceTracker::new();
@@ -930,18 +931,24 @@ fn spawn_uprobes_supervisor(
 ) -> std::io::Result<()> {
     crate::spawn::spawn_named("uprobes-supervisor", move || {
         let mut running: Option<RunningUprobes> = None;
+        // Whether the heartbeat is watched follows what is wanted, not what runs: a start the OS
+        // refuses leaves nothing running, and switching the capture off must still unregister.
+        let mut registered = false;
         let mut wanted = captures.effective();
         loop {
+            if heartbeat_watch(registered, wanted) == HeartbeatWatch::Watch {
+                monitor.lock().unwrap().register(
+                    heartbeat.clone(),
+                    NO_CANARY_SILENCE_DEADLINE_NS,
+                    schema::time::now_ns(),
+                );
+                registered = true;
+            }
             let current = running.as_ref().map_or(Captures::NONE, |r| r.captures);
             match plan(current, wanted) {
                 UprobesAction::Idle => {}
                 UprobesAction::Start(set) => {
                     tracing::info!(?set, "starting the uprobes sensor");
-                    monitor.lock().unwrap().register(
-                        heartbeat.clone(),
-                        NO_CANARY_SILENCE_DEADLINE_NS,
-                        schema::time::now_ns(),
-                    );
                     running = start_uprobes_or_log(&sink, &heartbeat, set);
                 }
                 UprobesAction::Restart(set) => {
@@ -959,8 +966,11 @@ fn spawn_uprobes_supervisor(
                     if let Some(old) = running.take() {
                         old.stop();
                     }
-                    monitor.lock().unwrap().unregister(heartbeat.name());
                 }
+            }
+            if heartbeat_watch(registered, wanted) == HeartbeatWatch::Unwatch {
+                monitor.lock().unwrap().unregister(heartbeat.name());
+                registered = false;
             }
             wanted = captures.wait_until_differs(wanted);
         }
