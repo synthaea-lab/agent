@@ -2772,6 +2772,36 @@ fn a_high_severity_built_in_alert_never_triggers_a_kill() {
     );
 }
 
+/// #613: the two refusals, with the text the operator's CLI prints (#155 typed them; the
+/// text was pinned on the `String` version first).
+#[test]
+fn a_suppression_is_refused_with_an_operator_readable_reason() {
+    let dir = tmp("suppress-refused");
+    let sink = sink_in(&dir);
+    assert_eq!(
+        sink.suppress_verdict(1, "", "T1105")
+            .unwrap_err()
+            .to_string(),
+        "comm and technique must not be empty"
+    );
+    assert_eq!(
+        sink.suppress_verdict(1, "x", "").unwrap_err().to_string(),
+        "comm and technique must not be empty"
+    );
+    for i in 0..verdict::MAX_SUPPRESSIONS {
+        assert_eq!(sink.suppress_verdict(1, "x", &format!("T{i}")), Ok(true));
+    }
+    assert_eq!(
+        sink.suppress_verdict(1, "x", "one-more")
+            .unwrap_err()
+            .to_string(),
+        format!(
+            "suppression list is full ({} entries): lift one first",
+            verdict::MAX_SUPPRESSIONS
+        )
+    );
+}
+
 /// #613: a suppression drops the finding from the fused verdict, never from
 /// the audit trail.
 #[test]
