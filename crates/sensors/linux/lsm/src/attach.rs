@@ -9,7 +9,7 @@ use aya_obj::btf::BtfKind;
 use schema::sensor::SensorError;
 
 /// Name of the eBPF program in `sensor-linux`'s compiled object (the function name
-/// under `#[lsm(hook = "file_open")]` in `crates/sensors/linux/ebpf/src/main.rs`).
+/// under `#[lsm(hook = "file_open")]` in `crates/sensors/linux/ebpf/src/lsm/file_open.rs`).
 const FILE_OPEN_PROGRAM: &str = "file_open";
 /// LSM hook name passed to `Lsm::load` — the kernel's hook, not our program name.
 /// They happen to match for this one; kept as separate constants because they won't
