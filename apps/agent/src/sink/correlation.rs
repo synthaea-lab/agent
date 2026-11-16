@@ -178,7 +178,8 @@ impl DetectionSink {
         let generation = event.meta().process_generation;
         if let Some(ref mut scorer) = *self.ml_scorer.lock_recovering() {
             let ml_llr = ml_evidence(scorer, &engine, pid, generation);
-            // `Err` only means the pid has no behavior vector yet: normal for its first events.
+            // Either `MlUpdateError` means the score has no belief to land on; right after
+            // `on_event` for this pid, that is an evicted or replaced entity, not a failure.
             let _ = engine.update_belief_with_ml(pid, generation, ml_llr);
         }
 

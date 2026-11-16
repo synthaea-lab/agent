@@ -1,7 +1,7 @@
 //! `BehaviorVector` feature extraction and the naive-Bayes belief tests.
 
 use super::*;
-use crate::KillShield;
+use crate::{KillShield, MlUpdateError};
 
 // ── BehaviorVector ─────────────────────────────────────────────────────────
 
@@ -377,6 +377,43 @@ fn update_belief_with_ml_none_leaves_the_belief_untouched() {
         .log_odds;
 
     assert_eq!(before, after, "a None LLR must be a complete no-op");
+}
+
+#[test]
+fn update_belief_with_ml_for_a_pid_the_bus_never_saw_is_unknown_pid() {
+    let mut engine = CorrelationEngine::new();
+    assert_eq!(
+        engine.update_belief_with_ml(42, None, Some(0.5)),
+        Err(MlUpdateError::UnknownPid { pid: 42 })
+    );
+}
+
+#[test]
+fn update_belief_with_ml_after_another_incarnation_of_the_parent_took_the_belief_is_no_belief() {
+    // Two children named `x` of two lives of pid 77: the second replaces the belief kept
+    // under (77, "x") (#592), so the first child's ML term has nothing to land on.
+    let child = |pid: u32, parent_generation: u64, ts_ns: u64| {
+        exec_with_meta(
+            EventMeta {
+                process_generation: Some(u64::from(pid)),
+                parent_process_generation: Some(parent_generation),
+                ..meta_full(pid, 77, "x", ts_ns)
+            },
+            "",
+        )
+    };
+    let mut engine = CorrelationEngine::new();
+    engine.on_event(child(10, 1, 1_000_000_000));
+    engine.on_event(child(11, 2, 2_000_000_000));
+
+    assert_eq!(
+        engine.update_belief_with_ml(10, Some(10), Some(0.5)),
+        Err(MlUpdateError::NoBelief { pid: 10 })
+    );
+    assert_eq!(
+        engine.update_belief_with_ml(11, Some(11), Some(0.5)),
+        Ok(())
+    );
 }
 
 #[test]

@@ -694,6 +694,7 @@ dependencies = [
  "serde_json",
  "siblings",
  "store",
+ "thiserror 2.0.21",
  "tracing",
 ]
 

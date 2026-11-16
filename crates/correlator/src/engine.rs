@@ -19,6 +19,23 @@ use crate::{
     },
 };
 
+/// Why [`CorrelationEngine::update_belief_with_ml`] could not add an ML score.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum MlUpdateError {
+    /// The bus holds no event for this incarnation of the pid.
+    #[error("no event for pid {pid} in the correlation window")]
+    UnknownPid {
+        /// The pid the score was for.
+        pid: u32,
+    },
+    /// The pid's entity has no belief for this incarnation of its parent.
+    #[error("no belief for the entity of pid {pid}")]
+    NoBelief {
+        /// The pid the score was for.
+        pid: u32,
+    },
+}
+
 /// Processes excluded from the correlation engine — legitimate system activity that
 /// generates noise (spawn + connection) under normal conditions. Same logic as the
 /// exclusion lists in `rules`, applied here at the correlation level.
@@ -575,11 +592,15 @@ impl CorrelationEngine {
     ///
     /// # Errors
     ///
-    /// Returns `Err(())` when `ml_llr` is `Some` but [`Self::on_event`] never created
-    /// a belief state for this pid this cycle (no `BehaviorVector` yet — not enough
-    /// events in the correlator window). This is a normal condition for newly seen
-    /// pids and should be handled silently by the caller. `ml_llr = None` always
-    /// returns `Ok(())`: there is nothing to add either way.
+    /// Only when `ml_llr` is `Some`; `None` always returns `Ok(())`, there is nothing to add
+    /// either way. Both errors mean the score has no belief to land on, and a caller that
+    /// scores right after [`Self::on_event`] for the same pid can ignore them:
+    ///
+    /// - [`MlUpdateError::UnknownPid`] when the bus holds no event for this incarnation of
+    ///   the pid (never seen, or its events have aged out of the window);
+    /// - [`MlUpdateError::NoBelief`] when the pid's entity has no belief for this
+    ///   incarnation of its parent: another incarnation's child with the same `comm`
+    ///   replaced it (#592), or the belief map evicted it at its cap.
     ///
     /// # Example
     ///
@@ -593,23 +614,26 @@ impl CorrelationEngine {
     /// };
     /// engine.update_belief_with_ml(pid, generation, ml_llr)?;
     /// ```
-    #[allow(clippy::result_unit_err)]
     pub fn update_belief_with_ml(
         &mut self,
         pid: u32,
         generation: Option<u64>,
         ml_llr: Option<f32>,
-    ) -> Result<(), ()> {
+    ) -> Result<(), MlUpdateError> {
         let Some(llr) = ml_llr else {
             return Ok(());
         };
 
-        let entity_key = self.entity_of_pid(pid, generation).ok_or(())?;
+        let entity_key = self
+            .entity_of_pid(pid, generation)
+            .ok_or(MlUpdateError::UnknownPid { pid })?;
 
         // `on_event` creates this entity's belief state in the same cycle whenever a
         // `BehaviorVector` is available; if it isn't there yet either, there is no
         // base update to add the ML term to.
-        let state = self.belief_mut(&entity_key).ok_or(())?;
+        let state = self
+            .belief_mut(&entity_key)
+            .ok_or(MlUpdateError::NoBelief { pid })?;
         apply_ml_llr(state, llr);
         Ok(())
     }
