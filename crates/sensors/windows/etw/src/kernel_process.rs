@@ -29,6 +29,9 @@ pub(crate) enum KernelProcessEvent {
 }
 
 impl KernelProcessEvent {
+    /// Every id [`Self::from_id`] reads: the provider's event-id filter.
+    pub(crate) const EVENT_IDS: [u16; 8] = [1, 2, 3, 5, 23, 24, 25, 26];
+
     pub(crate) fn from_id(event_id: u16) -> Option<Self> {
         match event_id {
             1 => Some(Self::ProcessStart),
@@ -120,6 +123,17 @@ impl ProcessStart {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_event_id_filter_is_exactly_the_ids_read() {
+        for event_id in 0..=u16::MAX {
+            assert_eq!(
+                KernelProcessEvent::EVENT_IDS.contains(&event_id),
+                KernelProcessEvent::from_id(event_id).is_some(),
+                "EID {event_id}"
+            );
+        }
+    }
 
     #[test]
     fn handled_ids_map_to_their_event() {

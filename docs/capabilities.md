@@ -12,7 +12,7 @@ What the agent can do today, area by area, with the code and tests that back eac
 
 Every `partial` and `planned` row links a tracking issue; `tools/check-docs.py` fails CI otherwise.
 
-Totals: 273 capabilities, 151 built, 81 partial, 41 planned.
+Totals: 271 capabilities, 150 built, 81 partial, 40 planned.
 
 ## Contents
 
@@ -216,7 +216,7 @@ Totals: 273 capabilities, 151 built, 81 partial, 41 planned.
 | Memory-reaching opens of LSASS (Sysmon 10 equivalent) with spoof-resistant LSASS identification | built | cross_process.rs reaches_memory/lsass_open_is_reported/is_system_lsass/LsassTracker tests; providers.rs audit_api_provider |  | [sensors/windows/etw-enrichment.md#lsass-access](sensors/windows/etw-enrichment.md#lsass-access) |
 | Randomized session name with orphan cleanup across unclean shutdowns | built | sensor.rs stop_all_orphaned_sessions; normalize.rs random_session_name/parse_orphaned_sessions/select_orphaned_sessions/start_or_stop_session tests |  | [sensors/windows/etw.md#session-names-and-orphan-cleanup](sensors/windows/etw.md#session-names-and-orphan-cleanup) |
 | Deterministic liveness canary with blind-session diagnosis (own losses, foreign real-time sessions) | built | sensor.rs liveness_watch/silent_session_diagnosis; etw_sessions.rs; normalize.rs describe_silent_session/listing_is_conclusive/describe_foreign_sessions tests |  | [sensors/windows/etw.md#liveness-canary-and-blind-session-diagnosis](sensors/windows/etw.md#liveness-canary-and-blind-session-diagnosis) |
-| DNS, registry-write, PowerShell 4104, WMI, dynamic .NET assembly load and SMB connect telemetry | partial | providers.rs dns_provider/registry_provider/powershell_provider/wmi_provider/dotnet_provider/smb_provider; payload.rs decoders unit- and property-tested; user-mode providers enabled with all keywords | [#91](https://github.com/synthaea-lab/agent/issues/91) | [sensors/windows/etw.md#providers](sensors/windows/etw.md#providers) |
+| DNS, registry-write, PowerShell 4104, WMI, dynamic .NET assembly load and SMB connect telemetry | partial | providers.rs dns_provider/registry_provider/powershell_provider/wmi_provider/dotnet_provider/smb_provider; payload.rs decoders unit- and property-tested; enabled_for keyword masks + event-id filters; tests/kernel_registry_set_value.rs, tests/dotnet_event_filter.rs (elevated, not yet run); no live check of the Kernel-Network/PowerShell/AMSI/LDAP masks | [#91](https://github.com/synthaea-lab/agent/issues/91) | [sensors/windows/etw.md#providers](sensors/windows/etw.md#providers) |
 | LDAP search and NTLM usage telemetry (budgeted / deduplicated) | built | providers.rs ldap_provider/ntlm_provider; budget.rs PidBudget/KeyDedup tests; payload.rs ldap/ntlm decoder tests |  | [sensors/windows/etw.md#providers](sensors/windows/etw.md#providers) |
 | Container attribution for process-isolated (server silo) containers | partial | silo.rs (23 tests), hcs.rs, winapi.rs read_server_silo_id; lab Done-when unchecked; needs Windows 11 22H2 / Server 2025 | [#39](https://github.com/synthaea-lab/agent/issues/39) | [sensors/windows/etw-enrichment.md#containers](sensors/windows/etw-enrichment.md#containers) |
 | Executed image file identity for the T1204.002 rename-and-replace gate | partial | lib.rs identity_token/image_identity_is_capturable tests; winapi.rs image_file_id; race window up to ETW delivery latency remains | [#46](https://github.com/synthaea-lab/agent/issues/46) | [sensors/windows/etw-enrichment.md#image-file-identity](sensors/windows/etw-enrichment.md#image-file-identity) |

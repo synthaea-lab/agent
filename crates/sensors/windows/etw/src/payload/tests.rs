@@ -120,15 +120,15 @@ mod dns {
 mod registry {
     use super::*;
 
+    const RUN_KEY: &str = r"\REGISTRY\MACHINE\SOFTWARE\Microsoft\Windows\CurrentVersion\Run";
+
+    /// The EID 5 `SetValueKey` template of the manifest.
     fn set_value(data_type: u32, data: Vec<u8>) -> Fields {
         Fields::of(&[
-            (
-                "KeyName",
-                text_value(r"\REGISTRY\MACHINE\SOFTWARE\Microsoft\Windows\CurrentVersion\Run"),
-            ),
+            ("KeyName", text_value(RUN_KEY)),
             ("ValueName", text_value("updater")),
-            ("DataType", Value::U32(data_type)),
-            ("Data", Value::Bytes(data)),
+            ("Type", Value::U32(data_type)),
+            ("CapturedData", Value::Bytes(data)),
         ])
     }
 
@@ -178,6 +178,41 @@ mod registry {
     #[test]
     fn a_record_whose_key_was_not_resolved_is_dropped() {
         assert!(registry_set(&Fields::default(), meta()).is_none());
+    }
+
+    #[test]
+    fn a_write_naming_its_key_only_by_handle_is_dropped() {
+        let by_handle = Fields::of(&[
+            (
+                "KeyObject",
+                Value::Bytes(vec![0x10, 0x20, 0, 0, 0, 0xff, 0xff, 0xff]),
+            ),
+            ("KeyName", text_value("")),
+            ("ValueName", text_value("updater")),
+            ("Type", Value::U32(REG_SZ)),
+        ]);
+
+        assert!(registry_set(&by_handle, meta()).is_none());
+    }
+
+    #[test]
+    fn a_captured_prefix_cut_inside_a_utf16_unit_keeps_its_whole_units() {
+        let mut captured = utf16("C:\\long\\path");
+        captured.push(b'x');
+        let mut fields = set_value(REG_SZ, captured);
+        fields.0.insert("DataSize", Value::U32(200));
+
+        let event = registry_set(&fields, meta()).expect("named key");
+
+        assert_eq!(event.data.as_deref(), Some("C:\\long\\path"));
+    }
+
+    #[test]
+    fn a_complete_value_of_odd_length_is_not_text() {
+        let mut fields = set_value(REG_SZ, vec![b'a', 0, b'b']);
+        fields.0.insert("DataSize", Value::U32(3));
+
+        assert_eq!(registry_set(&fields, meta()).expect("named key").data, None);
     }
 }
 
@@ -231,6 +266,17 @@ mod wmi {
         assert_eq!(WmiOperation::from_id(11), None);
         assert_eq!(WmiOperation::from_id(22), None);
         assert_eq!(WmiOperation::from_id(25), None);
+    }
+
+    #[test]
+    fn the_event_id_filter_is_exactly_the_ids_read() {
+        for event_id in 0..=u16::MAX {
+            assert_eq!(
+                WmiOperation::EVENT_IDS.contains(&event_id),
+                WmiOperation::from_id(event_id).is_some(),
+                "EID {event_id}"
+            );
+        }
     }
 
     #[test]
@@ -383,6 +429,17 @@ mod ldap {
 
 mod ntlm {
     use super::*;
+
+    #[test]
+    fn the_event_id_filter_is_exactly_the_ids_read() {
+        for event_id in 0..=u16::MAX {
+            assert_eq!(
+                NTLM_EVENT_IDS.contains(&event_id),
+                ntlm_direction(event_id).is_some(),
+                "EID {event_id}"
+            );
+        }
+    }
 
     #[test]
     fn the_direction_follows_the_event_id() {
@@ -566,7 +623,8 @@ mod ntlm {
 mod never_panics {
     use super::*;
 
-    const NAMES: [&str; 35] = [
+    const NAMES: [&str; 36] = [
+        "DataSize",
         "Username",
         "DomainName",
         "TargetService",
@@ -586,8 +644,8 @@ mod never_panics {
         "QueryStatus",
         "KeyName",
         "ValueName",
-        "DataType",
-        "Data",
+        "Type",
+        "CapturedData",
         "ScriptBlockText",
         "ScriptBlockId",
         "Path",
