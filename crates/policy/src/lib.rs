@@ -118,87 +118,106 @@ pub fn service_main_path_is_trusted(path: &str) -> bool {
         return false;
     }
     let lower = path.to_ascii_lowercase();
-    // `is_trusted_system_path` is a raw `starts_with`, and the eBPF sensor reports
-    // `bprm->filename` as given — `/usr/../tmp/payload` passes it (non-blocking
-    // review finding; reaching `ppid == 1` still needs a unit, so this mostly
-    // overlaps the shell/interpreter and /opt//usr/local gaps above, but costs one
-    // line to close outright rather than rely on those alone).
-    if lower.split(['/', '\\']).any(|component| component == "..") {
-        return false;
-    }
-    if lower.starts_with("/usr/local/") || lower.starts_with("/opt/") {
-        return false;
-    }
-    const EXACT: &[&str] = &[
-        "sh",
-        "bash",
-        "dash",
-        "ash",
-        "zsh",
-        "ksh",
-        "csh",
-        "tcsh",
-        "fish",
-        "busybox",
-        "env",
-        "xargs",
-        "find",
-        "awk",
-        "gawk",
-        "mawk",
-        "nawk",
-        "sed",
-        "luajit",
-        "wish",
-        "expect",
-        "gdb",
-        "sudo",
-        "su",
-        "nsenter",
-        "chroot",
-        "pwsh",
-        "powershell",
-        // Script runners with no version-suffix convention of their own
-        // (review of #755, SherlockOmss 2026-10-19: each probed as a false
-        // "service main" at head). `nodejs` is the only binary name some
-        // Node.js packages on Debian/Ubuntu ship (old-dov 2026-10-19).
-        "nodejs",
-        "phpdbg",
-        "rscript",
-        "micropython",
-        "julia",
-        "guile",
-        "racket",
-        "jshell",
-    ];
-    const FAMILIES: &[&str] = &[
-        "python", "perl", "ruby", "node", "php", "java", "bun", "deno",
-        // Moved here from EXACT (`lua`, `tclsh`) or added (`php-cgi`, `pypy`)
-        // so a version suffix is also recognized (`lua5.4`, `tclsh8.6`,
-        // `php-cgi8.4`, `pypy3`) — review of #755, SherlockOmss 2026-10-19.
-        // `php-fpm` (the daemon) does not share the `php-cgi` prefix, so this
-        // does not reopen the `php-fpm8.4` false-positive old-dov's review fixed.
-        "lua", "tclsh", "php-cgi", "pypy",
-    ];
-    let name = lower.rsplit(['/', '\\']).next().unwrap_or(lower.as_str());
-    let is_family_interpreter = FAMILIES.iter().any(|family| {
-        name.strip_prefix(family).is_some_and(|rest| {
-            // A bare family name or a version suffix (`python3`, `python3.11`,
-            // `perl5.36.0`) is the interpreter; anything else (`php-fpm8.4`,
-            // `nodm`, `javac`) is a different binary that happens to share the
-            // prefix (review of #755, old-dov 2026-10-19: `starts_with` alone
-            // over-matches here, the unsafe direction for this check unlike
-            // `allow_exe`'s identical list — it strips protection from a real
-            // daemon, not from a script runner). Only digits and `.` after the
-            // prefix: no interpreter name in either list has a further suffix
-            // that isn't a version number. Two still do (`nodejs`, `php-cgi`
-            // without a trailing version): those are listed in `EXACT` or
-            // given their own family entry above instead.
-            rest.is_empty() || rest.chars().all(|c| c.is_ascii_digit() || c == '.')
-        })
-    });
-    !(EXACT.contains(&name) || is_family_interpreter)
+    !(has_parent_component(&lower)
+        || is_admin_or_third_party_prefix(&lower)
+        || is_shell_or_interpreter(file_name(&lower)))
 }
+
+/// A `..` component in either separator. `is_trusted_system_path` is a raw `starts_with`, and
+/// the eBPF sensor reports `bprm->filename` as given — `/usr/../tmp/payload` passes it
+/// (non-blocking review finding; reaching `ppid == 1` still needs a unit, so this mostly
+/// overlaps the shell/interpreter and /opt//usr/local gaps above, but costs one line to close
+/// outright rather than rely on those alone). `lower` is already lowercased.
+fn has_parent_component(lower: &str) -> bool {
+    lower.split(['/', '\\']).any(|component| component == "..")
+}
+
+/// `/usr/local/` and `/opt/`: trusted for a masquerade check, but they host third-party and
+/// admin-installed software, so not evidence of a package's own service. `lower` is already
+/// lowercased.
+fn is_admin_or_third_party_prefix(lower: &str) -> bool {
+    lower.starts_with("/usr/local/") || lower.starts_with("/opt/")
+}
+
+/// The last path component, in either separator. `lower` is already lowercased.
+fn file_name(lower: &str) -> &str {
+    lower.rsplit(['/', '\\']).next().unwrap_or(lower)
+}
+
+/// A shell or script runner: the image a unit that runs a script has, so never the service
+/// itself. Same list `config::load::is_interpreter` rejects for `allow_exe` (ADR-0029), see
+/// [`service_main_path_is_trusted`]. `name` is a lowercased file name.
+fn is_shell_or_interpreter(name: &str) -> bool {
+    SHELL_AND_INTERPRETER_NAMES.contains(&name) || is_interpreter_family_member(name)
+}
+
+/// An interpreter family name, bare or with a version suffix (`python3`, `python3.11`,
+/// `perl5.36.0`). Anything else (`php-fpm8.4`, `nodm`, `javac`) is a different binary that
+/// happens to share the prefix (review of #755, old-dov 2026-10-19: `starts_with` alone
+/// over-matches here, the unsafe direction for this check unlike `allow_exe`'s identical
+/// list — it strips protection from a real daemon, not from a script runner). Only digits
+/// and `.` after the prefix: no interpreter name in either list has a further suffix that
+/// isn't a version number. Two still do (`nodejs`, `php-cgi` without a trailing version):
+/// those are listed in `SHELL_AND_INTERPRETER_NAMES` or given their own family entry instead.
+fn is_interpreter_family_member(name: &str) -> bool {
+    INTERPRETER_FAMILIES.iter().any(|family| {
+        name.strip_prefix(family)
+            .is_some_and(|rest| rest.chars().all(|c| c.is_ascii_digit() || c == '.'))
+    })
+}
+
+const SHELL_AND_INTERPRETER_NAMES: &[&str] = &[
+    "sh",
+    "bash",
+    "dash",
+    "ash",
+    "zsh",
+    "ksh",
+    "csh",
+    "tcsh",
+    "fish",
+    "busybox",
+    "env",
+    "xargs",
+    "find",
+    "awk",
+    "gawk",
+    "mawk",
+    "nawk",
+    "sed",
+    "luajit",
+    "wish",
+    "expect",
+    "gdb",
+    "sudo",
+    "su",
+    "nsenter",
+    "chroot",
+    "pwsh",
+    "powershell",
+    // Script runners with no version-suffix convention of their own
+    // (review of #755, SherlockOmss 2026-10-19: each probed as a false
+    // "service main" at head). `nodejs` is the only binary name some
+    // Node.js packages on Debian/Ubuntu ship (old-dov 2026-10-19).
+    "nodejs",
+    "phpdbg",
+    "rscript",
+    "micropython",
+    "julia",
+    "guile",
+    "racket",
+    "jshell",
+];
+
+const INTERPRETER_FAMILIES: &[&str] = &[
+    "python", "perl", "ruby", "node", "php", "java", "bun", "deno",
+    // Moved here from EXACT (`lua`, `tclsh`) or added (`php-cgi`, `pypy`)
+    // so a version suffix is also recognized (`lua5.4`, `tclsh8.6`,
+    // `php-cgi8.4`, `pypy3`) — review of #755, SherlockOmss 2026-10-19.
+    // `php-fpm` (the daemon) does not share the `php-cgi` prefix, so this
+    // does not reopen the `php-fpm8.4` false-positive old-dov's review fixed.
+    "lua", "tclsh", "php-cgi", "pypy",
+];
 
 /// Whether an exec of `image_path` under a parent running `parent_image_path` is the
 /// process that holds one interactive login session: the per-connection process the

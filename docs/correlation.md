@@ -321,6 +321,19 @@ shield for a pid and incarnation. The rules behind it:
   script runners (by exact name or by family plus version suffix), because otherwise
   every payload run through `/usr/bin/python3` from a unit would be immune. A daemon
   whose own image is an interpreter (firewalld, tuned) therefore stays killable.
+
+  The decision, checked in this order (each step is a named predicate in
+  [`policy`](../crates/policy/src/lib.rs); a path that fails any step is not shielded):
+
+  | Step | Refuses | Example |
+  | --- | --- | --- |
+  | `is_trusted_system_path` | a path outside the system prefixes | `/tmp/payload`, `C:\Users\bob\svchost.exe` |
+  | `has_parent_component` | a `..` component, either separator | `/usr/../tmp/payload` |
+  | `is_admin_or_third_party_prefix` | `/opt/` and `/usr/local/` | `/opt/vendor/bin/agentd` |
+  | `is_shell_or_interpreter` | an exact shell or runner name, or a family name with only a version suffix | `/usr/bin/sh`, `/usr/bin/python3.11` |
+
+  A name that only shares a family prefix (`php-fpm8.4`, `nodm`, `javac`) is a real
+  daemon and keeps the shield. Pinned row by row by `service_main_path_decision_table`.
 - It is a path-and-parent heuristic, not package verification. A binary replaced
   under `/usr/sbin` by root is not caught by it, and a unit that runs a non-listed
   tool from a trusted path (`socat`, `ncat`) gets the shield.
