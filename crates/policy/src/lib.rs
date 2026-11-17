@@ -599,4 +599,81 @@ mod exclusion_tests {
             Some("C:\\Windows\\System32\\services.exe")
         ));
     }
+
+    // ── service_main_path_is_trusted ──────────────────────────────────────
+
+    /// The kill-shield decision as a table: one row per way a path can be refused or
+    /// accepted, so a refactor of the function keeps every branch (agent#165). `true` means
+    /// the image may be shielded from a kill on a Bayesian crossing alone.
+    #[test]
+    fn service_main_path_decision_table() {
+        let table: &[(&str, bool, &str)] = &[
+            // A system service's own binary.
+            ("/usr/sbin/NetworkManager", true, "a package daemon"),
+            ("/usr/lib/systemd/systemd-logind", true, "under /usr/lib"),
+            ("/lib/systemd/systemd-journald", true, "under /lib"),
+            ("/sbin/init", true, "under /sbin"),
+            (
+                "C:\\Windows\\System32\\svchost.exe",
+                true,
+                "windows system dir",
+            ),
+            // Not a trusted system location at all.
+            ("/tmp/payload", false, "not a system path"),
+            ("/home/bob/daemon", false, "a home directory"),
+            ("C:\\Users\\bob\\svchost.exe", false, "a user profile"),
+            ("C:\\Windows\\Temp\\x.exe", false, "a windows temp dir"),
+            // A system prefix reached through `..`, in either separator.
+            ("/usr/../tmp/payload", false, "dot-dot escapes the prefix"),
+            ("/usr/bin/../../tmp/x", false, "dot-dot further down"),
+            (
+                "C:\\Windows\\..\\Users\\x.exe",
+                false,
+                "dot-dot with backslashes",
+            ),
+            // Trusted for a masquerade check, not for a kill shield.
+            (
+                "/opt/vendor/bin/agentd",
+                false,
+                "/opt hosts third-party software",
+            ),
+            (
+                "/usr/local/bin/agentd",
+                false,
+                "/usr/local is admin-installed",
+            ),
+            ("/OPT/vendor/agentd", false, "the prefix test ignores case"),
+            // Shells and interpreters: the unit's image is not the service.
+            ("/usr/bin/sh", false, "exact: sh"),
+            ("/bin/bash", false, "exact: bash"),
+            ("/usr/bin/env", false, "exact: env"),
+            ("/usr/bin/nodejs", false, "exact: nodejs"),
+            ("/usr/bin/pwsh", false, "exact: pwsh"),
+            ("/usr/bin/python3", false, "family: python3"),
+            ("/usr/bin/python3.11", false, "family with a version"),
+            ("/usr/bin/perl5.36.0", false, "family with a long version"),
+            ("/usr/bin/lua5.4", false, "family: lua5.4"),
+            ("/usr/bin/php-cgi8.4", false, "family: php-cgi8.4"),
+            ("/usr/bin/pypy3", false, "family: pypy3"),
+            ("/usr/bin/python", false, "a bare family name"),
+            ("/USR/BIN/PYTHON3", false, "the name test ignores case"),
+            (
+                "C:\\Program Files\\PowerShell\\pwsh",
+                false,
+                "name after a backslash",
+            ),
+            // A binary that merely shares a family prefix is a real daemon.
+            ("/usr/sbin/php-fpm8.4", true, "php-fpm is not php-cgi"),
+            ("/usr/sbin/nodm", true, "nodm is not node"),
+            ("/usr/bin/javac", true, "javac is not java"),
+            ("/usr/sbin/pythond", true, "a letter after the family name"),
+        ];
+        for (path, shielded, why) in table {
+            assert_eq!(
+                service_main_path_is_trusted(path),
+                *shielded,
+                "{path}: {why}"
+            );
+        }
+    }
 }
