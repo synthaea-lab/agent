@@ -94,7 +94,7 @@ fn run_service_logic() -> anyhow::Result<()> {
     let config = SupervisorConfig {
         agent: &agent,
         alerts: &alerts,
-        restart_delay: 5,
+        restart_delay_secs: 5,
         heartbeat: HeartbeatSettings {
             interval_secs: 5,
             miss_limit: 6,

@@ -221,7 +221,7 @@ pub(crate) struct HeartbeatSettings {
 pub(crate) struct SupervisorConfig<'a> {
     pub(crate) agent: &'a Path,
     pub(crate) alerts: &'a Path,
-    pub(crate) restart_delay: u64,
+    pub(crate) restart_delay_secs: u64,
     pub(crate) heartbeat: HeartbeatSettings,
 }
 
@@ -274,7 +274,7 @@ impl<'a> Supervisor<'a> {
             }
         };
         Self {
-            backoff: Backoff::new(config.restart_delay),
+            backoff: Backoff::new(config.restart_delay_secs),
             heartbeat_path: heartbeat_path_for(config.alerts),
             config,
             probation,
@@ -297,8 +297,7 @@ impl<'a> Supervisor<'a> {
             self.report_definition_drift();
 
             if !self.agent_binary_intact() {
-                let (delay, _) = self.backoff.record_exit(Duration::ZERO);
-                if !sleep_unless_stopped(stop_flag, delay) {
+                if !self.wait_after_failed_start(stop_flag, None) {
                     return LoopExit::Stopped;
                 }
                 continue;
@@ -318,9 +317,7 @@ impl<'a> Supervisor<'a> {
                     // much a crash loop risk as an in-process panic — feed it
                     // into the same backoff instead of hammering at a fixed
                     // interval forever.
-                    let (delay, _) = self.backoff.record_exit(Duration::ZERO);
-                    eprintln!("[watchdog] spawn failed: {e}. Retrying in {delay}s...");
-                    if !sleep_unless_stopped(stop_flag, delay) {
+                    if !self.wait_after_failed_start(stop_flag, Some(&e)) {
                         return LoopExit::Stopped;
                     }
                     continue;
@@ -368,6 +365,20 @@ impl<'a> Supervisor<'a> {
         false
     }
 
+    /// Feeds a start that never happened (a refused binary, a failed spawn) into the
+    /// backoff, then waits. `false` when the stop flag rose during the wait.
+    fn wait_after_failed_start(
+        &mut self,
+        stop_flag: &AtomicBool,
+        spawn_error: Option<&std::io::Error>,
+    ) -> bool {
+        let (delay, _) = self.backoff.record_exit(Duration::ZERO);
+        if let Some(e) = spawn_error {
+            eprintln!("[watchdog] spawn failed: {e}. Retrying in {delay}s...");
+        }
+        sleep_unless_stopped(stop_flag, delay)
+    }
+
     /// Watches one child until it exits or is killed for a stalled heartbeat (→
     /// [`WatchOutcome::Restart`]), the stop flag rises (→ [`WatchOutcome::Stop`]:
     /// kill it and end supervision), or the release on probation fails its health
@@ -380,56 +391,24 @@ impl<'a> Supervisor<'a> {
         heartbeat: &mut HeartbeatMonitor,
         stop_flag: &AtomicBool,
     ) -> WatchOutcome {
-        let restart_after = |delay: u64| {
-            if sleep_unless_stopped(stop_flag, delay) {
-                WatchOutcome::Restart
-            } else {
-                WatchOutcome::Stop
-            }
-        };
         loop {
             if stop_flag.load(Ordering::SeqCst) {
-                let _ = child.kill();
-                let _ = child.wait();
+                kill_and_reap(child);
                 return WatchOutcome::Stop;
             }
             match child.try_wait() {
-                Ok(Some(status)) => {
-                    let uptime = spawn_time.elapsed();
-                    let (delay, class) = self.backoff.record_exit(uptime);
-                    match class {
-                        ExitClass::FastCrash => eprintln!(
-                            "[watchdog] agent exited ({status}) after {:.1}s — fast crash, backing off {delay}s...",
-                            uptime.as_secs_f64()
-                        ),
-                        ExitClass::Healthy => {
-                            eprintln!(
-                                "[watchdog] agent exited ({status}). Restarting in {delay}s..."
-                            );
-                        }
-                    }
-                    return restart_after(delay);
-                }
+                Ok(Some(status)) => return self.on_exit(status, spawn_time.elapsed(), stop_flag),
                 Ok(None) => {
                     if heartbeat.tick() {
-                        eprintln!(
-                            "[watchdog] agent heartbeat stalled ({} consecutive misses) — \
-                             killing and restarting (#102)",
-                            heartbeat.miss_limit
+                        return self.on_heartbeat_stall(
+                            child,
+                            spawn_time,
+                            heartbeat.miss_limit,
+                            stop_flag,
                         );
-                        let _ = child.kill();
-                        let _ = child.wait();
-                        let (delay, _) = self.backoff.record_exit(spawn_time.elapsed());
-                        return restart_after(delay);
                     }
-                    if let Some(LoopExit::RolledBack { failed, restored }) = settle_probation(
-                        &mut self.probation,
-                        heartbeat.progressed(),
-                        self.config.alerts,
-                    ) {
-                        let _ = child.kill();
-                        let _ = child.wait();
-                        return WatchOutcome::RolledBack { failed, restored };
+                    if let Some(outcome) = self.on_probation_check(child, heartbeat.progressed()) {
+                        return outcome;
                     }
                     std::thread::sleep(POLL_TICK);
                 }
@@ -439,6 +418,75 @@ impl<'a> Supervisor<'a> {
                 }
             }
         }
+    }
+
+    /// The child exited by itself after `uptime`: back off, then restart.
+    fn on_exit(
+        &mut self,
+        status: std::process::ExitStatus,
+        uptime: Duration,
+        stop_flag: &AtomicBool,
+    ) -> WatchOutcome {
+        let (delay, class) = self.backoff.record_exit(uptime);
+        match class {
+            ExitClass::FastCrash => eprintln!(
+                "[watchdog] agent exited ({status}) after {:.1}s — fast crash, backing off {delay}s...",
+                uptime.as_secs_f64()
+            ),
+            ExitClass::Healthy => {
+                eprintln!("[watchdog] agent exited ({status}). Restarting in {delay}s...");
+            }
+        }
+        restart_after(stop_flag, delay)
+    }
+
+    /// The heartbeat stalled for `miss_limit` checks: kill the child, back off, restart.
+    fn on_heartbeat_stall(
+        &mut self,
+        child: &mut Child,
+        spawn_time: Instant,
+        miss_limit: u32,
+        stop_flag: &AtomicBool,
+    ) -> WatchOutcome {
+        eprintln!(
+            "[watchdog] agent heartbeat stalled ({miss_limit} consecutive misses) — \
+             killing and restarting (#102)"
+        );
+        kill_and_reap(child);
+        let (delay, _) = self.backoff.record_exit(spawn_time.elapsed());
+        restart_after(stop_flag, delay)
+    }
+
+    /// Feeds the heartbeat's progress to the release on probation. `Some` when the
+    /// release failed: the child is killed and the rollback handed up.
+    fn on_probation_check(&mut self, child: &mut Child, advanced: bool) -> Option<WatchOutcome> {
+        let LoopExit::RolledBack { failed, restored } =
+            settle_probation(&mut self.probation, advanced, self.config.alerts)?
+        else {
+            return None;
+        };
+        kill_and_reap(child);
+        Some(WatchOutcome::RolledBack { failed, restored })
+    }
+}
+
+/// Waits `delay` seconds before the next start: `Restart`, or `Stop` if the stop flag rose.
+fn restart_after(stop_flag: &AtomicBool, delay: u64) -> WatchOutcome {
+    if sleep_unless_stopped(stop_flag, delay) {
+        WatchOutcome::Restart
+    } else {
+        WatchOutcome::Stop
+    }
+}
+
+/// Kills the child and waits for it, so no zombie is left. A failure of either is
+/// logged: it means the agent may still be running.
+fn kill_and_reap(child: &mut Child) {
+    if let Err(e) = child.kill() {
+        eprintln!("[watchdog] could not kill the agent: {e}");
+    }
+    if let Err(e) = child.wait() {
+        eprintln!("[watchdog] could not reap the agent: {e}");
     }
 }
 
@@ -726,7 +774,7 @@ pub(crate) fn cmd_run(
     let config = SupervisorConfig {
         agent: &agent,
         alerts: &alerts,
-        restart_delay,
+        restart_delay_secs: restart_delay,
         heartbeat: HeartbeatSettings {
             interval_secs: heartbeat_interval_secs,
             miss_limit: heartbeat_miss_limit,
@@ -968,6 +1016,50 @@ mod tests {
         std::fs::remove_file(&path).ok();
     }
 
+    fn config_for<'a>(agent: &'a Path, alerts: &'a Path) -> SupervisorConfig<'a> {
+        SupervisorConfig {
+            agent,
+            alerts,
+            restart_delay_secs: 0,
+            heartbeat: HeartbeatSettings {
+                interval_secs: 1,
+                miss_limit: 6,
+            },
+        }
+    }
+
+    #[test]
+    fn a_swapped_agent_binary_is_refused_and_reported() {
+        let dir = tempfile::tempdir().unwrap();
+        let agent = dir.path().join("agent");
+        let alerts = dir.path().join("alerts.ndjson");
+        std::fs::write(&agent, b"original").unwrap();
+        let supervisor = Supervisor::new(config_for(&agent, &alerts), None);
+
+        assert!(supervisor.agent_binary_intact());
+        assert!(!alerts.exists(), "an intact binary reports nothing");
+
+        std::fs::write(&agent, b"swapped").unwrap();
+        assert!(!supervisor.agent_binary_intact());
+        let record = std::fs::read_to_string(&alerts).unwrap();
+        assert!(record.contains("SELF-PROTECTION"), "{record}");
+        assert!(
+            record.contains("no longer matches its pinned hash"),
+            "{record}"
+        );
+    }
+
+    #[test]
+    fn without_a_pin_the_binary_check_is_disabled_not_failed() {
+        let dir = tempfile::tempdir().unwrap();
+        let agent = dir.path().join("missing-agent");
+        let alerts = dir.path().join("alerts.ndjson");
+        let supervisor = Supervisor::new(config_for(&agent, &alerts), None);
+
+        assert!(supervisor.agent_binary_intact());
+        assert!(!alerts.exists());
+    }
+
     #[test]
     fn self_protection_event_is_a_well_shaped_json_line() {
         let _serial = COUNTER_LOCK
@@ -1127,7 +1219,7 @@ mod probation_tests {
         SupervisorConfig {
             agent,
             alerts,
-            restart_delay: 0,
+            restart_delay_secs: 0,
             heartbeat: HeartbeatSettings {
                 interval_secs: 1,
                 miss_limit,
