@@ -149,7 +149,7 @@ Live status and ordering are on the [project board](https://github.com/orgs/synt
 
 ### [#97](https://github.com/synthaea-lab/agent/issues/97) Response and graceful-shutdown parity on Windows and macOS (kill, quarantine, final drain, kill loudness, protected files)
 
-- Bounded graceful shutdown with final upload drain (Linux SIGINT) (partial, Lifecycle). See [lifecycle.md#shutdown](lifecycle.md#shutdown).
+- Bounded graceful shutdown with final upload drain (SIGINT, all platforms) (partial, Lifecycle). See [lifecycle.md#shutdown](lifecycle.md#shutdown).
 - Termination-signal attribution before exit (kill-loudness) (partial, Lifecycle). See [lifecycle.md#shutdown](lifecycle.md#shutdown).
 - Quarantine of a YARA-matched file (partial, YARA). See [detection/yara.md#what-a-match-does](detection/yara.md#what-a-match-does).
 - Automated process kill on a correlator BAYES crossing, observe-only by default, with protected-pid refusal (partial, Response). See [response.md#the-kill-gate](response.md#the-kill-gate).
@@ -229,10 +229,6 @@ Live status and ordering are on the [project board](https://github.com/orgs/synt
 
 - Executed image file identity for the T1204.002 rename-and-replace gate (partial, ETW). See [sensors/windows/etw-enrichment.md#image-file-identity](sensors/windows/etw-enrichment.md#image-file-identity).
 - Signature-gated T1204.002 (downloaded file run) silenced only by a chain-verified signature on the image that ran (partial, Rule engine). See [detection/rules.md#signature-gated-findings](detection/rules.md#signature-gated-findings).
-
-### [#49](https://github.com/synthaea-lab/agent/issues/49) Linux: a security tool stopped through the kernel (prlimit CPU limit, memory.max OOM kill, cgroup.freeze) raises no alert
-
-- Detection of a security tool stopped through kernel resource limits (prlimit, memory.max, cgroup.freeze) (partial, Security model). See [security-model.md#what-is-not-defended](security-model.md#what-is-not-defended).
 
 ### [#62](https://github.com/synthaea-lab/agent/issues/62) arm64 builds (Linux aarch64, Windows ARM64)
 

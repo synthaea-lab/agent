@@ -23,9 +23,11 @@
 use std::{
     net::{IpAddr, ToSocketAddrs as _},
     path::PathBuf,
-    sync::{Arc, Mutex, OnceLock, PoisonError, RwLock},
+    sync::{Arc, Mutex, OnceLock, RwLock},
     time::Duration,
 };
+
+use crate::sync::{LockExt, RwLockExt};
 
 /// Addresses of the control-plane host kept at once. A host behind a CDN resolves to a handful.
 const MAX_CONTROL_PLANE_ADDRS: usize = 32;
@@ -115,7 +117,7 @@ impl OwnTraffic {
                 fresh.sort_unstable();
                 fresh.dedup();
                 fresh.truncate(MAX_CONTROL_PLANE_ADDRS);
-                *cp.resolved.write().unwrap_or_else(PoisonError::into_inner) = fresh;
+                *cp.resolved.write_recovering() = fresh;
             }
             Err(error) => {
                 tracing::debug!(%error, "ioc: the control-plane host did not resolve; keeping the last addresses");
@@ -157,12 +159,7 @@ impl OwnTraffic {
     pub(crate) fn is_control_plane_address(&self, address: IpAddr) -> bool {
         let address = address.to_canonical();
         self.control_plane.get().is_some_and(|cp| {
-            cp.literal == Some(address)
-                || cp
-                    .resolved
-                    .read()
-                    .unwrap_or_else(PoisonError::into_inner)
-                    .contains(&address)
+            cp.literal == Some(address) || cp.resolved.read_recovering().contains(&address)
         })
     }
 
@@ -172,7 +169,7 @@ impl OwnTraffic {
     /// that pid now runs is no longer the agent's even though its incarnation stamp is.
     pub(crate) fn record_exec(&self, exec: &schema::ExecEvent) {
         let sibling = self.sibling_of(exec);
-        let mut siblings = self.siblings.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut siblings = self.siblings.lock_recovering();
         match sibling {
             Some(sibling) => siblings.insert(exec.meta.pid, sibling),
             None => {
@@ -211,11 +208,7 @@ impl OwnTraffic {
             return Some(AgentOrigin::Own);
         }
         let generation = meta.process_generation?;
-        let sibling = *self
-            .siblings
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .get(&meta.pid)?;
+        let sibling = *self.siblings.lock_recovering().get(&meta.pid)?;
         (sibling.generation == generation
             && sibling.exec_ns <= meta.timestamp_ns
             && meta.container.is_none()
@@ -480,5 +473,26 @@ mod tests {
         own.record_exec(&exec_of(fake.to_str().unwrap(), 4545, Some(1), 1_000));
         assert!(own.siblings.lock().unwrap().is_empty());
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn locks_poisoned_by_a_panicking_thread_are_recovered() {
+        let own = OwnTraffic::new();
+        assert!(own.set_control_plane("https://127.0.0.1:8443"));
+        let cp = own.control_plane.get().unwrap();
+        std::thread::scope(|s| {
+            let _ = s
+                .spawn(|| {
+                    let _resolved = cp.resolved.write().unwrap();
+                    let _siblings = own.siblings.lock().unwrap();
+                    panic!("poison the own-traffic locks while holding them");
+                })
+                .join();
+        });
+        assert!(cp.resolved.is_poisoned() && own.siblings.is_poisoned());
+        assert!(own.is_control_plane_address("127.0.0.1".parse().unwrap()));
+        assert!(!own.is_control_plane_address("198.51.100.7".parse().unwrap()));
+        own.record_exec(&schema::fixtures::exec());
+        assert!(!own.siblings.is_poisoned());
     }
 }

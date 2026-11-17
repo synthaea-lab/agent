@@ -395,9 +395,11 @@ reads only whether the alert raised by *this* event is `BAYES`; see
   enrichment worker (signature-gated findings), the YARA file worker and the memory
   scanner. A finding the worker records late keys on its own event timestamp; the
   dedup check saturates, so a late arrival can at most be absorbed as a duplicate.
-- All locks use `lock().unwrap()`. A panic while one is held poisons it and turns the
-  next event into a panic; the progress heartbeat then stops and the watchdog's hang
-  detection restarts the agent ([Self-protection](self-protection.md#liveness-and-hang-detection)).
+- The agent's locks are taken through `LockExt::lock_recovering` (see
+  [Poisoned locks](lifecycle.md#poisoned-locks)): a panic while one is held does not turn
+  every later event into a panic. The progress heartbeat and the watchdog's hang detection
+  ([Self-protection](self-protection.md#liveness-and-hang-detection)) stay the backstop for a
+  thread that is stuck rather than panicked.
 
 ## Bounds and observability
 
