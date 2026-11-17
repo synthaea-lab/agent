@@ -357,7 +357,7 @@ carry only the status.
 | Spool append fails (real I/O error) | Logged; the event stays local-only. |
 | Upload cannot be set up (unreadable or encrypted key, missing CA bundle, spool directory) | With `server.offline_fallback = true` (default) the agent keeps detecting, prints and emits an `UPLOAD-DISABLED` alert; with `false`, `run` fails. See [`start_or_disable`](../apps/agent/src/upload.rs). |
 | Certificate rotated or rejected | Event segments: an HTTP 4xx (such as a proxy's `400` for a client certificate that does not verify) skips the segment at once; a rejection during the TLS handshake counts against the network budget. Detection segments: stay spooled, backoff. |
-| Shutdown | Linux: final drain up to 3 s. Other platforms: the threads end with the process; the spool re-delivers. |
+| Shutdown | Final drain up to 3 s on Linux, Windows and macOS on a Ctrl-C/SIGINT stop (`finish_run`, #147). It is skipped when the agent is killed: SIGTERM/SIGHUP/SIGQUIT on Linux on purpose (see lifecycle.md#shutdown), and a watchdog stop, which is `Child::kill` (SIGKILL / `TerminateProcess`) on every OS, which is how the agent runs in production; the spool re-delivers. |
 
 The offline fallback exists because a failure here is usually configuration, not the network.
 If it stopped `run`, a fresh install without certificates would detect nothing, restart in a

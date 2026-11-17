@@ -97,8 +97,9 @@ pub(crate) const MAIL_CLIENT_QUARANTINE_AGENTS: &[&str] = &["Mail"];
 /// 156, Firefox 159, Chrome 157, Edge, Brave 1.99, Opera, Vivaldi 8.3). The Firefox family is
 /// also matched by shape, see [`is_browser_download_image`]: its installs (a tarball unpacked
 /// anywhere, the Snap with a revision in the path, Debian's `firefox-esr`) have no fixed path.
-/// Other browsers' other installs are not here until a capture reports their image. `comm` is useless as the key: the rename
-/// runs on a thread-pool worker (`ThreadPoolForeg`, `BgIOThr~Pool #N`).
+/// Other browsers' other installs are not here until a capture reports their image. `comm` is
+/// useless as the key: the rename runs on a thread-pool worker (`ThreadPoolForeg`,
+/// `BgIOThr~Pool #N`).
 pub(crate) const BROWSER_DOWNLOAD_IMAGES: &[&str] = &[
     "/usr/lib64/chromium-browser/chromium-browser",
     "/usr/lib64/firefox/firefox",
@@ -119,7 +120,10 @@ const FIREFOX_DIR_NAMES: &[&str] = &["firefox", "firefox-esr"];
 /// [`BROWSER_DOWNLOAD_IMAGES`], or any path whose file name is `firefox`, `firefox-bin` or
 /// `firefox-esr` **and** whose parent directory is named `firefox` or `firefox-esr` (decision of
 /// 2026-11-12 on #221). That covers `/usr/lib64/firefox/firefox`, Debian's
-/// `/usr/lib/firefox-esr/firefox-esr`, a tarball's `<dir>/firefox/firefox-bin`, the Snap's
+/// `/usr/lib/firefox-esr/firefox-esr` (Debian 13 `firefox-esr` 140.15, 2026-11-12: read from
+/// `/proc` under `strace`, then confirmed from the sensor's own `file_rename` event on kernel
+/// 6.12, same `executable_path`, comm `BgIOThr~Pool #1`), a tarball's
+/// `<dir>/firefox/firefox-bin`, the Snap's
 /// `/snap/firefox/<rev>/usr/lib/firefox/firefox` and a Flatpak-shaped `/app/lib/firefox/firefox`
 /// (not verified). The Chromium Snap is matched by [`is_chromium_snap_image`]. Not `/usr/bin/firefox` (the launcher script, parent `bin`).
 ///
