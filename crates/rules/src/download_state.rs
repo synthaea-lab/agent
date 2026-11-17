@@ -14,6 +14,7 @@ use crate::{
     exclusions::{
         BITS_EXEC_WINDOW_NS, BROWSER_PARTIAL_SUFFIXES, DOWNLOAD_EXEC_WINDOW_NS, DOWNLOADER_COMMS,
         MAIL_CLIENT_QUARANTINE_AGENTS, QUARANTINE_EXEC_WINDOW_NS, is_browser_download_image,
+        is_chromium_snap_image,
     },
     has_write_intent,
     signature_gate::SignatureGatedAlert,
@@ -41,6 +42,10 @@ struct RecentQuarantine {
     origin_url: Option<String>,
     /// Set by the first exec that alerted: one alert per mark, not per run.
     alerted: bool,
+    /// The key (lowercased path) of the other record the same download was recorded under:
+    /// the Chromium Snap's rename path and the real Downloads path are one mark. An alert on
+    /// either sets `alerted` on both, so one download is one finding, not one per path.
+    twin: Option<String>,
 }
 
 /// A file a BITS job downloads, as [`crate::RuleState::on_bits_job`] saw it.
@@ -189,6 +194,7 @@ impl DownloadState {
             return None;
         }
         mark.alerted = true;
+        let twin = mark.twin.clone();
         // A mail client's mark is the one thing that says how the file arrived:
         // the finding names the attachment vector as well, and still only says
         // "marked by", since a person who saved an attachment on purpose and
@@ -198,7 +204,7 @@ impl DownloadState {
                 .iter()
                 .any(|client| agent.eq_ignore_ascii_case(client))
         });
-        Some(SignatureGatedAlert::new(Alert {
+        let alert = Alert {
             technique: if by_mail_client {
                 MAIL_ATTACHMENT_TECHNIQUE
             } else {
@@ -214,7 +220,13 @@ impl DownloadState {
                 mark.origin_url.as_deref().unwrap_or("unrecorded"),
                 mark.agent.as_deref().unwrap_or("unknown"),
             ),
-        }))
+        };
+        if let Some(twin) = twin
+            && let Some(other) = self.recent_quarantines.get_mut(&twin)
+        {
+            other.alerted = true;
+        }
+        Some(SignatureGatedAlert::new(alert))
     }
 
     /// T1197 — BITS Jobs. A file a BITS job downloaded is executed within
@@ -271,6 +283,7 @@ impl DownloadState {
                 agent: event.agent.clone(),
                 origin_url: event.origin_url.clone(),
                 alerted: false,
+                twin: None,
             },
         );
     }
@@ -300,19 +313,27 @@ impl DownloadState {
         if !is_partial(&event.old_path) || is_partial(&event.new_path) {
             return;
         }
-        let mark = || RecentQuarantine {
+        let mark = |twin: Option<String>| RecentQuarantine {
             timestamp_ns: event.meta.timestamp_ns,
             agent: Some(image.rsplit('/').next().unwrap_or(image).to_string()),
             origin_url: None,
             alerted: false,
+            twin,
         };
+        let path_key = event.new_path.to_lowercase();
         // The Chromium Snap reports the path it sees, through its own home; the file is at
-        // the real Downloads path, and that is the one a user runs. Mark both.
-        if let Some(real) = chromium_snap_real_download_path(&event.new_path) {
-            self.recent_quarantines.insert(real.to_lowercase(), mark());
+        // the real Downloads path, and that is the one a user runs. Mark both, as twins: an
+        // exec from either is the same download. Only that snap's image: another browser
+        // renaming into a `snap/chromium` directory is not evidence of the symlink.
+        let real_key = is_chromium_snap_image(image)
+            .then(|| chromium_snap_real_download_path(&event.new_path))
+            .flatten()
+            .map(|real| real.to_lowercase());
+        if let Some(real_key) = &real_key {
+            self.recent_quarantines
+                .insert(real_key.clone(), mark(Some(path_key.clone())));
         }
-        self.recent_quarantines
-            .insert(event.new_path.to_lowercase(), mark());
+        self.recent_quarantines.insert(path_key, mark(real_key));
     }
 
     /// Arms, re-arms or drops the path of a BITS job's file for

@@ -241,7 +241,11 @@ same signature gate applies.
   distribution entry does not cover it. `current`, a non-numeric revision and any other file or depth do not match.
   That Snap reports the rename under its own home, `<home>/snap/chromium/<revision>/Downloads/<file>`, a symlink to
   `<home>/Downloads`; the mark is also recorded at `<home>/Downloads/<file>` so that a run from the real directory joins.
-  Only the default `Downloads` name, only Chromium: no path is resolved, the alias is a guess about the symlink.
+  The alias is made only for that Snap's own image (another browser renaming into a `snap/chromium` directory gets
+  none), and the two records are twins: an exec from either path alerts once, and a re-download re-arms both.
+  Only the default `Downloads` name: on a non-English desktop the directory has the localized name
+  (`Téléchargements`) and no alias is made, so that case is **not covered**. No path is resolved, the alias is a
+  guess about the symlink.
 - Adding another browser is one line in `BROWSER_DOWNLOAD_IMAGES`. It holds only the images a capture
   showed (2026-11-10, Fedora 43 lab VM): Chromium and Firefox from the distribution packages,
   and the vendor packages of Chrome (`/opt/google/chrome/chrome`), Edge

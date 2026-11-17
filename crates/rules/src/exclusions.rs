@@ -148,7 +148,7 @@ pub(crate) fn is_browser_download_image(image: &str) -> bool {
 /// match, because the sensor reports the resolved revision directory. Only this layout: the
 /// file is `chrome` here, not `chromium-browser`, so the distribution entry in
 /// [`BROWSER_DOWNLOAD_IMAGES`] does not cover it.
-fn is_chromium_snap_image(image: &str) -> bool {
+pub(crate) fn is_chromium_snap_image(image: &str) -> bool {
     image
         .strip_prefix("/snap/chromium/")
         .and_then(|rest| rest.split_once('/'))
