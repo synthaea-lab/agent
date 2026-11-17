@@ -612,7 +612,9 @@ impl CorrelationEngine {
     ///     Err(ScorerError::FeatureOutOfBounds { .. }) => None,  // OOD
     ///     Err(e) => { error!("ML scorer: {e}"); None }  // Fail open
     /// };
-    /// engine.update_belief_with_ml(pid, generation, ml_llr)?;
+    /// // Both errors only mean the score had nowhere to land (see # Errors): this event is
+    /// // scored without ML, it is not a failure of the event's handling.
+    /// let _ = engine.update_belief_with_ml(pid, generation, ml_llr);
     /// ```
     pub fn update_belief_with_ml(
         &mut self,
@@ -628,9 +630,10 @@ impl CorrelationEngine {
             .entity_of_pid(pid, generation)
             .ok_or(MlUpdateError::UnknownPid { pid })?;
 
-        // `on_event` creates this entity's belief state in the same cycle whenever a
-        // `BehaviorVector` is available; if it isn't there yet either, there is no
-        // base update to add the ML term to.
+        // `on_event` creates this entity's belief in the same cycle (`BehaviorVector::from_window`
+        // is `None` only on an empty window, and the pid's own event is in it), so a miss here
+        // means the belief was replaced by another incarnation's child (#592) or evicted at the
+        // map's cap.
         let state = self
             .belief_mut(&entity_key)
             .ok_or(MlUpdateError::NoBelief { pid })?;

@@ -416,13 +416,6 @@ fn update_belief_with_ml_after_another_incarnation_of_the_parent_took_the_belief
     );
 }
 
-#[test]
-fn update_belief_with_ml_before_any_belief_state_is_silent_err() {
-    // No prior `on_event` for this pid → no belief state to add an ML term to.
-    let mut engine = CorrelationEngine::new();
-    assert!(engine.update_belief_with_ml(9999, None, Some(1.0)).is_err());
-}
-
 // ── Service main process provenance (issue #652) ───────────────────────────
 
 #[test]

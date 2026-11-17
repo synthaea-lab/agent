@@ -178,9 +178,14 @@ impl DetectionSink {
         let generation = event.meta().process_generation;
         if let Some(ref mut scorer) = *self.ml_scorer.lock_recovering() {
             let ml_llr = ml_evidence(scorer, &engine, pid, generation);
-            // Either `MlUpdateError` means the score has no belief to land on; right after
-            // `on_event` for this pid, that is an evicted or replaced entity, not a failure.
-            let _ = engine.update_belief_with_ml(pid, generation, ml_llr);
+            // Either `MlUpdateError` means the score has no belief to land on, not a failure:
+            // `UnknownPid` when the pid has no event on the bus (`on_event` skips event types
+            // the engine does not correlate), `NoBelief` for an evicted or replaced entity
+            // (#592). Debug, not warn: both are expected, and the event is still scored,
+            // only without the ML term.
+            if let Err(error) = engine.update_belief_with_ml(pid, generation, ml_llr) {
+                tracing::debug!(pid, %error, "ML score not folded into the belief");
+            }
         }
 
         let shield = engine.kill_shield(pid, generation);
