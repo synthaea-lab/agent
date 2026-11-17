@@ -9,7 +9,10 @@ use aya_ebpf::{
 use aya_log_ebpf::warn;
 use sensor_linux_wire::CapSetEvent;
 
-use crate::{fill_event_meta, into_ret};
+use crate::{
+    arch::{SyscallRecord, arg_offset},
+    fill_event_meta, into_ret,
+};
 
 /// Ring buffer shared with userspace for `capset` events.
 #[map]
@@ -21,15 +24,10 @@ static CAPSET_SCRATCH: PerCpuArray<CapSetEvent> = PerCpuArray::with_max_entries(
 
 /// Offsets of the `syscalls:sys_enter_capset` tracepoint (`hdrp`, `data`),
 /// assumed standard layout — see `SINGLE_ID_OFFSET`'s note in `identity.rs`.
-#[cfg(any(bpf_target_arch = "x86_64", bpf_target_arch = "aarch64"))]
-const CAPSET_HDRP_PTR_OFFSET: usize = 16;
-#[cfg(any(bpf_target_arch = "x86_64", bpf_target_arch = "aarch64"))]
-const CAPSET_DATA_PTR_OFFSET: usize = 24;
+///
 /// i686: inferred, not independently verified.
-#[cfg(bpf_target_arch = "x86")]
-const CAPSET_HDRP_PTR_OFFSET: usize = 12;
-#[cfg(bpf_target_arch = "x86")]
-const CAPSET_DATA_PTR_OFFSET: usize = 16;
+const CAPSET_HDRP_PTR_OFFSET: usize = arg_offset(0);
+const CAPSET_DATA_PTR_OFFSET: usize = arg_offset(1);
 
 pub fn sys_enter_capset(ctx: TracePointContext) -> u32 {
     into_ret(try_sys_enter_capset(ctx))
@@ -65,20 +63,14 @@ fn read_cap_data(ptr: u64) -> (u64, u64, u64) {
 }
 
 fn try_sys_enter_capset(ctx: TracePointContext) -> Result<u32, u32> {
-    #[cfg(any(bpf_target_arch = "x86_64", bpf_target_arch = "aarch64"))]
-    let hdrp_ptr: u64 = unsafe { ctx.read_at(CAPSET_HDRP_PTR_OFFSET).map_err(|_| 1u32)? };
-    #[cfg(bpf_target_arch = "x86")]
     let hdrp_ptr: u64 = unsafe {
-        ctx.read_at::<u32>(CAPSET_HDRP_PTR_OFFSET)
-            .map_err(|_| 1u32)? as u64
+        ctx.read_ulong_arg(CAPSET_HDRP_PTR_OFFSET)
+            .map_err(|_| 1u32)?
     };
 
-    #[cfg(any(bpf_target_arch = "x86_64", bpf_target_arch = "aarch64"))]
-    let data_ptr: u64 = unsafe { ctx.read_at(CAPSET_DATA_PTR_OFFSET).map_err(|_| 1u32)? };
-    #[cfg(bpf_target_arch = "x86")]
     let data_ptr: u64 = unsafe {
-        ctx.read_at::<u32>(CAPSET_DATA_PTR_OFFSET)
-            .map_err(|_| 1u32)? as u64
+        ctx.read_ulong_arg(CAPSET_DATA_PTR_OFFSET)
+            .map_err(|_| 1u32)?
     };
 
     let target_pid: u32 = if hdrp_ptr != 0 {

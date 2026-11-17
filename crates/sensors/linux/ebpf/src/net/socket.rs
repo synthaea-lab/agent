@@ -17,8 +17,7 @@ use aya_log_ebpf::warn;
 use sensor_linux_wire::SocketCreateEvent;
 
 use crate::{
-    SYS_EXIT_RET_OFFSET,
-    arch::{SyscallRecord, arg_offset},
+    arch::{SYS_EXIT_RET_OFFSET, SyscallRecord, arg_offset},
     fill_event_meta, into_ret,
 };
 

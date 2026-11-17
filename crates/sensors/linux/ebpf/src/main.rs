@@ -41,7 +41,6 @@ mod procmem;
 mod raw;
 mod uprobe;
 
-pub(crate) use arch::SYS_EXIT_RET_OFFSET;
 use aya_ebpf::{helpers::bpf_get_current_pid_tgid, macros::map, maps::HashMap};
 use sensor_linux_wire::{LineageEntry, TASK_COMM_LEN};
 

@@ -9,7 +9,10 @@ use aya_ebpf::{
 use aya_log_ebpf::warn;
 use sensor_linux_wire::IdentityChangeEvent;
 
-use crate::fill_event_meta;
+use crate::{
+    arch::{CULong, SyscallRecord, arg_offset},
+    fill_event_meta,
+};
 
 /// Ring buffer shared with userspace for `setuid`/`setgid`/`setresuid`/
 /// `setresgid`/`setfsuid`/`setfsgid` events.
@@ -33,11 +36,9 @@ const IDENTITY_KIND_SETFSGID: u8 = 5;
 /// standard layout (16-byte header + 8 bytes/arg on `x86_64/aarch64`);
 /// re-verify against `/format` on any newly supported kernel,
 /// same posture as every other offset const in this file.
-#[cfg(any(bpf_target_arch = "x86_64", bpf_target_arch = "aarch64"))]
-const SINGLE_ID_OFFSET: usize = 16;
+///
 /// i686: inferred, not independently verified (see `sys_enter_open`'s i686 note).
-#[cfg(bpf_target_arch = "x86")]
-const SINGLE_ID_OFFSET: usize = 12;
+const SINGLE_ID_OFFSET: usize = arg_offset(0);
 
 /// Offset of `setresuid(2)`/`setresgid(2)`'s first `uid_t`/`gid_t` argument
 /// (real) — identical shape for both, assumed standard layout, same posture
@@ -58,11 +59,9 @@ const SINGLE_ID_OFFSET: usize = 12;
 /// the verifier: the real mechanism is the BPF-to-BPF call/return, not the
 /// read count. Both are kept: one less thing to re-diagnose if a future
 /// change makes LLVM decide not to inline it anyway.
-#[cfg(any(bpf_target_arch = "x86_64", bpf_target_arch = "aarch64"))]
-const RES_ID_REAL_OFFSET: usize = 16;
+///
 /// i686: inferred, not independently verified.
-#[cfg(bpf_target_arch = "x86")]
-const RES_ID_REAL_OFFSET: usize = 12;
+const RES_ID_REAL_OFFSET: usize = arg_offset(0);
 
 /// Shared by all six probes below: fills `EventMeta` and the kind-specific id
 /// fields into `IDENTITY_CHANGE_SCRATCH`, then emits. Mirrors
@@ -121,10 +120,7 @@ fn emit_identity_change_event(
 /// it can't always prove.
 #[inline(always)]
 fn read_single_id(ctx: &TracePointContext) -> Result<u32, u32> {
-    #[cfg(any(bpf_target_arch = "x86_64", bpf_target_arch = "aarch64"))]
-    let id: u64 = unsafe { ctx.read_at(SINGLE_ID_OFFSET).map_err(|_| 1u32)? };
-    #[cfg(bpf_target_arch = "x86")]
-    let id: u64 = unsafe { ctx.read_at::<u32>(SINGLE_ID_OFFSET).map_err(|_| 1u32)? as u64 };
+    let id: u64 = unsafe { ctx.read_ulong_arg(SINGLE_ID_OFFSET).map_err(|_| 1u32)? };
     Ok(id as u32)
 }
 
@@ -193,16 +189,7 @@ fn try_sys_enter_setres(ctx: &TracePointContext) -> Result<(u32, u32, u32), u32>
     // One `bpf_probe_read_kernel` over all three contiguous arguments, not
     // three separate reads with three early returns — see the
     // `RES_ID_REAL_OFFSET` doc comment for why.
-    #[cfg(any(bpf_target_arch = "x86_64", bpf_target_arch = "aarch64"))]
-    {
-        let [real, effective, saved]: [u64; 3] =
-            unsafe { ctx.read_at(RES_ID_REAL_OFFSET).map_err(|_| 1u32)? };
-        Ok((real as u32, effective as u32, saved as u32))
-    }
-    #[cfg(bpf_target_arch = "x86")]
-    {
-        let [real, effective, saved]: [u32; 3] =
-            unsafe { ctx.read_at(RES_ID_REAL_OFFSET).map_err(|_| 1u32)? };
-        Ok((real, effective, saved))
-    }
+    let [real, effective, saved]: [CULong; 3] =
+        unsafe { ctx.read_at(RES_ID_REAL_OFFSET).map_err(|_| 1u32)? };
+    Ok((real as u32, effective as u32, saved as u32))
 }
