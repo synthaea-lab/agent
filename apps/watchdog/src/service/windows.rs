@@ -24,7 +24,7 @@ use windows_service::{
 
 use crate::{
     paths::{DEFAULT_ALERTS, resolve_agent_bin},
-    supervise::watchdog_loop,
+    supervise::{HeartbeatSettings, SupervisorConfig, watchdog_loop},
 };
 
 const SERVICE_TYPE: ServiceType = ServiceType::OWN_PROCESS;
@@ -91,7 +91,16 @@ fn run_service_logic() -> anyhow::Result<()> {
     // doc), so — same as `restart_delay` above — these can't be threaded
     // through `binPath` without a larger change; matching the existing
     // `restart_delay` precedent rather than introducing a new asymmetry.
-    watchdog_loop(&agent, &alerts, 5, 5, 6, &stop_flag);
+    let config = SupervisorConfig {
+        agent: &agent,
+        alerts: &alerts,
+        restart_delay: 5,
+        heartbeat: HeartbeatSettings {
+            interval_secs: 5,
+            miss_limit: 6,
+        },
+    };
+    watchdog_loop(config, &stop_flag);
 
     // Report STOPPED
     let _ = status_handle.set_service_status(ServiceStatus {

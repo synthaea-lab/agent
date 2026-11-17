@@ -207,138 +207,239 @@ enum WatchOutcome {
     RolledBack { failed: u64, restored: Option<u64> },
 }
 
+/// How the agent's heartbeat file is polled: one check every `interval_secs`, the agent
+/// declared hung after `miss_limit` consecutive checks without progress (#102).
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct HeartbeatSettings {
+    pub(crate) interval_secs: u64,
+    pub(crate) miss_limit: u32,
+}
+
+/// What the supervision loop needs to know: the agent to run, where its alerts go, the
+/// restart delay floor and the heartbeat policy.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct SupervisorConfig<'a> {
+    pub(crate) agent: &'a Path,
+    pub(crate) alerts: &'a Path,
+    pub(crate) restart_delay: u64,
+    pub(crate) heartbeat: HeartbeatSettings,
+}
+
 /// Restarts the agent in a loop until `stop_flag` becomes true. The Windows
 /// service entry point calls this: versioned self-update is Linux-only, so no
 /// release is ever on probation there.
 #[cfg_attr(not(windows), allow(dead_code))]
-pub(crate) fn watchdog_loop(
-    agent: &Path,
-    alerts: &Path,
-    restart_delay: u64,
-    heartbeat_interval_secs: u64,
-    heartbeat_miss_limit: u32,
-    stop_flag: &AtomicBool,
-) {
-    supervise_loop(
-        agent,
-        alerts,
-        restart_delay,
-        heartbeat_interval_secs,
-        heartbeat_miss_limit,
-        stop_flag,
-        None,
-    );
+pub(crate) fn watchdog_loop(config: SupervisorConfig<'_>, stop_flag: &AtomicBool) {
+    supervise_loop(config, stop_flag, None);
 }
 
 /// The supervision loop itself. With a `probation`, the release must show a
 /// heartbeat advance in time or it is rolled back ([`crate::probation`]).
 pub(crate) fn supervise_loop(
-    agent: &Path,
-    alerts: &Path,
-    restart_delay: u64,
-    heartbeat_interval_secs: u64,
-    heartbeat_miss_limit: u32,
+    config: SupervisorConfig<'_>,
     stop_flag: &AtomicBool,
-    mut probation: Option<Probation>,
+    probation: Option<Probation>,
 ) -> LoopExit {
-    let mut backoff = Backoff::new(restart_delay);
-    let heartbeat_path = heartbeat_path_for(alerts);
+    Supervisor::new(config, probation).run(stop_flag)
+}
 
-    // #103: pin the agent binary's hash once, at watchdog startup — every later
-    // spawn is checked against this baseline instead of trusting the path blindly.
-    // `None` (pin failed, e.g. the binary momentarily missing) disables the check
-    // for this run rather than refusing to supervise at all.
-    let binary_pin = match crate::tamper::BinaryPin::pin(agent) {
-        Ok(pin) => Some(pin),
-        Err(e) => {
-            eprintln!(
-                "[watchdog] could not pin agent binary integrity ({e}) — \
-                 integrity checking disabled for this run"
-            );
-            None
-        }
-    };
-
-    // #103: same idea for the installed service definition (systemd unit /
-    // OpenRC script) — `None` when there is nothing installed to watch (e.g.
-    // `run` invoked directly during development, without a prior `install`).
+/// The state one supervision run carries from spawn to spawn.
+struct Supervisor<'a> {
+    config: SupervisorConfig<'a>,
+    backoff: Backoff,
+    heartbeat_path: PathBuf,
+    probation: Option<Probation>,
+    /// #103: the agent binary's hash, pinned once at watchdog startup — every later spawn is
+    /// checked against this baseline instead of trusting the path blindly. `None` (pin failed,
+    /// e.g. the binary momentarily missing) disables the check for this run rather than
+    /// refusing to supervise at all.
+    binary_pin: Option<crate::tamper::BinaryPin>,
+    /// #103: same idea for the installed service definition (systemd unit / `OpenRC` script) —
+    /// `None` when there is nothing installed to watch (e.g. `run` invoked directly during
+    /// development, without a prior `install`).
     #[cfg(target_os = "linux")]
-    let definition_baseline = crate::service::snapshot_definition().ok();
+    definition_baseline: Option<crate::service::DefinitionSnapshot>,
+}
 
-    while !stop_flag.load(Ordering::SeqCst) {
-        // Every path that loops back here — a crash, a refused spawn, a stalled
-        // heartbeat — passes through this check, so a release whose agent never
-        // even starts still runs out its probation.
-        if let Some(exit) = settle_probation(&mut probation, false, alerts) {
-            return exit;
-        }
-
-        #[cfg(target_os = "linux")]
-        if let Some(baseline) = &definition_baseline
-            && let Ok(current) = crate::service::snapshot_definition()
-        {
-            for line in crate::service::drift_report(baseline, &current) {
-                report_self_protection_event(alerts, &line);
-            }
-        }
-
-        if let Some(pin) = &binary_pin
-            && !pin.verify()
-        {
-            report_self_protection_event(
-                alerts,
-                &format!(
-                    "agent binary at {} no longer matches its pinned hash — \
-                     refusing to launch it",
-                    agent.display()
-                ),
-            );
-            let (delay, _) = backoff.record_exit(Duration::ZERO);
-            if !sleep_unless_stopped(stop_flag, delay) {
-                return LoopExit::Stopped;
-            }
-            continue;
-        }
-
-        eprintln!("[watchdog] starting the agent...");
-        let spawn_time = Instant::now();
-        let mut heartbeat = HeartbeatMonitor::new(
-            heartbeat_path.clone(),
-            Duration::from_secs(heartbeat_interval_secs),
-            heartbeat_miss_limit,
-        );
-        let mut child = match spawn_agent(agent, alerts) {
-            Ok(c) => c,
+impl<'a> Supervisor<'a> {
+    fn new(config: SupervisorConfig<'a>, probation: Option<Probation>) -> Self {
+        let binary_pin = match crate::tamper::BinaryPin::pin(config.agent) {
+            Ok(pin) => Some(pin),
             Err(e) => {
-                // A spawn failure (missing binary, permission denied) is as
-                // much a crash loop risk as an in-process panic — feed it
-                // into the same backoff instead of hammering at a fixed
-                // interval forever.
-                let (delay, _) = backoff.record_exit(Duration::ZERO);
-                eprintln!("[watchdog] spawn failed: {e}. Retrying in {delay}s...");
+                eprintln!(
+                    "[watchdog] could not pin agent binary integrity ({e}) — \
+                     integrity checking disabled for this run"
+                );
+                None
+            }
+        };
+        Self {
+            backoff: Backoff::new(config.restart_delay),
+            heartbeat_path: heartbeat_path_for(config.alerts),
+            config,
+            probation,
+            binary_pin,
+            #[cfg(target_os = "linux")]
+            definition_baseline: crate::service::snapshot_definition().ok(),
+        }
+    }
+
+    fn run(&mut self, stop_flag: &AtomicBool) -> LoopExit {
+        while !stop_flag.load(Ordering::SeqCst) {
+            // Every path that loops back here — a crash, a refused spawn, a stalled
+            // heartbeat — passes through this check, so a release whose agent never
+            // even starts still runs out its probation.
+            if let Some(exit) = settle_probation(&mut self.probation, false, self.config.alerts) {
+                return exit;
+            }
+
+            #[cfg(target_os = "linux")]
+            self.report_definition_drift();
+
+            if !self.agent_binary_intact() {
+                let (delay, _) = self.backoff.record_exit(Duration::ZERO);
                 if !sleep_unless_stopped(stop_flag, delay) {
                     return LoopExit::Stopped;
                 }
                 continue;
             }
-        };
-        match watch_child(
-            &mut child,
-            spawn_time,
-            &mut backoff,
-            &mut heartbeat,
-            &mut probation,
-            alerts,
-            stop_flag,
-        ) {
-            WatchOutcome::Restart => {}
-            WatchOutcome::Stop => return LoopExit::Stopped,
-            WatchOutcome::RolledBack { failed, restored } => {
-                return LoopExit::RolledBack { failed, restored };
+
+            eprintln!("[watchdog] starting the agent...");
+            let spawn_time = Instant::now();
+            let mut heartbeat = HeartbeatMonitor::new(
+                self.heartbeat_path.clone(),
+                Duration::from_secs(self.config.heartbeat.interval_secs),
+                self.config.heartbeat.miss_limit,
+            );
+            let mut child = match spawn_agent(self.config.agent, self.config.alerts) {
+                Ok(c) => c,
+                Err(e) => {
+                    // A spawn failure (missing binary, permission denied) is as
+                    // much a crash loop risk as an in-process panic — feed it
+                    // into the same backoff instead of hammering at a fixed
+                    // interval forever.
+                    let (delay, _) = self.backoff.record_exit(Duration::ZERO);
+                    eprintln!("[watchdog] spawn failed: {e}. Retrying in {delay}s...");
+                    if !sleep_unless_stopped(stop_flag, delay) {
+                        return LoopExit::Stopped;
+                    }
+                    continue;
+                }
+            };
+            match self.watch_child(&mut child, spawn_time, &mut heartbeat, stop_flag) {
+                WatchOutcome::Restart => {}
+                WatchOutcome::Stop => return LoopExit::Stopped,
+                WatchOutcome::RolledBack { failed, restored } => {
+                    return LoopExit::RolledBack { failed, restored };
+                }
+            }
+        }
+        LoopExit::Stopped
+    }
+
+    /// Reports any drift of the installed service definition since startup.
+    #[cfg(target_os = "linux")]
+    fn report_definition_drift(&self) {
+        if let Some(baseline) = &self.definition_baseline
+            && let Ok(current) = crate::service::snapshot_definition()
+        {
+            for line in crate::service::drift_report(baseline, &current) {
+                report_self_protection_event(self.config.alerts, &line);
             }
         }
     }
-    LoopExit::Stopped
+
+    /// `false`, after reporting it, when the agent binary no longer matches its pinned hash.
+    fn agent_binary_intact(&self) -> bool {
+        let Some(pin) = &self.binary_pin else {
+            return true;
+        };
+        if pin.verify() {
+            return true;
+        }
+        report_self_protection_event(
+            self.config.alerts,
+            &format!(
+                "agent binary at {} no longer matches its pinned hash — \
+                 refusing to launch it",
+                self.config.agent.display()
+            ),
+        );
+        false
+    }
+
+    /// Watches one child until it exits or is killed for a stalled heartbeat (→
+    /// [`WatchOutcome::Restart`]), the stop flag rises (→ [`WatchOutcome::Stop`]:
+    /// kill it and end supervision), or the release on probation fails its health
+    /// check (→ [`WatchOutcome::RolledBack`]: kill it and hand the exit up). Polls in
+    /// short steps to react to the stop flag quickly.
+    fn watch_child(
+        &mut self,
+        child: &mut Child,
+        spawn_time: Instant,
+        heartbeat: &mut HeartbeatMonitor,
+        stop_flag: &AtomicBool,
+    ) -> WatchOutcome {
+        let restart_after = |delay: u64| {
+            if sleep_unless_stopped(stop_flag, delay) {
+                WatchOutcome::Restart
+            } else {
+                WatchOutcome::Stop
+            }
+        };
+        loop {
+            if stop_flag.load(Ordering::SeqCst) {
+                let _ = child.kill();
+                let _ = child.wait();
+                return WatchOutcome::Stop;
+            }
+            match child.try_wait() {
+                Ok(Some(status)) => {
+                    let uptime = spawn_time.elapsed();
+                    let (delay, class) = self.backoff.record_exit(uptime);
+                    match class {
+                        ExitClass::FastCrash => eprintln!(
+                            "[watchdog] agent exited ({status}) after {:.1}s — fast crash, backing off {delay}s...",
+                            uptime.as_secs_f64()
+                        ),
+                        ExitClass::Healthy => {
+                            eprintln!(
+                                "[watchdog] agent exited ({status}). Restarting in {delay}s..."
+                            );
+                        }
+                    }
+                    return restart_after(delay);
+                }
+                Ok(None) => {
+                    if heartbeat.tick() {
+                        eprintln!(
+                            "[watchdog] agent heartbeat stalled ({} consecutive misses) — \
+                             killing and restarting (#102)",
+                            heartbeat.miss_limit
+                        );
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        let (delay, _) = self.backoff.record_exit(spawn_time.elapsed());
+                        return restart_after(delay);
+                    }
+                    if let Some(LoopExit::RolledBack { failed, restored }) = settle_probation(
+                        &mut self.probation,
+                        heartbeat.progressed(),
+                        self.config.alerts,
+                    ) {
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        return WatchOutcome::RolledBack { failed, restored };
+                    }
+                    std::thread::sleep(POLL_TICK);
+                }
+                Err(e) => {
+                    eprintln!("[watchdog] try_wait error: {e}");
+                    return WatchOutcome::Restart;
+                }
+            }
+        }
+    }
 }
 
 /// Feeds one observation to the release on probation, if any. Returns the loop
@@ -522,77 +623,6 @@ fn die_with_parent(cmd: &mut std::process::Command) {
     }
 }
 
-/// Watches one child until it exits or is killed for a stalled heartbeat (→
-/// [`WatchOutcome::Restart`]), the stop flag rises (→ [`WatchOutcome::Stop`]:
-/// kill it and end supervision), or the release on probation fails its health
-/// check (→ [`WatchOutcome::RolledBack`]: kill it and hand the exit up). Polls in
-/// short steps to react to the stop flag quickly.
-fn watch_child(
-    child: &mut Child,
-    spawn_time: Instant,
-    backoff: &mut Backoff,
-    heartbeat: &mut HeartbeatMonitor,
-    probation: &mut Option<Probation>,
-    alerts: &Path,
-    stop_flag: &AtomicBool,
-) -> WatchOutcome {
-    let restart_after = |delay: u64| {
-        if sleep_unless_stopped(stop_flag, delay) {
-            WatchOutcome::Restart
-        } else {
-            WatchOutcome::Stop
-        }
-    };
-    loop {
-        if stop_flag.load(Ordering::SeqCst) {
-            let _ = child.kill();
-            let _ = child.wait();
-            return WatchOutcome::Stop;
-        }
-        match child.try_wait() {
-            Ok(Some(status)) => {
-                let uptime = spawn_time.elapsed();
-                let (delay, class) = backoff.record_exit(uptime);
-                match class {
-                    ExitClass::FastCrash => eprintln!(
-                        "[watchdog] agent exited ({status}) after {:.1}s — fast crash, backing off {delay}s...",
-                        uptime.as_secs_f64()
-                    ),
-                    ExitClass::Healthy => {
-                        eprintln!("[watchdog] agent exited ({status}). Restarting in {delay}s...");
-                    }
-                }
-                return restart_after(delay);
-            }
-            Ok(None) => {
-                if heartbeat.tick() {
-                    eprintln!(
-                        "[watchdog] agent heartbeat stalled ({} consecutive misses) — \
-                         killing and restarting (#102)",
-                        heartbeat.miss_limit
-                    );
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    let (delay, _) = backoff.record_exit(spawn_time.elapsed());
-                    return restart_after(delay);
-                }
-                if let Some(LoopExit::RolledBack { failed, restored }) =
-                    settle_probation(probation, heartbeat.progressed(), alerts)
-                {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    return WatchOutcome::RolledBack { failed, restored };
-                }
-                std::thread::sleep(POLL_TICK);
-            }
-            Err(e) => {
-                eprintln!("[watchdog] try_wait error: {e}");
-                return WatchOutcome::Restart;
-            }
-        }
-    }
-}
-
 /// Appends a self-protection finding to the alerts file as one JSON-Lines
 /// [`AlertRecord`] — the agent's own alert shape — so it reads like any rule or
 /// correlator alert (issue #103: "alerts on mismatch... instead of silently
@@ -693,15 +723,16 @@ pub(crate) fn cmd_run(
         );
     }
 
-    match supervise_loop(
-        &agent,
-        &alerts,
+    let config = SupervisorConfig {
+        agent: &agent,
+        alerts: &alerts,
         restart_delay,
-        heartbeat_interval_secs,
-        heartbeat_miss_limit,
-        &stop,
-        probation,
-    ) {
+        heartbeat: HeartbeatSettings {
+            interval_secs: heartbeat_interval_secs,
+            miss_limit: heartbeat_miss_limit,
+        },
+    };
+    match supervise_loop(config, &stop, probation) {
         LoopExit::Stopped => {
             eprintln!("[watchdog] stopped.");
             Ok(())
@@ -1091,6 +1122,19 @@ mod probation_tests {
 
     use super::*;
 
+    /// A zero restart delay and a one-second heartbeat check, as every test here wants.
+    fn test_config<'a>(agent: &'a Path, alerts: &'a Path, miss_limit: u32) -> SupervisorConfig<'a> {
+        SupervisorConfig {
+            agent,
+            alerts,
+            restart_delay: 0,
+            heartbeat: HeartbeatSettings {
+                interval_secs: 1,
+                miss_limit,
+            },
+        }
+    }
+
     /// `base/{bootstrap,versions/v<N>...}` with `current -> versions/v<current>`.
     fn install(versions: &[u64], current: u64) -> (tempfile::TempDir, Layout) {
         let dir = tempfile::tempdir().unwrap();
@@ -1123,11 +1167,7 @@ mod probation_tests {
             .with_deadline(Duration::from_secs(1));
 
         let exit = supervise_loop(
-            &agent,
-            &alerts,
-            0,
-            1,
-            6,
+            test_config(&agent, &alerts, 6),
             &AtomicBool::new(false),
             Some(probation),
         );
@@ -1178,7 +1218,7 @@ mod probation_tests {
                 stop.store(true, Ordering::SeqCst);
             })
         };
-        let exit = supervise_loop(&agent, &alerts, 0, 1, 1000, &stop, Some(probation));
+        let exit = supervise_loop(test_config(&agent, &alerts, 1000), &stop, Some(probation));
         watcher.join().unwrap();
 
         assert_eq!(exit, LoopExit::Stopped);
@@ -1214,7 +1254,7 @@ mod probation_tests {
                 stop.store(true, Ordering::SeqCst);
             })
         };
-        let exit = supervise_loop(&agent, &alerts, 0, 1, 6, &stop, None);
+        let exit = supervise_loop(test_config(&agent, &alerts, 6), &stop, None);
         stopper.join().unwrap();
         assert_eq!(exit, LoopExit::Stopped);
         assert_eq!(layout.current_release_version(), Some(1));
