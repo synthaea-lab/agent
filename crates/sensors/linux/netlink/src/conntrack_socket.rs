@@ -20,16 +20,11 @@
 //! on. This module does not toggle it; a beacon-detection caller needing byte/
 //! packet accounting must ensure it is enabled on the target host.
 
-use std::{
-    io,
-    os::fd::{AsRawFd, FromRawFd, OwnedFd},
-};
-
-pub use crate::socket::NetlinkError;
+pub use crate::nl_socket::NetlinkError;
 use crate::{
     conntrack_attrs::ConntrackFlow,
-    socket::nlmsg_error_errno,
-    wire::{NLM_F_DUMP, NLM_F_REQUEST, NLMSG_DONE, NLMSG_ERROR, NLMSG_HDR_LEN, NlMsgHeader},
+    nl_socket::{Bind, NetlinkSocket},
+    wire::{NLM_F_DUMP, NLM_F_REQUEST},
 };
 
 /// Not in every version of the `libc` crate's Linux constant set — see
@@ -75,117 +70,26 @@ pub fn dump() -> Result<Vec<ConntrackFlow>, NetlinkError> {
 }
 
 fn dump_one_family(family: u8) -> Result<Vec<ConntrackFlow>, NetlinkError> {
-    let fd = open_socket()?;
-    send_request(&fd, family)?;
-    read_dump(&fd)
-}
-
-fn open_socket() -> Result<OwnedFd, NetlinkError> {
-    // SAFETY: `socket(2)` with a fixed, valid family/type/protocol triple. The
-    // result is checked for the -1 error sentinel before being trusted as a real
-    // fd; on success it is immediately handed to `OwnedFd`, which becomes its
-    // sole owner (closed on drop) so no descriptor can leak past this function.
-    let raw = unsafe { libc::socket(libc::AF_NETLINK, libc::SOCK_RAW, NETLINK_NETFILTER) };
-    if raw < 0 {
-        return Err(NetlinkError::Io(io::Error::last_os_error()));
-    }
-    // SAFETY: `raw` was just verified >= 0 (a freshly-opened, uniquely-owned fd
-    // from the `socket(2)` call above), satisfying `from_raw_fd`'s precondition.
-    let fd = unsafe { OwnedFd::from_raw_fd(raw) };
-
-    // SAFETY: `addr` is zero-initialized `libc::sockaddr_nl`, a plain-old-data C
-    // struct with no invalid all-zero bit pattern (every field is an integer).
-    let mut addr: libc::sockaddr_nl = unsafe { std::mem::zeroed() };
-    addr.nl_family = libc::AF_NETLINK as libc::sa_family_t;
     // nl_pid = 0: let the kernel assign one — a single-shot dump socket, not a
-    // long-lived subscriber (contrast `proc_socket::open_socket`).
-
-    // SAFETY: `bind(2)` on the fd this function owns, passing a pointer to a
-    // local `sockaddr_nl` whose size exactly matches the `addrlen` argument — the
-    // kernel reads, never writes through this pointer for `bind`.
-    let ret = unsafe {
-        libc::bind(
-            fd.as_raw_fd(),
-            std::ptr::addr_of!(addr).cast(),
-            std::mem::size_of::<libc::sockaddr_nl>() as libc::socklen_t,
-        )
-    };
-    if ret < 0 {
-        return Err(NetlinkError::Io(io::Error::last_os_error()));
-    }
-    Ok(fd)
-}
-
-fn send_request(fd: &OwnedFd, family: u8) -> Result<(), NetlinkError> {
+    // long-lived subscriber (contrast `proc_socket::open`).
+    let socket = NetlinkSocket::open(NETLINK_NETFILTER, libc::SOCK_RAW, Bind::QUERY)?;
     // nfgen_family, version = NFNETLINK_V0, res_id = 0 (unused for CT_GET).
     let nfgenmsg = [family, 0, 0, 0];
-    let header = NlMsgHeader {
-        len: (NLMSG_HDR_LEN + NFGENMSG_LEN) as u32,
-        msg_type: (NFNL_SUBSYS_CTNETLINK << 8) | IPCTNL_MSG_CT_GET,
-        flags: NLM_F_REQUEST | NLM_F_DUMP,
-        seq: 1,
-        pid: 0,
-    };
-    let mut buf = Vec::with_capacity(NLMSG_HDR_LEN + NFGENMSG_LEN);
-    buf.extend_from_slice(&header.to_bytes());
-    buf.extend_from_slice(&nfgenmsg);
-
-    // SAFETY: `send(2)` on a fd this function borrows (still owned by the
-    // caller), with a pointer/length pair taken from a `Vec` we just built —
-    // the length passed matches the buffer exactly.
-    let sent = unsafe { libc::send(fd.as_raw_fd(), buf.as_ptr().cast(), buf.len(), 0) };
-    if sent < 0 {
-        return Err(NetlinkError::Io(io::Error::last_os_error()));
-    }
-    Ok(())
-}
-
-fn read_dump(fd: &OwnedFd) -> Result<Vec<ConntrackFlow>, NetlinkError> {
-    let mut entries = Vec::new();
-    let mut buf = vec![0u8; 64 * 1024];
+    socket.send_message(
+        (NFNL_SUBSYS_CTNETLINK << 8) | IPCTNL_MSG_CT_GET,
+        NLM_F_REQUEST | NLM_F_DUMP,
+        1,
+        0,
+        &nfgenmsg,
+    )?;
     let ct_new_type = (NFNL_SUBSYS_CTNETLINK << 8) | IPCTNL_MSG_CT_NEW;
-
-    'recv: loop {
-        // SAFETY: `recv(2)` into a buffer this function owns, with its exact
-        // allocated length as the size bound — the kernel never writes past it.
-        // The returned count is validated (>= 0) before any byte of `buf` is read.
-        let n = unsafe { libc::recv(fd.as_raw_fd(), buf.as_mut_ptr().cast(), buf.len(), 0) };
-        if n < 0 {
-            return Err(NetlinkError::Io(io::Error::last_os_error()));
+    socket.read_dump(|msg_type, payload| {
+        if msg_type == ct_new_type && payload.len() >= NFGENMSG_LEN {
+            ConntrackFlow::parse(&payload[NFGENMSG_LEN..])
+        } else {
+            None // an unexpected message type — ignore, don't abort the dump
         }
-        let received_len = usize::try_from(n).unwrap_or(0);
-        let received = &buf[..received_len];
-
-        let mut offset = 0usize;
-        while let Some(header) = NlMsgHeader::parse(&received[offset..]) {
-            let msg_len = header.len as usize;
-            if msg_len < NLMSG_HDR_LEN || offset + msg_len > received.len() {
-                break; // truncated/malformed frame — stop trusting this buffer
-            }
-            let payload = &received[offset + NLMSG_HDR_LEN..offset + msg_len];
-            match header.msg_type {
-                NLMSG_DONE => break 'recv,
-                NLMSG_ERROR => {
-                    let errno = nlmsg_error_errno(payload);
-                    if errno != 0 {
-                        return Err(NetlinkError::Kernel(errno));
-                    }
-                    break 'recv; // errno == 0 is an ACK, not a dump record
-                }
-                t if t == ct_new_type => {
-                    if payload.len() >= NFGENMSG_LEN
-                        && let Some(flow) = ConntrackFlow::parse(&payload[NFGENMSG_LEN..])
-                    {
-                        entries.push(flow);
-                    }
-                }
-                _ => {} // an unexpected message type — ignore, don't abort the dump
-            }
-            offset += (msg_len + 3) & !3; // NLMSG_ALIGN: 4-byte padding
-        }
-    }
-
-    Ok(entries)
+    })
 }
 
 #[cfg(test)]

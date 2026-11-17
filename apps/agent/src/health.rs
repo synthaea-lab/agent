@@ -17,7 +17,7 @@ use std::{
         Arc, Mutex,
         atomic::{AtomicBool, AtomicU64, Ordering},
     },
-    thread::{self, JoinHandle},
+    thread::JoinHandle,
     time::{Duration, Instant},
 };
 
@@ -320,13 +320,14 @@ impl HealthCollector {
 
     /// Spawns the collector thread. Returns a handle that can be used to stop
     /// the collector and a `StopHandle` to signal shutdown.
-    pub fn spawn(self) -> (JoinHandle<()>, StopHandle) {
+    ///
+    /// # Errors
+    ///
+    /// The OS refused the thread (see [`crate::spawn::spawn_named`]).
+    pub fn spawn(self) -> std::io::Result<(JoinHandle<()>, StopHandle)> {
         let stop = self.stop.clone();
-        let handle = thread::Builder::new()
-            .name("health-beacon".into())
-            .spawn(move || self.run())
-            .expect("spawning the health beacon thread");
-        (handle, StopHandle(stop))
+        let handle = crate::spawn::spawn_named("health-beacon", move || self.run())?;
+        Ok((handle, StopHandle(stop)))
     }
 
     fn run(self) {
@@ -384,7 +385,7 @@ impl StopHandle {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::mpsc;
+    use std::{sync::mpsc, thread};
 
     use super::*;
 
@@ -482,7 +483,7 @@ mod tests {
             },
         );
 
-        let (handle, stop) = collector.spawn();
+        let (handle, stop) = collector.spawn().unwrap();
 
         // Wait for the first beacon instead of sleeping a fixed time: a fixed
         // 50 ms sleep failed on slow CI runners (macOS) before the thread had
@@ -561,7 +562,7 @@ mod tests {
             |_| {},
         );
 
-        let (handle, stop) = collector.spawn();
+        let (handle, stop) = collector.spawn().unwrap();
 
         // Stop immediately - should not wait 60 seconds
         thread::sleep(Duration::from_millis(10));
@@ -701,7 +702,7 @@ mod tests {
         let handle = BeaconInterval::with_floor(interval, floor);
         handle.attach(Arc::clone(&collector.stop));
         collector.interval = handle.clone();
-        let (join, stop) = collector.spawn();
+        let (join, stop) = collector.spawn().unwrap();
         (rx, handle, join, stop)
     }
 

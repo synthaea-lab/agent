@@ -256,7 +256,7 @@ pub(crate) fn wire_run_pipeline(
         crate::heartbeat::heartbeat_path_for(alerts),
         sink.progress_handle(),
         crate::heartbeat::WRITE_INTERVAL,
-    );
+    )?;
 
     // Local control channel (#388): non-fatal by design, see `ipc_handler`.
     let sensor_health: SensorHealthSlot = Arc::new(std::sync::OnceLock::new());
@@ -564,7 +564,8 @@ mod tests {
                 std::thread::sleep(std::time::Duration::from_millis(300));
                 on_detection.fetch_add(1, Ordering::SeqCst);
             },
-        );
+        )
+        .unwrap();
         queue
             .enqueue_detection(schema::detection::Detection {
                 timestamp_ns: 1,

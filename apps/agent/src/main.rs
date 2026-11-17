@@ -83,6 +83,7 @@ mod silence;
 )]
 mod sink;
 mod snapshot_fetch;
+mod spawn;
 mod sync;
 #[cfg_attr(
     not(any(target_os = "linux", target_os = "macos", windows)),
