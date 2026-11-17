@@ -477,6 +477,23 @@ fn pe_version_strings_are_refused_outside_windows() {
     }
 }
 
+/// The refusal names the field, the reason and the fix in one sentence; a reflowed string
+/// literal once left a run of spaces in the middle of it.
+#[test]
+fn a_windows_only_field_outside_windows_is_refused_with_one_readable_sentence() {
+    let rule = unvalidated_field_rule("OriginalFileName", "'cmd.exe'");
+    let error = validate(&rule, "<test>/linux/rule.yml")
+        .expect_err("a Linux rule")
+        .to_string();
+    assert!(
+        error.contains(
+            "field `OriginalFileName` is Windows-only (PE version-resource metadata, issue #983); \
+             this rule is not under a `windows/` directory and would never match there"
+        ),
+        "{error}"
+    );
+}
+
 /// The Windows-only check reads the rule's platform directory, the innermost one, not any
 /// `windows` word in its path: a Linux rule kept under a `windows` checkout is a Linux rule.
 #[test]

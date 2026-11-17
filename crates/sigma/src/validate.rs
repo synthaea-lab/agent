@@ -329,7 +329,8 @@ fn validate_field_name(
         return Err(unsupported(
             path,
             format!(
-                "field `{field}` is Windows-only (PE version-resource metadata, issue #983);                  this rule is not under a `windows/` directory and would never match there"
+                "field `{field}` is Windows-only (PE version-resource metadata, issue #983); \
+                 this rule is not under a `windows/` directory and would never match there"
             ),
         ));
     }
