@@ -544,15 +544,13 @@ fn renaming_image<'a>(
     if let Some(path) = event.executable_path.as_deref().filter(|p| !p.is_empty()) {
         return Some(path);
     }
-    PidFact::current(images, event.meta.pid, event.meta.process_generation)
-        .or_else(|| {
-            PidFact::current(
-                images,
-                event.meta.ppid,
-                event.meta.parent_process_generation,
-            )
-        })
-        .filter(|image| !image.is_empty())
+    // Each lookup is filtered before the next is tried: an exec recorded with an empty image is
+    // "lost" too, and must fall through to the parent rather than stop the chain.
+    let known = |pid: u32, generation: Option<u64>| {
+        PidFact::current(images, pid, generation).filter(|image| !image.is_empty())
+    };
+    known(event.meta.pid, event.meta.process_generation)
+        .or_else(|| known(event.meta.ppid, event.meta.parent_process_generation))
 }
 
 /// The real path of a file the Chromium Snap saved, from the path its rename reports:

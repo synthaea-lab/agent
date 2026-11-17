@@ -313,6 +313,36 @@ fn an_empty_image_is_read_as_lost() {
 }
 
 #[test]
+fn an_own_exec_with_an_empty_image_falls_back_to_the_parent() {
+    // The pid's own exec was recorded but its image path is empty (the sensor lost it there
+    // too): the lookup that comes back empty is not an answer, so the browser parent is tried.
+    let mut state = RuleState::new();
+    state.on_exec(&exec_of(800, Some(3), CHROMIUM));
+    state.on_exec(&exec_of(901, Some(9), ""));
+    assert!(marked_by_lineage(
+        &mut state,
+        &lost_rename(901, Some(9), 800, Some(3))
+    ));
+}
+
+#[test]
+fn a_fact_seeded_at_startup_matches_any_incarnation_of_its_pid() {
+    // `seed_from_proc` records an image with no incarnation stamp, so a rename carrying one
+    // still joins it: a browser that started before the agent is found, and so is a pid that
+    // died and was reused by a process that forks without an exec (it inherits the seeded
+    // image instead of falling back to its parent). Intended for the first, the cost of the
+    // second (also on Linux, not only macOS).
+    let mut state = RuleState::new();
+    state
+        .pid_image_path
+        .insert(900, crate::state::PidFact::seeded(FIREFOX.into()));
+    assert!(marked_by_lineage(
+        &mut state,
+        &lost_rename(900, Some(8), 1, None)
+    ));
+}
+
+#[test]
 fn a_child_forked_without_an_exec_takes_its_parents_image() {
     // A Chromium zygote child: no exec of its own, the parent (the browser) has one.
     let mut state = RuleState::new();

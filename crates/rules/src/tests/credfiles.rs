@@ -69,6 +69,29 @@ fn a_shadow_alias_alerts_as_the_shadow_path_does() {
 }
 
 #[test]
+fn an_image_seeded_at_startup_applies_the_image_based_exclusion() {
+    // `seed_from_proc` also fills the image table (#17), which this rule reads: a process
+    // already running when the agent starts is now judged by its image, as one the agent saw
+    // exec always was. A masquerading `sshd` copied to /tmp is no longer excluded by its name.
+    // A behavior change outside T1204.002, pinned here for this rule; the other readers of
+    // the table (impact, network flow, LSASS access, the set-time dedup) are not pinned one by
+    // one: they all read it through the same lookup.
+    let mut unseeded = RuleState::new();
+    assert!(
+        read(&mut unseeded, 200, "sshd", "/etc/shadow").is_empty(),
+        "with no image known the name is all there is, and it is excluded"
+    );
+    let mut seeded = RuleState::new();
+    seeded
+        .pid_image_path
+        .insert(200, crate::state::PidFact::seeded("/tmp/sshd".into()));
+    assert_eq!(
+        techniques(&read(&mut seeded, 200, "sshd", "/etc/shadow")),
+        ["T1003.008"]
+    );
+}
+
+#[test]
 fn the_authentication_stack_reading_etc_shadow_does_not_alert() {
     for (comm, image) in [
         ("sshd", "/usr/sbin/sshd"),

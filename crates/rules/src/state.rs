@@ -62,7 +62,7 @@ impl PidFact {
     }
 
     /// A fact read from `/proc` or an external table at startup: no stamp to compare.
-    fn seeded(value: String) -> Self {
+    pub(crate) fn seeded(value: String) -> Self {
         Self::new(None, value)
     }
 
