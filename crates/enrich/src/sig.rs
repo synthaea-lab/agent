@@ -262,6 +262,83 @@ mod windows_impl {
         fn CryptCATAdminReleaseContext(cat_admin: *mut core::ffi::c_void, flags: u32) -> i32;
     }
 
+    impl WintrustData {
+        /// A `WINTRUST_DATA` asking for a silent, offline `WTD_STATEACTION_VERIFY` of
+        /// the subject `file` points at; `union_choice` says which kind of subject.
+        fn verifying(union_choice: u32, file: *mut core::ffi::c_void) -> Self {
+            Self {
+                cb_struct: size_of::<WintrustData>() as u32,
+                policy_callback_data: core::ptr::null_mut(),
+                sip_client_data: core::ptr::null_mut(),
+                ui_choice: WTD_UI_NONE,
+                revocation_checks: WTD_REVOKE_NONE,
+                union_choice,
+                file,
+                state_action: WTD_STATEACTION_VERIFY,
+                state_data: core::ptr::null_mut(),
+                url_reference: core::ptr::null_mut(),
+                prov_flags: WTD_CACHE_ONLY_URL_RETRIEVAL,
+                ui_context: 0,
+                signature_settings: core::ptr::null_mut(),
+            }
+        }
+    }
+
+    /// One `WinVerifyTrust` verification. The provider state it allocates is released
+    /// when this is dropped, whatever the verdict.
+    struct TrustState<'a> {
+        data: &'a mut WintrustData,
+        status: i32,
+    }
+
+    impl<'a> TrustState<'a> {
+        /// Runs the verification described by `data`.
+        ///
+        /// # Safety
+        ///
+        /// `data.file` must point at a live, fully initialized subject struct matching
+        /// `data.union_choice`, and everything that struct points at (paths, handle, hash,
+        /// catalog admin context) must stay valid until this value is dropped.
+        unsafe fn verify(data: &'a mut WintrustData) -> Self {
+            // SAFETY: `data` is a live, fully initialized `WINTRUST_DATA`; the caller
+            // guarantees its subject is valid for the call.
+            let status = unsafe {
+                WinVerifyTrust(
+                    0,
+                    &ACTION_GENERIC_VERIFY_V2,
+                    (data as *mut WintrustData).cast(),
+                )
+            };
+            Self { data, status }
+        }
+
+        fn signature(&self) -> Signature {
+            match self.status {
+                0 => Signature::Valid,
+                TRUST_E_NOSIGNATURE => Signature::Unsigned,
+                // Not a signable file type — a verdict of Invalid would brand every
+                // text/data file as tampered.
+                TRUST_E_PROVIDER_UNKNOWN | TRUST_E_SUBJECT_FORM_UNKNOWN => Signature::Unsupported,
+                _ => Signature::Invalid,
+            }
+        }
+    }
+
+    impl Drop for TrustState<'_> {
+        fn drop(&mut self) {
+            self.data.state_action = WTD_STATEACTION_CLOSE;
+            // SAFETY: same live `data` as the verify call, now asking the provider to
+            // release the state it allocated.
+            unsafe {
+                WinVerifyTrust(
+                    0,
+                    &ACTION_GENERIC_VERIFY_V2,
+                    (self.data as *mut WintrustData).cast(),
+                );
+            }
+        }
+    }
+
     pub(super) fn verify_wide(path_utf16: &[u16], h_file: *mut core::ffi::c_void) -> Signature {
         let mut file_info = WintrustFileInfo {
             cb_struct: size_of::<WintrustFileInfo>() as u32,
@@ -269,218 +346,189 @@ mod windows_impl {
             h_file,
             known_subject: core::ptr::null(),
         };
-        let mut data = WintrustData {
-            cb_struct: size_of::<WintrustData>() as u32,
-            policy_callback_data: core::ptr::null_mut(),
-            sip_client_data: core::ptr::null_mut(),
-            ui_choice: WTD_UI_NONE,
-            revocation_checks: WTD_REVOKE_NONE,
-            union_choice: WTD_CHOICE_FILE,
-            file: (&mut file_info as *mut WintrustFileInfo).cast(),
-            state_action: WTD_STATEACTION_VERIFY,
-            state_data: core::ptr::null_mut(),
-            url_reference: core::ptr::null_mut(),
-            prov_flags: WTD_CACHE_ONLY_URL_RETRIEVAL,
-            ui_context: 0,
-            signature_settings: core::ptr::null_mut(),
-        };
-        // SAFETY: `data` and `file_info` are fully initialized above and outlive
-        // the call; `h_file` is a live handle the caller holds open past it; the
-        // struct layout matches the manual WINTRUST_DATA binding.
-        let status = unsafe {
-            WinVerifyTrust(
-                0,
-                &ACTION_GENERIC_VERIFY_V2,
-                (&mut data as *mut WintrustData).cast(),
-            )
-        };
-        // Release verifier state regardless of the verdict.
-        data.state_action = WTD_STATEACTION_CLOSE;
-        // SAFETY: same live `data` as the verify call, now asking the provider to
-        // release the state it allocated.
-        unsafe {
-            WinVerifyTrust(
-                0,
-                &ACTION_GENERIC_VERIFY_V2,
-                (&mut data as *mut WintrustData).cast(),
-            );
+        let mut data = WintrustData::verifying(
+            WTD_CHOICE_FILE,
+            (&mut file_info as *mut WintrustFileInfo).cast(),
+        );
+        // SAFETY: `data` and `file_info` are fully initialized above and outlive the
+        // call; `h_file` is a live handle the caller holds open past it; the struct
+        // layout matches the manual WINTRUST_DATA binding.
+        unsafe { TrustState::verify(&mut data) }.signature()
+    }
+
+    /// An acquired catalog admin context, released on drop.
+    struct CatAdminContext(*mut core::ffi::c_void);
+
+    impl CatAdminContext {
+        /// `None` when the context cannot be acquired (a tooling failure).
+        fn acquire() -> Option<Self> {
+            let mut cat_admin: *mut core::ffi::c_void = core::ptr::null_mut();
+            // Null-terminated wide "SHA256" — the modern algorithm; this whole API
+            // requires Windows 8+ regardless, so there is no legacy-SHA1 case to
+            // support here.
+            let hash_algorithm: Vec<u16> = "SHA256\0".encode_utf16().collect();
+            // SAFETY: `cat_admin` is an out-param the callee fully initializes on
+            // success; `hash_algorithm` is a valid null-terminated wide string that
+            // outlives this call.
+            let acquired = unsafe {
+                CryptCATAdminAcquireContext2(
+                    &mut cat_admin,
+                    core::ptr::null(),
+                    hash_algorithm.as_ptr(),
+                    core::ptr::null(),
+                    0,
+                )
+            };
+            (acquired != 0 && !cat_admin.is_null()).then_some(Self(cat_admin))
         }
-        match status {
-            0 => Signature::Valid,
-            TRUST_E_NOSIGNATURE => Signature::Unsigned,
-            // Not a signable file type — a verdict of Invalid would brand every
-            // text/data file as tampered.
-            TRUST_E_PROVIDER_UNKNOWN | TRUST_E_SUBJECT_FORM_UNKNOWN => Signature::Unsupported,
-            _ => Signature::Invalid,
+
+        /// The SHA-256 of the open file, `None` when it cannot be computed.
+        fn hash_file(&self, h_file: *mut core::ffi::c_void) -> Option<Vec<u8>> {
+            // Two-call pattern: first learn the required hash buffer size (null
+            // `hash` pointer), then fill it.
+            let mut hash_len: u32 = 0;
+            // SAFETY: `self.0` is a live context; a null `hash` with `hash_len`
+            // pointing at a live `u32` is the documented size-query mode.
+            unsafe {
+                CryptCATAdminCalcHashFromFileHandle2(
+                    self.0,
+                    h_file,
+                    &mut hash_len,
+                    core::ptr::null_mut(),
+                    0,
+                );
+            }
+            if hash_len == 0 {
+                return None;
+            }
+            let mut hash = vec![0u8; hash_len as usize];
+            // SAFETY: `hash` is sized exactly to the length reported by the call
+            // above and outlives this call.
+            let hashed = unsafe {
+                CryptCATAdminCalcHashFromFileHandle2(
+                    self.0,
+                    h_file,
+                    &mut hash_len,
+                    hash.as_mut_ptr(),
+                    0,
+                )
+            };
+            (hashed != 0).then_some(hash)
         }
+
+        /// The first installed catalog listing `hash`. `None` means the file is not a
+        /// member of any installed catalog — genuinely unsigned, not a tooling failure.
+        fn find_catalog(&self, hash: &mut [u8]) -> Option<CatalogContext<'_>> {
+            // SAFETY: `self.0` and `hash` are both live and valid for this call.
+            let handle = unsafe {
+                CryptCATAdminEnumCatalogFromHash(
+                    self.0,
+                    hash.as_mut_ptr(),
+                    hash.len() as u32,
+                    0,
+                    core::ptr::null_mut(),
+                )
+            };
+            (!handle.is_null()).then_some(CatalogContext {
+                admin: self,
+                handle,
+            })
+        }
+    }
+
+    impl Drop for CatAdminContext {
+        fn drop(&mut self) {
+            // SAFETY: releasing a context acquired in `acquire`, exactly once.
+            unsafe { CryptCATAdminReleaseContext(self.0, 0) };
+        }
+    }
+
+    /// A catalog context found by [`CatAdminContext::find_catalog`]. Borrowing the admin
+    /// context makes it drop first: the documented catalog-then-admin release order.
+    struct CatalogContext<'a> {
+        admin: &'a CatAdminContext,
+        handle: *mut core::ffi::c_void,
+    }
+
+    impl CatalogContext<'_> {
+        /// The path of the catalog file, `None` when it cannot be read.
+        fn info(&self) -> Option<CatalogInfo> {
+            let mut info = CatalogInfo {
+                cb_struct: size_of::<CatalogInfo>() as u32,
+                catalog_file: [0u16; MAX_PATH],
+            };
+            // SAFETY: `self.handle` was returned non-null by the enumeration; `info` is
+            // fully sized with `cb_struct` set per the documented contract.
+            let got = unsafe { CryptCATCatalogInfoFromContext(self.handle, &mut info, 0) };
+            (got != 0).then_some(info)
+        }
+    }
+
+    impl Drop for CatalogContext<'_> {
+        fn drop(&mut self) {
+            // SAFETY: `handle` and the admin context are live and released once here;
+            // the admin context is released after this, when its own drop runs.
+            unsafe { CryptCATAdminReleaseCatalogContext(self.admin.0, self.handle, 0) };
+        }
+    }
+
+    /// Verifies the file against the catalog that lists it.
+    fn verify_member(
+        admin: &CatAdminContext,
+        catalog: &CatalogInfo,
+        hash: &mut [u8],
+        path_utf16: &[u16],
+        h_file: *mut core::ffi::c_void,
+    ) -> Signature {
+        // The member tag WinVerifyTrust expects in catalog mode is the file hash
+        // rendered as an uppercase hex string, wide-encoded.
+        let mut tag = String::with_capacity(hash.len() * 2 + 1);
+        for byte in hash.iter() {
+            use std::fmt::Write as _;
+            let _ = write!(tag, "{byte:02X}");
+        }
+        let tag_utf16: Vec<u16> = tag.encode_utf16().chain(std::iter::once(0)).collect();
+
+        let mut catalog_file_info = WintrustCatalogInfo {
+            cb_struct: size_of::<WintrustCatalogInfo>() as u32,
+            catalog_version: 0,
+            catalog_file_path: catalog.catalog_file.as_ptr(),
+            member_tag: tag_utf16.as_ptr(),
+            member_file_path: path_utf16.as_ptr(),
+            member_file: h_file,
+            calculated_hash: hash.as_mut_ptr(),
+            calculated_hash_len: hash.len() as u32,
+            catalog_context: core::ptr::null(),
+            cat_admin: admin.0,
+        };
+        let mut data = WintrustData::verifying(
+            WTD_CHOICE_CATALOG,
+            (&mut catalog_file_info as *mut WintrustCatalogInfo).cast(),
+        );
+        // SAFETY: `data` and `catalog_file_info` are fully initialized above and
+        // outlive the call; `h_file` is the caller's open handle, held past this
+        // function's return; `admin` stays live for the call; the struct layout matches
+        // the manual WINTRUST_DATA/WINTRUST_CATALOG_INFO bindings in catalog mode
+        // (`union_choice = WTD_CHOICE_CATALOG`).
+        unsafe { TrustState::verify(&mut data) }.signature()
     }
 
     /// Catalog-membership fallback: only called when [`verify_wide`] already
     /// reported [`Signature::Unsigned`]. Every early return is `Unsigned` too —
     /// a tooling failure here must never read as `Valid` or `Invalid`.
     pub(super) fn catalog_verify(path_utf16: &[u16], h_file: *mut core::ffi::c_void) -> Signature {
-        let mut cat_admin: *mut core::ffi::c_void = core::ptr::null_mut();
-        // Null-terminated wide "SHA256" — the modern algorithm; this whole API
-        // requires Windows 8+ regardless, so there is no legacy-SHA1 case to
-        // support here.
-        let hash_algorithm: Vec<u16> = "SHA256\0".encode_utf16().collect();
-        // SAFETY: `cat_admin` is an out-param the callee fully initializes on
-        // success; `hash_algorithm` is a valid null-terminated wide string that
-        // outlives this call.
-        let acquired = unsafe {
-            CryptCATAdminAcquireContext2(
-                &mut cat_admin,
-                core::ptr::null(),
-                hash_algorithm.as_ptr(),
-                core::ptr::null(),
-                0,
-            )
-        };
-        if acquired == 0 || cat_admin.is_null() {
+        let Some(admin) = CatAdminContext::acquire() else {
             return Signature::Unsigned;
-        }
-
-        // Two-call pattern: first learn the required hash buffer size (null
-        // `hash` pointer), then fill it.
-        let mut hash_len: u32 = 0;
-        // SAFETY: `cat_admin` was just acquired above; a null `hash` with
-        // `hash_len` pointing at a live `u32` is the documented size-query mode.
-        unsafe {
-            CryptCATAdminCalcHashFromFileHandle2(
-                cat_admin,
-                h_file,
-                &mut hash_len,
-                core::ptr::null_mut(),
-                0,
-            );
-        }
-        if hash_len == 0 {
-            // SAFETY: releasing a context acquired above; nothing uses it after.
-            unsafe { CryptCATAdminReleaseContext(cat_admin, 0) };
+        };
+        let Some(mut hash) = admin.hash_file(h_file) else {
             return Signature::Unsigned;
-        }
-        let mut hash = vec![0u8; hash_len as usize];
-        // SAFETY: `hash` is sized exactly to the length reported by the call
-        // above and outlives this call.
-        let hashed = unsafe {
-            CryptCATAdminCalcHashFromFileHandle2(
-                cat_admin,
-                h_file,
-                &mut hash_len,
-                hash.as_mut_ptr(),
-                0,
-            )
         };
-        if hashed == 0 {
-            // SAFETY: releasing a context acquired above; nothing uses it after.
-            unsafe { CryptCATAdminReleaseContext(cat_admin, 0) };
+        let Some(catalog) = admin.find_catalog(&mut hash) else {
             return Signature::Unsigned;
-        }
-
-        // SAFETY: `cat_admin` and `hash` are both live and valid for this call.
-        let cat_info = unsafe {
-            CryptCATAdminEnumCatalogFromHash(
-                cat_admin,
-                hash.as_mut_ptr(),
-                hash_len,
-                0,
-                core::ptr::null_mut(),
-            )
         };
-        if cat_info.is_null() {
-            // Not a member of any installed catalog — genuinely unsigned, not a
-            // tooling failure.
-            // SAFETY: releasing a context acquired above; nothing uses it after.
-            unsafe { CryptCATAdminReleaseContext(cat_admin, 0) };
+        let Some(info) = catalog.info() else {
             return Signature::Unsigned;
-        }
-
-        let mut catalog_info = CatalogInfo {
-            cb_struct: size_of::<CatalogInfo>() as u32,
-            catalog_file: [0u16; MAX_PATH],
         };
-        // SAFETY: `cat_info` was just returned non-null above; `catalog_info` is
-        // fully sized with `cb_struct` set per the documented contract.
-        let got_catalog_path =
-            unsafe { CryptCATCatalogInfoFromContext(cat_info, &mut catalog_info, 0) };
-
-        let verdict = if got_catalog_path == 0 {
-            Signature::Unsigned
-        } else {
-            // The member tag WinVerifyTrust expects in catalog mode is the file
-            // hash rendered as an uppercase hex string, wide-encoded.
-            let mut tag = String::with_capacity(hash.len() * 2 + 1);
-            for byte in &hash {
-                use std::fmt::Write as _;
-                let _ = write!(tag, "{byte:02X}");
-            }
-            let tag_utf16: Vec<u16> = tag.encode_utf16().chain(std::iter::once(0)).collect();
-
-            let mut catalog_file_info = WintrustCatalogInfo {
-                cb_struct: size_of::<WintrustCatalogInfo>() as u32,
-                catalog_version: 0,
-                catalog_file_path: catalog_info.catalog_file.as_ptr(),
-                member_tag: tag_utf16.as_ptr(),
-                member_file_path: path_utf16.as_ptr(),
-                member_file: h_file,
-                calculated_hash: hash.as_mut_ptr(),
-                calculated_hash_len: hash_len,
-                catalog_context: core::ptr::null(),
-                cat_admin,
-            };
-            let mut data = WintrustData {
-                cb_struct: size_of::<WintrustData>() as u32,
-                policy_callback_data: core::ptr::null_mut(),
-                sip_client_data: core::ptr::null_mut(),
-                ui_choice: WTD_UI_NONE,
-                revocation_checks: WTD_REVOKE_NONE,
-                union_choice: WTD_CHOICE_CATALOG,
-                file: (&mut catalog_file_info as *mut WintrustCatalogInfo).cast(),
-                state_action: WTD_STATEACTION_VERIFY,
-                state_data: core::ptr::null_mut(),
-                url_reference: core::ptr::null_mut(),
-                prov_flags: WTD_CACHE_ONLY_URL_RETRIEVAL,
-                ui_context: 0,
-                signature_settings: core::ptr::null_mut(),
-            };
-            // SAFETY: `data` and `catalog_file_info` are fully initialized above
-            // and outlive the call; `h_file` is the caller's open handle, held
-            // past this function's return; the struct
-            // layout matches the manual WINTRUST_DATA/WINTRUST_CATALOG_INFO
-            // bindings in catalog mode (`union_choice = WTD_CHOICE_CATALOG`).
-            let status = unsafe {
-                WinVerifyTrust(
-                    0,
-                    &ACTION_GENERIC_VERIFY_V2,
-                    (&mut data as *mut WintrustData).cast(),
-                )
-            };
-            data.state_action = WTD_STATEACTION_CLOSE;
-            // SAFETY: same live `data` as the verify call, now asking the
-            // provider to release the state it allocated.
-            unsafe {
-                WinVerifyTrust(
-                    0,
-                    &ACTION_GENERIC_VERIFY_V2,
-                    (&mut data as *mut WintrustData).cast(),
-                );
-            }
-            match status {
-                0 => Signature::Valid,
-                TRUST_E_NOSIGNATURE => Signature::Unsigned,
-                TRUST_E_PROVIDER_UNKNOWN | TRUST_E_SUBJECT_FORM_UNKNOWN => Signature::Unsupported,
-                _ => Signature::Invalid,
-            }
-        };
-
-        // SAFETY: `cat_info` and `cat_admin` were acquired above and are each
-        // released exactly once here, in the documented catalog-then-admin
-        // order; `h_file` (used by the WinVerifyTrust call above) belongs to
-        // the caller and stays open.
-        unsafe {
-            CryptCATAdminReleaseCatalogContext(cat_admin, cat_info, 0);
-            CryptCATAdminReleaseContext(cat_admin, 0);
-        }
-        verdict
+        verify_member(&admin, &info, &mut hash, path_utf16, h_file)
     }
 }
