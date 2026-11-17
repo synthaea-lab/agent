@@ -43,7 +43,7 @@ const NETLINK_SILENCE_DEADLINE_NS: u64 =
 const AVC_SILENCE_DEADLINE_NS: u64 = 3 * AVC_POLL_TIMEOUT_MS as u64 * 1_000_000;
 
 /// The actual OS-level kill call for issue #25's automated response —
-/// `response::kill_process` takes this as an injected closure rather than calling
+/// `response::kill_process_as` takes this as an injected closure rather than calling
 /// `libc` itself, since `response` is base-tier-only and platform dispatch belongs
 /// here (CLAUDE.md: platform-specific code stays out of library crates outside
 /// `crates/sensors/*`). `SIGKILL`, not `SIGTERM`: a process correlated as

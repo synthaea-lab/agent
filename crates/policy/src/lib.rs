@@ -378,7 +378,7 @@ impl Default for EventLogPolicy {
 /// `response` is base-tier-only (`tools/check-deps.py`: leaf crates depend on
 /// `schema`+`policy` alone), so it cannot read a live config/loader either — same
 /// posture as [`EventLogPolicy`]: the `agent` binary owns/constructs this at
-/// startup and passes it into `response::kill_process`/`quarantine_file` on every
+/// startup and passes it into `response::kill_process_as`/`quarantine_file` on every
 /// call, rather than the response crate reaching for global state.
 ///
 /// Defaults to **both disabled** — "policy off = observe-only" is issue #25's own
