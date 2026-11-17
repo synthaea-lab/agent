@@ -112,7 +112,7 @@ impl Backoff {
 /// Tracks a child's heartbeat file across polls, declaring it hung after
 /// `miss_limit` consecutive checks see no advance in the counter (#102).
 ///
-/// Driven by [`watch_child`]'s existing ~500ms poll loop (via [`Self::tick`])
+/// Driven by [`Supervisor::watch_child`]'s existing ~500ms poll loop (via [`Self::tick`])
 /// rather than its own wall-clock timer: `ticks_per_check` counts how many
 /// polls make up one heartbeat-check interval, so the actual miss-counting
 /// state machine ([`Self::observe`]) needs no clock at all and is directly
@@ -200,7 +200,7 @@ pub(crate) enum LoopExit {
     RolledBack { failed: u64, restored: Option<u64> },
 }
 
-/// What one [`watch_child`] run ended with.
+/// What one [`Supervisor::watch_child`] run ended with.
 enum WatchOutcome {
     Restart,
     Stop,
