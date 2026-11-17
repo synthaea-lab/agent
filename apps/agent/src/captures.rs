@@ -141,13 +141,14 @@ impl CaptureSet {
 pub(crate) enum UprobesAction {
     /// Already running what is wanted, or nothing running and nothing wanted.
     Idle,
-    /// Nothing is running and something is wanted: start the thread, register its heartbeat with
-    /// the silence monitor.
+    /// Nothing is running and something is wanted: start the thread. Its heartbeat is already
+    /// watched (see [`heartbeat_watch`]).
     Start(Captures),
     /// Running with another set: stop the thread, start a new one. Capture has a gap in between.
     Restart(Captures),
-    /// Something is running and nothing is wanted: stop the thread and stop watching its
-    /// heartbeat, or a capture that was switched off would read as a silent sensor.
+    /// Something is running and nothing is wanted: stop the thread. The heartbeat is
+    /// unregistered by [`heartbeat_watch`], not here, so that it also happens after a refused
+    /// start, when `plan` sees nothing running and answers [`UprobesAction::Idle`].
     Stop,
 }
 
@@ -159,6 +160,29 @@ pub(crate) fn plan(running: Captures, wanted: Captures) -> UprobesAction {
         (false, true) => UprobesAction::Stop,
         (false, false) => UprobesAction::Restart(wanted),
         (true, true) => UprobesAction::Idle,
+    }
+}
+
+/// What the supervisor does with the uprobes heartbeat in the silence monitor.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum HeartbeatWatch {
+    /// Something is wanted and the heartbeat is not watched yet: register it. This happens
+    /// before the thread is started, so a start the OS refuses is still reported as silence.
+    Watch,
+    /// Nothing is wanted any more and the heartbeat is still watched: unregister it. This does
+    /// not depend on whether a thread runs: a start that was refused leaves none running, and a
+    /// capture that is deliberately off must still never accrue silence.
+    Unwatch,
+    /// Already as it should be.
+    Leave,
+}
+
+/// Whether the heartbeat is watched (`registered`) follows what is wanted, not what runs.
+pub(crate) fn heartbeat_watch(registered: bool, wanted: Captures) -> HeartbeatWatch {
+    match (registered, wanted.is_empty()) {
+        (false, false) => HeartbeatWatch::Watch,
+        (true, true) => HeartbeatWatch::Unwatch,
+        (true, false) | (false, true) => HeartbeatWatch::Leave,
     }
 }
 
@@ -401,6 +425,61 @@ mod tests {
                     assert!(!set.is_empty(), "{running:?} -> {wanted:?}");
                     assert_eq!(set, wanted);
                 }
+            }
+        }
+    }
+
+    /// Replays the supervisor's decisions for a sequence of wanted sets, with every start
+    /// refused (`running` stays empty), and returns whether the heartbeat is still watched.
+    fn watched_after_refused_starts(wanted_sequence: &[Captures]) -> bool {
+        let mut registered = false;
+        for &wanted in wanted_sequence {
+            if heartbeat_watch(registered, wanted) == HeartbeatWatch::Watch {
+                registered = true;
+            }
+            // A refused start leaves nothing running, so `plan` sees `NONE` every time.
+            let _ = plan(Captures::NONE, wanted);
+            if heartbeat_watch(registered, wanted) == HeartbeatWatch::Unwatch {
+                registered = false;
+            }
+        }
+        registered
+    }
+
+    #[test]
+    fn a_refused_start_is_watched_while_the_capture_is_wanted() {
+        assert!(watched_after_refused_starts(&[TLS]));
+    }
+
+    #[test]
+    fn a_refused_start_then_the_capture_switched_off_no_longer_watches_the_heartbeat() {
+        // `plan(NONE, NONE)` is `Idle`, not `Stop`, so the unregister cannot hang on `Stop`.
+        assert_eq!(plan(Captures::NONE, Captures::NONE), UprobesAction::Idle);
+        assert!(!watched_after_refused_starts(&[TLS, Captures::NONE]));
+    }
+
+    #[test]
+    fn a_refused_restart_then_the_capture_switched_off_no_longer_watches_the_heartbeat() {
+        // Running TLS, widened to TLS+DNS: the restart stops the old thread and the new start
+        // is refused, so nothing runs while TLS+DNS is wanted. Switching everything off must
+        // still unregister.
+        assert!(!watched_after_refused_starts(&[
+            TLS,
+            TLS.union(DNS),
+            Captures::NONE
+        ]));
+    }
+
+    #[test]
+    fn the_heartbeat_is_watched_exactly_while_something_is_wanted() {
+        for wanted in all() {
+            for registered in [false, true] {
+                let after = match heartbeat_watch(registered, wanted) {
+                    HeartbeatWatch::Watch => true,
+                    HeartbeatWatch::Unwatch => false,
+                    HeartbeatWatch::Leave => registered,
+                };
+                assert_eq!(after, !wanted.is_empty(), "{registered} / {wanted:?}");
             }
         }
     }
