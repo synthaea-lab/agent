@@ -26,16 +26,23 @@ eBPF sensor keeps the event in a pinned map for the restarted agent; the fallbac
 auditd's log (#275):
 
 1. The operator loads [`synthaea-kill.rules`](../../../packaging/linux/audit/synthaea-kill.rules):
-   `-S kill -F a1=9` and `-S tgkill -F a2=9`, key `synthaea-kill`. The packages neither install nor load it
-   (it changes the host's audit configuration, and an immutable configuration refuses it). `tkill`
-   is left out, as in the eBPF probe: it takes a thread id.
-2. At start, `AuditSensor` (given the state directory) reads the marker `audit-agent.pid` (pid and start
-   time of the previous instance) and writes its own. A clean stop removes the marker, so only a
-   kill leaves one behind.
-3. It reads the tail of `/var/log/audit/audit.log` and `audit.log.1` ([`killrec`](../../../crates/sensors/linux/audit/src/killrec.rs),
-   at most 16 MiB each) for the latest `SYSCALL` record with that key, `success=yes`, signal 9, whose
-   target is the marker's pid, sent after that instance started and within 10 minutes of now. The
-   marker's pid equal to the current pid (a recycled pid) attributes nothing.
+   `-S kill -F a1=9`, `-S tkill -F a1=9` and `-S tgkill -F a2=9`, key `synthaea-kill`. The packages neither
+   install nor load it (it changes the host's audit configuration, and an immutable configuration refuses it).
+   A `tkill` or `tgkill` counts only when its thread id equals the agent's pid, the main thread: `SIGKILL` is
+   process-wide, so that kills the agent (the eBPF probe leaves `tkill` out; the fallback reads it, because
+   one `syscall(200, pid, 9)` kills the agent and leaves no other record).
+2. At start, `AuditSensor` (given the state directory) reads the marker `audit-agent.pid` (pid, process group,
+   start time and boot id of the previous instance) and writes its own, mode 0600. A clean stop removes the
+   marker, so only a kill leaves one behind.
+3. It reads the tail of `/var/log/audit/audit.log`, then `audit.log.1`, `.2` and so on up to `.9`
+   ([`killrec`](../../../crates/sensors/linux/audit/src/killrec.rs), at most 16 MiB each), for the latest
+   `SYSCALL` record with that key, `success=yes` and signal 9 that hit the old instance: its pid, its process
+   group (`kill -9 -<pgid>` is recorded with `a0` as the 32-bit negative number, read as a group) or every
+   process (`kill(-1, 9)`), recorded after that instance started. The walk stops at the first file whose newest
+   record is older than the marker's start, so a record rotated out twice (`auditctl --signal rotate`) is still
+   found. A marker with this instance's own pid (a recycled pid) or from another boot attributes nothing.
+   There is no upper bound on the record's time and no wall-clock window: the restart's clock is not trusted
+   against the log's.
 4. It emits an `Event::Signal` (signal 9, sender in `meta`, target the old pid): the same event the eBPF
    replay emits, so the T1562.001 rule attributes it, High unless the sender is pid 1.
 
@@ -45,9 +52,20 @@ in `a0` (hex); a single record is in `audit.log` at once, without the 50-record 
 (`flush = INCREMENTAL_ASYNC`, `freq = 50`); `kill -0` and SIGTERM are not recorded by these rules; `systemctl kill`
 leaves no record with `kill`, `tkill`, `tgkill` or `pidfd_send_signal`, and its sender would be pid 1.
 
-**Limits.** No rule, no attribution. Needs `/var/log/audit/audit.log` readable by the agent (root) and auditd writing
-to it (`write_logs = yes`, `log_format = ENRICHED` or `RAW`; the key is read from the kernel part of the line). The
-agent killed by SIGKILL and not restarted within 10 minutes is not reported. The volume of SIGKILL records on a real
+When the marker survived and no record accounts for the previous instance, the restarted agent logs a warning
+(`the previous agent instance did not stop cleanly and auditd's log holds no SIGKILL record for it`) with the
+old pid, the log files it read and the ones it could not read, instead of staying silent.
+
+**Limits.** No rule, no attribution. Ways to SIGKILL the agent that these rules do not record, so are not
+attributed: `systemctl kill` (no record, as captured), `rt_sigqueueinfo`, `rt_tgsigqueueinfo` and
+`pidfd_send_signal`. A default Fedora ships `-a never,task`, which removes syscall auditing from every task:
+with `synthaea-kill.rules` loaded next to it nothing is recorded, not even a plain `kill -9`; the rule needs no
+`never,task` ahead of it (reproduced on Fedora 43, kernel 7.2, by the reviewer of #287; Rocky 9.8 has none). Needs `/var/log/audit/audit.log` readable by the agent (root) and auditd writing
+to it (`write_logs = yes`, `log_format = ENRICHED` or `RAW`; the key is read from the kernel part of the line). Two
+residual gaps of the marker: a clock set back before the kill puts the record before the marker's start, so
+it is not found (the warning above covers it), and a pid reused within the same boot by a process that is
+then killed can be taken for the agent (the boot id bounds it to one boot; there is no trusted clock to bound
+it further). The volume of SIGKILL records on a real
 host is not measured. Tested on the captured line and on files, and run end to end on Rocky 9.8 (2026-11-16, agent built without
 eBPF probes, rule loaded, agent started as a systemd unit, killed, restarted on the same state directory): the restarted agent
 logged `the previous agent instance was sent SIGKILL, reporting it` and raised T1562.001 with the sender's pid and `comm`
