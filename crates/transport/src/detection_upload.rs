@@ -235,7 +235,7 @@ fn fit_detection_reporting(
 
 /// How many of `events`, from the first, fit in the body of `value` (which holds no events yet)
 /// under [`MAX_DETECTION_BODY_BYTES`]; each event is measured once.
-fn longest_fitting_prefix(
+fn fitting_prefix_len(
     value: &serde_json::Value,
     events: &[serde_json::Value],
 ) -> std::result::Result<usize, serde_json::Error> {
@@ -258,7 +258,38 @@ fn shorten_detection(
     original: usize,
 ) -> std::result::Result<Vec<u8>, serde_json::Error> {
     let mut value = serde_json::to_value(detection)?;
+    note_shortening_in_title(&mut value, original);
+    bound_small_parts(&mut value);
 
+    let mut events = match value.get_mut("events").map(serde_json::Value::take) {
+        Some(serde_json::Value::Array(events)) => events,
+        _ => Vec::new(),
+    };
+
+    if let Some(body) = cut_padding(&mut value, &mut events)? {
+        return Ok(body);
+    }
+    if let Some(body) = keep_leading_events(&mut value, &events)? {
+        return Ok(body);
+    }
+    if let Some(body) = keep_first_event_identity(&mut value, &events)? {
+        return Ok(body);
+    }
+    body_without_events(&mut value)
+}
+
+/// The body of `value` with `events` as its events.
+fn body_with_events(
+    value: &mut serde_json::Value,
+    events: Vec<serde_json::Value>,
+) -> std::result::Result<Vec<u8>, serde_json::Error> {
+    value["events"] = serde_json::Value::Array(events);
+    serde_json::to_vec(value)
+}
+
+/// Prefixes the title of `value` with how many bytes the detection had before it was shortened,
+/// within [`TITLE_MAX_BYTES`].
+fn note_shortening_in_title(value: &mut serde_json::Value, original: usize) {
     let note = format!("[events shortened from {original} bytes] ");
     if let Some(title) = value.get_mut("title")
         && let Some(text) = title.as_str()
@@ -267,52 +298,60 @@ fn shorten_detection(
         cut_string(&mut text, TITLE_MAX_BYTES.saturating_sub(note.len()));
         *title = serde_json::Value::String(format!("{note}{text}"));
     }
-    bound_small_parts(&mut value);
+}
 
-    let mut events = match value.get_mut("events").map(serde_json::Value::take) {
-        Some(serde_json::Value::Array(events)) => events,
-        _ => Vec::new(),
-    };
-    let finish = |value: &mut serde_json::Value,
-                  events: Vec<serde_json::Value>|
-     -> std::result::Result<Vec<u8>, serde_json::Error> {
-        value["events"] = serde_json::Value::Array(events);
-        serde_json::to_vec(value)
-    };
-
-    // 1. Cut what a process pads.
+/// Step 1: cut what a process pads, harder at each of [`SHORTEN_STEPS`]; the body as soon as it
+/// fits, `None` when no step is enough (`events` then hold the hardest cut).
+fn cut_padding(
+    value: &mut serde_json::Value,
+    events: &mut [serde_json::Value],
+) -> std::result::Result<Option<Vec<u8>>, serde_json::Error> {
     for (string_cap, array_cap) in SHORTEN_STEPS {
-        for event in &mut events {
+        for event in &mut *events {
             shorten_events(event, string_cap, array_cap);
         }
-        let body = finish(&mut value, events.clone())?;
+        let body = body_with_events(value, events.to_vec())?;
         if body.len() <= MAX_DETECTION_BODY_BYTES {
-            return Ok(body);
+            return Ok(Some(body));
         }
     }
+    Ok(None)
+}
 
-    // 2. Drop events from the end, the first kept: measure every event once and keep the longest
-    // prefix that fits.
+/// Step 2: drop events from the end, the first kept: measure every event once and keep the longest
+/// prefix that fits; `None` when not even one event fits.
+fn keep_leading_events(
+    value: &mut serde_json::Value,
+    events: &[serde_json::Value],
+) -> std::result::Result<Option<Vec<u8>>, serde_json::Error> {
     value["events"] = serde_json::Value::Array(Vec::new());
-    let keep = longest_fitting_prefix(&value, &events)?;
-    if keep > 0 {
-        events.truncate(keep);
-        return finish(&mut value, events);
+    let keep = fitting_prefix_len(value, events)?;
+    if keep == 0 {
+        return Ok(None);
     }
+    body_with_events(value, events[..keep].to_vec()).map(Some)
+}
 
-    // 3. Not even one event fits: the first one, reduced to its identity.
-    if let Some(first) = events.first() {
-        let stub = vec![identity_of(first)];
-        let body = finish(&mut value, stub)?;
-        if body.len() <= MAX_DETECTION_BODY_BYTES {
-            return Ok(body);
-        }
-    }
+/// Step 3: not even one event fits, so keep the first one, reduced to its identity; `None` when
+/// there is no first event or the body is still over the limit.
+fn keep_first_event_identity(
+    value: &mut serde_json::Value,
+    events: &[serde_json::Value],
+) -> std::result::Result<Option<Vec<u8>>, serde_json::Error> {
+    let Some(first) = events.first() else {
+        return Ok(None);
+    };
+    let body = body_with_events(value, vec![identity_of(first)])?;
+    Ok((body.len() <= MAX_DETECTION_BODY_BYTES).then_some(body))
+}
 
-    // 4. Without events: bounded by construction (title, source, techniques, attributions). Checked
-    // all the same: an oversize body is never returned, it is a serialization error the caller
-    // drops and counts like any record that cannot be sent.
-    let body = finish(&mut value, Vec::new())?;
+/// Step 4: without events, bounded by construction (title, source, techniques, attributions).
+/// Checked all the same: an oversize body is never returned, it is a serialization error the
+/// caller drops and counts like any record that cannot be sent.
+fn body_without_events(
+    value: &mut serde_json::Value,
+) -> std::result::Result<Vec<u8>, serde_json::Error> {
+    let body = body_with_events(value, Vec::new())?;
     if body.len() > MAX_DETECTION_BODY_BYTES {
         return Err(serde::ser::Error::custom(
             "detection over the body limit even without its events",
@@ -322,39 +361,28 @@ fn shorten_detection(
 }
 
 /// What to do with a record whose upload failed.
-enum Verdict {
+enum FailureOutcome {
     /// The server refuses this record for good: drop it, upload the rest of the segment.
     DropRecord,
     /// The failure is not about this record: the segment stays spooled, the loop backs off.
     KeepSegment(TransportError),
 }
 
-/// The body to send for `record`: shortened when over the limit (and traced on the host), or
-/// `None` when it cannot be serialized — the record is then dropped, the rest of its segment goes on.
-fn prepare_body(record: &QueuedDetection) -> Option<Vec<u8>> {
-    match fit_detection_reporting(&record.detection) {
-        Ok((body, shortened_from)) => {
-            if let Some(original) = shortened_from {
-                // The size is chosen by the process, so the host keeps a trace too: the
-                // stored title carries the note, but only on the server.
-                tracing::warn!(
-                    key = %record.key,
-                    original_bytes = original,
-                    sent_bytes = body.len(),
-                    "detection over the body limit; events shortened before sending"
-                );
-            }
-            Some(body)
-        }
-        Err(error) => {
-            tracing::warn!(
-                %error,
-                key = %record.key,
-                "detection cannot be serialized; dropped, the rest of its segment goes on"
-            );
-            None
-        }
+/// The body to send for `record`: shortened when over the limit (and traced on the host, since
+/// the stored title carries the note only on the server), or the serialization error when it
+/// cannot be serialized.
+fn prepare_body(record: &QueuedDetection) -> std::result::Result<Vec<u8>, serde_json::Error> {
+    let (body, shortened_from) = fit_detection_reporting(&record.detection)?;
+    if let Some(original) = shortened_from {
+        // The size is chosen by the process, so the host keeps a trace too.
+        tracing::warn!(
+            key = %record.key,
+            original_bytes = original,
+            sent_bytes = body.len(),
+            "detection over the body limit; events shortened before sending"
+        );
     }
+    Ok(body)
 }
 
 /// Uploads detections one at a time, preserving each record's retry key.
@@ -406,15 +434,23 @@ impl<D: DetectionDrain> DetectionUploader<D> {
         let mut uploaded = 0usize;
         let mut dropped = 0u64;
         for record in &records {
-            let Some(body) = prepare_body(record) else {
-                dropped += 1;
-                continue;
+            let body = match prepare_body(record) {
+                Ok(body) => body,
+                Err(error) => {
+                    tracing::warn!(
+                        %error,
+                        key = %record.key,
+                        "detection cannot be serialized; dropped, the rest of its segment goes on"
+                    );
+                    dropped += 1;
+                    continue;
+                }
             };
             match self.client.upload_detection_bytes(&body, &record.key) {
                 Ok(()) => uploaded += 1,
                 Err(error) => match self.apply_failure(error, &record.key) {
-                    Verdict::DropRecord => dropped += 1,
-                    Verdict::KeepSegment(error) => return Err(error),
+                    FailureOutcome::DropRecord => dropped += 1,
+                    FailureOutcome::KeepSegment(error) => return Err(error),
                 },
             }
         }
@@ -428,14 +464,14 @@ impl<D: DetectionDrain> DetectionUploader<D> {
     /// Classifies a failed upload of the record `key`. A record the server refuses for good is
     /// dropped on its own and the rest of its segment goes on. Any other error keeps the segment
     /// spooled and counts a failure for the backoff.
-    fn apply_failure(&mut self, error: TransportError, key: &str) -> Verdict {
+    fn apply_failure(&mut self, error: TransportError, key: &str) -> FailureOutcome {
         if refuses_this_record(&error) {
             tracing::warn!(
                 error = %error,
                 key = %key,
                 "server refused a detection for good; dropped, the rest of its segment goes on"
             );
-            return Verdict::DropRecord;
+            return FailureOutcome::DropRecord;
         }
         // Nothing here says the record is bad: either the failure is transient, or it
         // is about the whole agent (a certificate that does not verify, a rotated CA,
@@ -449,7 +485,7 @@ impl<D: DetectionDrain> DetectionUploader<D> {
         } else {
             tracing::warn!(error = %error, "server refused the upload for a reason that is not about this detection (certificate, authentication, route); segment remains spooled, retrying with backoff");
         }
-        Verdict::KeepSegment(error)
+        FailureOutcome::KeepSegment(error)
     }
 
     /// Exponential retry delay, capped by the transport configuration.
