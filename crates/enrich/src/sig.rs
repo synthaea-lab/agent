@@ -379,7 +379,7 @@ mod windows_impl {
                     0,
                 )
             };
-            (acquired != 0 && !cat_admin.is_null()).then_some(Self(cat_admin))
+            (acquired != 0 && !cat_admin.is_null()).then(|| Self(cat_admin))
         }
 
         /// The SHA-256 of the open file, `None` when it cannot be computed.
@@ -413,7 +413,12 @@ mod windows_impl {
                     0,
                 )
             };
-            (hashed != 0).then_some(hash)
+            if hashed == 0 {
+                return None;
+            }
+            // The call may shorten `hash_len`; honour it.
+            hash.truncate(hash_len as usize);
+            Some(hash)
         }
 
         /// The first installed catalog listing `hash`. `None` means the file is not a
@@ -429,7 +434,7 @@ mod windows_impl {
                     core::ptr::null_mut(),
                 )
             };
-            (!handle.is_null()).then_some(CatalogContext {
+            (!handle.is_null()).then(|| CatalogContext {
                 admin: self,
                 handle,
             })
@@ -530,5 +535,30 @@ mod windows_impl {
             return Signature::Unsigned;
         };
         verify_member(&admin, &info, &mut hash, path_utf16, h_file)
+    }
+}
+
+#[cfg(all(test, windows))]
+mod tests {
+    use std::os::windows::{ffi::OsStrExt as _, io::AsRawHandle as _};
+
+    use schema::Signature;
+
+    /// A file listed in no installed catalog must come back `Unsigned` through the
+    /// `find_catalog` miss path, which releases the admin context and nothing else.
+    #[test]
+    fn a_file_in_no_catalog_is_unsigned() {
+        let path = std::env::temp_dir().join(format!("synthaea-nocatalog-{}", std::process::id()));
+        std::fs::write(&path, b"in no catalog").unwrap();
+        let file = std::fs::File::open(&path).unwrap();
+        let path_utf16: Vec<u16> = path
+            .as_os_str()
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect();
+        let got = super::windows_impl::catalog_verify(&path_utf16, file.as_raw_handle());
+        drop(file);
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(got, Signature::Unsigned);
     }
 }
