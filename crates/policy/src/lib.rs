@@ -126,20 +126,19 @@ pub fn service_main_path_is_trusted(path: &str) -> bool {
 /// A `..` component in either separator. `is_trusted_system_path` is a raw `starts_with`, and
 /// the eBPF sensor reports `bprm->filename` as given — `/usr/../tmp/payload` passes it
 /// (non-blocking review finding; reaching `ppid == 1` still needs a unit, so this mostly
-/// overlaps the shell/interpreter and /opt//usr/local gaps above, but costs one line to close
-/// outright rather than rely on those alone). `lower` is already lowercased.
+/// overlaps `is_shell_or_interpreter` and `is_admin_or_third_party_prefix`, but costs one line to
+/// close outright rather than rely on those alone).
 fn has_parent_component(lower: &str) -> bool {
     lower.split(['/', '\\']).any(|component| component == "..")
 }
 
 /// `/usr/local/` and `/opt/`: trusted for a masquerade check, but they host third-party and
-/// admin-installed software, so not evidence of a package's own service. `lower` is already
-/// lowercased.
+/// admin-installed software, so not evidence of a package's own service.
 fn is_admin_or_third_party_prefix(lower: &str) -> bool {
     lower.starts_with("/usr/local/") || lower.starts_with("/opt/")
 }
 
-/// The last path component, in either separator. `lower` is already lowercased.
+/// The last path component, in either separator.
 fn file_name(lower: &str) -> &str {
     lower.rsplit(['/', '\\']).next().unwrap_or(lower)
 }
@@ -211,7 +210,7 @@ const SHELL_AND_INTERPRETER_NAMES: &[&str] = &[
 
 const INTERPRETER_FAMILIES: &[&str] = &[
     "python", "perl", "ruby", "node", "php", "java", "bun", "deno",
-    // Moved here from EXACT (`lua`, `tclsh`) or added (`php-cgi`, `pypy`)
+    // Moved here from SHELL_AND_INTERPRETER_NAMES (`lua`, `tclsh`) or added (`php-cgi`, `pypy`)
     // so a version suffix is also recognized (`lua5.4`, `tclsh8.6`,
     // `php-cgi8.4`, `pypy3`) — review of #755, SherlockOmss 2026-10-19.
     // `php-fpm` (the daemon) does not share the `php-cgi` prefix, so this

@@ -701,7 +701,7 @@ fn a_daemon_that_shares_an_interpreter_family_prefix_still_qualifies() {
 #[test]
 fn interpreters_the_blocklist_used_to_miss_are_now_excluded() {
     // Review of #755 (old-dov and SherlockOmss, 2026-10-19): a handful of real
-    // script runners had no version-suffix convention `FAMILIES` could already
+    // script runners had no version-suffix convention `INTERPRETER_FAMILIES` could already
     // tolerate (`nodejs`, the only Node.js binary name some Debian/Ubuntu
     // packages ship) or weren't in either list at all (`php-cgi`, which runs
     // scripts, unlike the `php-fpm` daemon the previous test pins as protected).
