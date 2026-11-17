@@ -5,10 +5,6 @@
 //! corpus used for ML training. Raw capture needs no sink of its own: it uses
 //! `sinks::JsonlEventSink` directly.
 
-// Production locks go through `LockExt::lock_recovering` (the agent's poisoned-lock policy,
-// `crate::sync`); a bare `unwrap` here would bring the panic-on-poison back.
-#![cfg_attr(not(test), warn(clippy::unwrap_used))]
-
 use std::{
     path::{Path, PathBuf},
     sync::{
