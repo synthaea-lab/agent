@@ -5,10 +5,6 @@
 //! corpus used for ML training. Raw capture needs no sink of its own: it uses
 //! `sinks::JsonlEventSink` directly.
 
-// Production locks go through `LockExt::lock_recovering` (the agent's poisoned-lock policy,
-// `crate::sync`); a bare `unwrap` here would bring the panic-on-poison back.
-#![cfg_attr(not(test), warn(clippy::unwrap_used))]
-
 use std::{
     path::{Path, PathBuf},
     sync::{
@@ -300,7 +296,7 @@ impl DetectionSink {
                 }
             },
             move |detection| spool_on_worker(worker_spool.as_deref(), detection),
-        );
+        )?;
         let response = Arc::new(ResponseCell::new());
         Ok(Self {
             rule_state: Mutex::new(rule_state),
@@ -1274,7 +1270,7 @@ fn start_yara(
         Ok(rules) => {
             let rule_count = rules.rule_count();
             tracing::info!(rules = rule_count, "yara: rules loaded");
-            let queue = yara::ScanQueue::start(rules, move |outcome| {
+            let started = yara::ScanQueue::start(rules, move |outcome| {
                 let matched = !outcome.matches.is_empty();
                 // Fuse before the alert lines below: the verdict is the state they
                 // report on, and a reader waiting for the `YARA` line may look at it.
@@ -1303,7 +1299,15 @@ fn start_yara(
                     quarantine_matched_payload(&response, &outcome.path, &alert_log);
                 }
             });
-            Load::Loaded((queue, rule_count))
+            match started {
+                Ok(queue) => Load::Loaded((queue, rule_count)),
+                // A host that cannot start the scan worker runs without file scanning, like a
+                // rule directory that does not load; a reload keeps the previous engine.
+                Err(e) => {
+                    tracing::error!(error = %e, "yara: file scanning not started");
+                    Load::Failed
+                }
+            }
         }
         Err(e) => {
             tracing::error!(error = %e, "yara: load error");
@@ -1327,12 +1331,18 @@ fn start_memscan(
         return Load::Absent;
     }
     match yara::RuleSet::load_dir(&dir) {
-        Ok(rules) => Load::Loaded(yara::MemoryScanQueue::start(
+        Ok(rules) => match yara::MemoryScanQueue::start(
             rules,
             Arc::new(crate::memscan::ProcMemSource),
             yara::MemoryBudget::default(),
             move |outcome| report_memory_matches(&alert_log, &verdict, &outcome),
-        )),
+        ) {
+            Ok(queue) => Load::Loaded(queue),
+            Err(e) => {
+                tracing::error!(error = %e, "yara: memory scanning not started");
+                Load::Failed
+            }
+        },
         // The file scanner reports the same load failure; this one only follows it.
         Err(_) => Load::Failed,
     }

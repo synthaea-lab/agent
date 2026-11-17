@@ -231,7 +231,8 @@ same signature gate applies.
   `firefox-esr` downloading an ELF that was then run, raised T1204.002 `marked by firefox-esr` in 2 of
   2 runs, and nothing for a `curl` plus `mv` control) and a
   Flatpak-shaped `/app/lib/firefox/firefox`; not `/usr/bin/firefox` (the launcher, parent `bin`),
-  not `/tmp/other/firefox`, not a fork under another directory name (`librewolf`, `firefox-developer-edition`).
+  not `/tmp/other/firefox`, not a fork under another directory name (`librewolf`, `firefox-developer-edition`; the Developer Edition
+  tarball under `/opt/firefox-developer-edition/` was captured on 2026-11-16 and raises nothing).
   A false match only arms the signature-gated T1204.002 on an exec of the renamed file; a miss hides a
   real download. Case-sensitive.
 - Adding another browser is one line in `BROWSER_DOWNLOAD_IMAGES`. It holds only the images a capture

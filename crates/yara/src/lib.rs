@@ -43,6 +43,13 @@ pub enum YaraError {
     /// once rules are compiled into one `yara_x::Rules` set.
     #[error("missing or invalid rule metadata in `{identifier}`: {what}")]
     MissingMetadata { identifier: String, what: String },
+    /// The OS refused a scan worker thread (`EAGAIN`: a thread or process limit). `thread` names
+    /// the worker, so a log line says which one the host could not start.
+    #[error("failed to start the {thread} thread: {source}")]
+    Spawn {
+        thread: &'static str,
+        source: std::io::Error,
+    },
 }
 
 /// Required `meta:` fields, extracted and validated at compile time so a rule
