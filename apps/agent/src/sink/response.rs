@@ -19,6 +19,8 @@ pub(super) struct ResponseHooks {
     /// base-tier-only and platform dispatch belongs to the binary (CLAUDE.md).
     pub(super) terminate: Box<dyn Fn(u32) -> std::io::Result<()> + Send + Sync>,
     pub(super) quarantine_dir: PathBuf,
+    /// The pid the kill gate refuses as "the agent's own". The process's pid, except in a test.
+    pub(super) own_pid: u32,
 }
 
 /// The hooks, set at most once. A cell rather than a constructor argument because the YARA
@@ -77,10 +79,35 @@ impl DetectionSink {
         terminate: impl Fn(u32) -> std::io::Result<()> + Send + Sync + 'static,
         quarantine_dir: PathBuf,
     ) {
+        self.install_response(policy, terminate, quarantine_dir, std::process::id());
+    }
+
+    /// [`Self::enable_response`] with the agent's own pid chosen by the caller. A test process
+    /// has an arbitrary real pid that a fixed test pid can equal, and the kill gate then
+    /// refuses that pid (agent#247, seen once on macOS CI).
+    #[cfg(test)]
+    pub(crate) fn enable_response_as_pid(
+        &self,
+        own_pid: u32,
+        policy: ResponsePolicy,
+        terminate: impl Fn(u32) -> std::io::Result<()> + Send + Sync + 'static,
+        quarantine_dir: PathBuf,
+    ) {
+        self.install_response(policy, terminate, quarantine_dir, own_pid);
+    }
+
+    fn install_response(
+        &self,
+        policy: ResponsePolicy,
+        terminate: impl Fn(u32) -> std::io::Result<()> + Send + Sync + 'static,
+        quarantine_dir: PathBuf,
+        own_pid: u32,
+    ) {
         let hooks = ResponseHooks {
             policy,
             terminate: Box::new(terminate),
             quarantine_dir,
+            own_pid,
         };
         if self.response.set(hooks).is_err() {
             tracing::warn!("response: already enabled, the first policy stays in force");
@@ -109,7 +136,7 @@ impl DetectionSink {
                 reason: shield_refusal(shield),
             }
         } else {
-            ::response::kill_process(pid, &hooks.policy, |p| (hooks.terminate)(p))
+            ::response::kill_process_as(pid, hooks.own_pid, &hooks.policy, |p| (hooks.terminate)(p))
         };
         let message = match outcome {
             KillOutcome::Killed { pid } => format!("killed pid {pid} on {reason}"),

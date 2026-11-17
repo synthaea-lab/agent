@@ -141,7 +141,11 @@ neighbours in [`sink/tests.rs`](../apps/agent/src/sink/tests.rs).
    pid 0 and any pid that does not fit a signed `pid_t` (on Unix both address a process
    group, or every process), pid 1, and the agent's own pid. The pid comes from
    telemetry and the kill is a privileged signal by number, so a wrong number must
-   fail closed.
+   fail closed. `kill_process` reads the agent's pid from the process;
+   `kill_process_as` takes it as an argument, and the sink keeps the one it was given
+   (`ResponseHooks::own_pid`). Only the sink tests choose it (`TEST_AGENT_PID`): a test
+   process has an arbitrary real pid that a fixed test pid can equal, and the gate then
+   refuses the victim (agent#247).
 2. **Policy.** `kill_enabled == false` returns `ObserveOnly` without calling
    `terminate`.
 3. **`terminate(pid)`.** On Linux this is

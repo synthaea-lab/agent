@@ -113,7 +113,8 @@ With a control plane configured, [`upload::start`](../apps/agent/src/upload.rs) 
 | Enrichment queue, events | 4096 items | The event is dropped from enrichment, logging and upload, and `enrich_dropped` is incremented in the health beacon. A gated alert riding with it is handed back and raised **unverified** on the capture thread. Capture never blocks. |
 | Enrichment queue, detections | Same channel | The capture thread appends to the detection spool itself and logs a warning. A finding is never dropped. Under sustained overload this puts file I/O on the capture thread, by design. |
 | Event / detection spool | `storage.spool_max_mb` each | The oldest segments are dropped and counted. |
-| Alert recent buffer | 256 alerts | The oldest is dropped from the buffer. `alerts.ndjson` still has every alert. |
+| Alert recent buffer | 256 alerts | The oldest is dropped from the buffer. `alerts.ndjson` still has every alert it could write. |
+| `alerts.ndjson` | The disk | An alert the file refuses (a full disk) is not retried and does not stop the agent. It still reaches stderr and the recent buffer, and `alerts_dropped` is incremented in the health beacon. |
 | Verdict evidence | Bounded per entity in `verdict` | Duplicates within 30 s are absorbed, but still logged. |
 | YARA file and memory scans | Budgeted queues in `yara` | Requests are shed and counted. |
 
@@ -129,12 +130,12 @@ With a control plane configured, [`upload::start`](../apps/agent/src/upload.rs) 
 | `enrich` | all | `DetectionSink::new` | When the queue is dropped, i.e. with the process |
 | `correlator-tick` | all | [`start_correlator_ticker`](../apps/agent/src/sink/correlation.rs). Advances the correlator clock every second so window-expiry alerts fire without new events. Holds only a `Weak` reference to the sink. | When the sink is dropped |
 | `yara-scan`, `yara-memscan` | all (memscan Linux only) | `start_yara` / `start_memscan` when `rules/yara` exists | With the process |
-| `transport-upload`, `detection-upload` | all, with a control plane | [`upload::start`](../apps/agent/src/upload.rs) | `ShutdownPlan` on Linux (with a 3 s final drain), otherwise with the process |
+| `transport-upload`, `detection-upload` | all, with a control plane | [`upload::start`](../apps/agent/src/upload.rs) | `ShutdownPlan` through `finish_run`, with a 3 s final drain (all platforms, #147) |
 | `heartbeat` | all | `wire_run_pipeline` | With the process |
 | `ipc-server` | all | [`ipc_handler::spawn`](../apps/agent/src/ipc_handler.rs) (current-thread tokio) | With the process. A failure there is logged and never stops detection. |
 | `snapshot-fetch`, `ioc-control-plane`, `decoy-register`, `deception-refresh` | all, when enabled | `wire_run_pipeline` / `plant_canaries` | With the process |
 | `sensor-silence` | Linux, Windows | [`silence::spawn_monitor`](../apps/agent/src/silence.rs). Polls every 10 s and turns each confirmed stall into a T1562 alert. | With the process |
-| `health-beacon` | Linux, Windows | `health_collector(...).spawn()` | `ShutdownPlan` on Linux, otherwise with the process |
+| `health-beacon` | Linux, Windows | `health_collector(...).spawn()` | `ShutdownPlan` through `finish_run` (Linux, Windows) |
 | `kill-loudness` | Linux | [`kill_loudness::spawn_watcher`](../apps/agent/src/kill_loudness.rs) | Ends the process itself |
 | `netlink-poll` | Linux | [`spawn_netlink_poller`](../apps/agent/src/commands/linux.rs), every 10 s | `ShutdownPlan` |
 | `journal-tail`, `journal-canary` | Linux | [`spawn_journal_tail`](../apps/agent/src/commands/linux.rs) | With the process |
@@ -144,6 +145,8 @@ With a control plane configured, [`upload::start`](../apps/agent/src/upload.rs) 
 | `self-integrity`, `inventory` | Linux | `integrity::spawn_monitor`, `inventory::spawn_monitor` | With the process |
 | `socket-poller`, `minifilter`, Event Log thread | Windows | [`run_windows_sensors`](../apps/agent/src/commands/windows.rs) | Shutdown flag, then joined |
 | `socket-poller`, `unifiedlog-tail`, `ne-receiver` | macOS | [`run_macos_sensors`](../apps/agent/src/commands/macos.rs) | Stop flag, or the `log stream` child being killed |
+
+**A thread the OS refuses.** The threads that used to `.expect` their spawn (21 of them) are now started through [`spawn::spawn_named`](../apps/agent/src/spawn.rs), which returns the OS error (`EAGAIN`: a container or `RLIMIT_NPROC` limit, a full pid table) with the thread's name in the message. The starters pass it up and `agent run` exits with it, such as `could not start the heartbeat thread: ...`, instead of panicking with a backtrace that does not say which thread it was starting (AC-016, [#159](https://github.com/synthaea-lab/agent/issues/159)). Two threads are started after start-up and so cannot fail `run`: the `uprobes` sensor, which the uprobes supervisor starts and restarts when the wanted captures change, and the journal canary, which the journal tail starts. A refusal there is logged (`uprobes sensor not started`, `journal canary not started`) and the thread stays off. The uprobes heartbeat is watched for as long as a capture is wanted, whether or not the thread runs, so a refused start is reported as silence, and it is unregistered when nothing is wanted any more, so a capture switched off after a refusal is not reported as tampering. The journal heartbeat pulses on every line `journalctl` delivers, so a canary that never started is noticed only on an idle host, where the journal sensor goes silent. The YARA workers belong to the optional engines: [`yara::ScanQueue::start`](../crates/yara/src/queue.rs) and [`yara::MemoryScanQueue::start`](../crates/yara/src/memory.rs) return `YaraError::Spawn`, and the sink treats it like a rule directory that does not load: logged at error level (`yara: file scanning not started`), that engine stays unloaded, and on a content reload the previous engine is kept.
 
 Shared mutable state in `DetectionSink` is behind `Mutex`es (`RuleState`, correlator, Sigma, YARA, verdict), because several producer threads call `on_event` at once. Code takes a lock, collects alerts, and releases the lock before recording them. `record_rule_alerts` takes the rule-state lock again, so stateful rule steps go through `DetectionSink::rule_alerts`, which releases the lock before recording.
 
@@ -225,9 +228,9 @@ sequenceDiagram
   KL->>Op: exit(128 + signo)
 ```
 
-Linux has two shutdown paths:
+The end of `agent run` is one shared function, [`commands::common::finish_run`](../apps/agent/src/commands/common.rs) (#147), called by `cmd_run` on Linux, Windows and macOS. Linux has two shutdown paths:
 
-- **SIGINT.** `LinuxSensor::run` returns on its own Ctrl-C handler. `cmd_run` then flushes the enrichment queue (with a 1 s bound) so that accepted findings reach the spool. Then it calls [`ShutdownPlan::execute`](../apps/agent/src/shutdown.rs):
+- **SIGINT.** `LinuxSensor::run` returns on its own Ctrl-C handler. `cmd_run` then calls `finish_run`, which flushes the enrichment queue (with a 1 s bound) so that accepted findings reach the spool. Then it calls [`ShutdownPlan::execute`](../apps/agent/src/shutdown.rs):
   - every registered worker is signalled first;
   - each one is then joined against a single shared 6 s deadline (`SHUTDOWN_BUDGET`), which covers the upload loop's 3 s final drain plus margin;
   - a worker still running at the deadline is logged and detached;
@@ -236,7 +239,7 @@ Linux has two shutdown paths:
 
 SIGKILL cannot be caught or attributed by the agent itself. The eBPF sensor records SIGKILLs aimed at the agent from the kernel side, and the restarted agent reports the sender. Under the audit fallback this gap remains. The watchdog stops its child with `Child::kill`, which is SIGKILL on Unix.
 
-On Windows and macOS, Ctrl-C sets the sensors' stop flags. The primary sensor returns, the supplementary threads are joined (Windows) or end with the process (macOS). Upload, health and enrichment threads end with the process: there is no `ShutdownPlan` and no enrichment flush. This loses no spooled data, since the spool redelivers, but it does skip the final upload drain.
+On Windows and macOS, Ctrl-C sets the sensors' stop flags. The primary sensor returns and the supplementary threads are joined (Windows) or end with the process (macOS). `cmd_run` then calls the same `finish_run` as Linux, with a `ShutdownPlan` holding the two upload threads (and, on Windows, the health beacon): the enrichment queue is flushed (1 s bound) and the upload loops make their final drain within the 6 s `SHUTDOWN_BUDGET`. Before #147 these two platforms skipped both, which lost no spooled data (the spool redelivers) but skipped the final drain. Their `cmd_run` is built and tested only in CI, not in a local run: the shared function is covered on every platform by `finish_run_signals_and_joins_every_registered_worker`. The workers that still end with the process (the silence monitor, `heartbeat`, `ipc-server`) are not in the plan.
 
 ## Degraded modes
 
@@ -252,6 +255,30 @@ On Windows and macOS, Ctrl-C sets the sensors' stop flags. The primary sensor re
 | Enrichment overload | See [Bounds and overload behavior](#bounds-and-overload-behavior). |
 | ETW fails (Windows) | The run continues on the Event Log, socket and minifilter sources, and a silence alert is raised. |
 | A uprobes capture set changes | The uprobes sensor restarts with the new set. Capture has a gap while it reloads. |
+
+## Poisoned locks
+
+A `std::sync::Mutex` is poisoned when a thread panics while holding it. With `lock().unwrap()` every
+later `lock()` panics too, so one panic in a rule evaluation or an upload step would spread to every
+thread touching the same state, the capture thread included: the sensor kills itself. The agent takes
+the guard back instead, logs the recovery once with its call site, and clears the poison
+([`sync.rs`](../apps/agent/src/sync.rs)). The state a panicking thread left may be half updated; for
+in-memory detection state that costs at most a missed or repeated alert, which is cheaper than a dead
+sensor. This is a decision, not an accident: the alternative (let the panic spread and rely on the
+watchdog's hang detection to restart the agent) loses every event in flight and the state built so far.
+
+- `LockExt::lock_recovering` for `Mutex`, `RwLockExt::{read,write}_recovering` for `RwLock`, and
+  `CondvarExt::{wait_while,wait_timeout}_recovering` for the two condvar waits the agent has.
+- `apps/agent` denies `clippy::unwrap_used` outside tests at the crate root, so a bare `unwrap` on a
+  lock cannot come back; the same lint used to be set on the sink module alone.
+- Out of scope, and why: counting recoveries in the health beacon (a schema change, a separate issue);
+  the `unwrap`s on `serde_json::to_string` of a string in `crates/policy` (infallible); `Mutex::get_mut`
+  in a `Drop` (no lock is taken); the container sensor's Docker cache (`crates/sensors/linux/container`,
+  its own crate, no lint there yet); the YARA memory-scan gate, which cannot depend on the agent's helper
+  and takes the guard back with `PoisonError::into_inner` in place.
+- Tested: each module that holds such a lock has a test that panics while holding it and checks the
+  next caller still works (`sync`, `alerts`, `captures`, `health`, `ioc`, `own_traffic`, `silence`,
+  `upload`); the `commands/linux.rs` sites share the `silence` monitor's lock and are covered by its test.
 
 ## Configuration knobs that shape the lifecycle
 

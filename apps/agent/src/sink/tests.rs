@@ -480,6 +480,7 @@ fn quarantine_fixture(
         },
         terminate: Box::new(|_| panic!("quarantine never terminates")),
         quarantine_dir: dir.join("quarantine"),
+        own_pid: std::process::id(),
     };
     let log = crate::alerts::AlertLog::open(&dir.join("alerts.ndjson"), 8).unwrap();
     (
@@ -1622,7 +1623,55 @@ fn enable_response_twice_keeps_the_first_policy() {
     );
 }
 
+/// The pid the recording kill hook treats as the agent's own. Above Linux's `pid_max` (2^22) and
+/// below `i32::MAX`, so no test pid and no real process of the runner can equal it. The test
+/// process's real pid is arbitrary: with the real one, a test whose victim pid happened to be it
+/// was refused and recorded nothing (agent#247).
+const TEST_AGENT_PID: u32 = 2_000_000_000;
+
 fn enable_recording_kill(sink: &DetectionSink, dir: &std::path::Path) -> Arc<Mutex<Vec<u32>>> {
+    let killed = Arc::new(Mutex::new(Vec::new()));
+    let killed_rec = Arc::clone(&killed);
+    sink.enable_response_as_pid(
+        TEST_AGENT_PID,
+        policy::ResponsePolicy {
+            kill_enabled: true,
+            quarantine_enabled: false,
+            isolate_enabled: false,
+        },
+        move |pid| {
+            killed_rec.lock().unwrap().push(pid);
+            Ok(())
+        },
+        dir.join("quarantine"),
+    );
+    killed
+}
+
+/// The gate still refuses the agent's own pid: a Bayesian crossing of that pid is reported
+/// as refused and `terminate` never runs.
+#[test]
+fn a_crossing_of_the_agents_own_pid_is_refused_not_killed() {
+    let dir = tmp("bayes-own-pid");
+    let sink = sink_in(&dir);
+    let killed = enable_recording_kill(&sink, &dir);
+    drive_bayes_crossing(&sink, TEST_AGENT_PID);
+    let alerts = alerts_in(&dir);
+    assert!(
+        alerts.contains(&format!("refused to kill pid {TEST_AGENT_PID}")),
+        "{alerts}"
+    );
+    assert!(killed.lock().unwrap().is_empty(), "{alerts}");
+}
+
+/// The production entry protects the real process: `enable_response`, not the
+/// `enable_response_as_pid` test seam, refuses a crossing of `std::process::id()`. The sink
+/// kill tests all inject `TEST_AGENT_PID`, so without this nothing pins the pid
+/// `enable_response` hands the kill gate (agent#277).
+#[test]
+fn enable_response_refuses_a_crossing_of_the_agents_real_pid() {
+    let dir = tmp("bayes-real-own-pid");
+    let sink = sink_in(&dir);
     let killed = Arc::new(Mutex::new(Vec::new()));
     let killed_rec = Arc::clone(&killed);
     sink.enable_response(
@@ -1637,7 +1686,19 @@ fn enable_recording_kill(sink: &DetectionSink, dir: &std::path::Path) -> Arc<Mut
         },
         dir.join("quarantine"),
     );
-    killed
+    let own = std::process::id();
+    drive_bayes_crossing(&sink, own);
+    let alerts = alerts_in(&dir);
+    // The own-pid reason, not just the shared prefix: the service-main and login-session
+    // shields write `refused to kill pid ...` too.
+    assert!(
+        alerts.lines().any(|line| {
+            line.contains(&format!("refused to kill pid {own} on "))
+                && line.contains(": the agent's own pid")
+        }),
+        "{alerts}"
+    );
+    assert!(killed.lock().unwrap().is_empty(), "{alerts}");
 }
 
 /// Issue #652: `NetworkManager` crossed `BAYES` on a stock Fedora host with no rule or
