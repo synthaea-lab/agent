@@ -70,7 +70,8 @@ sequenceDiagram
 must be `Send + Sync`. On Linux almost all events arrive on one thread, so the lock is
 uncontended. The DNS uprobe, conntrack and log-source threads take it too. **Never hold the
 lock while calling `record_rule_alerts`**: that path takes it again (for the damage manifest).
-The sink binds the alerts to a local first, then records them.
+Stateful steps go through `DetectionSink::rule_alerts(event, |state| state.on_x(e))`, which
+evaluates under the lock, drops the guard, then records, so the sink no longer writes the hazard.
 
 ## `RuleState` internals
 
@@ -226,9 +227,13 @@ same signature gate applies.
 - The Firefox family is also matched by shape (decision of 2026-11-12 on #221): the file name is
   `firefox`, `firefox-bin` or `firefox-esr` **and** the parent directory is named `firefox` or
   `firefox-esr`. That covers a Mozilla tarball (`<dir>/firefox/firefox-bin`), the Snap
-  (`/snap/firefox/<rev>/usr/lib/firefox/firefox`), Debian's `/usr/lib/firefox-esr/firefox-esr` and a
+  (`/snap/firefox/<rev>/usr/lib/firefox/firefox`), Debian's `/usr/lib/firefox-esr/firefox-esr` (Debian 13 VM, 2026-11-12: read from
+  `/proc` under `strace` and confirmed in the sensor's `file_rename` event, kernel 6.12; an end-to-end run there, headless
+  `firefox-esr` downloading an ELF that was then run, raised T1204.002 `marked by firefox-esr` in 2 of
+  2 runs, and nothing for a `curl` plus `mv` control) and a
   Flatpak-shaped `/app/lib/firefox/firefox`; not `/usr/bin/firefox` (the launcher, parent `bin`),
-  not `/tmp/other/firefox`, not a fork under another directory name (`librewolf`, `firefox-developer-edition`).
+  not `/tmp/other/firefox`, not a fork under another directory name (`librewolf`, `firefox-developer-edition`; the Developer Edition
+  tarball under `/opt/firefox-developer-edition/` was captured on 2026-11-16 and raises nothing).
   A false match only arms the signature-gated T1204.002 on an exec of the renamed file; a miss hides a
   real download. Case-sensitive.
 - The Chromium Snap is matched by its layout, not by the list: `/snap/chromium/<revision>/usr/lib/chromium-browser/chrome`,
@@ -236,7 +241,11 @@ same signature gate applies.
   distribution entry does not cover it. `current`, a non-numeric revision and any other file or depth do not match.
   That Snap reports the rename under its own home, `<home>/snap/chromium/<revision>/Downloads/<file>`, a symlink to
   `<home>/Downloads`; the mark is also recorded at `<home>/Downloads/<file>` so that a run from the real directory joins.
-  Only the default `Downloads` name, only Chromium: no path is resolved, the alias is a guess about the symlink.
+  The alias is made only for that Snap's own image (another browser renaming into a `snap/chromium` directory gets
+  none), and the two records are twins: an exec from either path alerts once, and a re-download re-arms both.
+  Only the default `Downloads` name: on a non-English desktop the directory has the localized name
+  (`Téléchargements`) and no alias is made, so that case is **not covered**. No path is resolved, the alias is a
+  guess about the symlink.
 - Adding another browser is one line in `BROWSER_DOWNLOAD_IMAGES`. It holds only the images a capture
   showed (2026-11-10, Fedora 43 lab VM): Chromium and Firefox from the distribution packages,
   and the vendor packages of Chrome (`/opt/google/chrome/chrome`), Edge

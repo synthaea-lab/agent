@@ -1,6 +1,7 @@
 //! The health-beacon counters that come from outside the sink's rarity statistics, the spool and
 //! the silence monitor (#863): how many times the watchdog restarted the agent, how many
-//! tamper-class alerts there were, and what the Linux parent-image cache's cap dropped.
+//! tamper-class alerts there were, what the Linux parent-image cache's cap dropped, and how many
+//! alerts `alerts.ndjson` did not get.
 //!
 //! What counts as a tamper event, stated plainly: an alert the agent's own monitors raise through
 //! [`crate::sink::DetectionSink::emit_tamper`] (a sensor confirmed silent, a shipped binary or its
@@ -90,6 +91,7 @@ impl HostCountersSource for AgentHostCounters {
             ioc_cooled_down,
             ioc_own_skipped,
             ioc_sibling_skipped,
+            alerts_dropped: self.sink.alert_log().dropped_writes(),
         }
     }
 }
@@ -253,6 +255,15 @@ mod tests {
             ),
             (0, 0)
         );
+    }
+
+    #[test]
+    fn an_alert_log_that_writes_every_alert_reports_none_dropped() {
+        let sink = sink("alerts-dropped");
+        sink.emit("T1059", "an ordinary alert");
+        let counters =
+            AgentHostCounters::new(sink, WatchdogReport::default(), None).host_counters();
+        assert_eq!(counters.alerts_dropped, 0);
     }
 
     #[test]

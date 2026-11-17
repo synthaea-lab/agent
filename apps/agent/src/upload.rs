@@ -24,7 +24,7 @@ use transport::{
     TransportConfig, UploadLoop,
 };
 
-use crate::shutdown::ShutdownPlan;
+use crate::{shutdown::ShutdownPlan, sync::LockExt};
 
 /// The spool's on-disk cap in bytes, from `storage.spool_max_mb` (mebibytes, as the
 /// configuration documents; 4096 by default). Beyond it the spool sheds oldest and
@@ -51,23 +51,22 @@ struct DetectionSpoolDrain(Arc<Mutex<EventSpool>>);
 
 impl DetectionDrain for DetectionSpoolDrain {
     fn drain(&mut self) -> std::io::Result<Vec<QueuedDetection>> {
-        self.0.lock().unwrap().drain_oldest()
+        self.0.lock_recovering().drain_oldest()
     }
 
     fn ack(&mut self) -> std::io::Result<()> {
-        self.0.lock().unwrap().ack().map(|_| ())
+        self.0.lock_recovering().ack().map(|_| ())
     }
 
     fn ack_dropping(&mut self, dropped: u64) -> std::io::Result<()> {
         self.0
-            .lock()
-            .unwrap()
+            .lock_recovering()
             .ack_counting_dropped(dropped)
             .map(|_| ())
     }
 
     fn skip(&mut self) -> std::io::Result<()> {
-        self.0.lock().unwrap().skip().map(|_| ())
+        self.0.lock_recovering().skip().map(|_| ())
     }
 }
 
@@ -94,40 +93,37 @@ pub(crate) fn persist_detection(
         &hex[20..]
     );
     spool
-        .lock()
-        .unwrap()
+        .lock_recovering()
         .push(&QueuedDetection { key, detection })
 }
 
 impl EventDrain for SpoolDrain {
     fn drain(&mut self) -> std::io::Result<Vec<schema::Event>> {
-        self.0.lock().unwrap().drain_oldest()
+        self.0.lock_recovering().drain_oldest()
     }
 
     fn ack(&mut self) -> std::io::Result<()> {
-        self.0.lock().unwrap().ack().map(|_| ())
+        self.0.lock_recovering().ack().map(|_| ())
     }
 
     fn skip(&mut self) -> std::io::Result<()> {
-        self.0.lock().unwrap().skip().map(|_| ())
+        self.0.lock_recovering().skip().map(|_| ())
     }
 }
 
 /// What `run` keeps after starting the upload pipeline: the spool handle the
 /// sink appends to (and health reads), and a client for the health beacon's
 /// heartbeat POSTs, plus the upload thread's stop flag and join handle so a
-/// graceful shutdown (#316) can end it with one last drain. Platforms that do
-/// not shut down gracefully yet just let the thread die with the process —
-/// safe, the spool redelivers.
+/// graceful shutdown (#316) can end it with one last drain (`finish_run`, all
+/// platforms since #147). A kill the agent cannot intercept loses nothing: the
+/// spool redelivers.
 pub(crate) struct TransportHandle {
     pub(crate) spool: Arc<Mutex<EventSpool>>,
     pub(crate) detection_spool: Arc<Mutex<EventSpool>>,
     // Read by the health beacon, which macOS doesn't wire yet (#317).
     #[cfg_attr(not(any(target_os = "linux", windows)), allow(dead_code))]
     pub(crate) client: Arc<TransportClient>,
-    #[cfg_attr(not(target_os = "linux"), allow(dead_code))] // graceful shutdown is Linux-first
     upload_stop: Arc<AtomicBool>,
-    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     upload_thread: JoinHandle<()>,
     detection_upload_stop: Arc<AtomicBool>,
     detection_upload_thread: JoinHandle<()>,
@@ -136,7 +132,6 @@ pub(crate) struct TransportHandle {
 impl TransportHandle {
     /// Registers the upload thread with `plan`: stopping it makes the loop
     /// exit its poll/backoff sleep and attempt the final spool drain.
-    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     pub(crate) fn register_shutdown(self, plan: &mut ShutdownPlan) {
         let stop = self.upload_stop;
         plan.register(
@@ -295,10 +290,7 @@ pub(crate) fn start(
     let uploader = EventUploader::new(upload_client, SpoolDrain(Arc::clone(&spool)));
     let mut upload_loop = UploadLoop::new(uploader, UPLOAD_POLL_INTERVAL);
     let upload_stop = upload_loop.stop_handle();
-    let upload_thread = std::thread::Builder::new()
-        .name("transport-upload".into())
-        .spawn(move || upload_loop.run())
-        .expect("spawning the transport upload thread");
+    let upload_thread = crate::spawn::spawn_named("transport-upload", move || upload_loop.run())?;
 
     let detection_uploader = DetectionUploader::new(
         detection_client,
@@ -306,10 +298,8 @@ pub(crate) fn start(
     );
     let mut detection_loop = UploadLoop::new(detection_uploader, UPLOAD_POLL_INTERVAL);
     let detection_upload_stop = detection_loop.stop_handle();
-    let detection_upload_thread = std::thread::Builder::new()
-        .name("detection-upload".into())
-        .spawn(move || detection_loop.run())
-        .expect("spawning the detection upload thread");
+    let detection_upload_thread =
+        crate::spawn::spawn_named("detection-upload", move || detection_loop.run())?;
 
     Ok(TransportHandle {
         spool,
@@ -332,12 +322,13 @@ pub(crate) struct SpoolHealth {
 
 impl crate::health::SpoolStatsSource for SpoolHealth {
     fn spool_bytes(&self) -> u64 {
-        self.events.lock().unwrap().stats().bytes + self.detections.lock().unwrap().stats().bytes
+        self.events.lock_recovering().stats().bytes
+            + self.detections.lock_recovering().stats().bytes
     }
 
     fn spool_dropped(&self) -> u64 {
-        self.events.lock().unwrap().stats().dropped_records
-            + self.detections.lock().unwrap().stats().dropped_records
+        self.events.lock_recovering().stats().dropped_records
+            + self.detections.lock_recovering().stats().dropped_records
     }
 }
 
@@ -387,6 +378,31 @@ mod tests {
     };
 
     use super::*;
+
+    /// #147: Windows and macOS never shut the uploaders down because they never registered them.
+    /// Both upload threads must be in the plan, and stopping the plan must join them.
+    #[test]
+    fn register_shutdown_registers_both_upload_threads_and_the_plan_joins_them() {
+        let dir = tempfile::tempdir().unwrap();
+        let handle = start(
+            &ControlPlane {
+                // Nothing listens: the loops only idle until they are told to stop.
+                url: "http://127.0.0.1:9",
+                ca_cert: None,
+                client_cert: None,
+                offline_fallback: true,
+            },
+            &dir.path().join("alerts.ndjson"),
+            1 << 20,
+        )
+        .unwrap();
+        let mut plan = ShutdownPlan::default();
+        handle.register_shutdown(&mut plan);
+
+        assert_eq!(plan.names(), ["transport-upload", "detection-upload"]);
+        let stragglers = plan.execute(std::time::Duration::from_secs(5));
+        assert!(stragglers.is_empty(), "{stragglers:?}");
+    }
 
     #[test]
     fn the_ca_and_the_client_certificate_reach_the_transport_config() {
@@ -730,5 +746,29 @@ mod tests {
         server.offline_fallback = true;
         let target = resolve_run_target(None, false, None, None, None, &server).unwrap();
         assert!(target.control_plane().offline_fallback);
+    }
+
+    #[test]
+    fn a_spool_poisoned_by_a_panicking_thread_is_still_drained_and_counted() {
+        let poisoned = spool("poisoned");
+        let held = Arc::clone(&poisoned);
+        let _ = std::thread::spawn(move || {
+            let _guard = held.lock().unwrap();
+            panic!("poison the spool while holding it");
+        })
+        .join();
+        assert!(poisoned.is_poisoned());
+        let health = SpoolHealth {
+            events: Arc::clone(&poisoned),
+            detections: spool("poisoned-detections"),
+        };
+        assert_eq!(crate::health::SpoolStatsSource::spool_dropped(&health), 0);
+        assert!(!poisoned.is_poisoned());
+        assert!(
+            SpoolDrain(Arc::clone(&poisoned))
+                .drain()
+                .unwrap()
+                .is_empty()
+        );
     }
 }

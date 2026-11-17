@@ -2702,6 +2702,7 @@ version = "0.0.1"
 dependencies = [
  "libc",
  "schema",
+ "thiserror 2.0.21",
  "tracing",
 ]
 

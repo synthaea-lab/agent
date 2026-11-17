@@ -116,6 +116,7 @@
 // off-Linux, the lib target legitimately has unused items (same idiom as
 // `apps/agent/src/health.rs`). The lint stays live on Linux, where dead code is real.
 mod conntrack_attrs;
+mod frame;
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 mod normalize;
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
@@ -132,6 +133,8 @@ mod wire;
 #[cfg(target_os = "linux")]
 mod conntrack_socket;
 #[cfg(target_os = "linux")]
+mod nl_socket;
+#[cfg(target_os = "linux")]
 mod proc_socket;
 #[cfg(target_os = "linux")]
 mod socket;
@@ -141,14 +144,15 @@ use std::net::SocketAddr;
 pub use conntrack_attrs::{ConntrackFlow, FlowCounters, FlowTuple, TcpState};
 #[cfg(target_os = "linux")]
 pub use conntrack_socket::dump as dump_conntrack;
+pub use frame::{FrameError, NetlinkMessages, netlink_messages};
+#[cfg(target_os = "linux")]
+pub use nl_socket::NetlinkError;
 #[cfg(target_os = "linux")]
 pub use poll::NetlinkPollSensor;
 pub use poll::{POLL_INTERVAL, PollStopHandle};
 pub use proc_events::ProcEvent;
 #[cfg(target_os = "linux")]
 pub use proc_socket::ProcEventSubscription;
-#[cfg(target_os = "linux")]
-pub use socket::NetlinkError;
 pub use wire::{DiagMsg, IPPROTO_TCP, IPPROTO_UDP, TCP_CLOSE, TCP_ESTABLISHED, TCP_LISTEN};
 
 /// A socket's state, as reported by `sock_diag`. This crate only ever requests
