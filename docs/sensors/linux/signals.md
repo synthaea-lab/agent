@@ -128,7 +128,9 @@ gets the agent's exe; any other target gets neither, so it cannot read as a sign
 - A restarted tool's new pid is unwatched until the next scan (up to 5 s).
 - Tools not run by a systemd unit, and template instances (`clamd@scan.service`), are not watched.
 - The kernel can end or freeze a tool without a signal this path reports: a CPU rlimit or a
-  `memory.max` OOM kill (`SEND_SIG_PRIV`), or `cgroup.freeze` (no signal). Tracked in
+  `memory.max` OOM kill (`SEND_SIG_PRIV`), or `cgroup.freeze` (no signal). The rules read how
+  such a limit is set (exec of `systemctl` or `prlimit`, a write to a cgroup limit file, which
+  the open probe now passes); the kill itself stays unreported. Tracked in
   [#49](https://github.com/synthaea-lab/agent/issues/49).
 - Only the agent's own pid is watched on the `kill`/`tgkill` path; the watchdog process is not. That
   path compares the pid argument as the sender wrote it, in the sender's pid namespace.

@@ -8,6 +8,8 @@ use std::sync::Arc;
 
 use schema::sensor::{EventSink, Sensor as _};
 
+use crate::shutdown::ShutdownPlan;
+
 /// Forwards to a shared `Arc<dyn EventSink>` — ownership plumbing to satisfy
 /// `Sensor::run`'s `Box<dyn EventSink>` signature (same shape as Windows).
 struct SharedSink(Arc<dyn EventSink>);
@@ -280,7 +282,15 @@ pub(crate) fn cmd_run(opts: super::RunOptions) -> anyhow::Result<()> {
         storage,
         pipeline.transport.as_ref(),
     );
-    run_macos_sensors(Box::new(SharedSink(pipeline.sink)), false)
+    let mut shutdown = ShutdownPlan::default();
+    if let Some(transport) = pipeline.transport {
+        transport.register_shutdown(&mut shutdown);
+    }
+    let sink = Arc::clone(&pipeline.sink);
+    let result = run_macos_sensors(Box::new(SharedSink(pipeline.sink)), false);
+    // The enrichment flush and the upload loops' last drain, as on Linux (#147).
+    super::common::finish_run(&sink, shutdown);
+    result
 }
 
 pub(crate) fn cmd_capture_events(output: &std::path::Path) -> anyhow::Result<()> {

@@ -11,17 +11,15 @@ use ferrisetw::{
     schema_locator::SchemaLocator,
 };
 use schema::{
-    AmsiContentEvent, AssemblyLoadEvent, ConnectEvent, DnsQueryEvent, Event, EventMeta,
-    FileOpenEvent, ImageLoadEvent, LdapSearchEvent, NtlmAuthEvent, NtlmDirection,
-    ProcessAccessEvent, RegistrySetEvent, RemoteThreadEvent, ScriptBlockEvent, SmbConnectEvent,
-    UdpSendEvent, WmiActivityEvent, sensor::EventSink,
+    AmsiContentEvent, ConnectEvent, Event, EventMeta, FileOpenEvent, ImageLoadEvent,
+    ProcessAccessEvent, RemoteThreadEvent, UdpSendEvent, sensor::EventSink,
 };
 
 use crate::{
     amsi,
     cross_process::{self, ThreadOrigin},
     kernel_process::{self, ExecContext, KernelProcessEvent, ProcessStart, UNKNOWN_IMAGE},
-    normalize,
+    normalize, payload,
     sensor::{SharedState, find_lsass},
     silo,
     sync::LockExt,
@@ -104,10 +102,6 @@ pub(crate) const ALL_PROVIDERS: [(&str, &str); 14] = [
 /// thread stops (EID 4) THREAD brings along are dropped on their id before any
 /// parsing.
 const KERNEL_PROCESS_KEYWORDS: u64 = 0x10 | 0x20 | 0x40 | 0x4000;
-
-/// `AssemblyFlags` bit indicating a dynamic (in-memory) assembly load.
-/// File-backed assemblies are high-volume noise; only dynamic loads are forwarded.
-const ASSEMBLY_FLAG_DYNAMIC: u32 = 0x2;
 
 pub(crate) fn process_provider(sink: Arc<dyn EventSink>, state: Arc<SharedState>) -> Provider {
     let callback = move |record: &EventRecord, locator: &SchemaLocator| {
@@ -653,58 +647,14 @@ pub(crate) fn dns_provider(sink: Arc<dyn EventSink>, state: Arc<SharedState>) ->
             return;
         };
         let parser = Parser::create(record, &schema_def);
-
-        let pid = record.process_id();
-        let query: String = parser.try_parse("QueryName").unwrap_or_default();
-        if query.is_empty() {
-            return; // malformed record — no name, no value for detection
+        if let Some(event) = payload::dns_query(&parser, header_meta(record, &state)) {
+            sink.on_event(Event::DnsQuery(event));
         }
-        let qtype: u16 = parser.try_parse("QueryType").unwrap_or(0);
-        let result_raw: String = parser.try_parse("QueryResults").unwrap_or_default();
-        let status: u32 = parser.try_parse("QueryStatus").unwrap_or(0);
-        let timestamp_ns = normalize::filetime_to_ns(record.raw_timestamp());
-
-        let comm = state.comm_for(pid).unwrap_or_default();
-
-        sink.on_event(Event::DnsQuery(DnsQueryEvent {
-            meta: state.meta(pid, 0, comm, timestamp_ns),
-            query,
-            qtype: u32::from(qtype),
-            result: if result_raw.is_empty() {
-                None
-            } else {
-                Some(result_raw)
-            },
-            results: Vec::new(),
-            results_truncated: false,
-            status,
-        }));
     };
 
     Provider::by_guid(DNS_CLIENT_GUID)
         .add_callback(callback)
         .build()
-}
-
-/// Decodes a `REG_SZ` / `REG_EXPAND_SZ` value: UTF-16 LE bytes → String.
-/// Returns `None` for empty input, odd-length buffers, or invalid UTF-16.
-fn decode_reg_string(bytes: Vec<u8>) -> Option<String> {
-    if bytes.is_empty() || !bytes.len().is_multiple_of(2) {
-        return None;
-    }
-    let units: Vec<u16> = bytes
-        .as_chunks::<2>()
-        .0
-        .iter()
-        .map(|c| u16::from_le_bytes(*c))
-        .collect();
-    let s = String::from_utf16_lossy(&units);
-    let trimmed = s.trim_end_matches('\0');
-    if trimmed.is_empty() {
-        None
-    } else {
-        Some(trimmed.to_string())
-    }
 }
 
 /// Registry write events (EID 4 — `RegSetValueKey`).
@@ -733,35 +683,9 @@ pub(crate) fn registry_provider(sink: Arc<dyn EventSink>, state: Arc<SharedState
             return;
         };
         let parser = Parser::create(record, &schema_def);
-
-        let raw_key: String = parser.try_parse("KeyName").unwrap_or_default();
-        if raw_key.is_empty() {
-            // Opaque handle — kernel did not resolve the name (rare on Server 2022).
-            return;
+        if let Some(event) = payload::registry_set(&parser, header_meta(record, &state)) {
+            sink.on_event(Event::RegistrySet(event));
         }
-        let key = normalize::normalize_registry_key(&raw_key);
-        let value_name: String = parser.try_parse("ValueName").unwrap_or_default();
-        let data_type: u32 = parser.try_parse("DataType").unwrap_or(0);
-        let data_bytes: Vec<u8> = parser.try_parse("Data").unwrap_or_default();
-
-        // Decode string types; leave binary/DWORD as None.
-        let data = if data_type == 1 || data_type == 2 {
-            decode_reg_string(data_bytes)
-        } else {
-            None
-        };
-
-        let pid = record.process_id();
-        let timestamp_ns = normalize::filetime_to_ns(record.raw_timestamp());
-        let comm = state.comm_for(pid).unwrap_or_default();
-
-        sink.on_event(Event::RegistrySet(RegistrySetEvent {
-            meta: state.meta(pid, 0, comm, timestamp_ns),
-            key,
-            value_name,
-            data_type,
-            data,
-        }));
     };
 
     Provider::by_guid(KERNEL_REGISTRY_GUID)
@@ -800,33 +724,9 @@ pub(crate) fn powershell_provider(sink: Arc<dyn EventSink>, state: Arc<SharedSta
             return;
         };
         let parser = Parser::create(record, &schema_def);
-
-        let text: String = parser.try_parse("ScriptBlockText").unwrap_or_default();
-        if text.is_empty() {
-            return; // malformed or empty block — no detection value
+        if let Some(event) = payload::script_block(&parser, header_meta(record, &state)) {
+            sink.on_event(Event::ScriptBlock(event));
         }
-        let script_block_id: String = parser.try_parse("ScriptBlockId").unwrap_or_default();
-        let path_raw: String = parser.try_parse("Path").unwrap_or_default();
-        let path = if path_raw.is_empty() {
-            None
-        } else {
-            Some(path_raw)
-        };
-        let message_number: u32 = parser.try_parse("MessageNumber").unwrap_or(1);
-        let message_total: u32 = parser.try_parse("MessageTotal").unwrap_or(1);
-
-        let pid = record.process_id();
-        let timestamp_ns = normalize::filetime_to_ns(record.raw_timestamp());
-        let comm = state.comm_for(pid).unwrap_or_default();
-
-        sink.on_event(Event::ScriptBlock(ScriptBlockEvent {
-            meta: state.meta(pid, 0, comm, timestamp_ns),
-            script_block_id,
-            path,
-            text,
-            message_number,
-            message_total,
-        }));
     };
 
     Provider::by_guid(POWERSHELL_GUID)
@@ -921,24 +821,14 @@ pub(crate) fn ldap_provider(sink: Arc<dyn EventSink>, state: Arc<SharedState>) -
             return;
         };
         let parser = Parser::create(record, &schema_def);
-        // The field, not the header: the header pid of a provider running
-        // in-process is the same, but the field is what the manifest promises.
-        let pid = parser
-            .try_parse::<u32>("ProcessId")
-            .unwrap_or_else(|_| record.process_id());
+        let pid = payload::ldap_pid(&parser, record.process_id());
         let timestamp_ns = normalize::filetime_to_ns(record.raw_timestamp());
         if !state.ldap.lock_or_recover().spend(pid, timestamp_ns) {
             return;
         }
-        let attributes: String = parser.try_parse("AttributeList").unwrap_or_default();
         let comm = state.comm_for(pid).unwrap_or_default();
-        sink.on_event(Event::LdapSearch(LdapSearchEvent {
-            meta: state.meta(pid, 0, comm, timestamp_ns),
-            filter: parser.try_parse("SearchFilter").unwrap_or_default(),
-            base_dn: parser.try_parse("DistinguishedName").unwrap_or_default(),
-            scope: parser.try_parse("ScopeOfSearch").unwrap_or(0),
-            attributes: normalize::split_ldap_attributes(&attributes),
-        }));
+        let meta = state.meta(pid, 0, comm, timestamp_ns);
+        sink.on_event(Event::LdapSearch(payload::ldap_search(&parser, meta)));
     };
 
     Provider::by_guid(LDAP_CLIENT_GUID)
@@ -961,80 +851,34 @@ pub(crate) fn ldap_provider(sink: Arc<dyn EventSink>, state: Arc<SharedState>) -
 /// SMB the process is the kernel (`SYSTEM`, pid 4).
 pub(crate) fn ntlm_provider(sink: Arc<dyn EventSink>, state: Arc<SharedState>) -> Provider {
     let callback = move |record: &EventRecord, locator: &SchemaLocator| {
-        let direction = match record.event_id() {
-            4020 | 4021 | 4026 | 4027 => NtlmDirection::Outgoing,
-            4022 | 4023 => NtlmDirection::Incoming,
-            _ => return,
+        let Some(direction) = payload::ntlm_direction(record.event_id()) else {
+            return;
         };
         state.events_seen.fetch_add(1, Ordering::Relaxed);
         let Ok(schema_def) = locator.event_schema(record) else {
             return;
         };
         let parser = Parser::create(record, &schema_def);
-        let text = |name: &str| parser.try_parse::<String>(name).unwrap_or_default();
-        let user = normalize::ntlm_account(&text("Username"), &text("DomainName"));
-        let service = text("TargetService");
-        let target = if matches!(service.trim(), "" | "-" | "Null" | "(NULL)") {
-            text("TargetMachine")
-        } else {
-            service
-        };
-        let ip_field = match direction {
-            NtlmDirection::Outgoing => "TargetIP",
-            NtlmDirection::Incoming => "ClientIP",
-        };
-        let remote_address = text(ip_field).trim().parse::<std::net::IpAddr>().ok();
-        let ntlm_version = text("NtlmVersion");
+        let auth = payload::ntlm_auth(direction, &parser);
         let timestamp_ns = normalize::filetime_to_ns(record.raw_timestamp());
-        let status = match direction {
-            NtlmDirection::Incoming => parser
-                .try_parse::<u32>("Status")
-                .map(|s| format!("{s:#010x}"))
-                .ok()
-                .or_else(|| Some(text("Status")).filter(|s| s.starts_with("0x"))),
-            NtlmDirection::Outgoing => None,
-        };
-        // The status and the event id are part of the key: an incoming failure and the
-        // success that follows it within the window (same account, address, target and
-        // version) are two different facts, and the success is the one the rules need
-        // (#744 review: without them the success was swallowed as a duplicate).
-        let key = normalize::ntlm_dedup_key(
-            direction,
-            record.event_id(),
-            &user,
-            &target,
-            remote_address,
-            &ntlm_version,
-            status.as_deref(),
-        );
+        // Deduplicated before the process lookup, so a burst of identical
+        // authentications costs one token read, not one per record.
+        let key = auth.dedup_key(record.event_id());
         if !state.ntlm.lock_or_recover().first(&key, timestamp_ns) {
             return;
         }
         // Only `NTLMv2` was ever observed; the weak-version rule matches the other
         // spellings loosely. Log any version that is not `NTLMv2` (once per dedup key) so
         // the first real sample of `NTLMv1`/`LM` shows how the provider writes it.
-        if !ntlm_version.trim().eq_ignore_ascii_case("NTLMv2") {
-            tracing::debug!(version = %ntlm_version, "NTLM version other than NTLMv2");
+        if !auth.ntlm_version.trim().eq_ignore_ascii_case("NTLMv2") {
+            tracing::debug!(version = %auth.ntlm_version, "NTLM version other than NTLMv2");
         }
-        // `ProcessPID` and `Status` are integers the event viewer *displays*
-        // in hex (`0x4`, `0xc000006d`): a string parse fails on them (lab:
-        // the header pid, lsass, and an empty status came out). Integer
-        // first, the string forms as a fallback.
-        let pid = parser
-            .try_parse::<u32>("ProcessPID")
-            .ok()
-            .or_else(|| normalize::parse_ntlm_pid(&text("ProcessPID")))
-            .unwrap_or_else(|| record.process_id());
-        let comm = state.comm_for(pid).unwrap_or_else(|| text("ProcessName"));
-        sink.on_event(Event::NtlmAuth(NtlmAuthEvent {
-            meta: state.meta(pid, 0, comm, timestamp_ns),
-            direction,
-            user,
-            target,
-            remote_address,
-            ntlm_version,
-            status,
-        }));
+        let pid = payload::ntlm_pid(&parser, record.process_id());
+        let comm = state
+            .comm_for(pid)
+            .unwrap_or_else(|| payload::ntlm_process_name(&parser));
+        let meta = state.meta(pid, 0, comm, timestamp_ns);
+        sink.on_event(Event::NtlmAuth(auth.into_event(meta)));
     };
 
     Provider::by_guid(NTLM_GUID).add_callback(callback).build()
@@ -1054,50 +898,18 @@ pub(crate) fn ntlm_provider(sink: Arc<dyn EventSink>, state: Arc<SharedState>) -
 /// `MethodName` (String). Both: PID from the record header.
 pub(crate) fn wmi_provider(sink: Arc<dyn EventSink>, state: Arc<SharedState>) -> Provider {
     let callback = move |record: &EventRecord, locator: &SchemaLocator| {
-        let eid = record.event_id();
-        // 23 = ExecQuery, 24 = ExecMethod — the two high-value WMI operations.
-        if eid != 23 && eid != 24 {
+        let Some(operation) = payload::WmiOperation::from_id(record.event_id()) else {
             return;
-        }
+        };
         state.events_seen.fetch_add(1, Ordering::Relaxed);
         let Ok(schema_def) = locator.event_schema(record) else {
             return;
         };
         let parser = Parser::create(record, &schema_def);
-
-        let namespace: String = parser.try_parse("NamespaceName").unwrap_or_default();
-        let pid = record.process_id();
-        let timestamp_ns = normalize::filetime_to_ns(record.raw_timestamp());
-        let comm = state.comm_for(pid).unwrap_or_default();
-
-        let (query, method) = if eid == 23 {
-            let q: String = parser.try_parse("Query").unwrap_or_default();
-            (if q.is_empty() { None } else { Some(q) }, None)
-        } else {
-            // EID 24: ObjectPath + MethodName → "ClassName.MethodName"
-            let class: String = parser.try_parse("ObjectPath").unwrap_or_default();
-            let meth: String = parser.try_parse("MethodName").unwrap_or_default();
-            let combined = format!("{class}.{meth}");
-            (
-                None,
-                if combined == "." {
-                    None
-                } else {
-                    Some(combined)
-                },
-            )
-        };
-
-        if query.is_none() && method.is_none() {
-            return; // nothing actionable
+        if let Some(event) = payload::wmi_activity(operation, &parser, header_meta(record, &state))
+        {
+            sink.on_event(Event::WmiActivity(event));
         }
-
-        sink.on_event(Event::WmiActivity(WmiActivityEvent {
-            meta: state.meta(pid, 0, comm, timestamp_ns),
-            namespace,
-            query,
-            method,
-        }));
     };
 
     Provider::by_guid(WMI_ACTIVITY_GUID)
@@ -1128,31 +940,10 @@ pub(crate) fn dotnet_provider(sink: Arc<dyn EventSink>, state: Arc<SharedState>)
             return;
         };
         let parser = Parser::create(record, &schema_def);
-
-        let flags: u32 = parser.try_parse("AssemblyFlags").unwrap_or(0);
-        // Drop file-backed assemblies — only in-memory loads have detection value.
-        if flags & ASSEMBLY_FLAG_DYNAMIC == 0 {
-            return;
+        if let Some(event) = payload::assembly_load(&parser, header_meta(record, &state)) {
+            state.events_seen.fetch_add(1, Ordering::Relaxed);
+            sink.on_event(Event::AssemblyLoad(event));
         }
-
-        state.events_seen.fetch_add(1, Ordering::Relaxed);
-
-        let assembly_name: String = parser
-            .try_parse("FullyQualifiedAssemblyName")
-            .unwrap_or_default();
-        if assembly_name.is_empty() {
-            return;
-        }
-
-        let pid = record.process_id();
-        let timestamp_ns = normalize::filetime_to_ns(record.raw_timestamp());
-        let comm = state.comm_for(pid).unwrap_or_default();
-
-        sink.on_event(Event::AssemblyLoad(AssemblyLoadEvent {
-            meta: state.meta(pid, 0, comm, timestamp_ns),
-            assembly_name,
-            flags,
-        }));
     };
 
     Provider::by_guid(DOTNET_RUNTIME_GUID)
@@ -1184,22 +975,10 @@ pub(crate) fn smb_provider(sink: Arc<dyn EventSink>, state: Arc<SharedState>) ->
             return;
         };
         let parser = Parser::create(record, &schema_def);
-
-        let server_name: String = parser.try_parse("ServerName").unwrap_or_default();
-        if server_name.is_empty() {
-            return;
+        if let Some(event) = payload::smb_connect(&parser, header_meta(record, &state)) {
+            state.events_seen.fetch_add(1, Ordering::Relaxed);
+            sink.on_event(Event::SmbConnect(event));
         }
-
-        state.events_seen.fetch_add(1, Ordering::Relaxed);
-
-        let pid = record.process_id();
-        let timestamp_ns = normalize::filetime_to_ns(record.raw_timestamp());
-        let comm = state.comm_for(pid).unwrap_or_default();
-
-        sink.on_event(Event::SmbConnect(SmbConnectEvent {
-            meta: state.meta(pid, 0, comm, timestamp_ns),
-            server_name,
-        }));
     };
 
     Provider::by_guid(SMB_CLIENT_GUID)
@@ -1327,6 +1106,19 @@ fn bits_file_added(
         );
     }
     event
+}
+
+/// The meta of a record about the process in its header: the providers that fire in the
+/// calling thread's context (DNS, registry, `PowerShell`, WMI, .NET, SMB).
+fn header_meta(record: &EventRecord, state: &SharedState) -> EventMeta {
+    let pid = record.process_id();
+    let comm = state.comm_for(pid).unwrap_or_default();
+    state.meta(
+        pid,
+        0,
+        comm,
+        normalize::filetime_to_ns(record.raw_timestamp()),
+    )
 }
 
 /// The client a record names in `processId`; `None` when it names none, which

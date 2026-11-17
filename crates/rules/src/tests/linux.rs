@@ -349,6 +349,15 @@ fn readonly_bashrc_does_not_alert() {
 }
 
 #[test]
+fn a_read_only_truncating_open_of_a_persistence_path_alerts() {
+    // #233: `open(O_RDONLY | O_TRUNC)` empties the file on Linux, so it modifies the
+    // persistence path like any write. It used to read as a pure read.
+    let event = file_open_event("/etc/cron.d/backup", O_RDONLY | schema::O_TRUNC);
+    let alert = check_persistence_write(&event).expect("a truncation is a write");
+    assert_eq!(alert.technique, "T1053.003");
+}
+
+#[test]
 fn write_outside_persistence_paths_does_not_alert() {
     let event = file_open_event("/tmp/test.txt", 577);
     assert!(check_persistence_write(&event).is_none());

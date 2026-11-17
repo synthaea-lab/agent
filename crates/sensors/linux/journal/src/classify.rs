@@ -29,8 +29,8 @@
 //! the *same* account (not the usual one-module-per-account-source arrangement)
 //! would otherwise double-count one failed password as two, and `pam_sss` itself
 //! logs its own "authentication failure" line even for an account it doesn't
-//! manage (`PAM_USER_UNKNOWN`) — both mitigated one level up, in `tail.rs`'s
-//! `ClassifiedJournal` (#881 review, `SherlockOmss` 2026-10-22): a one-line
+//! manage (`PAM_USER_UNKNOWN`) — both mitigated one level up, in `pam_filter.rs`'s
+//! `PamFailureFilter` (#881 review, `SherlockOmss` 2026-10-22): a one-line
 //! lookahead retracts a `pam_sss` failure confirmed as `PAM_USER_UNKNOWN` by
 //! [`pam_sss_reports_user_unknown`], and a pid-keyed dedup window drops a second
 //! failure from the same pid as the first double-logged by a second stacked
@@ -301,12 +301,12 @@ fn classify_pam(message: &str) -> Option<JournalEvent> {
     // authenticators for the same account could double-count one wrong password;
     // pam_sss's own "authentication failure" line also fires for PAM_USER_UNKNOWN,
     // an account it simply doesn't manage, not a wrong password) — both mitigated
-    // one level up, in tail.rs's ClassifiedJournal, rather than here: this function
+    // one level up, in pam_filter.rs's PamFailureFilter, rather than here: this function
     // stays a stateless, one-record-at-a-time classifier, and both mitigations
     // need to look at more than one record (a pid-keyed dedup window for the
     // double-count; a one-line lookahead at the following "received for user
     // %s: %d (%s)" line for PAM_USER_UNKNOWN, via pam_sss_reports_user_unknown
-    // below). See tail.rs's struct doc for the detail (#881 review, SherlockOmss
+    // below). See pam_filter.rs's module doc for the detail (#881 review, SherlockOmss
     // 2026-10-22).
     let rest = ["pam_unix(", "pam_sss("]
         .into_iter()
@@ -347,7 +347,7 @@ fn classify_pam(message: &str) -> Option<JournalEvent> {
 /// from the journal alone — when it's set, this helper simply never confirms,
 /// which is the documented, pre-existing gap, not a new one.
 ///
-/// `(pam_sss review, #881)`. Used by `tail.rs`'s one-line lookahead to retract
+/// `(pam_sss review, #881)`. Used by `pam_filter.rs`'s one-line lookahead to retract
 /// a just-classified `PamAuthFailure`; not part of the classification
 /// allowlist itself — this line is never, by itself, any `JournalEvent`.
 pub(crate) fn pam_sss_reports_user_unknown(message: &str, service: &str) -> bool {

@@ -76,9 +76,14 @@ const SSL_LIBRARY_PREFIXES: &[&str] = &["libssl.so", "libgnutls.so"];
 /// Some bash builds link libedit instead of libreadline.
 const READLINE_LIBRARY_PREFIXES: &[&str] = &["libreadline.so", "libedit.so"];
 
-/// glibc only: musl names its libc `ld-musl-*.so.1` and lays out `getaddrinfo` in a
-/// different symbol table shape; musl support is issue #267 Phase 2.
-const LIBC_LIBRARY_PREFIXES: &[&str] = &["libc.so", "libc-"];
+/// glibc's `libc.so.6` / `libc-2.31.so`, and musl's `ld-musl-<arch>.so.1`, which is
+/// musl's libc and its dynamic loader in one file and exports `getaddrinfo`. On Alpine,
+/// `/usr/lib/libc.so` points at that file but ships in `musl-dev`, so a host without
+/// build tools has only `ld-musl-*` and the `libc.musl-*` symlink to it.
+const LIBC_LIBRARY_PREFIXES: &[&str] = &["libc.so", "libc-", "ld-musl-"];
+
+/// The libc functions [`resolve_dns_symbols`] looks up.
+pub(crate) const DNS_SYMBOLS: [&str; 3] = ["getaddrinfo", "gethostbyname_r", "gethostbyname2_r"];
 
 /// Lists the regular files under `root`/[`LIBRARY_DIRS`] whose name starts with one of
 /// `prefixes`, one path per inode so a library reached through several symlinks is resolved once.
@@ -103,15 +108,16 @@ fn has_any_prefix(path: &Path, prefixes: &[&str]) -> bool {
         .is_some_and(|name| prefixes.iter().any(|prefix| name.starts_with(prefix)))
 }
 
-/// Resolves the `getaddrinfo(3)` symbol from system libc libraries (issue
-/// #267 Phase 1).
+/// Resolves the DNS lookup symbols from system libc libraries: `getaddrinfo(3)` (issue
+/// #267 Phase 1) and the reentrant `gethostbyname_r`/`gethostbyname2_r` that the legacy
+/// `gethostbyname`/`gethostbyname2` call on glibc and musl (agent#240).
 ///
 /// # Errors
 ///
 /// Returns [`ResolverError`] if library discovery or symbol parsing fails.
 pub fn resolve_dns_symbols() -> Result<Vec<SymbolInfo>, ResolverError> {
     let libraries = find_libraries(Path::new("/"), LIBC_LIBRARY_PREFIXES);
-    let target_symbols = ["getaddrinfo"];
+    let target_symbols = DNS_SYMBOLS;
 
     let mut all_symbols = Vec::new();
     for lib in &libraries {
@@ -367,6 +373,24 @@ mod tests {
                 "lib/aarch64-linux-gnu/libgnutls.so.30",
                 "usr/lib/aarch64-linux-gnu/libssl.so.3"
             ]
+        );
+    }
+
+    #[test]
+    fn dns_library_search_finds_musl_without_the_dev_symlink() {
+        // An Alpine host without musl-dev has no /usr/lib/libc.so: the getaddrinfo
+        // uprobe found no library there, so lookups kept only the UDP/53 query and
+        // lost their resolved addresses.
+        let root = library_tree(&["lib/ld-musl-x86_64.so.1"]);
+        std::os::unix::fs::symlink(
+            "ld-musl-x86_64.so.1",
+            root.path().join("lib/libc.musl-x86_64.so.1"),
+        )
+        .expect("create symlink");
+
+        assert_eq!(
+            found_names(root.path(), LIBC_LIBRARY_PREFIXES),
+            ["lib/ld-musl-x86_64.so.1"]
         );
     }
 

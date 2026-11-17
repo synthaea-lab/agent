@@ -233,6 +233,19 @@ against labelled captures; the ML pipeline's calibration step regenerates the bo
 `log_likelihood_ratio`, and the suspicious-path list mirrors the one in `crates/ml`.
 Treat both as a parity seam.
 
+Where the Rust vector and the ml mirror
+(`synthaea_ml.features.behavior.extract_behavior_features`) disagree, Rust is the
+runtime reference, because the Bayes filter runs on it
+([agent#203](https://github.com/synthaea-lab/agent/issues/203)): any IPv6 destination
+outside loopback, `::`, `fe80::/10`, `fc00::/7` and `ff00::/8` is external (this also
+covers ranges that are not globally routable, such as NAT64 `64:ff9b::/96` and
+documentation `2001:db8::/32`); an IPv4-mapped address (`::ffff:a.b.c.d`, what a
+dual-stack socket records for an IPv4 peer) is classified as its IPv4 address; `0.0.0.0`
+and `::` are internal; and the suspicious-path match lowercases with ASCII rules only (no
+Unicode case folding). Unit tests in `crates/correlator/src/tests/behavior.rs` pin these
+rules. The mirror must be
+aligned on them and `calibrate_llr.py` rerun before the weights are trusted.
+
 ### Update rule
 
 On every correlated event for a pid that has events in the window,
