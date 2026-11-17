@@ -840,21 +840,34 @@ fn describe_reload_count(count: Option<usize>) -> String {
 ///
 /// # Errors
 ///
-/// Returns an error (as a `String` — this is a best-effort notification,
-/// not a typed API another caller pattern-matches on) if a short-lived
-/// current-thread runtime cannot be built, the connection fails, or the
-/// agent's own handler reports a failure.
-fn notify_running_agent(ipc_endpoint: &str) -> Result<ipc::ReloadContentResponse, String> {
+/// Returns a [`NotifyError`] if a short-lived current-thread runtime cannot be built,
+/// the connection fails, or the agent's own handler reports a failure.
+fn notify_running_agent(ipc_endpoint: &str) -> Result<ipc::ReloadContentResponse, NotifyError> {
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
-        .map_err(|e| e.to_string())?;
+        .map_err(NotifyError::Runtime)?;
     runtime.block_on(async {
         let mut client = ipc::Client::connect(ipc_endpoint, "agent-apply-content-manifest")
             .await
-            .map_err(|e| e.to_string())?;
-        client.reload_content().await.map_err(|e| e.to_string())
+            .map_err(NotifyError::Connect)?;
+        client.reload_content().await.map_err(NotifyError::Reload)
     })
+}
+
+/// Why [`notify_running_agent`] could not reach a running agent. Each variant prints as
+/// its cause, which is the text the caller shows the operator.
+#[derive(Debug, thiserror::Error)]
+enum NotifyError {
+    /// The short-lived runtime could not be built.
+    #[error("{0}")]
+    Runtime(std::io::Error),
+    /// No agent is listening at the endpoint, or the handshake failed.
+    #[error("{0}")]
+    Connect(ipc::ClientError),
+    /// The agent's own handler reported a failure.
+    #[error("{0}")]
+    Reload(ipc::ClientError),
 }
 
 #[cfg(test)]

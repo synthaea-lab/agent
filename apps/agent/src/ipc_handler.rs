@@ -140,7 +140,8 @@ impl Handler for AgentHandler {
     ) -> Result<SuppressionResponse, String> {
         let changed = self
             .sink
-            .suppress_verdict(entry.ppid, &entry.comm, &entry.technique)?;
+            .suppress_verdict(entry.ppid, &entry.comm, &entry.technique)
+            .map_err(|e| e.to_string())?;
         Ok(SuppressionResponse { changed })
     }
 

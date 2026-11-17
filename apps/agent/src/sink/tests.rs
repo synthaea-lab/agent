@@ -2849,11 +2849,15 @@ fn a_refused_suppression_says_why() {
     let sink = sink_in(&dir);
 
     assert_eq!(
-        sink.suppress_verdict(1, "", "T1105").unwrap_err().to_string(),
+        sink.suppress_verdict(1, "", "T1105")
+            .unwrap_err()
+            .to_string(),
         "comm and technique must not be empty"
     );
     assert_eq!(
-        sink.suppress_verdict(1, "bash", "").unwrap_err().to_string(),
+        sink.suppress_verdict(1, "bash", "")
+            .unwrap_err()
+            .to_string(),
         "comm and technique must not be empty"
     );
 

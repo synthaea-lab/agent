@@ -33,6 +33,18 @@ pub(crate) use correlation::{correlator_case_id, model_root};
 use recording::{Finding, record_ioc_hit, record_rule_alert, spool_on_worker};
 use response::{DAMAGE_MANIFEST_MAX, ResponseCell};
 
+/// Why [`DetectionSink::suppress_verdict`] refused a mark. The text reaches the operator
+/// through the IPC reply.
+#[derive(Debug, PartialEq, Eq, thiserror::Error)]
+pub(crate) enum SuppressError {
+    /// An empty `comm` or `technique` could never match a finding.
+    #[error("comm and technique must not be empty")]
+    EmptyKey,
+    /// Marks are operator-applied and never expire, so the list is capped.
+    #[error("suppression list is full ({max} entries): lift one first")]
+    Full { max: usize },
+}
+
 /// Dispatches every event to the detection engines and the output sinks. `Mutex`
 /// around the mutable state (`RuleState`) rather than no synchronization: the
 /// `EventSink` trait requires `Send + Sync` and only exposes `&self`, to stay correct
@@ -900,16 +912,17 @@ impl DetectionSink {
     ///
     /// # Errors
     ///
-    /// An empty `comm` or `technique` (it could never match a finding), or the
-    /// suppression list being full ([`verdict::MAX_SUPPRESSIONS`]).
+    /// [`SuppressError::EmptyKey`] for an empty `comm` or `technique` (it could never
+    /// match a finding), [`SuppressError::Full`] when the suppression list is full
+    /// ([`verdict::MAX_SUPPRESSIONS`]).
     pub(crate) fn suppress_verdict(
         &self,
         ppid: u32,
         comm: &str,
         technique: &str,
-    ) -> Result<bool, String> {
+    ) -> Result<bool, SuppressError> {
         if comm.is_empty() || technique.is_empty() {
-            return Err("comm and technique must not be empty".to_string());
+            return Err(SuppressError::EmptyKey);
         }
         let outcome = self
             .verdict
@@ -924,10 +937,9 @@ impl DetectionSink {
                 Ok(true)
             }
             verdict::SuppressOutcome::AlreadySuppressed => Ok(false),
-            verdict::SuppressOutcome::Full => Err(format!(
-                "suppression list is full ({} entries): lift one first",
-                verdict::MAX_SUPPRESSIONS
-            )),
+            verdict::SuppressOutcome::Full => Err(SuppressError::Full {
+                max: verdict::MAX_SUPPRESSIONS,
+            }),
         }
     }
 
