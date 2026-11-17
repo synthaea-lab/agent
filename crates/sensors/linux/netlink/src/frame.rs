@@ -9,30 +9,15 @@
 use crate::wire::{NLMSG_HDR_LEN, NlMsgHeader};
 
 /// A message whose header cannot be trusted. The rest of the buffer is not walked after one.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum FrameError {
     /// The header's length field is smaller than the header itself.
+    #[error("netlink message length {len} is shorter than its {NLMSG_HDR_LEN}-byte header")]
     ShorterThanHeader { len: u32 },
     /// The header's length field reaches past the end of the received bytes.
+    #[error("netlink message of {len} bytes overruns the {available} bytes received")]
     Overrun { len: u32, available: usize },
 }
-
-impl std::fmt::Display for FrameError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::ShorterThanHeader { len } => write!(
-                f,
-                "netlink message length {len} is shorter than its {NLMSG_HDR_LEN}-byte header"
-            ),
-            Self::Overrun { len, available } => write!(
-                f,
-                "netlink message of {len} bytes overruns the {available} bytes received"
-            ),
-        }
-    }
-}
-
-impl std::error::Error for FrameError {}
 
 /// Iterates over the messages in `buf` as `(msg_type, payload)`, payload being the bytes after the
 /// header and before the padding.

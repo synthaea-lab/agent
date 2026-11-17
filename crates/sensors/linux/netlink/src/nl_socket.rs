@@ -18,24 +18,18 @@ use crate::{
 };
 
 /// Errors from driving the real netlink socket.
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 pub enum NetlinkError {
+    // Not `#[from]`: that would also make the I/O error this error's `source()`, and the message
+    // already prints it, so a reporter walking the chain would print it twice. The `From` impl
+    // below is written by hand for that reason.
+    #[error("netlink I/O error: {0}")]
     Io(io::Error),
     /// The kernel replied with `NLMSG_ERROR` and this non-zero errno, positive
     /// (`libc::EPERM`, not the `-EPERM` on the wire).
+    #[error("kernel returned NLMSG_ERROR (errno {0})")]
     Kernel(i32),
 }
-
-impl std::fmt::Display for NetlinkError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Io(e) => write!(f, "netlink I/O error: {e}"),
-            Self::Kernel(errno) => write!(f, "kernel returned NLMSG_ERROR (errno {errno})"),
-        }
-    }
-}
-
-impl std::error::Error for NetlinkError {}
 
 impl From<io::Error> for NetlinkError {
     fn from(e: io::Error) -> Self {
@@ -306,6 +300,22 @@ mod tests {
     fn nlmsg_error_errno_reports_a_truncated_payload_as_ebadmsg() {
         assert_eq!(nlmsg_error_errno(&[0xff, 0xff]), libc::EBADMSG);
         assert_eq!(nlmsg_error_errno(&[]), libc::EBADMSG);
+    }
+
+    #[test]
+    fn error_messages_and_sources_are_what_callers_have_always_seen() {
+        use std::error::Error as _;
+
+        let kernel = NetlinkError::Kernel(libc::EPERM);
+        assert_eq!(kernel.to_string(), "kernel returned NLMSG_ERROR (errno 1)");
+        assert!(kernel.source().is_none());
+
+        let io = NetlinkError::from(io::Error::other("boom"));
+        assert_eq!(io.to_string(), "netlink I/O error: boom");
+        assert!(
+            io.source().is_none(),
+            "the message already carries the cause"
+        );
     }
 
     #[test]
