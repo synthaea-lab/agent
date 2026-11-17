@@ -2841,6 +2841,38 @@ fn a_suppressed_technique_leaves_the_verdict_but_stays_in_the_alert_log() {
     assert!(record().is_some(), "lifting the mark restores fusion");
 }
 
+/// #155: the refusals reach the operator through the IPC reply, so their text is part of
+/// the behaviour the typed error must keep.
+#[test]
+fn a_refused_suppression_says_why() {
+    let dir = tmp("suppress-refused");
+    let sink = sink_in(&dir);
+
+    assert_eq!(
+        sink.suppress_verdict(1, "", "T1105").unwrap_err().to_string(),
+        "comm and technique must not be empty"
+    );
+    assert_eq!(
+        sink.suppress_verdict(1, "bash", "").unwrap_err().to_string(),
+        "comm and technique must not be empty"
+    );
+
+    for ppid in 0..verdict::MAX_SUPPRESSIONS as u32 {
+        assert_eq!(sink.suppress_verdict(ppid, "bash", "T1105"), Ok(true));
+    }
+    assert_eq!(
+        sink.suppress_verdict(u32::MAX, "bash", "T1105")
+            .unwrap_err()
+            .to_string(),
+        "suppression list is full (1024 entries): lift one first"
+    );
+    assert_eq!(
+        sink.suppress_verdict(0, "bash", "T1105"),
+        Ok(false),
+        "a mark already there is not a new one, even on a full list"
+    );
+}
+
 /// #592 applied to YARA: a match from a recycled parent pid is a new entity and
 /// must not inherit the previous parent's evidence or severity.
 #[test]
