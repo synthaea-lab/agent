@@ -10,6 +10,7 @@ use crate::{Alert, ImageSignature, RuleState, exclusions::QUARANTINE_EXEC_WINDOW
 const CHROMIUM: &str = "/usr/lib64/chromium-browser/chromium-browser";
 const FIREFOX: &str = "/usr/lib64/firefox/firefox";
 const OPERA: &str = "/usr/lib64/opera-stable/opera";
+const DEBIAN_FIREFOX_ESR: &str = "/usr/lib/firefox-esr/firefox-esr";
 const FINAL: &str = "/home/u/Downloads/test.bin";
 
 fn rename(old: &str, new: &str, image: Option<&str>, timestamp_ns: u64) -> FileRenameEvent {
@@ -97,6 +98,8 @@ fn every_captured_browser_image_marks_a_finished_download() {
         ("/opt/brave.com/brave/brave", ".crdownload"),
         (OPERA, ".opdownload"),
         ("/opt/vivaldi/vivaldi-bin", ".crdownload"),
+        // Debian 13 firefox-esr: /proc under strace, and the sensor's own file_rename event
+        (DEBIAN_FIREFOX_ESR, ".part"),
     ] {
         let mut state = RuleState::new();
         state.on_file_rename(&rename(
