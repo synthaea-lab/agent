@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 use crate::{
     TransportClient, TransportConfig,
     error::{Result, TransportError},
-    upload::UploadStep,
+    upload::{UploadStep, backoff_after},
 };
 
 /// The largest detection body the control plane accepts: `client_max_body_size 8m` on the
@@ -233,6 +233,25 @@ fn fit_detection_reporting(
     shorten_detection(detection, original).map(|body| (body, Some(original)))
 }
 
+/// How many of `events`, from the first, fit in the body of `value` (which holds no events yet)
+/// under [`MAX_DETECTION_BODY_BYTES`]; each event is measured once.
+fn longest_fitting_prefix(
+    value: &serde_json::Value,
+    events: &[serde_json::Value],
+) -> std::result::Result<usize, serde_json::Error> {
+    let mut total = json_len(value)?;
+    let mut keep = 0usize;
+    for event in events {
+        let size = json_len(event)? + usize::from(keep > 0);
+        if total + size > MAX_DETECTION_BODY_BYTES {
+            break;
+        }
+        total += size;
+        keep += 1;
+    }
+    Ok(keep)
+}
+
 /// The shortening steps of [`fit_detection_to_limit`], for a detection of `original` bytes.
 fn shorten_detection(
     detection: &Detection,
@@ -275,17 +294,7 @@ fn shorten_detection(
     // 2. Drop events from the end, the first kept: measure every event once and keep the longest
     // prefix that fits.
     value["events"] = serde_json::Value::Array(Vec::new());
-    let fixed = json_len(&value)?;
-    let mut total = fixed;
-    let mut keep = 0usize;
-    for event in &events {
-        let size = json_len(event)? + usize::from(keep > 0);
-        if total + size > MAX_DETECTION_BODY_BYTES {
-            break;
-        }
-        total += size;
-        keep += 1;
-    }
+    let keep = longest_fitting_prefix(&value, &events)?;
     if keep > 0 {
         events.truncate(keep);
         return finish(&mut value, events);
@@ -310,6 +319,42 @@ fn shorten_detection(
         ));
     }
     Ok(body)
+}
+
+/// What to do with a record whose upload failed.
+enum Verdict {
+    /// The server refuses this record for good: drop it, upload the rest of the segment.
+    DropRecord,
+    /// The failure is not about this record: the segment stays spooled, the loop backs off.
+    KeepSegment(TransportError),
+}
+
+/// The body to send for `record`: shortened when over the limit (and traced on the host), or
+/// `None` when it cannot be serialized — the record is then dropped, the rest of its segment goes on.
+fn prepare_body(record: &QueuedDetection) -> Option<Vec<u8>> {
+    match fit_detection_reporting(&record.detection) {
+        Ok((body, shortened_from)) => {
+            if let Some(original) = shortened_from {
+                // The size is chosen by the process, so the host keeps a trace too: the
+                // stored title carries the note, but only on the server.
+                tracing::warn!(
+                    key = %record.key,
+                    original_bytes = original,
+                    sent_bytes = body.len(),
+                    "detection over the body limit; events shortened before sending"
+                );
+            }
+            Some(body)
+        }
+        Err(error) => {
+            tracing::warn!(
+                %error,
+                key = %record.key,
+                "detection cannot be serialized; dropped, the rest of its segment goes on"
+            );
+            None
+        }
+    }
 }
 
 /// Uploads detections one at a time, preserving each record's retry key.
@@ -361,55 +406,16 @@ impl<D: DetectionDrain> DetectionUploader<D> {
         let mut uploaded = 0usize;
         let mut dropped = 0u64;
         for record in &records {
-            let body = match fit_detection_reporting(&record.detection) {
-                Ok((body, shortened_from)) => {
-                    if let Some(original) = shortened_from {
-                        // The size is chosen by the process, so the host keeps a trace too: the
-                        // stored title carries the note, but only on the server.
-                        tracing::warn!(
-                            key = %record.key,
-                            original_bytes = original,
-                            sent_bytes = body.len(),
-                            "detection over the body limit; events shortened before sending"
-                        );
-                    }
-                    body
-                }
-                Err(error) => {
-                    tracing::warn!(
-                        %error,
-                        key = %record.key,
-                        "detection cannot be serialized; dropped, the rest of its segment goes on"
-                    );
-                    dropped += 1;
-                    continue;
-                }
+            let Some(body) = prepare_body(record) else {
+                dropped += 1;
+                continue;
             };
             match self.client.upload_detection_bytes(&body, &record.key) {
                 Ok(()) => uploaded += 1,
-                Err(error) if refuses_this_record(&error) => {
-                    tracing::warn!(
-                        error = %error,
-                        key = %record.key,
-                        "server refused a detection for good; dropped, the rest of its segment goes on"
-                    );
-                    dropped += 1;
-                }
-                Err(error) => {
-                    // Nothing here says the record is bad: either the failure is transient, or it
-                    // is about the whole agent (a certificate that does not verify, a rotated CA,
-                    // a `401`/`403`, a route or TLS problem). Skipping would erase the detection,
-                    // and every one behind it in turn, in seconds during a certificate rotation:
-                    // the segment stays spooled and the loop backs off. The spool's byte cap sheds
-                    // the oldest if this lasts.
-                    self.consecutive_failures = self.consecutive_failures.saturating_add(1);
-                    if error.is_retryable() {
-                        tracing::warn!(error = %error, "detection upload failed; segment remains spooled");
-                    } else {
-                        tracing::warn!(error = %error, "server refused the upload for a reason that is not about this detection (certificate, authentication, route); segment remains spooled, retrying with backoff");
-                    }
-                    return Err(error);
-                }
+                Err(error) => match self.apply_failure(error, &record.key) {
+                    Verdict::DropRecord => dropped += 1,
+                    Verdict::KeepSegment(error) => return Err(error),
+                },
             }
         }
         self.drain.ack_dropping(dropped)?;
@@ -419,18 +425,37 @@ impl<D: DetectionDrain> DetectionUploader<D> {
         Ok(uploaded + usize::try_from(dropped).unwrap_or(usize::MAX))
     }
 
+    /// Classifies a failed upload of the record `key`. A record the server refuses for good is
+    /// dropped on its own and the rest of its segment goes on. Any other error keeps the segment
+    /// spooled and counts a failure for the backoff.
+    fn apply_failure(&mut self, error: TransportError, key: &str) -> Verdict {
+        if refuses_this_record(&error) {
+            tracing::warn!(
+                error = %error,
+                key = %key,
+                "server refused a detection for good; dropped, the rest of its segment goes on"
+            );
+            return Verdict::DropRecord;
+        }
+        // Nothing here says the record is bad: either the failure is transient, or it
+        // is about the whole agent (a certificate that does not verify, a rotated CA,
+        // a `401`/`403`, a route or TLS problem). Skipping would erase the detection,
+        // and every one behind it in turn, in seconds during a certificate rotation:
+        // the segment stays spooled and the loop backs off. The spool's byte cap sheds
+        // the oldest if this lasts.
+        self.consecutive_failures = self.consecutive_failures.saturating_add(1);
+        if error.is_retryable() {
+            tracing::warn!(error = %error, "detection upload failed; segment remains spooled");
+        } else {
+            tracing::warn!(error = %error, "server refused the upload for a reason that is not about this detection (certificate, authentication, route); segment remains spooled, retrying with backoff");
+        }
+        Verdict::KeepSegment(error)
+    }
+
     /// Exponential retry delay, capped by the transport configuration.
     #[must_use]
     pub fn backoff_duration(&self) -> Duration {
-        if self.consecutive_failures == 0 {
-            return Duration::ZERO;
-        }
-        let base = self.config.retry_base.as_millis() as u64;
-        let cap = self.config.retry_max.as_millis() as u64;
-        Duration::from_millis(
-            base.saturating_mul(1 << (self.consecutive_failures - 1).min(10))
-                .min(cap),
-        )
+        backoff_after(&self.config, self.consecutive_failures)
     }
 }
 
