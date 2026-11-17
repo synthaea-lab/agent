@@ -11,7 +11,7 @@ use sensor_linux_wire::{
     FileDeleteEvent, FileRenameEvent, FileWriteEvent, TASK_COMM_LEN, is_filtered_path,
 };
 
-use crate::{fill_lineage, mount_signal::signal::is_agent_own_pid};
+use crate::{fill_lineage, into_ret, mount_signal::signal::is_agent_own_pid};
 
 /// Ring buffer shared with userspace for `write` events.
 #[map]
@@ -58,10 +58,7 @@ pub(crate) const WRITE_BUF_OFFSET: usize = 16;
 pub(crate) const WRITE_COUNT_OFFSET: usize = 20;
 
 pub fn sys_enter_write(ctx: TracePointContext) -> u32 {
-    match try_sys_enter_write(ctx) {
-        Ok(ret) => ret,
-        Err(ret) => ret,
-    }
+    into_ret(try_sys_enter_write(ctx))
 }
 
 fn try_sys_enter_write(ctx: TracePointContext) -> Result<u32, u32> {
@@ -131,10 +128,7 @@ const UNLINKAT_PATHNAME_PTR_OFFSET: usize = 24;
 const UNLINKAT_PATHNAME_PTR_OFFSET: usize = 16;
 
 pub fn sys_enter_unlink(ctx: TracePointContext) -> u32 {
-    match try_sys_enter_unlink(ctx) {
-        Ok(ret) => ret,
-        Err(ret) => ret,
-    }
+    into_ret(try_sys_enter_unlink(ctx))
 }
 
 fn try_sys_enter_unlink(ctx: TracePointContext) -> Result<u32, u32> {
@@ -150,10 +144,7 @@ fn try_sys_enter_unlink(ctx: TracePointContext) -> Result<u32, u32> {
 }
 
 pub fn sys_enter_unlinkat(ctx: TracePointContext) -> u32 {
-    match try_sys_enter_unlinkat(ctx) {
-        Ok(ret) => ret,
-        Err(ret) => ret,
-    }
+    into_ret(try_sys_enter_unlinkat(ctx))
 }
 
 fn try_sys_enter_unlinkat(ctx: TracePointContext) -> Result<u32, u32> {
@@ -282,10 +273,7 @@ const RENAMEAT2_OLDNAME_PTR_OFFSET: usize = 16;
 const RENAMEAT2_NEWNAME_PTR_OFFSET: usize = 24;
 
 pub fn sys_enter_rename(ctx: TracePointContext) -> u32 {
-    match try_sys_enter_rename(ctx) {
-        Ok(ret) => ret,
-        Err(ret) => ret,
-    }
+    into_ret(try_sys_enter_rename(ctx))
 }
 
 fn try_sys_enter_rename(ctx: TracePointContext) -> Result<u32, u32> {
@@ -308,10 +296,7 @@ fn try_sys_enter_rename(ctx: TracePointContext) -> Result<u32, u32> {
 }
 
 pub fn sys_enter_renameat(ctx: TracePointContext) -> u32 {
-    match try_sys_enter_renameat(ctx) {
-        Ok(ret) => ret,
-        Err(ret) => ret,
-    }
+    into_ret(try_sys_enter_renameat(ctx))
 }
 
 fn try_sys_enter_renameat(ctx: TracePointContext) -> Result<u32, u32> {
@@ -357,10 +342,7 @@ fn try_sys_enter_renameat(ctx: TracePointContext) -> Result<u32, u32> {
 }
 
 pub fn sys_enter_renameat2(ctx: TracePointContext) -> u32 {
-    match try_sys_enter_renameat2(ctx) {
-        Ok(ret) => ret,
-        Err(ret) => ret,
-    }
+    into_ret(try_sys_enter_renameat2(ctx))
 }
 
 fn try_sys_enter_renameat2(ctx: TracePointContext) -> Result<u32, u32> {

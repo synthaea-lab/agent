@@ -10,7 +10,7 @@ use aya_ebpf::{
 use aya_log_ebpf::warn;
 use sensor_linux_wire::{SignalEvent, TASK_COMM_LEN};
 
-use crate::fill_lineage;
+use crate::{fill_lineage, into_ret};
 
 /// Single-slot map holding the agent's own pid, written by userspace before any
 /// signal probe below is attached (issue #362). Filters `kill`/`tgkill` at the
@@ -110,10 +110,7 @@ const TGKILL_SIG_OFFSET: usize = 20;
 // `pidfd_send_signal` and `rt_sigqueueinfo` too, and compares the target's `tgid`.
 
 pub fn sys_enter_kill(ctx: TracePointContext) -> u32 {
-    match try_sys_enter_kill(ctx) {
-        Ok(ret) => ret,
-        Err(ret) => ret,
-    }
+    into_ret(try_sys_enter_kill(ctx))
 }
 
 fn try_sys_enter_kill(ctx: TracePointContext) -> Result<u32, u32> {
@@ -130,10 +127,7 @@ fn try_sys_enter_kill(ctx: TracePointContext) -> Result<u32, u32> {
 }
 
 pub fn sys_enter_tgkill(ctx: TracePointContext) -> u32 {
-    match try_sys_enter_tgkill(ctx) {
-        Ok(ret) => ret,
-        Err(ret) => ret,
-    }
+    into_ret(try_sys_enter_tgkill(ctx))
 }
 
 fn try_sys_enter_tgkill(ctx: TracePointContext) -> Result<u32, u32> {

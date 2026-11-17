@@ -9,7 +9,7 @@ use aya_ebpf::{
 use aya_log_ebpf::warn;
 use sensor_linux_wire::{KernelModuleEvent, TASK_COMM_LEN};
 
-use crate::fill_lineage;
+use crate::{fill_lineage, into_ret};
 
 /// Ring buffer shared with userspace for `init_module`/`finit_module`/
 /// `delete_module` events.
@@ -114,10 +114,7 @@ fn emit_kernel_module_event(
 }
 
 pub fn sys_enter_init_module(ctx: TracePointContext) -> u32 {
-    match try_sys_enter_init_module(ctx) {
-        Ok(ret) => ret,
-        Err(ret) => ret,
-    }
+    into_ret(try_sys_enter_init_module(ctx))
 }
 
 fn try_sys_enter_init_module(ctx: TracePointContext) -> Result<u32, u32> {
@@ -136,10 +133,7 @@ fn try_sys_enter_init_module(ctx: TracePointContext) -> Result<u32, u32> {
 }
 
 pub fn sys_enter_finit_module(ctx: TracePointContext) -> u32 {
-    match try_sys_enter_finit_module(ctx) {
-        Ok(ret) => ret,
-        Err(ret) => ret,
-    }
+    into_ret(try_sys_enter_finit_module(ctx))
 }
 
 fn try_sys_enter_finit_module(ctx: TracePointContext) -> Result<u32, u32> {
@@ -170,10 +164,7 @@ fn try_sys_enter_finit_module(ctx: TracePointContext) -> Result<u32, u32> {
 }
 
 pub fn sys_enter_delete_module(ctx: TracePointContext) -> u32 {
-    match try_sys_enter_delete_module(ctx) {
-        Ok(ret) => ret,
-        Err(ret) => ret,
-    }
+    into_ret(try_sys_enter_delete_module(ctx))
 }
 
 fn try_sys_enter_delete_module(ctx: TracePointContext) -> Result<u32, u32> {

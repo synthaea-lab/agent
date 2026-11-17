@@ -388,7 +388,7 @@ pub fn raw_sched_process_exec(ctx: RawTracePointContext) -> u32 {
     if let (Ok(pid), Ok(filename)) = (pid, filename)
         && !filename.is_null()
     {
-        let _ = crate::record_sched_process_exec(pid as u32, filename);
+        let _ = crate::exec::record_sched_process_exec(pid as u32, filename);
     } else {
         warn!(
             &ctx,

@@ -13,7 +13,7 @@ use aya_ebpf::{
 use aya_log_ebpf::warn;
 use sensor_linux_wire::{MountEvent, TASK_COMM_LEN};
 
-use crate::fill_lineage;
+use crate::{fill_lineage, into_ret};
 
 /// Ring buffer shared with userspace for `mount`/`umount2` events.
 #[map]
@@ -66,10 +66,7 @@ const UMOUNT_TARGET_PTR_OFFSET: usize = 16;
 const UMOUNT_TARGET_PTR_OFFSET: usize = 12;
 
 pub fn sys_enter_mount(ctx: TracePointContext) -> u32 {
-    match try_sys_enter_mount(ctx) {
-        Ok(ret) => ret,
-        Err(ret) => ret,
-    }
+    into_ret(try_sys_enter_mount(ctx))
 }
 
 fn try_sys_enter_mount(ctx: TracePointContext) -> Result<u32, u32> {
@@ -103,10 +100,7 @@ fn try_sys_enter_mount(ctx: TracePointContext) -> Result<u32, u32> {
 }
 
 pub fn sys_enter_umount(ctx: TracePointContext) -> u32 {
-    match try_sys_enter_umount(ctx) {
-        Ok(ret) => ret,
-        Err(ret) => ret,
-    }
+    into_ret(try_sys_enter_umount(ctx))
 }
 
 fn try_sys_enter_umount(ctx: TracePointContext) -> Result<u32, u32> {
