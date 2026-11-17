@@ -116,6 +116,7 @@
 // off-Linux, the lib target legitimately has unused items (same idiom as
 // `apps/agent/src/health.rs`). The lint stays live on Linux, where dead code is real.
 mod conntrack_attrs;
+mod frame;
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 mod normalize;
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
@@ -141,6 +142,7 @@ use std::net::SocketAddr;
 pub use conntrack_attrs::{ConntrackFlow, FlowCounters, FlowTuple, TcpState};
 #[cfg(target_os = "linux")]
 pub use conntrack_socket::dump as dump_conntrack;
+pub use frame::{FrameError, NetlinkMessages, netlink_messages};
 #[cfg(target_os = "linux")]
 pub use poll::NetlinkPollSensor;
 pub use poll::{POLL_INTERVAL, PollStopHandle};
