@@ -232,7 +232,7 @@ impl CorrelationEngine {
         // An access-log request has no pid: it only joins a web server's shell by time.
         // Record it, look for that pairing, and skip every pid-keyed step below.
         if let Event::HttpRequest(request) = &event {
-            self.record_web_request(&event, request);
+            self.record_web_request(request);
             return self.flush_web_shells();
         }
         let web_shell_event = match &event {
@@ -250,7 +250,8 @@ impl CorrelationEngine {
 
         self.bus.push(event);
 
-        let entity_key = self.update_belief_for(pid, generation, &comm);
+        let entity_key = self.entity_key_for(pid, generation, &comm);
+        self.update_belief_for(pid, generation, &entity_key);
 
         let mut web_alerts =
             web_shell_event.map_or_else(Vec::new, |shell_event| self.queue_web_shell(shell_event));
@@ -258,13 +259,14 @@ impl CorrelationEngine {
         // and request vectors for every incoming telemetry event.
         web_alerts.extend(self.flush_web_shells());
 
-        self.evaluate_rules_for(pid, generation, &comm, &entity_key, web_alerts)
+        web_alerts.extend(self.evaluate_rules_for(pid, generation, &comm, &entity_key));
+        web_alerts
     }
 
     /// Pushes an access-log request on the bus and into the bounded recent-request window
     /// (counting an eviction when it is full), then looks for a web-shell pairing.
-    fn record_web_request(&mut self, event: &Event, request: &HttpRequestEvent) {
-        self.bus.push(event.clone());
+    fn record_web_request(&mut self, request: &HttpRequestEvent) {
+        self.bus.push(Event::HttpRequest(request.clone()));
         if self.recent_web_requests.len() == MAX_RECENT_WEB_REQUESTS {
             self.recent_web_requests.pop_front();
             self.web_shell_shedding.requests_evicted += 1;
@@ -339,12 +341,12 @@ impl CorrelationEngine {
         }
     }
 
-    /// Updates the (ppid, comm) belief with the pid's current `BehaviorVector` and returns
-    /// the entity key. Keying by (ppid, comm) lets the belief survive respawns:
-    /// fork+exec = new pid, same (ppid, comm) → same `BeliefState`.
-    fn update_belief_for(&mut self, pid: u32, generation: Option<u64>, comm: &str) -> EntityRef {
-        let entity_key = self
-            .pid_entities
+    /// The entity a pid belongs to: the recorded (ppid, comm) when the pid's exec was
+    /// seen for the current incarnation, otherwise the fallback (pid, comm).
+    /// Keying by (ppid, comm) lets the belief survive respawns: fork+exec = new pid,
+    /// same (ppid, comm) → same `BeliefState`.
+    fn entity_key_for(&mut self, pid: u32, generation: Option<u64>, comm: &str) -> EntityRef {
+        self.pid_entities
             .get(&pid)
             .filter(|entry| entry.current(generation))
             .map(|entry| entry.value.clone())
@@ -352,34 +354,34 @@ impl CorrelationEngine {
                 ppid: pid,
                 comm: comm.to_owned(),
                 parent_generation: generation,
-            });
+            })
+    }
 
+    /// Updates the belief of `entity_key` with the pid's current `BehaviorVector`.
+    fn update_belief_for(&mut self, pid: u32, generation: Option<u64>, entity_key: &EntityRef) {
         if let Some(bv) = self.behavior_vector_for_pid(pid, generation) {
             let now_ns = self.latest_timestamp_ns(pid, generation);
-            let state = self.belief_or_insert(&entity_key, now_ns);
+            let state = self.belief_or_insert(entity_key, now_ns);
             // No ML LLR in internal path — external callers use `update_belief_with_ml`.
             update_belief(state, &bv, None, now_ns);
         }
-        entity_key
     }
 
-    /// Evaluates the correlation rules and the Bayesian alert for the pid, after the
-    /// pending web-shell alerts. IGNORED-list processes stop at the web alerts unless
-    /// they are masquerading.
+    /// Evaluates the correlation rules and the Bayesian alert for the pid.
+    /// IGNORED-list processes evaluate nothing (empty result) unless they are
+    /// masquerading.
     fn evaluate_rules_for(
         &mut self,
         pid: u32,
         generation: Option<u64>,
         comm: &str,
         entity_key: &EntityRef,
-        web_alerts: Vec<CorrelationAlert>,
     ) -> Vec<CorrelationAlert> {
         if is_ignored(comm) && !self.is_masquerading(pid, generation) {
-            return web_alerts;
+            return Vec::new();
         }
         let now_ns = self.latest_timestamp_ns(pid, generation);
-        let mut alerts = web_alerts;
-        alerts.extend(self.evaluate(pid, generation, now_ns));
+        let mut alerts = self.evaluate(pid, generation, now_ns);
         if !is_bayes_excluded(comm) || self.is_masquerading(pid, generation) {
             alerts.extend(self.bayes_alert(pid, comm, entity_key));
         }
@@ -673,17 +675,7 @@ impl CorrelationEngine {
             .events_for_pid(pid, generation)
             .last()
             .map(|e| e.meta().comm.clone())?;
-        Some(
-            self.pid_entities
-                .get(&pid)
-                .filter(|entry| entry.current(generation))
-                .map(|entry| entry.value.clone())
-                .unwrap_or(EntityRef {
-                    ppid: pid,
-                    comm,
-                    parent_generation: generation,
-                }),
-        )
+        Some(self.entity_key_for(pid, generation, &comm))
     }
 
     /// The belief for `entity`, created if absent. A stored belief built for a
