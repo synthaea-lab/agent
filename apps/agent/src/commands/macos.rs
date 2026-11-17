@@ -8,7 +8,7 @@ use std::sync::Arc;
 
 use schema::sensor::{EventSink, Sensor as _};
 
-use crate::shutdown::ShutdownPlan;
+use crate::{shutdown::ShutdownPlan, sync::LockExt as _};
 
 /// Forwards to a shared `Arc<dyn EventSink>` — ownership plumbing to satisfy
 /// `Sensor::run`'s `Box<dyn EventSink>` signature (same shape as Windows).
@@ -215,9 +215,8 @@ fn run_macos_sensors(sink: Box<dyn EventSink>, redact_commands: bool) -> anyhow:
         eprintln!("\n[!] Shutdown requested...");
         stop.stop();
         poll_stop.store(true, std::sync::atomic::Ordering::SeqCst);
-        if let Ok(mut guard) = log_child.lock()
-            && let Some(child) = guard.as_mut()
-        {
+        let mut guard = log_child.lock_recovering();
+        if let Some(child) = guard.as_mut() {
             // Ends the tail thread's stream; reaped below via wait().
             let _ = child.kill();
             let _ = child.wait();

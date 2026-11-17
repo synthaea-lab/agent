@@ -368,9 +368,10 @@ impl MemoryScanQueue {
     /// Returns whether it was queued; a shed request is counted under its reason.
     /// `now_ns` is event time, the clock the rest of the detection state uses.
     ///
-    /// # Panics
-    ///
-    /// Only if the admission lock is poisoned by a panic elsewhere.
+    /// A poisoned admission lock is taken back, cleared and logged once: the gate holds the
+    /// cooldown table and the per-minute rate window, so a half-updated state costs at most one
+    /// missed or repeated scan, which is cheaper than the capture thread panicking on every
+    /// later event (the agent's policy for in-memory detection state, `apps/agent/src/sync.rs`).
     pub fn enqueue(
         &self,
         pid: u32,
@@ -378,7 +379,13 @@ impl MemoryScanQueue {
         now_ns: u64,
         context: Option<ScanContext>,
     ) -> bool {
-        let mut gate = self.gate.lock().unwrap();
+        let mut gate = self.gate.lock().unwrap_or_else(|poisoned| {
+            tracing::warn!(
+                "yara: recovered a memory-scan gate poisoned by a panicking thread; its state may be partially updated"
+            );
+            self.gate.clear_poison();
+            std::sync::PoisonError::into_inner(poisoned)
+        });
         let key = (pid, generation);
         if let Some(&last) = gate.last_scan.peek(&key)
             && now_ns.saturating_sub(last) < COOLDOWN_NS

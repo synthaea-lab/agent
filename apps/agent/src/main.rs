@@ -16,6 +16,11 @@
 //! `kill_loudness` attributes who sent a catchable termination signal before the
 //! agent actually dies (#71).
 
+// Production locks go through `sync::{LockExt, RwLockExt, CondvarExt}` (the agent's poisoned-lock
+// policy, `sync.rs`): a bare `unwrap` on a lock would bring the panic-on-poison back, and a
+// panicking thread would then take the capture thread down with it. Test code is exempt.
+#![cfg_attr(not(test), deny(clippy::unwrap_used))]
+
 #[cfg_attr(
     not(any(target_os = "linux", target_os = "macos", windows)),
     allow(dead_code)
