@@ -70,7 +70,7 @@ fn a_shadow_alias_alerts_as_the_shadow_path_does() {
 
 #[test]
 fn an_image_seeded_at_startup_applies_the_image_based_exclusion() {
-    // `seed_from_proc` also fills the image table (#17), which this rule reads: a process
+    // `seed_processes` also fills the image table (#17), which this rule reads: a process
     // already running when the agent starts is now judged by its image, as one the agent saw
     // exec always was. A masquerading `sshd` copied to /tmp is no longer excluded by its name.
     // A behavior change outside T1204.002, pinned here for this rule; the other readers of
@@ -82,12 +82,38 @@ fn an_image_seeded_at_startup_applies_the_image_based_exclusion() {
         "with no image known the name is all there is, and it is excluded"
     );
     let mut seeded = RuleState::new();
-    seeded
-        .pid_image_path
-        .insert(200, crate::state::PidFact::seeded("/tmp/sshd".into()));
+    seeded.seed_processes([(200, "sshd".into(), Some("/tmp/sshd".into()), Some(7))]);
     assert_eq!(
         techniques(&read(&mut seeded, 200, "sshd", "/etc/shadow")),
         ["T1003.008"]
+    );
+}
+
+#[test]
+fn a_seeded_auth_stack_pid_is_not_inherited_by_a_reused_pid_that_reads_etc_shadow() {
+    // sshd (pid 200, stamp 7) started before the agent. It dies; pid 200 is reused by a process
+    // forked without an exec, whose stamp is another one. It must not inherit sshd's image and
+    // its /etc/shadow exclusion: that would be a detection gap, not an extra mark.
+    let mut state = RuleState::new();
+    state.seed_processes([(200, "sshd".into(), Some("/usr/sbin/sshd".into()), Some(7))]);
+    let read_as = |state: &mut RuleState, comm: &str, generation: Option<u64>| {
+        let mut event = file_open_event_full(200, comm, "/etc/shadow", O_RDONLY, 0);
+        event.meta.ppid = 1;
+        event.meta.process_generation = generation;
+        state.on_file_open(&event)
+    };
+    assert_eq!(
+        techniques(&read_as(&mut state, "python3", Some(9))),
+        ["T1003.008"],
+        "another incarnation of pid 200"
+    );
+    assert!(
+        read_as(&mut state, "sshd", Some(7)).is_empty(),
+        "the seeded incarnation itself is still the auth stack"
+    );
+    assert!(
+        read_as(&mut state, "sshd", None).is_empty(),
+        "no stamp on the event: cannot tell, the seeded fact answers"
     );
 }
 

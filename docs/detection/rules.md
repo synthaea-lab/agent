@@ -200,7 +200,7 @@ These are called once, before the sensors start
 
 | Method | Fills | Why |
 | --- | --- | --- |
-| `seed_from_proc` (Unix) / `seed_pid_comm` (Windows) | `pid_comm` | services started before the agent (nginx at boot) must be known as parents |
+| `seed_processes` (Linux, fed by the agent binary from `/proc`) / `seed_pid_comm` (Windows) | `pid_comm`, `pid_image_path` | services started before the agent (nginx at boot) must be known as parents |
 | `seed_listen_ports` | `known_listeners` | existing listeners are the baseline |
 | `seed_ld_trust_from_system` | extra trusted library dirs from `/etc/ld.so.conf` (`include`s followed) | `LD_PRELOAD` of an `ldconfig`-registered vendor directory is not a hijack (T1574.006) |
 | `seed_own_pid` | `own_pid` | the Event Log sensor's own `wevtutil`/`auditpol` children are excluded narrowly, still requiring a trusted image path |
@@ -255,18 +255,24 @@ same signature gate applies.
   lineage, in this order: the image of the exec the agent recorded for the renaming pid, if its
   incarnation stamp matches; otherwise the image recorded for the parent, if the parent's stamp matches
   (a process forked without an exec, such as a Chromium zygote child). A process already running when the
-  agent started has no exec event: `seed_from_proc` records its `/proc/<pid>/exe` at start-up (a link the
-  agent cannot read, or one ending in ` (deleted)` because the file was replaced, is left out). A recorded
+  agent started has no exec event: `seed_processes` records its `/proc/<pid>/exe` at start-up, with the
+  incarnation stamp the sensor puts on that process's events (a link the agent cannot read, or one ending in
+  ` (deleted)` because the file was replaced, is left out). A recorded
   image that is empty counts as lost, at each step: it falls through to the parent. A pid with
   no recorded image and no known parent marks nothing.
   Two consequences of seeding, both outside T1204.002. The seeded image fills `pid_image_path`, which the
   credential-read, impact, network-flow, LSASS and set-time rules also read: for a process that started
   before the agent, their image-based exclusions now apply, where the name alone decided before
   (pinned for the credential read by `an_image_seeded_at_startup_applies_the_image_based_exclusion`; the other
-  readers share the lookup and are not pinned one by one). And a seeded fact has no incarnation stamp, so it
-  matches any incarnation of its pid, on Linux as well as where the sensor gives no stamp (macOS): a seeded pid
-  that dies and is reused by a process that forks without an exec inherits the seeded image instead of
-  falling back to its parent (`a_fact_seeded_at_startup_matches_any_incarnation_of_its_pid`). A resolved image always wins, even when it is not a browser, and
+  readers share the lookup and are not pinned one by one). And a seeded fact carries the stamp of its process, derived once, by the
+  sensor's `primed_generation` (the agent binary reads `/proc` with the sensor's `read_seed_processes`, and
+  `rules` takes the result without reading `/proc` itself), so it answers for that incarnation only: a seeded
+  pid that dies and is reused by a process that forks without an exec inherits neither the image nor the
+  comm, and falls back to its parent (`a_fact_seeded_at_startup_matches_its_own_incarnation_only`); a seeded
+  auth-stack pid (`sshd`, `su`, `unix_chkpwd`) keeps no `/etc/shadow` exclusion for a reused pid
+  (`a_seeded_auth_stack_pid_is_not_inherited_by_a_reused_pid_that_reads_etc_shadow`). Where a stamp is
+  unreadable (`starttime` missing) or the event has none (macOS), the lookup cannot tell and the seeded fact
+  answers, as for the other pid tables. A resolved image always wins, even when it is not a browser, and
   the pid's own non-browser exec wins over a browser parent (a helper such as `cp` run from the browser
   marks nothing). Unit-tested only: no lab run, and no capture shows the sensor losing the race on a
   browser rename. What is still unchecked is listed under

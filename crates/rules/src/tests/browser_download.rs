@@ -326,19 +326,40 @@ fn an_own_exec_with_an_empty_image_falls_back_to_the_parent() {
 }
 
 #[test]
-fn a_fact_seeded_at_startup_matches_any_incarnation_of_its_pid() {
-    // `seed_from_proc` records an image with no incarnation stamp, so a rename carrying one
-    // still joins it: a browser that started before the agent is found, and so is a pid that
-    // died and was reused by a process that forks without an exec (it inherits the seeded
-    // image instead of falling back to its parent). Intended for the first, the cost of the
-    // second (also on Linux, not only macOS).
+fn a_fact_seeded_at_startup_matches_its_own_incarnation_only() {
+    // `seed_processes` records the image with the stamp the sensor gives that process's events:
+    // a browser that started before the agent is found; a pid that died and was reused by a
+    // process that forks without an exec (another stamp) does not inherit the seeded image and
+    // falls back to its parent, as for an image the agent saw exec.
+    let seed = |state: &mut RuleState| {
+        state.seed_processes([(900, "firefox".into(), Some(FIREFOX.into()), Some(8))]);
+    };
     let mut state = RuleState::new();
-    state
-        .pid_image_path
-        .insert(900, crate::state::PidFact::seeded(FIREFOX.into()));
+    seed(&mut state);
+    assert!(
+        marked_by_lineage(&mut state, &lost_rename(900, Some(8), 1, None)),
+        "the seeded incarnation"
+    );
+    let mut state = RuleState::new();
+    seed(&mut state);
+    assert!(
+        !marked_by_lineage(&mut state, &lost_rename(900, Some(9), 1, None)),
+        "a reused pid inherits nothing, and its parent (pid 1) is unknown"
+    );
+    // The fall back goes to the parent: a browser parent of the reused pid marks it.
+    let mut state = RuleState::new();
+    seed(&mut state);
+    state.on_exec(&exec_of(800, Some(3), CHROMIUM));
     assert!(marked_by_lineage(
         &mut state,
-        &lost_rename(900, Some(8), 1, None)
+        &lost_rename(900, Some(9), 800, Some(3))
+    ));
+    // No stamp on the event (macOS): cannot tell, the seeded fact answers.
+    let mut state = RuleState::new();
+    seed(&mut state);
+    assert!(marked_by_lineage(
+        &mut state,
+        &lost_rename(900, None, 1, None)
     ));
 }
 

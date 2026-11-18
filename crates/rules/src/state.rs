@@ -61,7 +61,7 @@ impl PidFact {
         Self { generation, value }
     }
 
-    /// A fact read from `/proc` or an external table at startup: no stamp to compare.
+    /// A fact from an external table at startup (Windows): no stamp to compare.
     pub(crate) fn seeded(value: String) -> Self {
         Self::new(None, value)
     }
@@ -93,7 +93,7 @@ pub struct RuleState {
     /// pid → comm of the last exec seen for this pid, to recover the parent's comm
     /// (T1059) with a simple `ppid` lookup without having to walk the process tree in
     /// userspace. LRU-bounded (`store::BoundedMap`) — a long-lived agent must not
-    /// grow this without limit. `pub(crate)` for the `seed_from_proc` test.
+    /// grow this without limit. `pub(crate)` for the `seed_processes` test.
     pub(crate) pid_comm: BoundedMap<u32, PidFact>,
     /// pid → kernel-reported `image_path` of the last exec seen for this pid. The
     /// only race-free source of "which binary is this pid" for rename-time
@@ -101,7 +101,7 @@ pub struct RuleState {
     /// after the event crossed the ring buffer, so a short-lived process (real
     /// `sed -i.bak`, or an encryptor that exits right after its renames) is already
     /// gone and it reads `None` (#513 review). LRU-bounded like `pid_comm`. `pub(crate)` for the
-    /// `seed_from_proc` test.
+    /// `seed_processes` test.
     pub(crate) pid_image_path: BoundedMap<u32, PidFact>,
     /// SETUID-ROOT-REQUEST's queued requests, stream clock and exec history: see
     /// [`IdentityRequests`].
@@ -239,7 +239,7 @@ impl RuleState {
     /// library directory registered with `ldconfig` (`/opt/<app>/lib`) is not mistaken
     /// for a planted preload. Linux-only in practice: elsewhere the file does not
     /// exist and this is a no-op. Best-effort, same caller responsibility as
-    /// [`Self::seed_from_proc`]: call once at startup; an unreadable file only means the
+    /// [`Self::seed_processes`]: call once at startup; an unreadable file only means the
     /// rule judges against the built-in baseline.
     pub fn seed_ld_trust_from_system(&mut self) {
         self.seed_ld_trust_dirs(crate::ld_trust::collect_ld_dirs(
@@ -260,13 +260,13 @@ impl RuleState {
     /// snapshot — without this, every service already listening when the agent
     /// attaches (sshd, nginx started by systemd at boot) would look exactly like
     /// a freshly planted backdoor listener on the very first poll after startup.
-    /// Same principle, same caller responsibility, as [`Self::seed_from_proc`].
+    /// Same principle, same caller responsibility, as [`Self::seed_processes`].
     pub fn seed_listen_ports(&mut self, ports: impl IntoIterator<Item = (IpAddr, u16, u8)>) {
         self.drift.seed_listen_ports(ports);
     }
 
     /// Pre-fills `pid_comm` from an external table (pid → comm) — the Windows
-    /// equivalent of `seed_from_proc` for systems without /proc. To be called once at
+    /// equivalent of `seed_processes` for systems without /proc. To be called once at
     /// startup with the list of already-running processes, so that the parent-side
     /// exclusions (SELF-SPAWN, T1059) also apply to processes started before the agent
     /// (e.g. RuntimeBroker.exe).
@@ -277,51 +277,42 @@ impl RuleState {
         );
     }
 
-    /// Pre-fills `pid_comm`, and `pid_image_path` where `/proc/<pid>/exe` is readable, with the
-    /// processes already running at startup (read from `/proc`). Without this, only processes exec'd *after* the collector attaches are
-    /// known — T1059 can then never resolve the comm of a web server started before the
-    /// agent (the normal case: nginx/apache launched by systemd at boot, agent launched
-    /// afterwards), blinding the rule to any service already in place. Found in real
-    /// conditions on 2026-08-14: an nginx webshell (perl module,
-    /// `system("/bin/sh", ...)`) triggered no T1059 alert as long as nginx had started
-    /// before the agent — yet the most common case in practice. Best-effort: a
-    /// `/proc/{pid}` that disappears between the listing and the read (process exiting)
-    /// is simply ignored.
-    pub fn seed_from_proc(&mut self) {
-        let Ok(entries) = std::fs::read_dir("/proc") else {
-            return;
-        };
-        for entry in entries.flatten() {
-            let Ok(pid) = entry.file_name().to_string_lossy().parse::<u32>() else {
-                continue;
-            };
-            let Ok(comm) = std::fs::read_to_string(entry.path().join("comm")) else {
-                continue;
-            };
-            self.pid_comm
-                .insert(pid, PidFact::seeded(comm.trim_end().to_string()));
-            // The image path too (#17): a browser started before the agent has no exec event, so
-            // its download's rename would find no image to join on. A link the agent cannot read
-            // (another user's process without root), a kernel thread (no link) and an image
-            // replaced since it started (`/proc/<pid>/exe` ends in " (deleted)": the path is no
-            // longer a file) are left unseeded, as they were.
-            if let Ok(exe) = std::fs::read_link(entry.path().join("exe")) {
-                let exe = exe.to_string_lossy().into_owned();
-                if !exe.is_empty() && !exe.ends_with(" (deleted)") {
-                    self.pid_image_path.insert(pid, PidFact::seeded(exe));
-                }
+    /// Pre-fills `pid_comm`, and `pid_image_path` where an image is given, with the processes
+    /// already running at startup: `(pid, comm, image, generation)`, read by the caller (the
+    /// agent binary, from `/proc`, with the sensor's own derivation of the stamp). Without this,
+    /// only processes exec'd *after* the collector attaches are known — T1059 can then never
+    /// resolve the comm of a web server started before the agent (the normal case:
+    /// nginx/apache launched by systemd at boot, agent launched afterwards), blinding the rule
+    /// to any service already in place. Found in real conditions on 2026-08-14: an nginx
+    /// webshell (perl module, `system("/bin/sh", ...)`) triggered no T1059 alert as long as
+    /// nginx had started before the agent — yet the most common case in practice.
+    ///
+    /// `generation` is the stamp the sensor puts on that process's events ([`PidFact`]): a
+    /// seeded fact answers only for that incarnation, so a pid that died and was reused by
+    /// another process does not inherit the seeded comm or image. `None` (no stamp readable)
+    /// reads as "cannot tell" and matches. The image goes to the other readers of
+    /// `pid_image_path` too (#17).
+    pub fn seed_processes(
+        &mut self,
+        processes: impl IntoIterator<Item = (u32, String, Option<String>, Option<u64>)>,
+    ) {
+        for (pid, comm, image, generation) in processes {
+            self.pid_comm.insert(pid, PidFact::new(generation, comm));
+            if let Some(image) = image {
+                self.pid_image_path
+                    .insert(pid, PidFact::new(generation, image));
             }
         }
     }
 
     /// Resolves a pid's comm: `pid_comm` first (filled by the execs seen since startup,
-    /// plus `seed_from_proc`), then falls back to a live `/proc` read.
+    /// plus `seed_processes`), then falls back to a live `/proc` read.
     ///
     /// The fallback is necessary: `pid_comm` only knows a process if it exec'd during
-    /// the capture, or was already running at startup (`seed_from_proc`) — not
+    /// the capture, or was already running at startup (`seed_processes`) — not
     /// processes `fork()`'d *after* startup that never exec afterwards (e.g. an nginx
     /// worker respawned by the master). Found in real conditions on 2026-08-14 with an
-    /// unstable nginx perl module that kept churning workers: `seed_from_proc` alone
+    /// unstable nginx perl module that kept churning workers: `seed_processes` alone
     /// let through any worker created after the collector attached. The fallback reads
     /// `/proc/{ppid}/comm`, valid as long as the parent is still alive at evaluation
     /// time — true in the vast majority of cases, the child executing right after the

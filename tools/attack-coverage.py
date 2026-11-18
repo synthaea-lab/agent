@@ -304,7 +304,7 @@ UNVERIFIED_NOTES = [
     "(same `executable_path`); Firefox's manual retry ends with the same `.part` -> "
     "final rename. An empty `executable_path` (the sensor lost the `/proc/<pid>/exe` race) is read from the lineage: "
     "the image of the exec the agent recorded for that pid and incarnation, otherwise its parent's (a process forked without an exec, "
-    "such as a Chromium zygote child); a process already running at start-up is read from `/proc/<pid>/exe` by `seed_from_proc` (an unreadable link, or one ending in \" (deleted)\", is left out); a pid with no recorded image and no known parent marks nothing. The fallback is unit-tested only: it was never run on a lab VM, "
+    "such as a Chromium zygote child); a process already running at start-up is read from `/proc/<pid>/exe` by `seed_processes` (an unreadable link, or one ending in \" (deleted)\", is left out); a pid with no recorded image and no known parent marks nothing. The fallback is unit-tested only: it was never run on a lab VM, "
     "and no capture shows the sensor losing the race on a browser rename "
     "(https://github.com/synthaea-lab/agent/issues/17, https://github.com/synthaea-lab/agent/issues/221).",
 ]
