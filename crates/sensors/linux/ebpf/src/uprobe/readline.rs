@@ -9,7 +9,7 @@ use aya_ebpf::{
 use aya_log_ebpf::warn;
 use sensor_linux_wire::{ReadlineInputEvent, TASK_COMM_LEN};
 
-use crate::fill_lineage;
+use crate::{fill_lineage, into_ret};
 
 /// Ring buffer for readline input events.
 #[map]
@@ -24,10 +24,7 @@ static READLINE_SCRATCH: PerCpuArray<ReadlineInputEvent> = PerCpuArray::with_max
 /// The return value is a malloc'd string (freed by caller), or NULL on EOF/error.
 #[uretprobe]
 pub fn readline_exit(ctx: RetProbeContext) -> u32 {
-    match try_readline_exit(ctx) {
-        Ok(ret) => ret,
-        Err(ret) => ret,
-    }
+    into_ret(try_readline_exit(ctx))
 }
 
 fn try_readline_exit(ctx: RetProbeContext) -> Result<u32, u32> {
