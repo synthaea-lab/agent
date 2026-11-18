@@ -23,7 +23,7 @@ use std::sync::Arc;
 use tokio::io::BufReader;
 
 use crate::{
-    error::ServerError,
+    error::{HandlerError, ServerError},
     frame::{FrameError, read_message, write_message},
     protocol::{
         ClientHello, PROTOCOL_VERSION, PolicyVersionResponse, RecentDetectionsResponse,
@@ -52,39 +52,41 @@ pub const RECENT_DETECTIONS_HARD_LIMIT: u32 = 256;
 /// future so the trait can be used across `tokio::spawn` boundaries.
 pub trait Handler: Send + Sync + 'static {
     /// Answer [`Request::Status`].
-    fn status(&self) -> impl std::future::Future<Output = Result<StatusResponse, String>> + Send;
+    fn status(
+        &self,
+    ) -> impl std::future::Future<Output = Result<StatusResponse, HandlerError>> + Send;
     /// Answer [`Request::SensorHealth`].
     fn sensor_health(
         &self,
-    ) -> impl std::future::Future<Output = Result<SensorHealthResponse, String>> + Send;
+    ) -> impl std::future::Future<Output = Result<SensorHealthResponse, HandlerError>> + Send;
     /// Answer [`Request::RecentDetections`]. `limit` is already clamped
     /// to [`RECENT_DETECTIONS_HARD_LIMIT`] by the caller.
     fn recent_detections(
         &self,
         limit: u32,
-    ) -> impl std::future::Future<Output = Result<RecentDetectionsResponse, String>> + Send;
+    ) -> impl std::future::Future<Output = Result<RecentDetectionsResponse, HandlerError>> + Send;
     /// Answer [`Request::PolicyVersion`].
     fn policy_version(
         &self,
-    ) -> impl std::future::Future<Output = Result<PolicyVersionResponse, String>> + Send;
+    ) -> impl std::future::Future<Output = Result<PolicyVersionResponse, HandlerError>> + Send;
     /// Answer [`Request::ReloadContent`] — re-read Sigma/YARA content and
     /// report what's loaded afterward. See [`Request::ReloadContent`]'s own
     /// doc comment for why this is the one mutating request in v2.
     fn reload_content(
         &self,
-    ) -> impl std::future::Future<Output = Result<ReloadContentResponse, String>> + Send;
+    ) -> impl std::future::Future<Output = Result<ReloadContentResponse, HandlerError>> + Send;
     /// Answer [`Request::SuppressVerdict`] — silence `entry`'s technique on its
     /// entity in the fused verdict, and audit the change (issue #613).
     fn suppress_verdict(
         &self,
         entry: SuppressionEntry,
-    ) -> impl std::future::Future<Output = Result<SuppressionResponse, String>> + Send;
+    ) -> impl std::future::Future<Output = Result<SuppressionResponse, HandlerError>> + Send;
     /// Answer [`Request::UnsuppressVerdict`] — the reverse of
     /// [`Self::suppress_verdict`].
     fn unsuppress_verdict(
         &self,
         entry: SuppressionEntry,
-    ) -> impl std::future::Future<Output = Result<SuppressionResponse, String>> + Send;
+    ) -> impl std::future::Future<Output = Result<SuppressionResponse, HandlerError>> + Send;
 }
 
 /// A canned handler that returns fixed responses. Ships with the crate
@@ -109,7 +111,7 @@ impl Default for StubHandler {
 }
 
 impl Handler for StubHandler {
-    async fn status(&self) -> Result<StatusResponse, String> {
+    async fn status(&self) -> Result<StatusResponse, HandlerError> {
         Ok(StatusResponse {
             agent_version: self.agent_version.clone(),
             started_at_ns: self.started_at_ns,
@@ -117,14 +119,17 @@ impl Handler for StubHandler {
             suppressions: vec![],
         })
     }
-    async fn sensor_health(&self) -> Result<SensorHealthResponse, String> {
+    async fn sensor_health(&self) -> Result<SensorHealthResponse, HandlerError> {
         // No sensors from the stub — the agent wires real ones in.
         Ok(SensorHealthResponse { sensors: vec![] })
     }
-    async fn recent_detections(&self, _limit: u32) -> Result<RecentDetectionsResponse, String> {
+    async fn recent_detections(
+        &self,
+        _limit: u32,
+    ) -> Result<RecentDetectionsResponse, HandlerError> {
         Ok(RecentDetectionsResponse { detections: vec![] })
     }
-    async fn policy_version(&self) -> Result<PolicyVersionResponse, String> {
+    async fn policy_version(&self) -> Result<PolicyVersionResponse, HandlerError> {
         Ok(PolicyVersionResponse {
             schema_version: 1,
             policy_version: None,
@@ -132,7 +137,7 @@ impl Handler for StubHandler {
             issued_at_ns: None,
         })
     }
-    async fn reload_content(&self) -> Result<ReloadContentResponse, String> {
+    async fn reload_content(&self) -> Result<ReloadContentResponse, HandlerError> {
         // The stub has no real detection pipeline to reload — reports both
         // engines absent, same as a fresh install with no content dir yet.
         Ok(ReloadContentResponse {
@@ -145,14 +150,14 @@ impl Handler for StubHandler {
     async fn suppress_verdict(
         &self,
         _entry: SuppressionEntry,
-    ) -> Result<SuppressionResponse, String> {
+    ) -> Result<SuppressionResponse, HandlerError> {
         // The stub has no verdict engine: nothing can be suppressed.
         Ok(SuppressionResponse { changed: false })
     }
     async fn unsuppress_verdict(
         &self,
         _entry: SuppressionEntry,
-    ) -> Result<SuppressionResponse, String> {
+    ) -> Result<SuppressionResponse, HandlerError> {
         Ok(SuppressionResponse { changed: false })
     }
 }
@@ -291,64 +296,61 @@ async fn serve_one<H: Handler>(
 }
 
 /// Route one parsed request through the handler, returning the exact
-/// [`Response`] variant to write back. The handler's `String` errors
-/// are packaged into [`Response::Error`] with [`WireError::HandlerFailed`]
-/// — the connection stays open, the client sees which request failed.
+/// [`Response`] variant to write back. A handler error becomes
+/// [`WireError::HandlerFailed`] in [`respond`] — the connection stays
+/// open, the client sees which request failed.
 async fn dispatch<H: Handler>(handler: &H, req: Request) -> Response {
     match req {
-        Request::Status => match handler.status().await {
-            Ok(r) => Response::Status(r),
-            Err(m) => Response::Error(WireError::HandlerFailed { message: m }),
-        },
-        Request::SensorHealth => match handler.sensor_health().await {
-            Ok(r) => Response::SensorHealth(r),
-            Err(m) => Response::Error(WireError::HandlerFailed { message: m }),
-        },
+        Request::Status => respond(handler.status().await, Response::Status),
+        Request::SensorHealth => respond(handler.sensor_health().await, Response::SensorHealth),
         Request::RecentDetections { limit } => {
             let clamped = limit.min(RECENT_DETECTIONS_HARD_LIMIT);
-            match handler.recent_detections(clamped).await {
-                Ok(r) => Response::RecentDetections(r),
-                Err(m) => Response::Error(WireError::HandlerFailed { message: m }),
-            }
+            respond(
+                handler.recent_detections(clamped).await,
+                Response::RecentDetections,
+            )
         }
-        Request::PolicyVersion => match handler.policy_version().await {
-            Ok(r) => Response::PolicyVersion(r),
-            Err(m) => Response::Error(WireError::HandlerFailed { message: m }),
-        },
-        Request::ReloadContent => match handler.reload_content().await {
-            Ok(r) => Response::ReloadContent(r),
-            Err(m) => Response::Error(WireError::HandlerFailed { message: m }),
-        },
+        Request::PolicyVersion => respond(handler.policy_version().await, Response::PolicyVersion),
+        Request::ReloadContent => respond(handler.reload_content().await, Response::ReloadContent),
         Request::SuppressVerdict {
             ppid,
             comm,
             technique,
-        } => match handler
-            .suppress_verdict(SuppressionEntry {
-                ppid,
-                comm,
-                technique,
-            })
-            .await
-        {
-            Ok(r) => Response::Suppression(r),
-            Err(m) => Response::Error(WireError::HandlerFailed { message: m }),
-        },
+        } => respond(
+            handler
+                .suppress_verdict(SuppressionEntry {
+                    ppid,
+                    comm,
+                    technique,
+                })
+                .await,
+            Response::Suppression,
+        ),
         Request::UnsuppressVerdict {
             ppid,
             comm,
             technique,
-        } => match handler
-            .unsuppress_verdict(SuppressionEntry {
-                ppid,
-                comm,
-                technique,
-            })
-            .await
-        {
-            Ok(r) => Response::Suppression(r),
-            Err(m) => Response::Error(WireError::HandlerFailed { message: m }),
-        },
+        } => respond(
+            handler
+                .unsuppress_verdict(SuppressionEntry {
+                    ppid,
+                    comm,
+                    technique,
+                })
+                .await,
+            Response::Suppression,
+        ),
+    }
+}
+
+/// The one place a handler's error turns into wire text: its `Display`,
+/// as [`WireError::HandlerFailed`].
+fn respond<T>(answer: Result<T, HandlerError>, response: impl FnOnce(T) -> Response) -> Response {
+    match answer {
+        Ok(body) => response(body),
+        Err(err) => Response::Error(WireError::HandlerFailed {
+            message: err.to_string(),
+        }),
     }
 }
 
@@ -363,5 +365,76 @@ fn map_frame_err_write(err: FrameError) -> ServerError {
     match err {
         FrameError::Io { source } => ServerError::Io { source },
         other => ServerError::Protocol(other.to_string()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Answers like [`StubHandler`] but refuses every suppression, as the
+    /// agent does for a full suppression table.
+    struct RefusingHandler(StubHandler);
+
+    #[derive(Debug, thiserror::Error)]
+    #[error("the suppression table is full")]
+    struct TableFull;
+
+    impl Handler for RefusingHandler {
+        async fn status(&self) -> Result<StatusResponse, HandlerError> {
+            self.0.status().await
+        }
+        async fn sensor_health(&self) -> Result<SensorHealthResponse, HandlerError> {
+            self.0.sensor_health().await
+        }
+        async fn recent_detections(
+            &self,
+            limit: u32,
+        ) -> Result<RecentDetectionsResponse, HandlerError> {
+            self.0.recent_detections(limit).await
+        }
+        async fn policy_version(&self) -> Result<PolicyVersionResponse, HandlerError> {
+            self.0.policy_version().await
+        }
+        async fn reload_content(&self) -> Result<ReloadContentResponse, HandlerError> {
+            self.0.reload_content().await
+        }
+        async fn suppress_verdict(
+            &self,
+            _entry: SuppressionEntry,
+        ) -> Result<SuppressionResponse, HandlerError> {
+            Err(HandlerError::new(TableFull))
+        }
+        async fn unsuppress_verdict(
+            &self,
+            entry: SuppressionEntry,
+        ) -> Result<SuppressionResponse, HandlerError> {
+            self.0.unsuppress_verdict(entry).await
+        }
+    }
+
+    fn suppress_request() -> Request {
+        Request::SuppressVerdict {
+            ppid: 7,
+            comm: "bash".to_string(),
+            technique: "T1059.004".to_string(),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_handler_error_reaches_the_client_as_its_message() {
+        let response = dispatch(&RefusingHandler(StubHandler::default()), suppress_request()).await;
+
+        assert!(matches!(
+            response,
+            Response::Error(WireError::HandlerFailed { message }) if message == "the suppression table is full"
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_handler_answer_is_the_matching_response() {
+        let response = dispatch(&RefusingHandler(StubHandler::default()), Request::Status).await;
+
+        assert!(matches!(response, Response::Status(status) if status.pipeline_healthy));
     }
 }
