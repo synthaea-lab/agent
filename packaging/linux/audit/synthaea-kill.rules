@@ -11,15 +11,23 @@
 ## It cannot be loaded when the audit configuration is immutable (-e 2). Only SIGKILL
 ## is matched (a1=9 for kill and tkill, a2=9 for tgkill), so `kill -0` and ordinary SIGTERM do
 ## not write a record. The volume of SIGKILLs on a real host is not measured. The agent reads a
-## tkill or tgkill only when its thread id is the agent's pid (the main thread): SIGKILL is
-## process-wide, so that kills it.
+## tkill or tgkill when the process id it names (tgkill's tgid, tkill's thread id) is the agent's
+## pid or the id of one of its threads, which the agent lists in its marker file: SIGKILL is
+## process-wide, so that kills it. A thread started in the seconds before the kill may be missing.
 ## A `systemctl kill`, rt_sigqueueinfo, rt_tgsigqueueinfo and pidfd_send_signal leave no record
 ## with these syscalls and stay unattributed.
 ## Needs no `-a never,task` ahead of it: a default Fedora ships one, which takes syscall
 ## auditing away from every task, and then nothing is recorded, not even a plain `kill -9`.
 ##
-## The lines are the same on x86_64 and aarch64 (`arch=b64`); the agent reads the syscall numbers of
-## both (62/200/234 and 129/130/131). Only x86_64 was captured.
+## The 64-bit lines are the same on x86_64 and aarch64 (`arch=b64`); the agent reads the syscall
+## numbers of both (62/200/234 and 129/130/131). The `arch=b32` lines record the 32-bit entry of a
+## 64-bit kernel (`int 0x80` from a 64-bit binary, i386 or arm compat; 37/238/270 and 37/238/268):
+## IA32 emulation is on by default on Fedora, and without them that kill leaves no record. A kernel
+## booted with `ia32_emulation=0` has no such entry and needs no `b32` line. Only x86_64 `b64` was
+## captured; the `b32` lines were not loaded on a lab host.
 -a always,exit -F arch=b64 -S kill -F a1=9 -k synthaea-kill
 -a always,exit -F arch=b64 -S tgkill -F a2=9 -k synthaea-kill
 -a always,exit -F arch=b64 -S tkill -F a1=9 -k synthaea-kill
+-a always,exit -F arch=b32 -S kill -F a1=9 -k synthaea-kill
+-a always,exit -F arch=b32 -S tgkill -F a2=9 -k synthaea-kill
+-a always,exit -F arch=b32 -S tkill -F a1=9 -k synthaea-kill
