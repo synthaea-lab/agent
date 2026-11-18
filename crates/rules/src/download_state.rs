@@ -186,9 +186,8 @@ impl DownloadState {
         event: &ExecEvent,
     ) -> Option<SignatureGatedAlert> {
         let now = event.meta.timestamp_ns;
-        let mark = self
-            .recent_quarantines
-            .get_mut(&event.image_path.to_lowercase())?;
+        let key = event.image_path.to_lowercase();
+        let mark = self.recent_quarantines.get_mut(&key)?;
         let age = now.saturating_sub(mark.timestamp_ns);
         if mark.alerted || age > QUARANTINE_EXEC_WINDOW_NS {
             return None;
@@ -221,8 +220,12 @@ impl DownloadState {
                 mark.agent.as_deref().unwrap_or("unknown"),
             ),
         };
+        // Only a mark that points back is the twin: the record at that key may since have been
+        // replaced by another download of the same name (a stale one-way pointer, e.g. after a
+        // snap refresh), and that one is a different file that must still alert.
         if let Some(twin) = twin
             && let Some(other) = self.recent_quarantines.get_mut(&twin)
+            && other.twin.as_deref() == Some(key.as_str())
         {
             other.alerted = true;
         }
@@ -329,6 +332,8 @@ impl DownloadState {
             .then(|| chromium_snap_real_download_path(&event.new_path))
             .flatten()
             .map(|real| real.to_lowercase());
+        // A snap download takes two slots of the bounded map, evicted separately; they are
+        // inserted back to back, so in practice they leave the map together.
         if let Some(real_key) = &real_key {
             self.recent_quarantines
                 .insert(real_key.clone(), mark(Some(path_key.clone())));

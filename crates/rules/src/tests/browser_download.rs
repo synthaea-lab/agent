@@ -396,3 +396,40 @@ fn a_new_download_of_the_same_snap_file_alerts_again() {
         );
     }
 }
+
+#[test]
+fn a_stale_twin_does_not_silence_a_newer_download_at_the_real_path() {
+    // The snap's Downloads is a real directory here, and another browser then downloads a file
+    // of the same name into ~/Downloads: two different files. The snap mark still points at the
+    // real path, but the mark there no longer points back, so running the snap file must not
+    // mark the Firefox download as alerted.
+    let snap_path = "/home/u/snap/chromium/3593/Downloads/test.bin";
+    let real_path = "/home/u/Downloads/test.bin";
+    let mut state = RuleState::new();
+    state.on_file_rename(&rename(
+        "/home/u/snap/chromium/3593/Downloads/Unconfirmed 1.crdownload",
+        snap_path,
+        Some(CHROMIUM_SNAP),
+        0,
+    ));
+    state.on_file_rename(&rename(
+        "/home/u/Downloads/test.bin.part",
+        real_path,
+        Some(FIREFOX),
+        1,
+    ));
+    assert_eq!(exec(&mut state, &run(snap_path, 2)).len(), 1, "snap file");
+    let alerts = exec(&mut state, &run(real_path, 3));
+    assert_eq!(alerts.len(), 1, "the Firefox download still alerts");
+    assert!(alerts[0].message.contains("marked by firefox"));
+
+    // Control: the Firefox download alone.
+    let mut state = RuleState::new();
+    state.on_file_rename(&rename(
+        "/home/u/Downloads/test.bin.part",
+        real_path,
+        Some(FIREFOX),
+        1,
+    ));
+    assert_eq!(exec(&mut state, &run(real_path, 3)).len(), 1, "control");
+}
