@@ -10,13 +10,10 @@
 //! a clock: a snapshot not newer than the one in force is refused, one dated beyond a small
 //! clock-skew tolerance is refused, and one older than the maximum age counts as absent.
 
-use ring::signature::{self, UnparsedPublicKey};
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    error::UpdaterError,
-    hash::{hash_bytes, hex_decode, hex_encode},
-    key::SNAPSHOT_PUBLIC_KEY,
+    error::UpdaterError, hash::hash_bytes, key::SNAPSHOT_PUBLIC_KEY, signed::SignedDocument,
 };
 
 /// The only `schema_version` this build accepts, versioned independently of the other manifests.
@@ -62,25 +59,25 @@ pub struct SnapshotManifest {
     pub size: u64,
 }
 
-impl SnapshotManifest {
-    /// The bytes signed and verified: 2-space-indented JSON, `signature` forced to `""`, fields
-    /// in the alphabetical order of the struct.
-    fn canonical_bytes(&self) -> Vec<u8> {
-        let unsigned = Self {
-            signature: String::new(),
-            ..self.clone()
-        };
-        serde_json::to_vec_pretty(&unsigned)
-            .expect("SnapshotManifest has no non-serializable content")
+impl SignedDocument for SnapshotManifest {
+    /// Looks for the key before it decodes the signature, as this document always did.
+    const KEY_BEFORE_SIGNATURE: bool = true;
+
+    fn signature(&self) -> &str {
+        &self.signature
     }
 
+    fn signature_mut(&mut self) -> &mut String {
+        &mut self.signature
+    }
+}
+
+impl SnapshotManifest {
     /// Signs in place with `key_pair`, over the bytes [`Self::verify_signature`] checks. The
     /// production signer is a key service the control plane asks (ADR-0033); this is what tests
     /// and the public test key use.
     pub fn sign(&mut self, key_pair: &ring::signature::Ed25519KeyPair) {
-        self.signature.clear();
-        let sig = key_pair.sign(&self.canonical_bytes());
-        self.signature = hex_encode(sig.as_ref());
+        self.sign_with_key_pair(key_pair);
     }
 
     /// Checks `schema_version`, `kind` and the Ed25519 signature against
@@ -107,11 +104,7 @@ impl SnapshotManifest {
                 found: self.kind.clone(),
             });
         }
-        let key = key.ok_or(UpdaterError::SigningKeyUnprovisioned)?;
-        let signature = hex_decode(&self.signature).ok_or(UpdaterError::SignatureInvalid)?;
-        UnparsedPublicKey::new(&signature::ED25519, key)
-            .verify(&self.canonical_bytes(), &signature)
-            .map_err(|_| UpdaterError::SignatureInvalid)
+        self.verify_against(key)
     }
 
     /// Whether this manifest may replace the snapshot in force and is not from the future.
@@ -179,7 +172,7 @@ mod tests {
     use ring::signature::KeyPair;
 
     use super::*;
-    use crate::key::test_snapshot_key_pair;
+    use crate::{hash::hex_encode, key::test_snapshot_key_pair};
 
     const NOW: u64 = 1_760_000_000;
 
