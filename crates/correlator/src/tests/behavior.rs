@@ -329,6 +329,30 @@ fn bayes_survives_respawn() {
     );
 }
 
+#[test]
+fn exec_without_ppid_keeps_the_belief_on_the_pid_fallback_key() {
+    // An exec with ppid 0 (the Windows ETW case) records no pid → entity entry: the
+    // belief stays keyed by (pid, comm), and a second pid does not inherit it.
+    let mut engine = CorrelationEngine::new();
+
+    engine.on_event(exec_with_meta(meta_full(500, 0, "tool", 0), ""));
+    engine.on_event(Event::Connect(ConnectEvent {
+        meta: meta_full(500, 0, "tool", 100_000_000),
+        daddr: std::net::IpAddr::V4([1, 2, 3, 4].into()),
+        dport: 4444,
+    }));
+    assert!(engine.belief_for_entity(500, "tool").is_some());
+    assert!(engine.belief_for_entity(0, "tool").is_none());
+
+    engine.on_event(exec_with_meta(meta_full(501, 0, "tool", 200_000_000), ""));
+    engine.on_event(Event::Connect(ConnectEvent {
+        meta: meta_full(501, 0, "tool", 300_000_000),
+        daddr: std::net::IpAddr::V4([1, 2, 3, 4].into()),
+        dport: 4444,
+    }));
+    assert!(engine.belief_for_entity(501, "tool").is_some());
+}
+
 // ── update_belief_with_ml (PR #345 review) ──────────────────────────────────
 
 #[test]
