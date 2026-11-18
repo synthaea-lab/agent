@@ -36,8 +36,10 @@ auditd's log (#275):
    Only `kill` takes a negative pid: `tkill` and `tgkill` refuse an id that is not positive. For `tgkill` the
    process is `a0`, the tgid.
 2. At start, `AuditSensor` (given the state directory) reads the marker `audit-agent.pid` (pid, process group,
-   start time, boot id, thread ids, uid and the newest audit serial of the previous instance) and writes its
-   own, mode 0600. A clean stop removes the marker, so only a kill leaves one behind.
+   start time, boot id, thread ids, uid and the newest kernel record of the log, its time and serial, as the
+   anchor) and writes its own, mode 0600. A clean stop removes the marker, and so does a stop by SIGTERM, SIGHUP
+   or SIGQUIT: the kill-loudness watcher ends the process with `exit` and removes it first, so a routine
+   `systemctl restart` leaves none and only a kill or a crash does.
 3. It reads the tail of `/var/log/audit/audit.log`, then `audit.log.1`, `.2` and so on up to `.9`
    ([`killrec`](../../../crates/sensors/linux/audit/src/killrec.rs), at most 16 MiB each), for the latest
    `SYSCALL` record with that key, `success=yes` and signal 9 that hit the old instance: its pid or one of its
@@ -45,11 +47,16 @@ auditd's log (#275):
    a group) or every process (`kill(-1, 9)`), written after that instance started. A group or `-1` kill counts
    only when the sender's `euid` is 0 or the agent's uid: an unprivileged `kill -9 -1` succeeds on that user's
    own processes and must not be blamed for a later crash of the agent. Within the same boot, "after that
-   instance started" is the audit serial of `msg=audit(<time>:<serial>)`: the marker stores the newest serial in
-   the log at start and the replay takes records with a larger one, so setting the clock back before the kill
-   does not hide it. Without a serial or a boot id, it falls back to the record's timestamp. The walk stops at
-   the first file whose newest record is not newer than the marker's start, so a record rotated out twice
-   (`auditctl --signal rotate`) is still found. A marker with this instance's own pid (a recycled pid) or from
+   instance started" is a position in the log, not a serial: the marker stores the header of the newest kernel
+   record of the log at start (`msg=audit(<time>:<serial>)`, auditd's own `type=DAEMON_*` records skipped, their
+   serial comes from another counter), the replay looks for the last line with that header from the newest file
+   back, and only what follows it in log order counts, whole newer files included; the latest such record wins.
+   The serial is not compared by value: the kernel restarts it at every boot and auditd appends to the same log
+   across boots, so an earlier boot's record would otherwise pass with a larger serial (found by SoFrexs and
+   reproduced on Fedora 43 by Jihair54). Setting the clock back before the kill does not hide it. Without an
+   anchor, with no boot id, or when no file holds the anchor any more (rotated out of reach), it falls back to the
+   record's timestamp, and then the walk stops at the first file whose newest record is older than the marker's
+   start, so a record rotated out twice (`auditctl --signal rotate`) is still found. A marker with this instance's own pid (a recycled pid) or from
    another boot attributes nothing. There is no upper bound on the record's time and no wall-clock window.
 4. It emits an `Event::Signal` (signal 9, sender in `meta`, target the old pid): the same event the eBPF
    replay emits, so the T1562.001 rule attributes it, High unless the sender is pid 1.
@@ -76,10 +83,11 @@ to it (`write_logs = yes`, `log_format = ENRICHED` or `RAW`; the key is read fro
 gaps of the marker: a pid or thread id reused within the same boot by a process that is then killed can be
 taken for the agent (the boot id bounds it to one boot; a record aimed at an unrelated process whose pid later
 becomes one of the agent's thread ids, a blocking-pool thread say, is read as a kill of the agent if the agent
-then dies without a clean stop); with no readable log at start or a wrapped serial the replay falls
+then dies without a clean stop); with no readable log at start or an anchor that left the log the replay falls
 back to timestamps, and a clock set back before the kill then costs the attribution (the warning above covers
-it). The `arch=b32` rules, the thread-id refresh and the serial anchor are tested on lines and files, and were
-not run on a lab host after the review of #287 at `7ce68b3a`. The volume of SIGKILL records on a real
+it). The `arch=b32` rules and the thread-id refresh were run on Fedora 43 at `74048cde` (Jihair54). The position anchor,
+the marker removal on a SIGTERM stop and the previous-boot case are tested on lines and files and in a re-executed
+child, and were **not run on a lab host** after the change that introduced them. The volume of SIGKILL records on a real
 host is not measured. Tested on the captured line and on files, and run end to end on Rocky 9.8 (2026-11-16, agent built without
 eBPF probes, rule loaded, agent started as a systemd unit, killed, restarted on the same state directory): the restarted agent
 logged `the previous agent instance was sent SIGKILL, reporting it` and raised T1562.001 with the sender's pid and `comm`

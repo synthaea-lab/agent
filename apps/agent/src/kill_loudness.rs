@@ -85,9 +85,15 @@ pub(crate) fn block_termination_signals() {
 /// who sent it, gives `enrich_queue` a bounded chance to drain (issue #341) before
 /// actually terminating the process (blocking suppressed the signal's own default
 /// disposition, so nothing else will end it).
+///
+/// `on_exit` runs just before that exit, after the sender was recorded: this is a stop the agent
+/// attributed itself, so whatever a successor would otherwise read as a crash (the audit
+/// fallback's instance marker) is removed here, since the process never returns to the code that
+/// would remove it.
 pub(crate) fn spawn_watcher(
     alerts_path: PathBuf,
     enrich_queue: EnrichQueue,
+    on_exit: impl FnOnce() + Send + 'static,
 ) -> std::io::Result<()> {
     crate::spawn::spawn_named("kill-loudness", move || {
         let set = watched_signal_set();
@@ -115,6 +121,7 @@ pub(crate) fn spawn_watcher(
                 "kill-loudness: enrich queue did not fully drain within the shutdown budget"
             );
         }
+        on_exit();
         std::process::exit(128 + signo);
     })?;
     Ok(())
@@ -247,7 +254,11 @@ mod tests {
         if pid == 0 {
             block_termination_signals();
             let queue = EnrichQueue::start(enrich::Enricher::new(), |_, _| {});
-            spawn_watcher(alerts, queue).expect("spawning the kill-loudness watcher");
+            let hook = ready.with_extension("exit-hook");
+            spawn_watcher(alerts, queue, move || {
+                std::fs::write(hook, "ran").expect("exit hook marker");
+            })
+            .expect("spawning the kill-loudness watcher");
             std::fs::write(ready, std::process::id().to_string()).expect("ready marker");
             // The watcher thread ends the process; reaching the end of this sleep
             // means the signal was not taken, which the parent reports as a timeout.
@@ -330,6 +341,10 @@ mod tests {
                 "died by a signal instead of exiting"
             );
 
+            assert!(
+                ready.with_extension("exit-hook").exists(),
+                "the exit hook must run before the process exits"
+            );
             let line = std::fs::read_to_string(&alerts).expect("alert line written");
             assert!(line.contains("\"technique\":\"T1562\""), "{line}");
             assert!(line.contains(signal_name(signo)), "{line}");

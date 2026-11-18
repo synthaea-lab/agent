@@ -88,8 +88,9 @@ pub struct SigkillRecord {
     pub gid: u32,
     /// The sender's effective uid.
     pub euid: u32,
-    /// The audit serial of the record, which the kernel increments within a boot: unlike the
-    /// timestamp, setting the clock does not move it.
+    /// The audit serial of the record. The kernel restarts it at every boot and auditd appends to
+    /// the same log across boots, so serials of different boots are not comparable: only the
+    /// record's position in the log, against the marker's [`Anchor`], says it came after.
     pub serial: u64,
     /// The login uid, `None` when auditd reports it unset.
     pub auid: Option<u32>,
@@ -231,9 +232,20 @@ pub struct Marker {
     pub tids: Vec<u32>,
     /// Its real uid: a group kill or `kill(-1, 9)` counts when the sender runs as it, or as root.
     pub uid: Option<u32>,
-    /// The audit serial of the newest record in the log at start. Within one boot, a record with
-    /// a larger serial was written after that point whatever the clock says.
-    pub serial: Option<u64>,
+    /// The newest kernel record in the log at start. Within one boot, what comes after it in the
+    /// log was written after the start, whatever the clock says. `None` with no readable record.
+    pub anchor: Option<Anchor>,
+}
+
+/// The header of a line of the audit log, `msg=audit(<sec>.<ms>:<serial>)`: what a marker keeps to
+/// find that line again. A kernel record, never one auditd numbers itself (`type=DAEMON_*`, whose
+/// serial comes from another counter and says nothing about the kernel's).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Anchor {
+    /// The header's time, Unix nanoseconds (millisecond precision).
+    pub timestamp_ns: u64,
+    /// The header's serial.
+    pub serial: u64,
 }
 
 impl Marker {
@@ -249,55 +261,68 @@ impl Marker {
             KillTarget::AllProcesses => may_signal,
         }
     }
-
-    /// Whether `record` was written after this instance started: by serial when `by_serial`
-    /// (the same boot, a serial in the marker), else by timestamp.
-    fn is_after_start(&self, record: &SigkillRecord, by_serial: bool) -> bool {
-        match (by_serial, self.serial) {
-            (true, Some(serial)) => record.serial > serial,
-            _ => record.timestamp_ns >= self.started_ns,
-        }
-    }
 }
 
-/// The latest record of a `SIGKILL` that hit `marker`'s instance among `lines`, written after it
-/// started. There is no upper bound: the restart's own wall clock is not something to trust
-/// against the log's.
+/// The latest record of a `SIGKILL` that hit `marker`'s instance among `lines`, dated at or after
+/// its start. There is no upper bound: the restart's own wall clock is not something to trust
+/// against the log's. This is the rule when no anchor can be used (see [`read_sigkill_of`]).
 pub fn last_sigkill_of<'a>(
     marker: &Marker,
-    by_serial: bool,
     lines: impl IntoIterator<Item = &'a str>,
 ) -> Option<SigkillRecord> {
     lines
         .into_iter()
         .filter_map(parse_kill_log_line)
-        .filter(|r| marker.is_hit_by(r) && marker.is_after_start(r, by_serial))
-        .max_by_key(|r| if by_serial { r.serial } else { r.timestamp_ns })
+        .filter(|r| marker.is_hit_by(r) && r.timestamp_ns >= marker.started_ns)
+        .max_by_key(|r| r.timestamp_ns)
 }
 
-/// The timestamp and the serial of the newest line of `text` that has an audit header.
-fn newest_header(text: &str) -> Option<(u64, u64)> {
-    text.lines().rev().find_map(|line| {
-        let (sec, ms, serial) = parse_msg_header(line).ok()?;
-        let ts = sec
-            .checked_mul(1_000_000_000)?
-            .checked_add(u64::from(ms.min(999)) * 1_000_000)?;
-        Some((ts, serial))
+/// The latest record of a `SIGKILL` that hit `marker`'s instance among `lines`, which must
+/// already be only the lines written after the start, in log order.
+fn last_sigkill_in<'a>(
+    marker: &Marker,
+    lines: impl IntoIterator<Item = &'a str>,
+) -> Option<SigkillRecord> {
+    lines
+        .into_iter()
+        .filter_map(parse_kill_log_line)
+        .filter(|r| marker.is_hit_by(r))
+        .last()
+}
+
+/// The header of a kernel record line, `None` for any other line and for auditd's own
+/// `type=DAEMON_*` records.
+fn kernel_header(line: &str) -> Option<Anchor> {
+    if line.starts_with("type=DAEMON_") {
+        return None;
+    }
+    let (sec, ms, serial) = parse_msg_header(line).ok()?;
+    let timestamp_ns = sec
+        .checked_mul(1_000_000_000)?
+        .checked_add(u64::from(ms.min(999)) * 1_000_000)?;
+    Some(Anchor {
+        timestamp_ns,
+        serial,
     })
 }
 
-/// The serial of the newest record in the log files, the first that has one: what a marker stores
-/// at start, so that the successor can tell what was written after.
+/// The newest kernel record header of `text`.
+fn newest_header(text: &str) -> Option<Anchor> {
+    text.lines().rev().find_map(kernel_header)
+}
+
+/// The newest kernel record in the log files, the first file that has one: what a marker stores at
+/// start, so that the successor can tell what was written after.
 #[must_use]
-pub fn newest_serial(paths: &[PathBuf]) -> Option<u64> {
+pub fn newest_anchor(paths: &[PathBuf]) -> Option<Anchor> {
     paths.iter().find_map(|path| {
-        let (text, _) = read_tail(path, SERIAL_TAIL_BYTES).ok()?;
-        newest_header(&text).map(|(_, serial)| serial)
+        let (text, _) = read_tail(path, ANCHOR_TAIL_BYTES).ok()?;
+        newest_header(&text)
     })
 }
 
-/// How much of the live log's end is read for the newest serial: a few thousand records.
-const SERIAL_TAIL_BYTES: u64 = 256 * 1024;
+/// How much of the live log's end is read for the newest record: a few thousand records.
+const ANCHOR_TAIL_BYTES: u64 = 256 * 1024;
 
 /// What a search of the log files found, and which files it could and could not read.
 #[derive(Debug, Default)]
@@ -312,14 +337,24 @@ pub struct Replay {
     pub truncated: Vec<PathBuf>,
 }
 
-/// [`last_sigkill_of`] over the tail of each file in `paths`, newest first. A file that does not
-/// exist is skipped; one that cannot be read is reported in [`Replay::unreadable`]. The walk
-/// stops at the first file whose newest record is not newer than the marker's start: the files
-/// after it are older still, so a record rotated out of `audit.log` and `audit.log.1` is still
-/// found in `audit.log.2`.
+/// The search for the kill of `marker`'s instance in the tail of each file in `paths`, newest
+/// first. A file that does not exist is skipped; one that cannot be read is reported in
+/// [`Replay::unreadable`].
+///
+/// With `by_anchor` (the same boot, an anchor in the marker) "written after the start" is a
+/// position: the last line carrying the anchor's header is looked for from the newest file back,
+/// and only what follows it in log order counts, whole newer files included. The serial is not
+/// compared by value, because the kernel restarts it at every boot while the log keeps the lines
+/// of earlier ones. The latest matching record in log order wins. When no file holds the anchor
+/// (it was rotated out of reach, or the log was replaced), or without `by_anchor`, a record counts
+/// when it is dated at or after the start. In that case the walk stops at the first file whose
+/// newest record is older than the start: the files after it are older still, so a record rotated
+/// out of `audit.log` and `audit.log.1` is still found in `audit.log.2`.
 #[must_use]
-pub fn read_sigkill_of(marker: &Marker, by_serial: bool, paths: &[PathBuf]) -> Replay {
+pub fn read_sigkill_of(marker: &Marker, by_anchor: bool, paths: &[PathBuf]) -> Replay {
+    let anchor = marker.anchor.filter(|_| by_anchor);
     let mut replay = Replay::default();
+    let mut texts: Vec<String> = Vec::new();
     for path in paths {
         let (text, truncated) = match read_tail(path, MAX_TAIL_BYTES) {
             Ok(read) => read,
@@ -333,20 +368,54 @@ pub fn read_sigkill_of(marker: &Marker, by_serial: bool, paths: &[PathBuf]) -> R
         if truncated {
             replay.truncated.push(path.clone());
         }
-        if let Some(record) = last_sigkill_of(marker, by_serial, text.lines()) {
-            replay.record = Some(record);
-            return replay;
-        }
+        let holds_anchor = anchor.is_some_and(|a| last_line_of(&text, &a).is_some());
         let ended_before_start =
-            newest_header(&text).is_some_and(|(ts, serial)| match (by_serial, marker.serial) {
-                (true, Some(start)) => serial <= start,
-                _ => ts < marker.started_ns,
-            });
-        if ended_before_start {
+            newest_header(&text).is_some_and(|h| h.timestamp_ns < marker.started_ns);
+        texts.push(text);
+        if holds_anchor {
+            break;
+        }
+        // Without an anchor the files after one that ended before the start are older still. With
+        // one, the clock may have moved, so every file is read until the anchor turns up.
+        if anchor.is_none() && ended_before_start {
             break;
         }
     }
+    replay.record = match anchor.and_then(|a| record_after_anchor(marker, &a, &texts)) {
+        // The anchor was found: what follows it decides, even when that is nothing.
+        Some(found) => found,
+        None => last_sigkill_of(marker, texts.iter().flat_map(|t| t.lines())),
+    };
     replay
+}
+
+/// The index of the last line of `text` whose header is `anchor`.
+fn last_line_of(text: &str, anchor: &Anchor) -> Option<usize> {
+    text.lines()
+        .enumerate()
+        .filter(|(_, line)| kernel_header(line) == Some(*anchor))
+        .map(|(n, _)| n)
+        .last()
+}
+
+/// The latest record that hit `marker`'s instance after `anchor` in log order, among `texts`
+/// (newest file first). `None` when no file holds the anchor; `Some(None)` when one does and
+/// nothing after it hit the instance.
+fn record_after_anchor(
+    marker: &Marker,
+    anchor: &Anchor,
+    texts: &[String],
+) -> Option<Option<SigkillRecord>> {
+    let (file, line) = texts
+        .iter()
+        .enumerate()
+        .find_map(|(i, text)| last_line_of(text, anchor).map(|n| (i, n)))?;
+    // Chronological order: the rest of the anchor's file, then each newer file whole.
+    let after = texts[file]
+        .lines()
+        .skip(line + 1)
+        .chain(texts[..file].iter().rev().flat_map(|t| t.lines()));
+    Some(last_sigkill_in(marker, after))
 }
 
 /// The last `max` bytes of `path` as text, and whether the file was longer.
@@ -404,7 +473,14 @@ pub fn read_marker(state_dir: &Path) -> Option<Marker> {
         .map(|tids| tids.split(',').filter_map(|t| t.parse().ok()).collect())
         .unwrap_or_default();
     let uid = parts.next().and_then(|uid| uid.parse().ok());
-    let serial = parts.next().and_then(|serial| serial.parse().ok());
+    let serial: Option<u64> = parts.next().and_then(|serial| serial.parse().ok());
+    let anchor_ns: Option<u64> = parts.next().and_then(|ns| ns.parse().ok());
+    // A marker from an agent that stored only the serial has no usable anchor: the serial alone
+    // cannot say which boot's line it was.
+    let anchor = serial.zip(anchor_ns).map(|(serial, timestamp_ns)| Anchor {
+        timestamp_ns,
+        serial,
+    });
     Some(Marker {
         pid,
         pgid,
@@ -412,7 +488,7 @@ pub fn read_marker(state_dir: &Path) -> Option<Marker> {
         boot_id,
         tids,
         uid,
-        serial,
+        anchor,
     })
 }
 
@@ -445,7 +521,7 @@ pub fn write_marker(state_dir: &Path, marker: &Marker) -> std::io::Result<()> {
         .join(",");
     writeln!(
         file,
-        "{} {} {} {} {} {} {}",
+        "{} {} {} {} {} {} {} {}",
         marker.pid,
         marker.started_ns,
         marker.pgid,
@@ -455,23 +531,32 @@ pub fn write_marker(state_dir: &Path, marker: &Marker) -> std::io::Result<()> {
             .uid
             .map_or_else(|| "-".to_string(), |u| u.to_string()),
         marker
-            .serial
-            .map_or_else(|| "-".to_string(), |s| s.to_string()),
+            .anchor
+            .map_or_else(|| "-".to_string(), |a| a.serial.to_string()),
+        marker
+            .anchor
+            .map_or_else(|| "-".to_string(), |a| a.timestamp_ns.to_string()),
     )?;
     std::fs::rename(tmp, state_dir.join(MARKER))
 }
 
-/// Removes the marker: this instance ended on its own.
+/// Removes the marker: this instance ended on its own. A marker that stays when it should not
+/// makes the next start report "did not stop cleanly", so a failure other than "no such file" is
+/// logged.
 pub fn remove_marker(state_dir: &Path) {
-    let _ = std::fs::remove_file(state_dir.join(MARKER));
+    if let Err(e) = std::fs::remove_file(state_dir.join(MARKER))
+        && e.kind() != std::io::ErrorKind::NotFound
+    {
+        tracing::warn!(error = %e, "sensor-linux-audit: could not remove the instance marker, the next start will report an unclean stop");
+    }
 }
 
 /// The search for the kill of the predecessor `marker` names, or `None` when there is nothing to
 /// look for: no marker, a marker with this instance's own pid (a recycled pid), or one from
 /// another boot (`boot_id` is this boot's id). Otherwise a [`Replay`], whose `record` is the kill
 /// written after that instance started, so that a marker with no record can be reported. Within
-/// the same boot the "after" is the audit serial the marker stored, which the clock does not move;
-/// without one (or without a boot id on either side) it is the timestamp.
+/// the same boot the "after" is the position of the anchor the marker stored, which the clock does
+/// not move; without one (or without a boot id on either side) it is the timestamp.
 #[must_use]
 pub fn previous_instance_kill(
     marker: Option<&Marker>,
@@ -726,19 +811,15 @@ mod tests {
     fn the_latest_matching_record_since_the_start_wins_and_there_is_no_upper_bound() {
         let lines = [at(100, "ff"), at(200, "ff"), at(300, "aa"), at(900, "ff")];
         let found = |since| {
-            last_sigkill_of(
-                &marker(0xff, since),
-                false,
-                lines.iter().map(String::as_str),
-            )
-            .map(|r| r.timestamp_ns / 1_000_000_000)
+            last_sigkill_of(&marker(0xff, since), lines.iter().map(String::as_str))
+                .map(|r| r.timestamp_ns / 1_000_000_000)
         };
         assert_eq!(found(0), Some(900));
         assert_eq!(found(250), Some(900));
         assert_eq!(found(901), None);
         // A record dated far after "now" (a clock set back after the kill) is still the kill.
         let far = [at(9_000_000_000, "ff")];
-        assert!(last_sigkill_of(&marker(0xff, 1), false, far.iter().map(String::as_str)).is_some());
+        assert!(last_sigkill_of(&marker(0xff, 1), far.iter().map(String::as_str)).is_some());
     }
 
     #[test]
@@ -752,7 +833,10 @@ mod tests {
             boot_id: Some("0f1e2d3c-aaaa-bbbb-cccc-1234567890ab".into()),
             tids: vec![4242, 4243, 4250],
             uid: Some(0),
-            serial: Some(31337),
+            anchor: Some(Anchor {
+                timestamp_ns: 1_794_826_302_839_000_000,
+                serial: 31337,
+            }),
         };
         write_marker(dir.path(), &marker).unwrap();
         assert_eq!(read_marker(dir.path()), Some(marker.clone()));
@@ -762,7 +846,7 @@ mod tests {
             boot_id: None,
             tids: Vec::new(),
             uid: None,
-            serial: None,
+            anchor: None,
             ..marker
         };
         write_marker(dir.path(), &bare).unwrap();
@@ -771,6 +855,9 @@ mod tests {
         std::fs::write(dir.path().join(MARKER), "7 8 9 boot\n").unwrap();
         let old = read_marker(dir.path()).unwrap();
         assert_eq!((old.pid, old.pgid, old.tids, old.uid), (7, 9, vec![], None));
+        // A marker that stored only the serial (no time) has no usable anchor.
+        std::fs::write(dir.path().join(MARKER), "7 8 9 boot - 0 31337\n").unwrap();
+        assert_eq!(read_marker(dir.path()).unwrap().anchor, None);
         write_marker(dir.path(), &bare).unwrap();
         #[cfg(unix)]
         {
@@ -941,62 +1028,173 @@ mod tests {
         assert!(!unknown.is_hit_by(&parse_kill_log_line(&l).unwrap()));
     }
 
-    #[test]
-    fn a_clock_set_back_before_the_kill_does_not_hide_it_within_a_boot() {
+    /// `line(62, a0, "9", "0", "")` with its header moved to `<sec>.000:<serial>`.
+    fn at_serial(sec: u64, serial: u64, a0: &str) -> String {
+        line(62, a0, "9", "0", "")
+            .replace("audit(1000.500:7)", &format!("audit({sec}.000:{serial})"))
+    }
+
+    /// A marker for pid 0xff, started at `started_s`, anchored on the record dated `sec` with `serial`.
+    fn anchored(started_s: u64, sec: u64, serial: u64) -> Marker {
+        Marker {
+            anchor: Some(Anchor {
+                timestamp_ns: ns(sec),
+                serial,
+            }),
+            ..marker(0xff, started_s)
+        }
+    }
+
+    /// The serial of the record the successor of `agent` finds in `files` (newest file first).
+    fn replay_of(agent: &Marker, files: &[&[String]]) -> Option<u64> {
         let dir = tempfile::tempdir().unwrap();
-        let log = dir.path().join("audit.log");
-        // The agent started when the log's newest record had serial 50, at t=5000. Then the clock
-        // was set back to t=100 and the kill was logged with serial 60: dated before the start.
-        let at_serial = |sec: u64, serial: u64, a0: &str| {
-            line(62, a0, "9", "0", "")
-                .replace("audit(1000.500:7)", &format!("audit({sec}.000:{serial})"))
-        };
-        std::fs::write(
-            &log,
-            format!(
-                "{}\n{}\n",
-                at_serial(4000, 50, "aa"),
-                at_serial(100, 60, "ff")
-            ),
-        )
-        .unwrap();
-        let agent = Marker {
-            serial: Some(50),
-            ..marker(0xff, 5000)
-        };
-        let by_time =
-            previous_instance_kill(Some(&agent), 1, Some("boot-b"), std::slice::from_ref(&log));
-        assert!(by_time.is_none(), "another boot: nothing to look for");
-        let found =
-            previous_instance_kill(Some(&agent), 1, Some("boot-a"), std::slice::from_ref(&log))
-                .unwrap();
-        assert_eq!(found.record.map(|r| r.serial), Some(60));
-        // A record with a serial at or below the start's was written before it, whatever its date.
-        std::fs::write(&log, format!("{}\n", at_serial(9000, 50, "ff"))).unwrap();
-        let found = previous_instance_kill(Some(&agent), 1, Some("boot-a"), &[log]).unwrap();
-        assert!(found.record.is_none());
+        let paths: Vec<PathBuf> = files
+            .iter()
+            .enumerate()
+            .map(|(i, lines)| {
+                let path = dir.path().join(format!("audit.log.{i}"));
+                std::fs::write(&path, format!("{}\n", lines.join("\n"))).unwrap();
+                path
+            })
+            .collect();
+        previous_instance_kill(Some(agent), 1, Some("boot-a"), &paths)
+            .unwrap()
+            .record
+            .map(|r| r.serial)
     }
 
     #[test]
-    fn the_newest_serial_is_the_last_header_of_the_first_readable_file() {
+    fn a_clock_set_back_before_the_kill_does_not_hide_it_within_a_boot() {
+        // The agent started when the log's newest record had serial 50, at t=4000. Then the clock
+        // was set back to t=100 and the kill was logged with serial 60: dated before the start.
+        let agent = anchored(5000, 4000, 50);
+        let log = [at_serial(4000, 50, "aa"), at_serial(100, 60, "ff")];
+        assert_eq!(replay_of(&agent, &[&log]), Some(60));
+        // The anchor's own event is not after it, whatever it aims at.
+        assert_eq!(replay_of(&agent, &[&[at_serial(4000, 50, "ff")]]), None);
+        // Another boot: nothing to look for.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("audit.log");
+        std::fs::write(&path, format!("{}\n", log.join("\n"))).unwrap();
+        assert!(previous_instance_kill(Some(&agent), 1, Some("boot-b"), &[path]).is_none());
+    }
+
+    #[test]
+    fn a_record_of_an_earlier_boot_before_the_anchor_is_not_the_kill() {
+        // Boot A: `kill -9 255` at serial 1 204 331. Reboot: the agent is pid 255 again and its
+        // anchor is an early serial of this boot. The older line has the larger serial and sits
+        // before the anchor in the file: by value it would pass, by position it does not.
+        let agent = anchored(5001, 5000, 1500);
+        let log = [
+            at_serial(1000, 1_204_331, "ff"),
+            at_serial(5000, 1500, "aa"),
+        ];
+        assert_eq!(replay_of(&agent, &[&log]), None);
+    }
+
+    #[test]
+    fn a_genuine_later_kill_wins_over_a_previous_boots_record_with_a_larger_serial() {
+        let agent = anchored(5001, 5000, 1500);
+        let log = [
+            at_serial(1000, 1_204_331, "ff"),
+            at_serial(5000, 1500, "aa"),
+            at_serial(6000, 40_000, "ff"),
+        ];
+        assert_eq!(replay_of(&agent, &[&log]), Some(40_000));
+    }
+
+    #[test]
+    fn the_latest_record_in_log_order_wins_not_the_largest_serial() {
+        let agent = anchored(5001, 5000, 1500);
+        let log = [
+            at_serial(5000, 1500, "aa"),
+            at_serial(6000, 90_000, "ff"),
+            at_serial(6100, 40_000, "ff"),
+        ];
+        assert_eq!(replay_of(&agent, &[&log]), Some(40_000));
+    }
+
+    #[test]
+    fn auditds_own_records_are_never_the_anchor_and_do_not_hide_a_kill() {
+        let daemon =
+            "type=DAEMON_ROTATE msg=audit(5100.000:9999): op=rotate-logs res=success".to_string();
+        let agent = anchored(5001, 5000, 1500);
+        let log = [
+            at_serial(5000, 1500, "aa"),
+            daemon.clone(),
+            at_serial(6000, 40_000, "ff"),
+        ];
+        assert_eq!(replay_of(&agent, &[&log]), Some(40_000));
+        // A newest line that is auditd's own is skipped when the marker takes its anchor.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("audit.log");
+        std::fs::write(
+            &path,
+            format!("{}\n{daemon}\n", at_serial(5000, 1500, "aa")),
+        )
+        .unwrap();
+        assert_eq!(
+            newest_anchor(&[path]),
+            Some(Anchor {
+                timestamp_ns: ns(5000),
+                serial: 1500
+            })
+        );
+    }
+
+    #[test]
+    fn an_anchor_in_an_older_file_counts_every_newer_file_whole() {
+        let agent = anchored(5001, 5000, 1500);
+        let newest = [at_serial(7000, 60, "ff")];
+        let older = [
+            at_serial(1000, 1_204_331, "ff"),
+            at_serial(5000, 1500, "aa"),
+        ];
+        assert_eq!(replay_of(&agent, &[&newest, &older]), Some(60));
+        // A record after the anchor in the older file counts too; the newer file's wins when it hits.
+        let older = [at_serial(5000, 1500, "aa"), at_serial(5500, 70, "ff")];
+        assert_eq!(replay_of(&agent, &[&newest, &older]), Some(60));
+        let newest = [at_serial(7000, 61, "aa")];
+        assert_eq!(replay_of(&agent, &[&newest, &older]), Some(70));
+    }
+
+    #[test]
+    fn an_anchor_that_left_the_log_falls_back_to_the_timestamp() {
+        let agent = anchored(5001, 5000, 1500);
+        // No file holds the anchor (rotated out): dated at or after the start counts, older does not.
+        let log = [at_serial(1000, 1_204_331, "ff"), at_serial(6000, 3, "ff")];
+        assert_eq!(replay_of(&agent, &[&log]), Some(3));
+        let log = [at_serial(1000, 1_204_331, "ff")];
+        assert_eq!(replay_of(&agent, &[&log]), None);
+    }
+
+    #[test]
+    fn the_anchor_is_the_last_kernel_header_of_the_first_readable_file() {
         let dir = tempfile::tempdir().unwrap();
         let live = dir.path().join("audit.log");
         let older = dir.path().join("audit.log.1");
         std::fs::write(&older, format!("{}\n", line(62, "ff", "9", "0", ""))).unwrap();
         let missing = dir.path().join("none");
+        let anchor = |ms: u64, serial| Anchor {
+            timestamp_ns: ms * 1_000_000,
+            serial,
+        };
         // An empty live log (just rotated): the next file answers.
         std::fs::write(&live, "").unwrap();
         assert_eq!(
-            newest_serial(&[missing.clone(), live.clone(), older.clone()]),
-            Some(7)
+            newest_anchor(&[missing.clone(), live.clone(), older.clone()]),
+            Some(anchor(1_000_500, 7))
         );
         std::fs::write(
             &live,
             "garbage\ntype=SYSCALL msg=audit(1.000:99): x=1\ntail\n",
         )
         .unwrap();
-        assert_eq!(newest_serial(&[missing, live, older]), Some(99));
-        assert_eq!(newest_serial(&[]), None);
+        assert_eq!(
+            newest_anchor(&[missing, live, older]),
+            Some(anchor(1_000, 99))
+        );
+        assert_eq!(newest_anchor(&[]), None);
     }
 
     #[test]

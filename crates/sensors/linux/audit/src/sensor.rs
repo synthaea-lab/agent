@@ -93,7 +93,7 @@ impl AuditSensor {
             tids: crate::killrec::current_thread_ids(),
             // SAFETY: `getuid(2)` takes no argument, cannot fail and touches no memory.
             uid: Some(unsafe { libc::getuid() }),
-            serial: crate::killrec::newest_serial(&self.log_paths),
+            anchor: crate::killrec::newest_anchor(&self.log_paths),
         };
         *self.marker.lock().unwrap_or_else(|e| e.into_inner()) = Some(this.clone());
         if let Err(e) = crate::killrec::write_marker(dir, &this) {
@@ -565,7 +565,7 @@ mod tests {
         let mut previous = after;
         previous.pid = 0xff;
         previous.started_ns = 0;
-        previous.serial = None;
+        previous.anchor = None;
         crate::killrec::write_marker(dir.path(), &previous).unwrap();
         let events = replayed(&sensor_in(dir.path(), log));
         assert_eq!(events.len(), 1, "{events:?}");
