@@ -166,6 +166,32 @@ fn set_time_event_reaches_the_timestomp_rule_through_the_real_sink() {
     assert!(alerts.contains("invoice.docx"), "{alerts}");
 }
 
+/// `record_rule_alerts` re-locks `rule_state` for a ransomware alert's damage manifest. A guard
+/// still held by the step that produced the alert would deadlock there (agent#144), so a step
+/// returning a T1486 alert must finish. The channel timeout turns a deadlock into a failure.
+#[test]
+fn a_stateful_step_returning_a_ransomware_alert_does_not_deadlock_the_manifest_lookup() {
+    let dir = tmp("rule-alerts-relock");
+    let sink = sink_in(&dir);
+    let event = Event::FileRename(schema::fixtures::file_rename());
+    let (done, finished) = std::sync::mpsc::channel();
+    let worker = Arc::clone(&sink);
+    thread::spawn(move || {
+        worker.rule_alerts(&event, |_| {
+            vec![rules::Alert {
+                technique: "T1486",
+                severity: schema::detection::Severity::High,
+                message: "mass rename".into(),
+            }]
+        });
+        let _ = done.send(());
+    });
+    assert!(
+        finished.recv_timeout(Duration::from_secs(10)).is_ok(),
+        "rule_alerts held the rule-state lock while recording a ransomware alert"
+    );
+}
+
 #[test]
 fn a_panic_inside_rule_evaluation_does_not_stop_later_events_from_being_processed() {
     let dir = tmp("poisoned-rule-state");
@@ -1638,6 +1664,43 @@ fn a_crossing_of_the_agents_own_pid_is_refused_not_killed() {
     assert!(killed.lock().unwrap().is_empty(), "{alerts}");
 }
 
+/// The production entry protects the real process: `enable_response`, not the
+/// `enable_response_as_pid` test seam, refuses a crossing of `std::process::id()`. The sink
+/// kill tests all inject `TEST_AGENT_PID`, so without this nothing pins the pid
+/// `enable_response` hands the kill gate (agent#277).
+#[test]
+fn enable_response_refuses_a_crossing_of_the_agents_real_pid() {
+    let dir = tmp("bayes-real-own-pid");
+    let sink = sink_in(&dir);
+    let killed = Arc::new(Mutex::new(Vec::new()));
+    let killed_rec = Arc::clone(&killed);
+    sink.enable_response(
+        policy::ResponsePolicy {
+            kill_enabled: true,
+            quarantine_enabled: false,
+            isolate_enabled: false,
+        },
+        move |pid| {
+            killed_rec.lock().unwrap().push(pid);
+            Ok(())
+        },
+        dir.join("quarantine"),
+    );
+    let own = std::process::id();
+    drive_bayes_crossing(&sink, own);
+    let alerts = alerts_in(&dir);
+    // The own-pid reason, not just the shared prefix: the service-main and login-session
+    // shields write `refused to kill pid ...` too.
+    assert!(
+        alerts.lines().any(|line| {
+            line.contains(&format!("refused to kill pid {own} on "))
+                && line.contains(": the agent's own pid")
+        }),
+        "{alerts}"
+    );
+    assert!(killed.lock().unwrap().is_empty(), "{alerts}");
+}
+
 /// Issue #652: `NetworkManager` crossed `BAYES` on a stock Fedora host with no rule or
 /// YARA hit and was killed. A package binary started by init is a system service's
 /// main process: the crossing still raises its alert, but the kill is refused.
@@ -2793,6 +2856,36 @@ fn a_high_severity_built_in_alert_never_triggers_a_kill() {
         !alerts_in(&dir).contains("killed pid"),
         "{}",
         alerts_in(&dir)
+    );
+}
+
+/// #613: the two refusals, with the text the operator's CLI prints (#155 typed them; the
+/// text was pinned on the `String` version first).
+#[test]
+fn a_suppression_is_refused_with_an_operator_readable_reason() {
+    let dir = tmp("suppress-refused");
+    let sink = sink_in(&dir);
+    assert_eq!(
+        sink.suppress_verdict(1, "", "T1105")
+            .unwrap_err()
+            .to_string(),
+        "comm and technique must not be empty"
+    );
+    assert_eq!(
+        sink.suppress_verdict(1, "x", "").unwrap_err().to_string(),
+        "comm and technique must not be empty"
+    );
+    for i in 0..verdict::MAX_SUPPRESSIONS {
+        assert_eq!(sink.suppress_verdict(1, "x", &format!("T{i}")), Ok(true));
+    }
+    assert_eq!(
+        sink.suppress_verdict(1, "x", "one-more")
+            .unwrap_err()
+            .to_string(),
+        format!(
+            "suppression list is full ({} entries): lift one first",
+            verdict::MAX_SUPPRESSIONS
+        )
     );
 }
 

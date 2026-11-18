@@ -189,6 +189,47 @@ fn uploader_against(
     (EventUploader::new(client, drain), acked, skipped)
 }
 
+/// A drain whose `skip` cannot be persisted: the poison escape hatch itself fails.
+struct FailingSkipDrain {
+    events: Vec<Event>,
+    acked: Arc<AtomicU32>,
+}
+
+impl EventDrain for FailingSkipDrain {
+    fn drain(&mut self) -> std::io::Result<Vec<Event>> {
+        Ok(self.events.clone())
+    }
+
+    fn ack(&mut self) -> std::io::Result<()> {
+        self.acked.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    }
+
+    fn skip(&mut self) -> std::io::Result<()> {
+        Err(std::io::Error::other("spool is read-only"))
+    }
+}
+
+#[test]
+fn a_skip_that_cannot_be_persisted_surfaces_its_own_error_not_the_servers() {
+    let url = canned_server(400, r#"{"error":"Invalid payload"}"#, 1);
+    let acked = Arc::new(AtomicU32::new(0));
+    let drain = FailingSkipDrain {
+        events: events(1),
+        acked: Arc::clone(&acked),
+    };
+    let client = TransportClient::new(TransportConfig::new(&url)).unwrap();
+    let mut uploader = EventUploader::new(client, drain);
+
+    let error = uploader.upload_once().unwrap_err();
+
+    assert!(
+        matches!(error, transport::TransportError::Io(_)),
+        "got {error:?}"
+    );
+    assert_eq!(acked.load(Ordering::SeqCst), 0);
+}
+
 fn events(n: usize) -> Vec<Event> {
     (0..n)
         .map(|i| {

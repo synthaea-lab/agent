@@ -11,19 +11,16 @@
 //! not just ones this process asked about — [`recv_events`](ProcEventSubscription::recv_events)
 //! is meant to be called in a loop by whatever owns the socket's lifetime.
 
-use std::{
-    io,
-    os::fd::{AsRawFd, FromRawFd, OwnedFd},
-    time::Duration,
-};
+use std::time::Duration;
 
-pub use crate::socket::NetlinkError;
+pub use crate::nl_socket::NetlinkError;
 use crate::{
+    frame::netlink_messages,
+    nl_socket::{Bind, NetlinkSocket, nlmsg_error_errno},
     proc_events::{
         CN_IDX_PROC, CN_MSG_HDR_LEN, CN_VAL_PROC, CnMsgHeader, PROC_CN_MCAST_LISTEN, ProcEvent,
     },
-    socket::nlmsg_error_errno,
-    wire::{NLMSG_DONE, NLMSG_ERROR, NLMSG_HDR_LEN, NlMsgHeader},
+    wire::{NLMSG_DONE, NLMSG_ERROR},
 };
 
 /// Not in every version of the `libc` crate's Linux constant set — see
@@ -42,7 +39,7 @@ const RECV_TIMEOUT: Duration = Duration::from_secs(2);
 /// which unsubscribes implicitly (the kernel only tracks group membership per
 /// open socket, not per explicit `PROC_CN_MCAST_IGNORE` — see the crate doc).
 pub struct ProcEventSubscription {
-    fd: OwnedFd,
+    socket: NetlinkSocket,
 }
 
 impl ProcEventSubscription {
@@ -58,10 +55,25 @@ impl ProcEventSubscription {
     /// [`NetlinkError::Io`] if the socket can't be created, bound, or the
     /// subscribe request can't be sent.
     pub fn open() -> Result<Self, NetlinkError> {
-        let fd = open_socket()?;
-        set_recv_timeout(&fd, RECV_TIMEOUT)?;
-        send_subscribe(&fd)?;
-        Ok(Self { fd })
+        // nl_pid = this process's pid, matching the kernel documentation's own
+        // sample (Documentation/connector/cn_proc.c): unlike the one-shot sock_diag
+        // query, a long-lived subscription is exactly the case that convention
+        // exists for.
+        // nl_groups = CN_IDX_PROC: subscribing to the process-events multicast
+        // group is done by setting its own idx value as the bind-time group mask
+        // (not a bit-shifted group number) — see the crate doc; verified against
+        // the kernel connector sample.
+        let socket = NetlinkSocket::open(
+            NETLINK_CONNECTOR,
+            libc::SOCK_DGRAM,
+            Bind {
+                pid: std::process::id(),
+                groups: CN_IDX_PROC,
+            },
+        )?;
+        socket.set_recv_timeout(RECV_TIMEOUT)?;
+        send_subscribe(&socket)?;
+        Ok(Self { socket })
     }
 
     /// Blocks for up to [`RECV_TIMEOUT`] waiting for the kernel to deliver at
@@ -79,33 +91,28 @@ impl ProcEventSubscription {
     pub fn recv_events(&self) -> Result<Vec<ProcEvent>, NetlinkError> {
         let mut buf = vec![0u8; 64 * 1024];
 
-        // SAFETY: `recv(2)` into a buffer this function owns, with its exact
-        // allocated length as the size bound — the kernel never writes past it.
-        // The returned count is validated before any byte of `buf` is read.
-        let n = unsafe { libc::recv(self.fd.as_raw_fd(), buf.as_mut_ptr().cast(), buf.len(), 0) };
-        if n < 0 {
-            let err = io::Error::last_os_error();
-            if matches!(
-                err.kind(),
-                io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
-            ) {
+        let received_len = match self.socket.recv(&mut buf) {
+            Ok(n) => n,
+            Err(err)
+                if matches!(
+                    err.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) =>
+            {
                 return Ok(Vec::new()); // RECV_TIMEOUT elapsed — no events, not a failure
             }
-            return Err(NetlinkError::Io(err));
-        }
-        let received_len = usize::try_from(n).unwrap_or(0);
+            Err(err) => return Err(NetlinkError::Io(err)),
+        };
         let received = &buf[..received_len];
 
         let mut events = Vec::new();
-        let mut offset = 0usize;
-        while let Some(header) = NlMsgHeader::parse(&received[offset..]) {
-            let msg_len = header.len as usize;
-            if msg_len < NLMSG_HDR_LEN || offset + msg_len > received.len() {
-                break; // truncated/malformed frame — stop trusting this buffer
-            }
-            let payload = &received[offset + NLMSG_HDR_LEN..offset + msg_len];
+        for message in netlink_messages(received) {
+            // A frame whose header cannot be trusted: stop trusting this buffer.
+            let Ok((msg_type, payload)) = message else {
+                break;
+            };
 
-            match header.msg_type {
+            match msg_type {
                 NLMSG_ERROR => {
                     let errno = nlmsg_error_errno(payload);
                     if errno != 0 {
@@ -130,85 +137,13 @@ impl ProcEventSubscription {
                 }
                 _ => {} // an unexpected message type — ignore, don't abort the stream
             }
-            offset += (msg_len + 3) & !3; // NLMSG_ALIGN: 4-byte padding
         }
 
         Ok(events)
     }
 }
 
-fn open_socket() -> Result<OwnedFd, NetlinkError> {
-    // SAFETY: `socket(2)` with a fixed, valid family/type/protocol triple. The
-    // result is checked for the -1 error sentinel before being trusted as a real
-    // fd; on success it is immediately handed to `OwnedFd`, which becomes its
-    // sole owner (closed on drop) so no descriptor can leak past this function.
-    let raw = unsafe { libc::socket(libc::AF_NETLINK, libc::SOCK_DGRAM, NETLINK_CONNECTOR) };
-    if raw < 0 {
-        return Err(NetlinkError::Io(io::Error::last_os_error()));
-    }
-    // SAFETY: `raw` was just verified >= 0 (a freshly-opened, uniquely-owned fd
-    // from the `socket(2)` call above), satisfying `from_raw_fd`'s precondition.
-    let fd = unsafe { OwnedFd::from_raw_fd(raw) };
-
-    // SAFETY: `addr` is zero-initialized `libc::sockaddr_nl`, a plain-old-data C
-    // struct with no invalid all-zero bit pattern (every field is an integer).
-    let mut addr: libc::sockaddr_nl = unsafe { std::mem::zeroed() };
-    addr.nl_family = libc::AF_NETLINK as libc::sa_family_t;
-    // nl_pid = this process's pid, matching the kernel documentation's own
-    // sample (Documentation/connector/cn_proc.c): unlike the one-shot sock_diag
-    // query, a long-lived subscription is exactly the case that convention
-    // exists for.
-    addr.nl_pid = std::process::id();
-    // nl_groups = CN_IDX_PROC: subscribing to the process-events multicast
-    // group is done by setting its own idx value as the bind-time group mask
-    // (not a bit-shifted group number) — see the crate doc; verified against
-    // the kernel connector sample.
-    addr.nl_groups = CN_IDX_PROC;
-
-    // SAFETY: `bind(2)` on the fd this function owns, passing a pointer to a
-    // local `sockaddr_nl` whose size exactly matches the `addrlen` argument — the
-    // kernel reads, never writes through this pointer for `bind`.
-    let ret = unsafe {
-        libc::bind(
-            fd.as_raw_fd(),
-            std::ptr::addr_of!(addr).cast(),
-            std::mem::size_of::<libc::sockaddr_nl>() as libc::socklen_t,
-        )
-    };
-    if ret < 0 {
-        return Err(NetlinkError::Io(io::Error::last_os_error()));
-    }
-    Ok(fd)
-}
-
-fn set_recv_timeout(fd: &OwnedFd, timeout: Duration) -> Result<(), NetlinkError> {
-    // `as _` rather than naming `libc::time_t`/`libc::suseconds_t` directly: both
-    // aliases are deprecated on musl (Alpine) -- 32-bit today, becoming 64-bit in a
-    // future musl/libc-crate release -- so inferring the field type from the struct
-    // literal instead keeps this correct on both without an `#[allow(deprecated)]`.
-    let tv = libc::timeval {
-        tv_sec: timeout.as_secs() as _,
-        tv_usec: timeout.subsec_micros() as _,
-    };
-    // SAFETY: `setsockopt(2)` on the fd this function borrows, with a
-    // `libc::timeval` whose size exactly matches the `optlen` argument passed
-    // alongside it.
-    let ret = unsafe {
-        libc::setsockopt(
-            fd.as_raw_fd(),
-            libc::SOL_SOCKET,
-            libc::SO_RCVTIMEO,
-            std::ptr::addr_of!(tv).cast(),
-            std::mem::size_of::<libc::timeval>() as libc::socklen_t,
-        )
-    };
-    if ret < 0 {
-        return Err(NetlinkError::Io(io::Error::last_os_error()));
-    }
-    Ok(())
-}
-
-fn send_subscribe(fd: &OwnedFd) -> Result<(), NetlinkError> {
+fn send_subscribe(socket: &NetlinkSocket) -> Result<(), NetlinkError> {
     let mcast_op = PROC_CN_MCAST_LISTEN.to_ne_bytes();
     let cn_header = CnMsgHeader {
         idx: CN_IDX_PROC,
@@ -218,30 +153,14 @@ fn send_subscribe(fd: &OwnedFd) -> Result<(), NetlinkError> {
         len: mcast_op.len() as u16,
         flags: 0,
     };
-    let nl_header = NlMsgHeader {
-        len: (NLMSG_HDR_LEN + CN_MSG_HDR_LEN + mcast_op.len()) as u32,
-        // Matching the kernel connector sample again: the request, like the
-        // broadcasts it turns on, is framed with NLMSG_DONE rather than a
-        // connector-specific message type.
-        msg_type: NLMSG_DONE,
-        flags: 0,
-        seq: 0,
-        pid: std::process::id(),
-    };
+    let mut body = Vec::with_capacity(CN_MSG_HDR_LEN + mcast_op.len());
+    body.extend_from_slice(&cn_header.to_bytes());
+    body.extend_from_slice(&mcast_op);
 
-    let mut buf = Vec::with_capacity(nl_header.len as usize);
-    buf.extend_from_slice(&nl_header.to_bytes());
-    buf.extend_from_slice(&cn_header.to_bytes());
-    buf.extend_from_slice(&mcast_op);
-
-    // SAFETY: `send(2)` on a fd this function borrows (still owned by the
-    // caller), with a pointer/length pair taken from a `Vec` we just built —
-    // the length passed matches the buffer exactly.
-    let sent = unsafe { libc::send(fd.as_raw_fd(), buf.as_ptr().cast(), buf.len(), 0) };
-    if sent < 0 {
-        return Err(NetlinkError::Io(io::Error::last_os_error()));
-    }
-    Ok(())
+    // Matching the kernel connector sample again: the request, like the
+    // broadcasts it turns on, is framed with NLMSG_DONE rather than a
+    // connector-specific message type.
+    socket.send_message(NLMSG_DONE, 0, 0, std::process::id(), &body)
 }
 
 #[cfg(test)]

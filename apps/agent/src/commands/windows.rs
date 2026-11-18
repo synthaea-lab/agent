@@ -13,7 +13,7 @@ use schema::{
 };
 use tamper::heartbeat::{SensorHeartbeat, SilenceMonitor};
 
-use crate::{shutdown::ShutdownPlan, silence::PulsingSink};
+use crate::{shutdown::ShutdownPlan, silence::PulsingSink, sync::LockExt};
 
 /// Silence deadline (#71/#388) for the ETW sensor, pulsed on every event it
 /// forwards. ETW is the high-volume sensor (process, file, registry, DNS...),
@@ -388,14 +388,11 @@ fn spawn_minifilter(
     }
     let heartbeat = SensorHeartbeat::new("windows-minifilter");
     if let Some(monitor) = silence {
-        monitor
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .register(
-                heartbeat.clone(),
-                MINIFILTER_SILENCE_DEADLINE_NS,
-                schema::time::now_ns(),
-            );
+        monitor.lock_recovering().register(
+            heartbeat.clone(),
+            MINIFILTER_SILENCE_DEADLINE_NS,
+            schema::time::now_ns(),
+        );
     }
     let stats = Arc::new(Mutex::new(ChannelStats::default()));
     std::thread::Builder::new()
@@ -431,9 +428,7 @@ fn register_heartbeats(
         sockets: SensorHeartbeat::new("windows-sockets"),
     };
     let now_ns = schema::time::now_ns();
-    let mut monitor = monitor
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut monitor = monitor.lock_recovering();
     monitor.register(heartbeats.etw.clone(), ETW_SILENCE_DEADLINE_NS, now_ns);
     monitor.register(
         heartbeats.sockets.clone(),
@@ -516,7 +511,7 @@ pub(crate) fn cmd_run(opts: super::RunOptions) -> anyhow::Result<()> {
     // once the sensors are built (`run_windows_sensors`); the monitor thread
     // polls an empty list until then, which is harmless.
     let silence_monitor = Arc::new(Mutex::new(SilenceMonitor::new()));
-    crate::silence::spawn_monitor(Arc::clone(&silence_monitor), Arc::clone(&pipeline.sink));
+    crate::silence::spawn_monitor(Arc::clone(&silence_monitor), Arc::clone(&pipeline.sink))?;
 
     // Health beacon (#134/#317): without it the control plane never hears from
     // a Windows agent, and its silent-agent detection flags every one of them.
@@ -531,7 +526,7 @@ pub(crate) fn cmd_run(opts: super::RunOptions) -> anyhow::Result<()> {
             None,
         )),
     );
-    let (health_handle, health_stop) = health.spawn();
+    let (health_handle, health_stop) = health.spawn()?;
     let mut shutdown = ShutdownPlan::default();
     shutdown.register("health-beacon", move || health_stop.stop(), health_handle);
     if let Some(transport) = pipeline.transport {

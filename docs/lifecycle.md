@@ -146,7 +146,9 @@ With a control plane configured, [`upload::start`](../apps/agent/src/upload.rs) 
 | `socket-poller`, `minifilter`, Event Log thread | Windows | [`run_windows_sensors`](../apps/agent/src/commands/windows.rs) | Shutdown flag, then joined |
 | `socket-poller`, `unifiedlog-tail`, `ne-receiver` | macOS | [`run_macos_sensors`](../apps/agent/src/commands/macos.rs) | Stop flag, or the `log stream` child being killed |
 
-Shared mutable state in `DetectionSink` is behind `Mutex`es (`RuleState`, correlator, Sigma, YARA, verdict), because several producer threads call `on_event` at once. Code takes a lock, collects alerts, and releases the lock before recording them. `record_rule_alerts` takes the rule-state lock again, so callers bind the alerts first (see the `FileSetTime` and `ProcessAccess` arms of `on_event`).
+**A thread the OS refuses.** The threads that used to `.expect` their spawn (21 of them) are now started through [`spawn::spawn_named`](../apps/agent/src/spawn.rs), which returns the OS error (`EAGAIN`: a container or `RLIMIT_NPROC` limit, a full pid table) with the thread's name in the message. The starters pass it up and `agent run` exits with it, such as `could not start the heartbeat thread: ...`, instead of panicking with a backtrace that does not say which thread it was starting (AC-016, [#159](https://github.com/synthaea-lab/agent/issues/159)). Two threads are started after start-up and so cannot fail `run`: the `uprobes` sensor, which the uprobes supervisor starts and restarts when the wanted captures change, and the journal canary, which the journal tail starts. A refusal there is logged (`uprobes sensor not started`, `journal canary not started`) and the thread stays off. The uprobes heartbeat is watched for as long as a capture is wanted, whether or not the thread runs, so a refused start is reported as silence, and it is unregistered when nothing is wanted any more, so a capture switched off after a refusal is not reported as tampering. The journal heartbeat pulses on every line `journalctl` delivers, so a canary that never started is noticed only on an idle host, where the journal sensor goes silent. The YARA workers belong to the optional engines: [`yara::ScanQueue::start`](../crates/yara/src/queue.rs) and [`yara::MemoryScanQueue::start`](../crates/yara/src/memory.rs) return `YaraError::Spawn`, and the sink treats it like a rule directory that does not load: logged at error level (`yara: file scanning not started`), that engine stays unloaded, and on a content reload the previous engine is kept.
+
+Shared mutable state in `DetectionSink` is behind `Mutex`es (`RuleState`, correlator, Sigma, YARA, verdict), because several producer threads call `on_event` at once. Code takes a lock, collects alerts, and releases the lock before recording them. `record_rule_alerts` takes the rule-state lock again, so stateful rule steps go through `DetectionSink::rule_alerts`, which releases the lock before recording.
 
 ## Startup
 
@@ -253,6 +255,30 @@ On Windows and macOS, Ctrl-C sets the sensors' stop flags. The primary sensor re
 | Enrichment overload | See [Bounds and overload behavior](#bounds-and-overload-behavior). |
 | ETW fails (Windows) | The run continues on the Event Log, socket and minifilter sources, and a silence alert is raised. |
 | A uprobes capture set changes | The uprobes sensor restarts with the new set. Capture has a gap while it reloads. |
+
+## Poisoned locks
+
+A `std::sync::Mutex` is poisoned when a thread panics while holding it. With `lock().unwrap()` every
+later `lock()` panics too, so one panic in a rule evaluation or an upload step would spread to every
+thread touching the same state, the capture thread included: the sensor kills itself. The agent takes
+the guard back instead, logs the recovery once with its call site, and clears the poison
+([`sync.rs`](../apps/agent/src/sync.rs)). The state a panicking thread left may be half updated; for
+in-memory detection state that costs at most a missed or repeated alert, which is cheaper than a dead
+sensor. This is a decision, not an accident: the alternative (let the panic spread and rely on the
+watchdog's hang detection to restart the agent) loses every event in flight and the state built so far.
+
+- `LockExt::lock_recovering` for `Mutex`, `RwLockExt::{read,write}_recovering` for `RwLock`, and
+  `CondvarExt::{wait_while,wait_timeout}_recovering` for the two condvar waits the agent has.
+- `apps/agent` denies `clippy::unwrap_used` outside tests at the crate root, so a bare `unwrap` on a
+  lock cannot come back; the same lint used to be set on the sink module alone.
+- Out of scope, and why: counting recoveries in the health beacon (a schema change, a separate issue);
+  the `unwrap`s on `serde_json::to_string` of a string in `crates/policy` (infallible); `Mutex::get_mut`
+  in a `Drop` (no lock is taken); the container sensor's Docker cache (`crates/sensors/linux/container`,
+  its own crate, no lint there yet); the YARA memory-scan gate, which cannot depend on the agent's helper
+  and takes the guard back with `PoisonError::into_inner` in place.
+- Tested: each module that holds such a lock has a test that panics while holding it and checks the
+  next caller still works (`sync`, `alerts`, `captures`, `health`, `ioc`, `own_traffic`, `silence`,
+  `upload`); the `commands/linux.rs` sites share the `silence` monitor's lock and are covered by its test.
 
 ## Configuration knobs that shape the lifecycle
 

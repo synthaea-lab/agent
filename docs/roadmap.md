@@ -230,10 +230,6 @@ Live status and ordering are on the [project board](https://github.com/orgs/synt
 - Executed image file identity for the T1204.002 rename-and-replace gate (partial, ETW). See [sensors/windows/etw-enrichment.md#image-file-identity](sensors/windows/etw-enrichment.md#image-file-identity).
 - Signature-gated T1204.002 (downloaded file run) silenced only by a chain-verified signature on the image that ran (partial, Rule engine). See [detection/rules.md#signature-gated-findings](detection/rules.md#signature-gated-findings).
 
-### [#49](https://github.com/synthaea-lab/agent/issues/49) Linux: a security tool stopped through the kernel (prlimit CPU limit, memory.max OOM kill, cgroup.freeze) raises no alert
-
-- Detection of a security tool stopped through kernel resource limits (prlimit, memory.max, cgroup.freeze) (partial, Security model). See [security-model.md#what-is-not-defended](security-model.md#what-is-not-defended).
-
 ### [#62](https://github.com/synthaea-lab/agent/issues/62) arm64 builds (Linux aarch64, Windows ARM64)
 
 - aarch64 support (partial, eBPF probes). See [sensors/linux/README.md#requirements-and-platform-differences](sensors/linux/README.md#requirements-and-platform-differences).

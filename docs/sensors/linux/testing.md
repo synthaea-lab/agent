@@ -43,7 +43,7 @@ drain path kills the sensor.
 | --- | --- | --- |
 | `parse_exec_record` | [`wire/tests/exec_record.rs`](../../../crates/sensors/linux/wire/tests/exec_record.rs) | [`exec_record_parse`](../../../tests/fuzz/fuzz_targets/exec_record_parse.rs) |
 | `parse_audit_message` | [`audit/tests/robustness.rs`](../../../crates/sensors/linux/audit/tests/robustness.rs) | [`audit_parse`](../../../tests/fuzz/fuzz_targets/audit_parse.rs) |
-| `DiagMsg`, `ProcEvent`, `ConntrackFlow` | [`netlink/tests/robustness.rs`](../../../crates/sensors/linux/netlink/tests/robustness.rs) | [`netlink_parse`](../../../tests/fuzz/fuzz_targets/netlink_parse.rs) |
+| `DiagMsg`, `ProcEvent`, `ConntrackFlow`, `netlink_messages` (framing) | [`netlink/tests/robustness.rs`](../../../crates/sensors/linux/netlink/tests/robustness.rs) | [`netlink_parse`](../../../tests/fuzz/fuzz_targets/netlink_parse.rs) |
 | access-log and MySQL parsers | unit tests | [`logs_parse`](../../../tests/fuzz/fuzz_targets/logs_parse.rs) |
 
 The deterministic suites use a seeded LCG, so they are reproducible without a fuzzer. The

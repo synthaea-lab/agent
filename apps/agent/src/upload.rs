@@ -24,7 +24,7 @@ use transport::{
     TransportConfig, UploadLoop,
 };
 
-use crate::shutdown::ShutdownPlan;
+use crate::{shutdown::ShutdownPlan, sync::LockExt};
 
 /// The spool's on-disk cap in bytes, from `storage.spool_max_mb` (mebibytes, as the
 /// configuration documents; 4096 by default). Beyond it the spool sheds oldest and
@@ -51,23 +51,22 @@ struct DetectionSpoolDrain(Arc<Mutex<EventSpool>>);
 
 impl DetectionDrain for DetectionSpoolDrain {
     fn drain(&mut self) -> std::io::Result<Vec<QueuedDetection>> {
-        self.0.lock().unwrap().drain_oldest()
+        self.0.lock_recovering().drain_oldest()
     }
 
     fn ack(&mut self) -> std::io::Result<()> {
-        self.0.lock().unwrap().ack().map(|_| ())
+        self.0.lock_recovering().ack().map(|_| ())
     }
 
     fn ack_dropping(&mut self, dropped: u64) -> std::io::Result<()> {
         self.0
-            .lock()
-            .unwrap()
+            .lock_recovering()
             .ack_counting_dropped(dropped)
             .map(|_| ())
     }
 
     fn skip(&mut self) -> std::io::Result<()> {
-        self.0.lock().unwrap().skip().map(|_| ())
+        self.0.lock_recovering().skip().map(|_| ())
     }
 }
 
@@ -94,22 +93,21 @@ pub(crate) fn persist_detection(
         &hex[20..]
     );
     spool
-        .lock()
-        .unwrap()
+        .lock_recovering()
         .push(&QueuedDetection { key, detection })
 }
 
 impl EventDrain for SpoolDrain {
     fn drain(&mut self) -> std::io::Result<Vec<schema::Event>> {
-        self.0.lock().unwrap().drain_oldest()
+        self.0.lock_recovering().drain_oldest()
     }
 
     fn ack(&mut self) -> std::io::Result<()> {
-        self.0.lock().unwrap().ack().map(|_| ())
+        self.0.lock_recovering().ack().map(|_| ())
     }
 
     fn skip(&mut self) -> std::io::Result<()> {
-        self.0.lock().unwrap().skip().map(|_| ())
+        self.0.lock_recovering().skip().map(|_| ())
     }
 }
 
@@ -292,10 +290,7 @@ pub(crate) fn start(
     let uploader = EventUploader::new(upload_client, SpoolDrain(Arc::clone(&spool)));
     let mut upload_loop = UploadLoop::new(uploader, UPLOAD_POLL_INTERVAL);
     let upload_stop = upload_loop.stop_handle();
-    let upload_thread = std::thread::Builder::new()
-        .name("transport-upload".into())
-        .spawn(move || upload_loop.run())
-        .expect("spawning the transport upload thread");
+    let upload_thread = crate::spawn::spawn_named("transport-upload", move || upload_loop.run())?;
 
     let detection_uploader = DetectionUploader::new(
         detection_client,
@@ -303,10 +298,8 @@ pub(crate) fn start(
     );
     let mut detection_loop = UploadLoop::new(detection_uploader, UPLOAD_POLL_INTERVAL);
     let detection_upload_stop = detection_loop.stop_handle();
-    let detection_upload_thread = std::thread::Builder::new()
-        .name("detection-upload".into())
-        .spawn(move || detection_loop.run())
-        .expect("spawning the detection upload thread");
+    let detection_upload_thread =
+        crate::spawn::spawn_named("detection-upload", move || detection_loop.run())?;
 
     Ok(TransportHandle {
         spool,
@@ -329,12 +322,13 @@ pub(crate) struct SpoolHealth {
 
 impl crate::health::SpoolStatsSource for SpoolHealth {
     fn spool_bytes(&self) -> u64 {
-        self.events.lock().unwrap().stats().bytes + self.detections.lock().unwrap().stats().bytes
+        self.events.lock_recovering().stats().bytes
+            + self.detections.lock_recovering().stats().bytes
     }
 
     fn spool_dropped(&self) -> u64 {
-        self.events.lock().unwrap().stats().dropped_records
-            + self.detections.lock().unwrap().stats().dropped_records
+        self.events.lock_recovering().stats().dropped_records
+            + self.detections.lock_recovering().stats().dropped_records
     }
 }
 
@@ -752,5 +746,29 @@ mod tests {
         server.offline_fallback = true;
         let target = resolve_run_target(None, false, None, None, None, &server).unwrap();
         assert!(target.control_plane().offline_fallback);
+    }
+
+    #[test]
+    fn a_spool_poisoned_by_a_panicking_thread_is_still_drained_and_counted() {
+        let poisoned = spool("poisoned");
+        let held = Arc::clone(&poisoned);
+        let _ = std::thread::spawn(move || {
+            let _guard = held.lock().unwrap();
+            panic!("poison the spool while holding it");
+        })
+        .join();
+        assert!(poisoned.is_poisoned());
+        let health = SpoolHealth {
+            events: Arc::clone(&poisoned),
+            detections: spool("poisoned-detections"),
+        };
+        assert_eq!(crate::health::SpoolStatsSource::spool_dropped(&health), 0);
+        assert!(!poisoned.is_poisoned());
+        assert!(
+            SpoolDrain(Arc::clone(&poisoned))
+                .drain()
+                .unwrap()
+                .is_empty()
+        );
     }
 }
