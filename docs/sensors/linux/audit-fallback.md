@@ -73,8 +73,10 @@ attributed. A default Fedora ships `-a never,task`, which removes syscall auditi
 with `synthaea-kill.rules` loaded next to it nothing is recorded, not even a plain `kill -9`; the rule needs no
 `never,task` ahead of it (reproduced on Fedora 43, kernel 7.2, by the reviewer of #287; Rocky 9.8 has none). Needs `/var/log/audit/audit.log` readable by the agent (root) and auditd writing
 to it (`write_logs = yes`, `log_format = ENRICHED` or `RAW`; the key is read from the kernel part of the line). Residual
-gaps of the marker: a pid reused within the same boot by a process that is then killed can be taken for the
-agent (the boot id bounds it to one boot); with no readable log at start or a wrapped serial the replay falls
+gaps of the marker: a pid or thread id reused within the same boot by a process that is then killed can be
+taken for the agent (the boot id bounds it to one boot; a record aimed at an unrelated process whose pid later
+becomes one of the agent's thread ids, a blocking-pool thread say, is read as a kill of the agent if the agent
+then dies without a clean stop); with no readable log at start or a wrapped serial the replay falls
 back to timestamps, and a clock set back before the kill then costs the attribution (the warning above covers
 it). The `arch=b32` rules, the thread-id refresh and the serial anchor are tested on lines and files, and were
 not run on a lab host after the review of #287 at `7ce68b3a`. The volume of SIGKILL records on a real
