@@ -95,7 +95,7 @@ impl SnapshotManifest {
         self.verify_signature_with(SNAPSHOT_PUBLIC_KEY.as_ref())
     }
 
-    fn verify_signature_with(&self, key: Option<&[u8; 32]>) -> Result<(), UpdaterError> {
+    pub(crate) fn verify_signature_with(&self, key: Option<&[u8; 32]>) -> Result<(), UpdaterError> {
         if self.schema_version != SNAPSHOT_MANIFEST_SCHEMA_VERSION {
             return Err(UpdaterError::SchemaVersionUnsupported {
                 found: self.schema_version,

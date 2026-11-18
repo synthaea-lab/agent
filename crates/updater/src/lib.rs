@@ -34,6 +34,8 @@ pub mod key;
 pub mod layout;
 pub mod manifest;
 pub mod rotation;
+#[cfg(test)]
+mod signing_golden;
 pub mod snapshot;
 pub mod trust_state;
 
