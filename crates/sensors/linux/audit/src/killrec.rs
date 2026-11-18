@@ -1014,6 +1014,8 @@ mod tests {
         assert_eq!(replay.truncated, [log]);
     }
 
+    // `/proc/self/task` exists on Linux only; the module itself builds everywhere.
+    #[cfg(target_os = "linux")]
     #[test]
     fn the_thread_ids_of_this_process_include_its_pid() {
         let tids = current_thread_ids();
