@@ -46,6 +46,16 @@ $ErrorActionPreference = 'Stop'
 $RepoRoot = Resolve-Path (Join-Path $PSScriptRoot '..\..')
 $OnnxDir = Join-Path $RepoRoot 'onnxruntime'
 $OnnxVersion = 'v1.30.0'
+# The commit the tag pointed at when this was pinned (2026-10-12), the same as ONNX_COMMIT in
+# build-onnxruntime-static.sh. A tag can be moved, and the source no longer comes from upstream:
+# a tree that is not this commit fails the build.
+$OnnxCommit = 'f2c39fe2f838cf35ce7da92824f5a5e3ee6e88a7'
+# github.com/microsoft/onnxruntime answers 404 since 2026-11-18. The source of the pinned commit
+# is an asset of the `deps-onnxruntime-v1.30.0` release of this repository (a shallow clone with
+# its .git), checked against its sha256 and then against $OnnxCommit. $env:ONNX_REPO_URL, when
+# set, clones that URL instead.
+$OnnxArchiveUrl = if ($env:ONNX_ARCHIVE_URL) { $env:ONNX_ARCHIVE_URL } else { 'https://github.com/synthaea-lab/agent/releases/download/deps-onnxruntime-v1.30.0/onnxruntime-v1.30.0.tar.gz' }
+$OnnxArchiveSha256 = 'cc001656879b0c464fca55dbe65834f7adc569b585284a4e1e353c058c00a701'
 
 # onnxruntime's generated .vcxproj passes /DEF: paths unquoted, so a space anywhere in
 # the build path fails deep inside MSVC with `LNK1181: cannot open input file
@@ -98,11 +108,33 @@ if ($Clean -and (Test-Path $OnnxDir)) {
 }
 
 if (-not (Test-Path $OnnxDir)) {
-    Write-Host "[onnxruntime] Cloning $OnnxVersion (shallow clone)"
-    git clone --depth 1 --branch $OnnxVersion https://github.com/microsoft/onnxruntime.git $OnnxDir
-    if ($LASTEXITCODE -ne 0) { throw "git clone failed (exit $LASTEXITCODE)" }
+    if ($env:ONNX_REPO_URL) {
+        Write-Host "[onnxruntime] Cloning $OnnxVersion from $($env:ONNX_REPO_URL) (shallow clone)"
+        git clone --depth 1 --branch $OnnxVersion $env:ONNX_REPO_URL $OnnxDir
+        if ($LASTEXITCODE -ne 0) { throw "git clone failed (exit $LASTEXITCODE)" }
+    } else {
+        Write-Host "[onnxruntime] Downloading $OnnxVersion source (~500 MB): $OnnxArchiveUrl"
+        $Archive = Join-Path ([System.IO.Path]::GetTempPath()) "onnxruntime-src-$([guid]::NewGuid()).tar.gz"
+        try {
+            Invoke-WebRequest -Uri $OnnxArchiveUrl -OutFile $Archive
+            $ActualSha256 = (Get-FileHash -Algorithm SHA256 -Path $Archive).Hash.ToLowerInvariant()
+            if ($ActualSha256 -ne $OnnxArchiveSha256) {
+                throw "The archive has sha256 $ActualSha256, expected $OnnxArchiveSha256."
+            }
+            # The archive holds one top-level `onnxruntime/` directory: it lands at $OnnxDir.
+            tar -xzf $Archive -C (Split-Path -Parent $OnnxDir)
+            if ($LASTEXITCODE -ne 0) { throw "tar failed (exit $LASTEXITCODE)" }
+        } finally {
+            Remove-Item -Force -ErrorAction SilentlyContinue $Archive
+        }
+    }
 } else {
     Write-Host "[onnxruntime] Using existing checkout: $OnnxDir"
+}
+
+$ActualCommit = (git -C $OnnxDir rev-parse HEAD).Trim()
+if ($ActualCommit -ne $OnnxCommit) {
+    throw "$OnnxDir is at $ActualCommit, expected $OnnxCommit ($OnnxVersion). A stale checkout or another tree: rerun with -Clean, or update `$OnnxCommit on purpose."
 }
 
 Push-Location $OnnxDir

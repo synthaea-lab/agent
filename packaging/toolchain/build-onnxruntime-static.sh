@@ -37,6 +37,14 @@ ONNX_VERSION="v1.30.0"
 # The commit the tag pointed at when this was pinned (2026-10-12). A tag can be moved; a build
 # of something else than what was reviewed must fail, not run.
 ONNX_COMMIT="f2c39fe2f838cf35ce7da92824f5a5e3ee6e88a7"
+# Where the source comes from. github.com/microsoft/onnxruntime answers 404 since 2026-11-18 (CI:
+# `fatal: could not read Username`). The source of the pinned commit is an asset of the
+# `deps-onnxruntime-v1.30.0` release of this repository: a shallow clone with its .git, checked
+# against ONNX_ARCHIVE_SHA256 and then against ONNX_COMMIT below. ONNX_REPO_URL, when set, clones
+# that URL instead (the upstream URL if it comes back, or a local path); the commit check applies
+# to it too.
+ONNX_ARCHIVE_URL="${ONNX_ARCHIVE_URL:-https://github.com/synthaea-lab/agent/releases/download/deps-onnxruntime-v1.30.0/onnxruntime-v1.30.0.tar.gz}"
+ONNX_ARCHIVE_SHA256="cc001656879b0c464fca55dbe65834f7adc569b585284a4e1e353c058c00a701"
 CLEAN=false
 
 # The platform decides the build directory onnxruntime's build.py uses and how to count CPUs
@@ -91,9 +99,27 @@ fi
 
 # Clone if not present
 if [ ! -d "$ONNX_DIR" ]; then
-  echo "[onnxruntime] Cloning $ONNX_VERSION (shallow clone, ~200 MB)"
-  git clone --depth 1 --branch "$ONNX_VERSION" \
-    https://github.com/microsoft/onnxruntime.git "$ONNX_DIR"
+  if [ -n "${ONNX_REPO_URL:-}" ]; then
+    echo "[onnxruntime] Cloning $ONNX_VERSION from $ONNX_REPO_URL (shallow clone, ~200 MB)"
+    git clone --depth 1 --branch "$ONNX_VERSION" "$ONNX_REPO_URL" "$ONNX_DIR"
+  else
+    echo "[onnxruntime] Downloading $ONNX_VERSION source (~500 MB): $ONNX_ARCHIVE_URL"
+    ARCHIVE="$(mktemp "${TMPDIR:-/tmp}/onnxruntime-src.XXXXXX")"
+    trap 'rm -f "$ARCHIVE"' EXIT
+    curl --proto '=https' --tlsv1.2 --fail --location --silent --show-error \
+      --retry 5 --retry-all-errors --output "$ARCHIVE" "$ONNX_ARCHIVE_URL"
+    if command -v sha256sum >/dev/null 2>&1; then
+      ACTUAL_SHA256="$(sha256sum "$ARCHIVE" | cut -d' ' -f1)"
+    else
+      ACTUAL_SHA256="$(shasum -a 256 "$ARCHIVE" | cut -d' ' -f1)"
+    fi
+    if [ "$ACTUAL_SHA256" != "$ONNX_ARCHIVE_SHA256" ]; then
+      echo "[onnxruntime] ERROR: the archive has sha256 $ACTUAL_SHA256, expected $ONNX_ARCHIVE_SHA256." >&2
+      exit 1
+    fi
+    # The archive holds one top-level `onnxruntime/` directory: it lands at $ONNX_DIR.
+    tar -xzf "$ARCHIVE" -C "$(dirname "$ONNX_DIR")"
+  fi
 else
   echo "[onnxruntime] Using existing checkout: $ONNX_DIR"
 fi
