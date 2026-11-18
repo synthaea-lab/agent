@@ -905,9 +905,9 @@ impl DetectionSink {
         ppid: u32,
         comm: &str,
         technique: &str,
-    ) -> Result<bool, String> {
+    ) -> Result<bool, SuppressError> {
         if comm.is_empty() || technique.is_empty() {
-            return Err("comm and technique must not be empty".to_string());
+            return Err(SuppressError::EmptyField);
         }
         let outcome = self
             .verdict
@@ -922,10 +922,7 @@ impl DetectionSink {
                 Ok(true)
             }
             verdict::SuppressOutcome::AlreadySuppressed => Ok(false),
-            verdict::SuppressOutcome::Full => Err(format!(
-                "suppression list is full ({} entries): lift one first",
-                verdict::MAX_SUPPRESSIONS
-            )),
+            verdict::SuppressOutcome::Full => Err(SuppressError::Full),
         }
     }
 
@@ -1542,6 +1539,21 @@ impl EventSink for DetectionSink {
         // lock, a wedged Sigma/YARA call) stops the heartbeat from advancing.
         self.progress.fetch_add(1, Ordering::Relaxed);
     }
+}
+
+/// Why [`DetectionSink::suppress_verdict`] refused an operator's suppression. The text is
+/// what the CLI prints back.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub(crate) enum SuppressError {
+    /// An empty `comm` or `technique`: the mark could never match a finding.
+    #[error("comm and technique must not be empty")]
+    EmptyField,
+    /// [`verdict::MAX_SUPPRESSIONS`] marks are already active.
+    #[error(
+        "suppression list is full ({} entries): lift one first",
+        verdict::MAX_SUPPRESSIONS
+    )]
+    Full,
 }
 
 #[cfg(test)]

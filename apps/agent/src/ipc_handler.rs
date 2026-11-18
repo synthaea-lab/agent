@@ -138,9 +138,11 @@ impl Handler for AgentHandler {
         &self,
         entry: SuppressionEntry,
     ) -> Result<SuppressionResponse, String> {
+        // The IPC trait still answers in text (#153): the refusal's message is what the CLI prints.
         let changed = self
             .sink
-            .suppress_verdict(entry.ppid, &entry.comm, &entry.technique)?;
+            .suppress_verdict(entry.ppid, &entry.comm, &entry.technique)
+            .map_err(|refusal| refusal.to_string())?;
         Ok(SuppressionResponse { changed })
     }
 
