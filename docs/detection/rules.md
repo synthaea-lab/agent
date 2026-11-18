@@ -242,7 +242,9 @@ same signature gate applies.
   That Snap reports the rename under its own home, `<home>/snap/chromium/<revision>/Downloads/<file>`, a symlink to
   `<home>/Downloads`; the mark is also recorded at `<home>/Downloads/<file>` so that a run from the real directory joins.
   The alias is made only for that Snap's own image (another browser renaming into a `snap/chromium` directory gets
-  none), and the two records are twins: an exec from either path alerts once, and a re-download re-arms both.
+  none), and the two records are twins: an exec from either path alerts once, and a re-download re-arms both. The
+  alert reaches the other record only while that record still points back; one replaced by another download of the
+  same name (a different file) is not silenced.
   Only the default `Downloads` name: on a non-English desktop the directory has the localized name
   (`Téléchargements`) and no alias is made, so that case is **not covered**. No path is resolved, the alias is a
   guess about the symlink.

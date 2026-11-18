@@ -9,7 +9,7 @@ use aya_ebpf::{
 use aya_log_ebpf::warn;
 use sensor_linux_wire::{PrctlEvent, TASK_COMM_LEN};
 
-use crate::fill_lineage;
+use crate::{fill_lineage, into_ret};
 
 /// Ring buffer shared with userspace for filtered `prctl(2)` events.
 #[map]
@@ -41,10 +41,7 @@ const PRCTL_OPTION_OFFSET: usize = 12;
 const PRCTL_ARG2_OFFSET: usize = 16;
 
 pub fn sys_enter_prctl(ctx: TracePointContext) -> u32 {
-    match try_sys_enter_prctl(ctx) {
-        Ok(ret) => ret,
-        Err(ret) => ret,
-    }
+    into_ret(try_sys_enter_prctl(ctx))
 }
 
 fn try_sys_enter_prctl(ctx: TracePointContext) -> Result<u32, u32> {

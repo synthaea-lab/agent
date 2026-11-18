@@ -9,7 +9,7 @@ use aya_ebpf::{
 use aya_log_ebpf::warn;
 use sensor_linux_wire::{MemfdCreateEvent, TASK_COMM_LEN};
 
-use crate::{SYS_EXIT_RET_OFFSET, fill_lineage};
+use crate::{SYS_EXIT_RET_OFFSET, fill_lineage, into_ret};
 
 /// Ring buffer shared with userspace for `memfd_create` events (issue #265).
 #[map]
@@ -45,10 +45,7 @@ const MEMFD_CREATE_NAME_PTR_OFFSET: usize = 12;
 const MEMFD_CREATE_FLAGS_OFFSET: usize = 16;
 
 pub fn sys_enter_memfd_create(ctx: TracePointContext) -> u32 {
-    match try_sys_enter_memfd_create(ctx) {
-        Ok(ret) => ret,
-        Err(ret) => ret,
-    }
+    into_ret(try_sys_enter_memfd_create(ctx))
 }
 
 fn try_sys_enter_memfd_create(ctx: TracePointContext) -> Result<u32, u32> {
@@ -105,10 +102,7 @@ fn try_sys_enter_memfd_create(ctx: TracePointContext) -> Result<u32, u32> {
 }
 
 pub fn sys_exit_memfd_create(ctx: TracePointContext) -> u32 {
-    match try_sys_exit_memfd_create(ctx) {
-        Ok(ret) => ret,
-        Err(ret) => ret,
-    }
+    into_ret(try_sys_exit_memfd_create(ctx))
 }
 
 /// Completes the event `try_sys_enter_memfd_create` parked in `MEMFD_ARGS` with the

@@ -177,7 +177,7 @@ Filtering happens before the ring buffer wherever volume would otherwise be unbo
 | Filter | Where | Effect |
 | --- | --- | --- |
 | Path prefix and write intent | [`is_filtered_path`](../../../crates/sensors/linux/wire/src/path_filter.rs), all 14 file programs | Drops `/sys/` and `/dev/` (except `/dev/shm/`) always; drops `/proc/`, `/tmp/`, `/var/tmp/`, `/dev/shm/` only for read-only opens; never drops `/proc/<pid>/root/...` |
-| Agent's own pid | [`is_agent_own_pid`](../../../crates/sensors/linux/ebpf/src/main.rs) in `open`, `write` and the DNS capture | The agent's spool writes would otherwise double write-ring pressure during bursts; userspace drops the rest |
+| Agent's own pid | [`is_agent_own_pid`](../../../crates/sensors/linux/ebpf/src/mount_signal/signal.rs) in `open`, `write` and the DNS capture | The agent's spool writes would otherwise double write-ring pressure during bursts; userspace drops the rest |
 | Address family | `connect`, `bind`, `sendto`, `recvfrom`, `accept` | Only `AF_INET`/`AF_INET6`; a null address (`send`, `recv`) is skipped |
 | `bpf(2)` command | `sys_enter_bpf` | Only `BPF_MAP_CREATE`, `BPF_PROG_LOAD`, `BPF_PROG_ATTACH` |
 | `prctl(2)` option | `sys_enter_prctl` | Only `PR_SET_SECUREBITS` and `PR_CAPBSET_DROP`; `PR_SET_NAME` runs on every thread rename |

@@ -5,14 +5,10 @@
 
 use std::{collections::BTreeMap, path::PathBuf};
 
-use ring::signature::{self, Ed25519KeyPair, UnparsedPublicKey};
+use ring::signature::Ed25519KeyPair;
 use serde::{Deserialize, Serialize};
 
-use crate::{
-    error::UpdaterError,
-    hash::{hex_decode, hex_encode},
-    key::RELEASE_PUBLIC_KEY,
-};
+use crate::{error::UpdaterError, key::RELEASE_PUBLIC_KEY, signed::SignedDocument};
 
 /// The only `schema_version` this build accepts (ADR-0015 Decision 2: readers
 /// reject an unknown value outright rather than parsing leniently).
@@ -43,6 +39,18 @@ pub struct ReleaseManifest {
     pub signature: String,
 }
 
+/// The canonical bytes keep `entries` in its `BTreeMap`'s natural sorted key order (ADR-0015
+/// decision 2).
+impl SignedDocument for ReleaseManifest {
+    fn signature(&self) -> &str {
+        &self.signature
+    }
+
+    fn signature_mut(&mut self) -> &mut String {
+        &mut self.signature
+    }
+}
+
 impl ReleaseManifest {
     /// Builds an unsigned manifest at the current [`MANIFEST_SCHEMA_VERSION`].
     /// Call [`Self::sign`] before distributing it.
@@ -56,29 +64,13 @@ impl ReleaseManifest {
         }
     }
 
-    /// The canonical bytes this manifest signs and verifies over: 2-space-indented
-    /// JSON with `signature` forced to `""`, fields in the alphabetical order they
-    /// are declared in the struct, and `entries` in its `BTreeMap`'s natural sorted
-    /// key order (ADR-0015 Decision 2).
-    fn canonical_bytes(&self) -> Vec<u8> {
-        let unsigned = Self {
-            signature: String::new(),
-            ..self.clone()
-        };
-        serde_json::to_vec_pretty(&unsigned)
-            .expect("ReleaseManifest has no non-serializable content")
-    }
-
     /// Signs this manifest in place with `key_pair`, replacing whatever
     /// `signature` currently holds. Production signing happens out of band
     /// (ADR-0015 Deferred: production key generation and custody) — this is used
     /// by the test/dev release tooling and this crate's own tests, always against
     /// [`crate::key::test_key_pair`] today.
     pub fn sign(&mut self, key_pair: &Ed25519KeyPair) {
-        self.signature.clear();
-        let msg = self.canonical_bytes();
-        let sig = key_pair.sign(&msg);
-        self.signature = hex_encode(sig.as_ref());
+        self.sign_with_key_pair(key_pair);
     }
 
     /// Signs this manifest in place with `sign`, which receives the canonical bytes
@@ -93,10 +85,7 @@ impl ReleaseManifest {
         &mut self,
         sign: impl FnOnce(&[u8]) -> Result<Vec<u8>, E>,
     ) -> Result<(), E> {
-        self.signature.clear();
-        let sig = sign(&self.canonical_bytes())?;
-        self.signature = hex_encode(&sig);
-        Ok(())
+        self.sign_via(sign)
     }
 
     /// Verifies this manifest's `schema_version` and Ed25519 signature against
@@ -128,15 +117,7 @@ impl ReleaseManifest {
                 expected: MANIFEST_SCHEMA_VERSION,
             });
         }
-        let sig_bytes = hex_decode(&self.signature).ok_or(UpdaterError::SignatureInvalid)?;
-        let msg = self.canonical_bytes();
-        let public_key = UnparsedPublicKey::new(
-            &signature::ED25519,
-            key.ok_or(UpdaterError::SigningKeyUnprovisioned)?.as_slice(),
-        );
-        public_key
-            .verify(&msg, &sig_bytes)
-            .map_err(|_| UpdaterError::SignatureInvalid)
+        self.verify_against(key)
     }
 
     /// Rejects the whole manifest if any entry's path could escape the release
