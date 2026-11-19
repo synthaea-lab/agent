@@ -287,7 +287,15 @@ pub(crate) fn check_masquerading(event: &ExecEvent) -> Option<Alert> {
     };
 
     let lower_path = path.to_ascii_lowercase();
-    let legitimate = allowed.iter().any(|prefix| lower_path.starts_with(prefix));
+    // `image_path` is the unresolved `bprm->filename`, so a prefix proves nothing
+    // when the path can still climb out of it: `/usr/bin/../../tmp/x/sh` starts
+    // with `/usr/bin/` and runs from `/tmp/x`. A `.` or `..` component means the
+    // location is unproven, so the path is never treated as legitimate.
+    let has_dot_component = lower_path
+        .split(['/', '\\'])
+        .any(|component| component == "." || component == "..");
+    let legitimate =
+        !has_dot_component && allowed.iter().any(|prefix| lower_path.starts_with(prefix));
     if legitimate {
         return None;
     }

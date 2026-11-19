@@ -75,6 +75,63 @@ fn the_sbin_allowance_is_for_shells_only() {
     assert!(check_masquerading(&exec_with_path("/sbin/login", "login")).is_some());
 }
 
+/// `image_path` is the unresolved `bprm->filename`: a path that merely *starts*
+/// inside a system directory can still land anywhere through `..`.
+#[test]
+fn dot_dot_cannot_walk_out_of_a_system_directory() {
+    for path in [
+        "/bin/../tmp/x/sh",
+        "/usr/bin/../../tmp/x/bash",
+        "/usr/local/bin/../../../tmp/x/bash",
+        "/usr/sbin/../../tmp/x/sh",
+        "/sbin/../tmp/x/zsh",
+        "/usr/sbin/../sbin/../../tmp/x/sh",
+        "/usr/bin/./../../tmp/x/sh",
+        "/usr/sbin/sshd/../../../tmp/x/sshd",
+        "/usr/bin/../../tmp/x/sudo",
+    ] {
+        let name = path.rsplit('/').next().unwrap();
+        assert!(
+            check_masquerading(&exec_with_path(path, name)).is_some(),
+            "{path} must alert"
+        );
+    }
+}
+
+#[test]
+fn a_dot_component_is_not_proof_of_location_either() {
+    assert!(check_masquerading(&exec_with_path("/usr/bin/./bash", "bash")).is_some());
+}
+
+#[test]
+fn dot_dot_cannot_walk_out_of_a_windows_system_directory() {
+    for path in [
+        "C:\\Windows\\System32\\..\\..\\Users\\Public\\svchost.exe",
+        "c:\\windows\\system32\\..\\temp\\lsass.exe",
+        "C:\\Windows\\System32\\.\\svchost.exe",
+        "C:\\Windows/System32/../../Users/Public/svchost.exe",
+    ] {
+        let name = path.rsplit(['/', '\\']).next().unwrap();
+        assert!(
+            check_masquerading(&exec_with_path(path, name)).is_some(),
+            "{path} must alert"
+        );
+    }
+}
+
+#[test]
+fn names_that_merely_contain_dots_stay_silent_in_their_home() {
+    assert!(check_masquerading(&exec_with_path("/usr/bin/bash", "bash")).is_none());
+    assert!(check_masquerading(&exec_with_path("/usr/sbin/sshd", "sshd")).is_none());
+    assert!(
+        check_masquerading(&exec_with_path(
+            "C:\\Windows\\System32\\svchost.exe",
+            "svchost.exe"
+        ))
+        .is_none()
+    );
+}
+
 #[test]
 fn windows_masquerade_is_case_insensitive() {
     let event = exec_with_path("C:\\Users\\Public\\SvcHost.exe", "SvcHost.exe");
