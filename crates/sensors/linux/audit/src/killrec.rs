@@ -504,7 +504,7 @@ pub fn write_marker(state_dir: &Path, marker: &Marker) -> std::io::Result<()> {
 
 /// [`write_marker`] that writes nothing once `stopping` is set, under [`MARKER_LOCK`]: a refresh
 /// that fires between the stop hook's removal and the process's exit must not put the file back.
-fn write_marker_unless(
+pub(crate) fn write_marker_unless(
     state_dir: &Path,
     marker: &Marker,
     stopping: &std::sync::atomic::AtomicBool,
@@ -569,7 +569,8 @@ pub fn remove_marker(state_dir: &Path) {
 static MARKER_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// Set once this process is stopping on a signal: no marker write follows.
-static STOPPING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+pub(crate) static STOPPING: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
 
 /// For the stop hook of a signalled exit: removes the marker when it is this process's own, and
 /// stops later writes of it. The marker on disk is the predecessor's until this instance's sensor

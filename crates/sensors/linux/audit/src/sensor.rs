@@ -81,6 +81,16 @@ impl AuditSensor {
     /// is not moved to `spawn_blocking`: the sink is borrowed, and the replay must have been
     /// emitted before the first live record.
     fn replay_previous_sigkill(&self, sink: &dyn EventSink) -> ReplayOutcome {
+        self.replay_previous_sigkill_with(sink, &crate::killrec::STOPPING)
+    }
+
+    /// [`Self::replay_previous_sigkill`] with the "this process is stopping" flag given, so that a
+    /// test can set it without stopping every other test of the binary.
+    fn replay_previous_sigkill_with(
+        &self,
+        sink: &dyn EventSink,
+        stopping: &std::sync::atomic::AtomicBool,
+    ) -> ReplayOutcome {
         let Some(dir) = &self.state_dir else {
             return ReplayOutcome::NothingToLookFor;
         };
@@ -98,7 +108,7 @@ impl AuditSensor {
             anchor: crate::killrec::newest_anchor(&self.log_paths),
         };
         *self.marker.lock().unwrap_or_else(|e| e.into_inner()) = Some(this.clone());
-        if let Err(e) = crate::killrec::write_marker(dir, &this) {
+        if let Err(e) = crate::killrec::write_marker_unless(dir, &this, stopping) {
             tracing::warn!(error = %e, "sensor-linux-audit: could not write the instance marker, a SIGKILL of this agent will not be attributed");
         }
         let Some(replay) = crate::killrec::previous_instance_kill(
@@ -135,6 +145,12 @@ impl AuditSensor {
                 .ok()
                 .map(|exe| exe.to_string_lossy().into_owned()),
         ));
+        // A stop signal that came before this instance wrote its marker left the predecessor's
+        // marker on disk (the write is skipped once the process is stopping). The kill is reported
+        // now, so the marker goes with it: otherwise the next start would report it again.
+        if stopping.load(std::sync::atomic::Ordering::Acquire) {
+            crate::killrec::remove_marker(dir);
+        }
         ReplayOutcome::Reported
     }
 
@@ -620,8 +636,32 @@ mod tests {
         sensor.refresh_marker();
         let after = crate::killrec::read_marker(dir.path()).unwrap();
         assert_eq!(after.anchor.map(|a| a.serial), Some(9));
-        // Nothing new in the log: the marker is left as it is.
+        // Nothing new in the log: the anchor stays. (Not the whole marker: its thread list follows
+        // the other tests' threads, which start and end while this one runs.)
         sensor.refresh_marker();
-        assert_eq!(crate::killrec::read_marker(dir.path()).unwrap(), after);
+        assert_eq!(
+            crate::killrec::read_marker(dir.path()).unwrap().anchor,
+            after.anchor
+        );
+    }
+
+    #[test]
+    fn a_stop_before_the_marker_is_written_does_not_leave_the_kill_to_be_reported_twice() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("audit.log");
+        std::fs::write(&log, format!("{}\n", kill_line("ff"))).unwrap();
+        previous_marker(dir.path(), 0xff, 900);
+        let sensor = sensor_in(dir.path(), log.clone());
+        // SIGTERM arrived after the previous marker was read, before this instance wrote its own.
+        let stopping = std::sync::atomic::AtomicBool::new(true);
+        let sink = Collect::default();
+        let outcome = sensor.replay_previous_sigkill_with(&sink, &stopping);
+        assert_eq!(outcome, ReplayOutcome::Reported);
+        assert_eq!(sink.0.lock().unwrap().len(), 1);
+        // The predecessor's marker is gone and this instance wrote none: the next start has
+        // nothing to report again.
+        assert!(crate::killrec::read_marker(dir.path()).is_none());
+        let next = replayed_with_outcome(&sensor_in(dir.path(), log));
+        assert!(next.0.is_empty(), "{:?}", next.0);
     }
 }
