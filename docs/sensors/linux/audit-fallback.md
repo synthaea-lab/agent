@@ -86,16 +86,17 @@ becomes one of the agent's thread ids, a blocking-pool thread say, is read as a 
 then dies without a clean stop); the anchor is refreshed every 5 s with the thread list, so it stays near the end of `audit.log` and the replay
 reads one or two files; with no readable log at start, or an anchor that left the log between two refreshes (more than
 `num_logs` rotations in 5 s), the replay falls back to timestamps, and a clock set back before the kill then costs the attribution (the warning above covers
-it). The `arch=b32` rules and the thread-id refresh were run on Fedora 43 at `74048cde` (Jihair54). The position anchor and its refresh,
-the marker removal on a SIGTERM stop (only the instance's own marker: a stop before the sensor replayed the predecessor's
-marker leaves it for the next start, and no write follows the removal) and the previous-boot case are tested on lines and files and in a re-executed
-child, and were **not run on a lab host** after the change that introduced them. The volume of SIGKILL records on a real
-host is not measured. Tested on the captured line and on files, and run end to end on Rocky 9.8 (2026-11-16, agent built without
-eBPF probes, rule loaded, agent started as a systemd unit, killed, restarted on the same state directory): the restarted agent
-logged `the previous agent instance was sent SIGKILL, reporting it` and raised T1562.001 with the sender's pid and `comm`
-for `kill -KILL` from bash (`comm=bash`) and for `/usr/bin/kill` (`comm=kill`); after `systemctl kill -s KILL` it reported
-nothing (no record, as captured); after a clean stop and restart it reported nothing. Not run: other kernels, aarch64,
-an agent that is not root, the volume of SIGKILL records.
+it). The `arch=b32` rules and the thread-id refresh were run on Fedora 43 at `74048cde` (Jihair54). The position anchor, its refresh and the marker removal on a SIGTERM stop (only the instance's own marker: a stop before the sensor replayed the predecessor's
+marker leaves it for the next start, and no write follows the removal) were run on Fedora 43 (Jihair54, kernel 7.2.10, agent binary with the runtime fix) and on Rocky 9.8
+(agent built from `fa18b064`, audit fallback, rule loaded, 2026-11-19): `kill -KILL` from bash, `/usr/bin/kill`, `tgkill` of a worker thread, and `kill -KILL`
+followed by `service auditd rotate` (the record read from `audit.log.1`) were each reported by the restarted agent as `the previous agent instance was sent SIGKILL`
+with T1562.001 and the sender's `comm`; `systemctl kill -s KILL` was not attributed (the log says no SIGKILL record); a clean stop and a `SIGTERM` stop reported nothing and removed
+the marker. An agent that is not root and has no capability cannot start in the audit fallback (`audit socket open: netlink socket error: 1`, EPERM, exit 1). Volume, one lab host:
+3000 `kill -KILL` in one second added 3000 `synthaea-kill` records (about 780 bytes each, `audit.log` +2.35 MB), cost the agent 0.11 s of CPU and lost none. Not run on a lab host:
+commit `609fc24a` (a stop signal that beats the marker write no longer leaves the predecessor's kill to be reported twice: unit tests only), `tkill` and the previous-boot case (unit tests and Jihair54's offline replay),
+other kernels and distributions, aarch64, an agent that is not root with `CAP_AUDIT_READ`, and the volume on a loaded real host (one poste, 3000 kills of `sleep`).
+Earlier, tested on the captured line and on files and run end to end on Rocky 9.8 (2026-11-16, agent built without eBPF probes, rule loaded, agent started as a systemd unit, killed,
+restarted on the same state directory): same result for `kill -KILL` from bash (`comm=bash`) and `/usr/bin/kill` (`comm=kill`), nothing for `systemctl kill -s KILL` and after a clean stop.
 
 Netlink multicast delivers one copy of each record to every subscribed socket, so `AvcReader` and
 `AuditSensor` do not steal records from each other or from `auditd`.
