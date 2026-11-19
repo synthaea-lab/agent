@@ -281,6 +281,17 @@ impl Default for AuditSensor {
     }
 }
 
+/// The runtime the sensor loop runs on. It needs the time driver as well as the I/O driver:
+/// the loop ticks a `tokio::time::interval` to refresh the marker, and without
+/// `enable_time` the first call panics ("timers are disabled") at start-up.
+fn sensor_runtime() -> Result<tokio::runtime::Runtime, SensorError> {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_io()
+        .enable_time()
+        .build()
+        .map_err(|e| format!("tokio runtime: {e}").into())
+}
+
 impl Sensor for AuditSensor {
     fn name(&self) -> &str {
         "linux-audit"
@@ -298,10 +309,7 @@ impl Sensor for AuditSensor {
     }
 
     fn run(&mut self, sink: Box<dyn EventSink>) -> Result<(), SensorError> {
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_io()
-            .build()
-            .map_err(|e| format!("tokio runtime: {e}"))?;
+        let rt = sensor_runtime()?;
         rt.block_on(self.run_async(sink))
     }
 
@@ -345,6 +353,17 @@ pub(crate) fn audit_ts_to_epoch_ns(sec: u64, ms: u32) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sensor_runtime_has_the_time_driver() {
+        // `run_async` ticks `tokio::time::interval`; on a runtime without the time driver the
+        // first `interval` call panics at start-up (found on a lab VM, agent#275).
+        let rt = sensor_runtime().expect("runtime");
+        rt.block_on(async {
+            let mut tick = tokio::time::interval(std::time::Duration::from_millis(1));
+            tick.tick().await;
+        });
+    }
 
     #[test]
     fn timestamp_conversion() {
