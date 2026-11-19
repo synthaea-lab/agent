@@ -499,8 +499,22 @@ pub fn read_marker(state_dir: &Path) -> Option<Marker> {
 ///
 /// The write or the rename failed.
 pub fn write_marker(state_dir: &Path, marker: &Marker) -> std::io::Result<()> {
-    use std::io::Write;
+    write_marker_unless(state_dir, marker, &STOPPING)
+}
 
+/// [`write_marker`] that writes nothing once `stopping` is set, under [`MARKER_LOCK`]: a refresh
+/// that fires between the stop hook's removal and the process's exit must not put the file back.
+fn write_marker_unless(
+    state_dir: &Path,
+    marker: &Marker,
+    stopping: &std::sync::atomic::AtomicBool,
+) -> std::io::Result<()> {
+    use std::{io::Write, sync::atomic::Ordering};
+
+    let _guard = MARKER_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    if stopping.load(Ordering::Acquire) {
+        return Ok(());
+    }
     let tmp = state_dir.join(format!("{MARKER}.tmp"));
     // A leftover from a crash must not block the write, and `create_new` must not follow a
     // link someone planted at the fixed name.
@@ -548,6 +562,32 @@ pub fn remove_marker(state_dir: &Path) {
         && e.kind() != std::io::ErrorKind::NotFound
     {
         tracing::warn!(error = %e, "sensor-linux-audit: could not remove the instance marker, the next start will report an unclean stop");
+    }
+}
+
+/// Serialises the writes and the stop-time removal of the marker.
+static MARKER_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Set once this process is stopping on a signal: no marker write follows.
+static STOPPING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// For the stop hook of a signalled exit: removes the marker when it is this process's own, and
+/// stops later writes of it. The marker on disk is the predecessor's until this instance's sensor
+/// has replayed it, and a stop in that window must not delete the evidence of the predecessor's
+/// kill (the next start would find nothing to attribute).
+pub fn remove_own_marker(state_dir: &Path) {
+    remove_own_marker_with(state_dir, std::process::id(), &STOPPING);
+}
+
+fn remove_own_marker_with(
+    state_dir: &Path,
+    own_pid: u32,
+    stopping: &std::sync::atomic::AtomicBool,
+) {
+    let _guard = MARKER_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    stopping.store(true, std::sync::atomic::Ordering::Release);
+    if read_marker(state_dir).is_some_and(|m| m.pid == own_pid) {
+        remove_marker(state_dir);
     }
 }
 
@@ -1218,5 +1258,29 @@ mod tests {
     fn the_thread_ids_of_this_process_include_its_pid() {
         let tids = current_thread_ids();
         assert!(tids.contains(&std::process::id()), "{tids:?}");
+    }
+
+    #[test]
+    fn the_stop_hook_keeps_a_marker_that_is_not_its_own() {
+        let dir = tempfile::tempdir().unwrap();
+        let stopping = std::sync::atomic::AtomicBool::new(false);
+        // The predecessor (pid 255) was killed; this instance stops before its sensor replayed it.
+        write_marker(dir.path(), &marker(0xff, 900)).unwrap();
+        remove_own_marker_with(dir.path(), 0x100, &stopping);
+        assert_eq!(read_marker(dir.path()).map(|m| m.pid), Some(0xff));
+        // Its own marker goes.
+        write_marker(dir.path(), &marker(0x100, 900)).unwrap();
+        remove_own_marker_with(dir.path(), 0x100, &stopping);
+        assert!(read_marker(dir.path()).is_none());
+    }
+
+    #[test]
+    fn no_marker_is_written_once_the_process_is_stopping() {
+        let dir = tempfile::tempdir().unwrap();
+        let stopping = std::sync::atomic::AtomicBool::new(false);
+        remove_own_marker_with(dir.path(), 0x100, &stopping);
+        // A refresh that fires after the hook's removal must not put the marker back.
+        write_marker_unless(dir.path(), &marker(0x100, 900), &stopping).unwrap();
+        assert!(read_marker(dir.path()).is_none());
     }
 }

@@ -31,7 +31,7 @@ auditd's log (#275):
    packages neither install nor load it (it changes the host's audit configuration, and an immutable
    configuration refuses it). `SIGKILL` is process-wide, so a `kill`, `tkill` or `tgkill` naming the agent's pid
    or the id of any of its threads kills the agent. The marker lists the thread ids, and the agent compares them
-   with `/proc/self/task` every 5 s and rewrites the marker when they change. The kernel reads the pid and the
+   with `/proc/self/task` every 5 s and rewrites the marker when they change (it also moves the anchor to the newest kernel record then). The kernel reads the pid and the
    signal as `int`, so the parser keeps the low 32 bits of `a0`, `a1` and `a2` (`a1=100000009` is a SIGKILL).
    Only `kill` takes a negative pid: `tkill` and `tgkill` refuse an id that is not positive. For `tgkill` the
    process is `a0`, the tgid.
@@ -83,10 +83,12 @@ to it (`write_logs = yes`, `log_format = ENRICHED` or `RAW`; the key is read fro
 gaps of the marker: a pid or thread id reused within the same boot by a process that is then killed can be
 taken for the agent (the boot id bounds it to one boot; a record aimed at an unrelated process whose pid later
 becomes one of the agent's thread ids, a blocking-pool thread say, is read as a kill of the agent if the agent
-then dies without a clean stop); with no readable log at start or an anchor that left the log the replay falls
-back to timestamps, and a clock set back before the kill then costs the attribution (the warning above covers
-it). The `arch=b32` rules and the thread-id refresh were run on Fedora 43 at `74048cde` (Jihair54). The position anchor,
-the marker removal on a SIGTERM stop and the previous-boot case are tested on lines and files and in a re-executed
+then dies without a clean stop); the anchor is refreshed every 5 s with the thread list, so it stays near the end of `audit.log` and the replay
+reads one or two files; with no readable log at start, or an anchor that left the log between two refreshes (more than
+`num_logs` rotations in 5 s), the replay falls back to timestamps, and a clock set back before the kill then costs the attribution (the warning above covers
+it). The `arch=b32` rules and the thread-id refresh were run on Fedora 43 at `74048cde` (Jihair54). The position anchor and its refresh,
+the marker removal on a SIGTERM stop (only the instance's own marker: a stop before the sensor replayed the predecessor's
+marker leaves it for the next start, and no write follows the removal) and the previous-boot case are tested on lines and files and in a re-executed
 child, and were **not run on a lab host** after the change that introduced them. The volume of SIGKILL records on a real
 host is not measured. Tested on the captured line and on files, and run end to end on Rocky 9.8 (2026-11-16, agent built without
 eBPF probes, rule loaded, agent started as a systemd unit, killed, restarted on the same state directory): the restarted agent

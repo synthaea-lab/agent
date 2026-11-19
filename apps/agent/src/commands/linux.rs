@@ -296,12 +296,13 @@ pub(crate) fn cmd_run(opts: super::RunOptions) -> anyhow::Result<()> {
     // bounded shutdown drain.
     // A stop by SIGTERM, SIGHUP or SIGQUIT ends in the watcher's `exit`, which never returns to the
     // audit sensor's own clean-stop code: the watcher removes the audit fallback's instance marker,
-    // or every restart would leave one and the next start would report an unclean stop.
+    // or every restart would leave one and the next start would report an unclean stop. Only this
+    // instance's own marker: until the sensor has replayed it, the file is the predecessor's.
     let marker_dir = storage.state_dir.clone();
     crate::kill_loudness::spawn_watcher(
         alerts.to_path_buf(),
         sink.enrich_queue().clone(),
-        move || sensor_linux_audit::killrec::remove_marker(&marker_dir),
+        move || sensor_linux_audit::killrec::remove_own_marker(&marker_dir),
     )?;
 
     // Select the primary sensor (eBPF or audit fallback) before creating heartbeats

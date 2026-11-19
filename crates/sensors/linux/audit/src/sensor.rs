@@ -40,7 +40,7 @@ enum ReplayOutcome {
     NoRecord,
 }
 
-/// How often the marker's thread list is compared with `/proc/self/task`: the runtime starts
+/// How often the marker's thread list is compared with `/proc/self/task` and its anchor with the log: the runtime starts
 /// workers on demand, and a `kill(<tid>, 9)` of one that the marker lacks is not attributed.
 const THREAD_REFRESH: std::time::Duration = std::time::Duration::from_secs(5);
 
@@ -74,8 +74,10 @@ impl AuditSensor {
     /// Reads the previous instance's marker, writes this one's, and emits the replayed kill, if any.
     ///
     /// Synchronous, on the runtime thread, once at start-up and before the listening loop: it
-    /// reads the tail of each audit log file (2 x 16 MiB at most per file, and the walk stops at
-    /// the first file older than the previous instance), which is brief next to the start. It
+    /// reads the tail of each audit log file (2 x 16 MiB at most per file). The walk ends at the file
+    /// holding the marker's anchor, refreshed every few seconds so that it is the newest file or one
+    /// behind it, or, without an anchor, at the first file older than the previous instance; either is
+    /// brief next to the start. It
     /// is not moved to `spawn_blocking`: the sink is borrowed, and the replay must have been
     /// emitted before the first live record.
     fn replay_previous_sigkill(&self, sink: &dyn EventSink) -> ReplayOutcome {
@@ -136,8 +138,11 @@ impl AuditSensor {
         ReplayOutcome::Reported
     }
 
-    /// Rewrites the marker when the process's thread ids changed since it was written.
-    fn refresh_marker_threads(&self) {
+    /// Rewrites the marker when the process's thread ids changed since it was written, or when the
+    /// log has a newer kernel record than its anchor. A kill always comes after the last refresh,
+    /// so a fresh anchor keeps the replay's walk to the newest file or two instead of the whole
+    /// chain once the start-up anchor has been rotated out.
+    fn refresh_marker(&self) {
         let Some(dir) = &self.state_dir else {
             return;
         };
@@ -146,12 +151,20 @@ impl AuditSensor {
             return;
         };
         let tids = crate::killrec::current_thread_ids();
-        if tids.is_empty() || tids == marker.tids {
+        let anchor = crate::killrec::newest_anchor(&self.log_paths);
+        let threads_changed = !tids.is_empty() && tids != marker.tids;
+        let anchor_moved = anchor.is_some() && anchor != marker.anchor;
+        if !threads_changed && !anchor_moved {
             return;
         }
-        marker.tids = tids;
+        if threads_changed {
+            marker.tids = tids;
+        }
+        if anchor_moved {
+            marker.anchor = anchor;
+        }
         if let Err(e) = crate::killrec::write_marker(dir, marker) {
-            tracing::warn!(error = %e, "sensor-linux-audit: could not refresh the thread list of the instance marker");
+            tracing::warn!(error = %e, "sensor-linux-audit: could not refresh the instance marker");
         }
     }
 
@@ -187,7 +200,7 @@ impl AuditSensor {
         loop {
             tokio::select! {
                 _ = &mut ctrl_c => break,
-                _ = threads.tick() => self.refresh_marker_threads(),
+                _ = threads.tick() => self.refresh_marker(),
                 _ = self.stop.notified() => break,
                 guard = async_socket.readable_mut() => {
                     let mut guard = guard.map_err(|e| format!("poll: {e}"))?;
@@ -557,7 +570,7 @@ mod tests {
         });
         let tid = tid_rx.recv().unwrap();
         assert!(!before.tids.contains(&tid));
-        sensor.refresh_marker_threads();
+        sensor.refresh_marker();
         let after = crate::killrec::read_marker(dir.path()).unwrap();
         assert!(after.tids.contains(&tid));
         // `kill -9 <worker tid>` of that process, replayed by its successor (another pid).
@@ -571,5 +584,25 @@ mod tests {
         assert_eq!(events.len(), 1, "{events:?}");
         done_tx.send(()).unwrap();
         worker.join().unwrap();
+    }
+
+    #[test]
+    fn a_refresh_moves_the_anchor_to_the_newest_kernel_record() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("audit.log");
+        std::fs::write(&log, format!("{}\n", kill_line("ff"))).unwrap();
+        let sensor = sensor_in(dir.path(), log.clone());
+        let _ = replayed(&sensor);
+        let before = crate::killrec::read_marker(dir.path()).unwrap();
+        assert_eq!(before.anchor.map(|a| a.serial), Some(7));
+        // The log grows while the agent runs; the next refresh follows it.
+        let newer = kill_line("ee").replace("audit(1000.500:7)", "audit(2000.500:9)");
+        std::fs::write(&log, format!("{}\n{newer}\n", kill_line("ff"))).unwrap();
+        sensor.refresh_marker();
+        let after = crate::killrec::read_marker(dir.path()).unwrap();
+        assert_eq!(after.anchor.map(|a| a.serial), Some(9));
+        // Nothing new in the log: the marker is left as it is.
+        sensor.refresh_marker();
+        assert_eq!(crate::killrec::read_marker(dir.path()).unwrap(), after);
     }
 }
