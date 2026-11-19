@@ -38,7 +38,7 @@ pub(super) enum ScorerLoadError {
 /// The `case_id` of a correlator finding: `{ppid}:{comm}`, with `@{generation}` of the
 /// parent appended when it is known, so two incarnations of a recycled parent pid do not
 /// share one case. The server treats it as an opaque string.
-pub(super) fn correlator_case_id(entity: &verdict::EntityKey) -> String {
+pub(crate) fn correlator_case_id(entity: &verdict::EntityKey) -> String {
     match entity.parent_generation {
         Some(generation) => format!("{}:{}@{generation}", entity.ppid, entity.comm),
         None => format!("{}:{}", entity.ppid, entity.comm),
@@ -157,7 +157,7 @@ impl DetectionSink {
         Ok(())
     }
 
-    pub(super) fn advance_correlation_time(&self, now_ns: u64) {
+    pub(crate) fn advance_correlation_time(&self, now_ns: u64) {
         let alerts = {
             let mut correlator = self.correlator.lock_recovering();
             correlator.advance_time(now_ns)

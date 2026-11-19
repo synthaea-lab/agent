@@ -38,7 +38,7 @@ cargo build -p agent --release
 
 ```sh
 cargo test --workspace --exclude sensor-linux-ebpf
-cargo test -p updater --no-default-features   # the packaged trust set (keys unprovisioned)
+cargo test -p updater --no-default-features   # the packaged trust set (the committed keys)
 tools/gauntlet.sh                             # everything CI runs, on one machine
 tools/gauntlet.sh --fast                      # skip the cross-target and docs passes
 git config core.hooksPath tools/hooks         # opt-in: run the gauntlet on pre-push

@@ -36,7 +36,7 @@
 //! and this held even after adding explicit bounds comparisons (`i32::clamp` and
 //! a hand-written if/else-if/else both compile to a branchless sign-extend-and-
 //! mask select the verifier can't see through — see the fix's comment in
-//! `crates/sensors/linux/ebpf/src/main.rs`). Fixed by returning a fixed constant
+//! `crates/sensors/linux/ebpf/src/lsm/file_open.rs`). Fixed by returning a fixed constant
 //! deny (`-1`) instead of forwarding the exact original errno — the only property
 //! this hook actually needs to preserve ("never override an earlier LSM's deny
 //! with our own allow"), and a compile-time constant trivially satisfies the

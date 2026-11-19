@@ -292,7 +292,7 @@ pub(crate) fn attach_raw_tracepoint(
         .program_mut(program_name)
         .expect("loaded just above")
         .try_into()
-        .expect("checked just above");
+        .map_err(|e| err(format!("`{program_name}` is not a raw tracepoint: {e}")))?;
     program.attach(tracepoint).map_err(|e| {
         err(format!(
             "failed to attach raw tracepoint `{tracepoint}` (needs CAP_BPF and CAP_PERFMON or root): {e}"

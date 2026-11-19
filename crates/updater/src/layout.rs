@@ -160,8 +160,7 @@ impl Layout {
     /// # Panics
     ///
     /// Never in practice: [`ReleaseManifest`] contains no type `serde_json` cannot
-    /// serialize (same invariant `ReleaseManifest`'s own `canonical_bytes` relies
-    /// on).
+    /// serialize (same invariant `SignedDocument::canonical_bytes` relies on).
     pub fn persist_manifest(&self, manifest: &ReleaseManifest) -> Result<(), UpdaterError> {
         let path = self
             .version_dir(manifest.release_version)

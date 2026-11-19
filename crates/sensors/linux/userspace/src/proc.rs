@@ -252,6 +252,59 @@ pub(crate) fn read_proc_images(limit: usize) -> Vec<(u32, u64, String)> {
     images
 }
 
+/// A process running when the agent starts, as `RuleState::seed_processes` takes it (#17).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SeedProcess {
+    /// The process id.
+    pub pid: u32,
+    /// `/proc/<pid>/comm`.
+    pub comm: String,
+    /// `/proc/<pid>/exe`, `None` when the link is unreadable (another user's process without
+    /// root), absent (a kernel thread) or ends in " (deleted)" (the path is no longer a file).
+    pub image: Option<String>,
+    /// The incarnation stamp the sensor puts on this process's events: [`primed_generation`], the
+    /// one derivation. `None` when `starttime` is unreadable ("no stamp": better unknown than
+    /// wrong), which a lookup reads as "cannot tell".
+    pub generation: Option<u64>,
+}
+
+/// Every running process, read from `/proc`, to seed the rule state with the facts the agent
+/// missed by attaching late. Best effort: a process that vanishes mid-scan is skipped.
+#[must_use]
+pub fn read_seed_processes() -> Vec<SeedProcess> {
+    let Ok(entries) = std::fs::read_dir("/proc") else {
+        return Vec::new();
+    };
+    let mut processes = Vec::new();
+    for entry in entries.flatten() {
+        let Some(pid) = entry
+            .file_name()
+            .to_str()
+            .and_then(|s| s.parse::<u32>().ok())
+        else {
+            continue;
+        };
+        let Ok(comm) = std::fs::read_to_string(entry.path().join("comm")) else {
+            continue;
+        };
+        let image = std::fs::read_link(entry.path().join("exe"))
+            .ok()
+            .map(|exe| exe.to_string_lossy().into_owned())
+            .filter(|exe| !exe.is_empty() && !exe.ends_with(" (deleted)"));
+        let generation = std::fs::read_to_string(entry.path().join("stat"))
+            .ok()
+            .map(|stat| primed_generation(&stat))
+            .filter(|generation| *generation != 0);
+        processes.push(SeedProcess {
+            pid,
+            comm: comm.trim_end().to_string(),
+            image,
+            generation,
+        });
+    }
+    processes
+}
+
 /// `starttime` (field 22 of `/proc/<pid>/stat`: clock ticks since boot at which the
 /// process started), the identity stamp for a process that predates the agent
 /// (issue #519). Fields after the closing `)` are counted from the state (field 3):
@@ -272,7 +325,7 @@ mod tests {
     use super::{
         argv_from_windows, is_proc_exit_race, parse_proc_cmdline, parse_proc_environ_security,
         parse_stat_ppid_comm, parse_stat_starttime, primed_generation, read_cmdline_file,
-        read_proc_images,
+        read_proc_images, read_seed_processes,
     };
 
     /// Writes `blob` to a fresh file under the temp dir and returns its path.
@@ -541,6 +594,27 @@ mod tests {
             std::path::Path::new(image),
             std::env::current_exe().unwrap().as_path()
         );
+    }
+
+    #[test]
+    fn a_seeded_process_carries_the_stamp_the_sensor_gives_its_events() {
+        // The seed and the sensor's priming (`PROC_LINEAGE`, parent images) must agree, or a
+        // seeded fact would match nothing: same pid, same `primed_generation` of its stat.
+        let own = std::process::id();
+        let seeded = read_seed_processes()
+            .into_iter()
+            .find(|p| p.pid == own)
+            .expect("this process is listed");
+        let stat = std::fs::read_to_string("/proc/self/stat").unwrap();
+        assert_eq!(seeded.generation, Some(primed_generation(&stat)));
+        let primed = read_proc_images(usize::MAX)
+            .into_iter()
+            .find(|(pid, _, _)| *pid == own)
+            .unwrap();
+        assert_eq!(seeded.generation, Some(primed.1));
+        assert_eq!(seeded.image.as_deref(), Some(primed.2.as_str()));
+        let expected_comm = std::fs::read_to_string("/proc/self/comm").unwrap();
+        assert_eq!(seeded.comm, expected_comm.trim_end());
     }
 
     #[test]

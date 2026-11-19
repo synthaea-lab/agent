@@ -67,7 +67,20 @@ pub fn kill_process(
     policy: &ResponsePolicy,
     terminate: impl FnOnce(u32) -> std::io::Result<()>,
 ) -> KillOutcome {
-    if let Some(reason) = protected_reason(pid, std::process::id()) {
+    kill_process_as(pid, std::process::id(), policy, terminate)
+}
+
+/// [`kill_process`] with the agent's own pid given instead of read from the process. The caller
+/// that owns the policy keeps the pid it protects, so a test can pick one that no fixed test pid
+/// can equal (agent#247: a test process whose real pid was the victim's was refused).
+#[must_use]
+pub fn kill_process_as(
+    pid: u32,
+    own_pid: u32,
+    policy: &ResponsePolicy,
+    terminate: impl FnOnce(u32) -> std::io::Result<()>,
+) -> KillOutcome {
+    if let Some(reason) = protected_reason(pid, own_pid) {
         return KillOutcome::Refused { pid, reason };
     }
     if !policy.kill_enabled {
