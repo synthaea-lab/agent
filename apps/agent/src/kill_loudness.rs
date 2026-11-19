@@ -32,9 +32,11 @@
 //! `exit` flow terminates the process, so `termination_signal_flow_records_sender_and_exits`
 //! runs it in a child: the test re-executes its own binary, the child blocks the
 //! signals and spawns the watcher, and the parent sends each watched signal and checks
-//! the exit status (`128 + signo`) and the alert line (sender pid = the parent). The
-//! audit-fallback SIGKILL gap is not covered by any test: it needs a lab capture (see
-//! `docs/self-protection.md#kill-loudness`).
+//! the exit status (`128 + signo`) and the alert line (sender pid = the parent). A SIGKILL
+//! cannot be caught, so it is not read here: under the audit fallback the next start reports it
+//! from auditd's log (`sensor-linux-audit`'s `killrec`, unit-tested, and run end to end on a Rocky
+//! 9.8 VM on 2026-11-19; see `docs/sensors/linux/audit-fallback.md` for what that run did and did
+//! not cover).
 
 #![cfg_attr(not(target_os = "linux"), allow(dead_code))]
 
