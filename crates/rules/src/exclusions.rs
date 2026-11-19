@@ -125,13 +125,13 @@ const FIREFOX_DIR_NAMES: &[&str] = &["firefox", "firefox-esr"];
 /// 6.12, same `executable_path`, comm `BgIOThr~Pool #1`), a tarball's
 /// `<dir>/firefox/firefox-bin`, the Snap's
 /// `/snap/firefox/<rev>/usr/lib/firefox/firefox` and a Flatpak-shaped `/app/lib/firefox/firefox`
-/// (not verified). Not `/usr/bin/firefox` (the launcher script, parent `bin`).
+/// (not verified). The Chromium Snap is matched by [`is_chromium_snap_image`]. Not `/usr/bin/firefox` (the launcher script, parent `bin`).
 ///
 /// A mark only arms the signature-gated T1204.002 on an exec of the renamed file, so a false
 /// match gives an extra alert on a file that something named like Firefox renamed from a
 /// partial name, and hides nothing; a miss hides a real download. Case-sensitive, like the list.
 pub(crate) fn is_browser_download_image(image: &str) -> bool {
-    if BROWSER_DOWNLOAD_IMAGES.contains(&image) {
+    if BROWSER_DOWNLOAD_IMAGES.contains(&image) || is_chromium_snap_image(image) {
         return true;
     }
     let mut parts = image.rsplit('/');
@@ -139,6 +139,24 @@ pub(crate) fn is_browser_download_image(image: &str) -> bool {
         return false;
     };
     FIREFOX_FILE_NAMES.contains(&file) && FIREFOX_DIR_NAMES.contains(&parent)
+}
+
+/// The Chromium Snap's main executable, `/snap/chromium/<rev>/usr/lib/chromium-browser/chrome`
+/// (captured 2026-11-16 on Ubuntu 26.04.1, Chromium 157 rev 3593, under X11 and Wayland,
+/// <https://github.com/synthaea-lab/agent/issues/267>). The revision changes with every
+/// update, so it is matched as one or more digits; `current` and any other component do not
+/// match, because the sensor reports the resolved revision directory. Only this layout: the
+/// file is `chrome` here, not `chromium-browser`, so the distribution entry in
+/// [`BROWSER_DOWNLOAD_IMAGES`] does not cover it.
+pub(crate) fn is_chromium_snap_image(image: &str) -> bool {
+    image
+        .strip_prefix("/snap/chromium/")
+        .and_then(|rest| rest.split_once('/'))
+        .is_some_and(|(rev, tail)| {
+            !rev.is_empty()
+                && rev.bytes().all(|b| b.is_ascii_digit())
+                && tail == "usr/lib/chromium-browser/chrome"
+        })
 }
 
 /// Suffixes of a browser's partial download file. A rename out of one of these, to a name

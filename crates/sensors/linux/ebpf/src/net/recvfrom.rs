@@ -14,7 +14,7 @@ use aya_ebpf::{
 use aya_log_ebpf::warn;
 use sensor_linux_wire::{TASK_COMM_LEN, UdpRecvEvent};
 
-use crate::{AF_INET, AF_INET6, SYS_EXIT_RET_OFFSET, fill_lineage};
+use crate::{AF_INET, AF_INET6, SYS_EXIT_RET_OFFSET, fill_lineage, into_ret};
 
 /// Ring buffer shared with userspace for `recvfrom` events.
 #[map]
@@ -57,10 +57,7 @@ const RECVFROM_ADDR_PTR_OFFSET: usize = 28;
 const RECVFROM_ADDR_LEN_PTR_OFFSET: usize = 32;
 
 pub fn sys_enter_recvfrom(ctx: TracePointContext) -> u32 {
-    match stash_recvfrom_addr(&ctx) {
-        Ok(ret) => ret,
-        Err(ret) => ret,
-    }
+    into_ret(stash_recvfrom_addr(&ctx))
 }
 
 fn stash_recvfrom_addr(ctx: &TracePointContext) -> Result<u32, u32> {
@@ -97,10 +94,7 @@ fn stash_recvfrom_addr(ctx: &TracePointContext) -> Result<u32, u32> {
 }
 
 pub fn sys_exit_recvfrom(ctx: TracePointContext) -> u32 {
-    match try_sys_exit_recvfrom(ctx) {
-        Ok(ret) => ret,
-        Err(ret) => ret,
-    }
+    into_ret(try_sys_exit_recvfrom(ctx))
 }
 
 /// No-ops when the matching enter wasn't tracked, the call failed (`ret < 0`), the
