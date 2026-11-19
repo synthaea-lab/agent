@@ -276,8 +276,11 @@ same signature gate applies.
   unreadable (`starttime` missing) or the event has none (macOS), the lookup cannot tell and the seeded fact
   answers, as for the other pid tables. A resolved image always wins, even when it is not a browser, and
   the pid's own non-browser exec wins over a browser parent (a helper such as `cp` run from the browser
-  marks nothing). Unit-tested only: no lab run, and no capture shows the sensor losing the race on a
-  browser rename. What is still unchecked is listed under
+  marks nothing). Unit-tested, and run on a lab VM on 2026-11-19 with a synthetic
+  renamer at the Firefox ESR path (Debian 13): 56 of 60 renames arrived with an empty image, 32 execs raised
+  T1204.002 (28 of them on such a rename) and the same helper from a non-browser path raised none. The fallback
+  needs the renamer's exec to be recorded before its rename, and the downloaded file's exec to come after
+  the rename. No capture shows a real browser losing the race. What is still unchecked is listed under
   "Not verified" in [attack-coverage.md](../attack-coverage.md).
 
 ## Signature-gated findings
