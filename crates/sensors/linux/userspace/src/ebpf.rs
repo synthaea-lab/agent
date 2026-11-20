@@ -69,6 +69,73 @@ pub fn load_ebpf() -> Result<aya::Ebpf, SensorError> {
     load_embedded(None)
 }
 
+/// A probe path the object carries but runs only when a load-time global enables it, with the
+/// BTF offsets it reads through. The globals are `.rodata` constants: left at 0, the verifier
+/// prunes the path, so the agent and `verify_probes` must set the same list (#310). `N` ties
+/// the names to the offset values a caller passes, so the two cannot drift in length.
+#[cfg(ebpf_embedded)]
+struct GatedPath<const N: usize> {
+    enabled: &'static str,
+    offsets: [&'static str; N],
+}
+
+/// `inode_setattr` timestamp hook (#1044): `iattr` and `dentry` field offsets.
+#[cfg(ebpf_embedded)]
+const INODE_SETATTR: GatedPath<5> = GatedPath {
+    enabled: "INODE_SETATTR_ENABLED",
+    offsets: [
+        "IATTR_VALID_OFFSET",
+        "IATTR_ATIME_OFFSET",
+        "IATTR_MTIME_OFFSET",
+        "DENTRY_PARENT_OFFSET",
+        "DENTRY_NAME_PTR_OFFSET",
+    ],
+};
+
+/// argv read at exec (#48): `task_struct.mm` and `mm_struct.arg_{start,end}` offsets.
+#[cfg(ebpf_embedded)]
+const EXEC_ARGV: GatedPath<3> = GatedPath {
+    enabled: "EXEC_ARGV_ENABLED",
+    offsets: ["TASK_MM_OFFSET", "MM_ARG_START_OFFSET", "MM_ARG_END_OFFSET"],
+};
+
+#[cfg(ebpf_embedded)]
+static ENABLED: u32 = 1;
+
+/// Stand-in for the BTF offsets when only the verifier's view matters: every gated path reads
+/// through `bpf_probe_read_kernel`, where an offset is a scalar added to the source pointer,
+/// so any small value exercises the same instructions as the kernel's real offsets.
+#[cfg(ebpf_embedded)]
+const STAND_IN_OFFSET: u32 = 8;
+
+/// Sets `path`'s enabled flag and its offsets, `must_exist` as everywhere here: a renamed
+/// global fails the load instead of leaving the path disabled.
+#[cfg(ebpf_embedded)]
+fn enable_gated<'a, const N: usize>(
+    loader: &mut aya::EbpfLoader<'a>,
+    path: &GatedPath<N>,
+    offsets: &'a [u32; N],
+) {
+    loader.override_global(path.enabled, &ENABLED, true);
+    for (&name, value) in path.offsets.iter().zip(offsets) {
+        loader.override_global(name, value, true);
+    }
+}
+
+/// A loader for the embedded object with every optional probe path enabled and stand-in
+/// offsets, for checking what the kernel's verifier accepts (`examples/verify_probes.rs`):
+/// the same gated paths the agent enables when BTF resolves their offsets, so the check
+/// covers the code that ships (#310). Not for running the sensor: the offsets are not the
+/// kernel's.
+#[cfg(ebpf_embedded)]
+#[must_use]
+pub fn verifier_loader() -> aya::EbpfLoader<'static> {
+    let mut loader = aya::EbpfLoader::new();
+    enable_gated(&mut loader, &INODE_SETATTR, &[STAND_IN_OFFSET; 5]);
+    enable_gated(&mut loader, &EXEC_ARGV, &[STAND_IN_OFFSET; 3]);
+    loader
+}
+
 #[cfg(ebpf_embedded)]
 fn load_embedded(tamper_pin: Option<&std::path::Path>) -> Result<aya::Ebpf, SensorError> {
     let offsets = crate::btf::read_scheduler_field_offsets().map_err(|e| {
@@ -92,10 +159,18 @@ fn load_embedded(tamper_pin: Option<&std::path::Path>) -> Result<aya::Ebpf, Sens
             tracing::warn!(error = %e, "exec argv offsets unavailable: argv read from /proc only");
         })
         .ok();
-    let enabled = 1u32;
+    // In `GatedPath` field order; bound before the loader, which keeps the references.
+    let setattr = setattr.map(|o| {
+        [
+            o.ia_valid,
+            o.ia_atime,
+            o.ia_mtime,
+            o.dentry_parent,
+            o.dentry_name_ptr,
+        ]
+    });
+    let argv = argv.map(|o| [o.task_mm, o.mm_arg_start, o.mm_arg_end]);
 
-    // A new optional path gated by a global goes into `examples/verify_probes.rs` as well:
-    // there the global would stay 0 and the verifier would prune the path unchecked (#310).
     let mut loader = aya::EbpfLoader::new();
     loader
         .override_global("TASK_PID_OFFSET", &offsets.task_pid, true)
@@ -104,21 +179,11 @@ fn load_embedded(tamper_pin: Option<&std::path::Path>) -> Result<aya::Ebpf, Sens
         .override_global("BINPRM_FILENAME_OFFSET", &offsets.binprm_filename, true)
         .override_global("SYSCALL_ARG_OFFSETS", &offsets.syscall_args, true)
         .override_global("SYSCALL_NR_OFFSET", &offsets.syscall_nr, true);
-    if let Some(o) = &setattr {
-        loader
-            .override_global("INODE_SETATTR_ENABLED", &enabled, true)
-            .override_global("IATTR_VALID_OFFSET", &o.ia_valid, true)
-            .override_global("IATTR_ATIME_OFFSET", &o.ia_atime, true)
-            .override_global("IATTR_MTIME_OFFSET", &o.ia_mtime, true)
-            .override_global("DENTRY_PARENT_OFFSET", &o.dentry_parent, true)
-            .override_global("DENTRY_NAME_PTR_OFFSET", &o.dentry_name_ptr, true);
+    if let Some(values) = &setattr {
+        enable_gated(&mut loader, &INODE_SETATTR, values);
     }
-    if let Some(o) = &argv {
-        loader
-            .override_global("EXEC_ARGV_ENABLED", &enabled, true)
-            .override_global("TASK_MM_OFFSET", &o.task_mm, true)
-            .override_global("MM_ARG_START_OFFSET", &o.mm_arg_start, true)
-            .override_global("MM_ARG_END_OFFSET", &o.mm_arg_end, true);
+    if let Some(values) = &argv {
+        enable_gated(&mut loader, &EXEC_ARGV, values);
     }
     if let Some(path) = tamper_pin {
         loader.map_pin_path("SIGNAL_TAMPER_LAST", path);

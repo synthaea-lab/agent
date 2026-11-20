@@ -18,42 +18,22 @@
 //! The counts also let a refactor of the probes show what it cost the verifier: compare the
 //! output before and after (AS-003).
 //!
-//! The optional code paths are loaded enabled, the way the agent loads them when BTF resolves
-//! their offsets (`src/ebpf.rs`): a gating global left at 0 is a constant in `.rodata`, and the
-//! verifier then prunes everything behind it, so the check would pass code it never saw (#310).
+//! The optional code paths are loaded enabled through `sensor_linux::verifier_loader`, from the
+//! same list of gated paths the agent enables when BTF resolves their offsets: a gating global
+//! left at 0 is a constant in `.rodata`, and the verifier then prunes everything behind it, so
+//! the check would pass code it never saw (#310).
 
 #[cfg(all(target_os = "linux", ebpf_embedded))]
 mod linux {
     use std::{collections::BTreeSet, error::Error, process::ExitCode};
 
-    use aya::{Btf, EbpfLoader, programs::Program};
-
-    /// Enabled flag for each optional path the agent turns on at load (`src/ebpf.rs`).
-    const ENABLED: u32 = 1;
-    /// Stand-in for the BTF offsets those paths read through: the verifier bounds them as
-    /// scalars added to a pointer handed to `bpf_probe_read_kernel`, so any small value
-    /// exercises the same instructions as the kernel's real offsets.
-    const OFFSET: u32 = 8;
+    use aya::{Btf, programs::Program};
 
     pub(crate) fn run() -> Result<ExitCode, Box<dyn Error>> {
         let allowed = allowed_refusals(std::env::args().skip(1))?;
-        // `must_exist = true`, as in the agent: a renamed or dropped global fails the check
-        // instead of silently loading that path disabled again.
-        let mut ebpf = EbpfLoader::new()
-            .override_global("EXEC_ARGV_ENABLED", &ENABLED, true)
-            .override_global("TASK_MM_OFFSET", &OFFSET, true)
-            .override_global("MM_ARG_START_OFFSET", &OFFSET, true)
-            .override_global("MM_ARG_END_OFFSET", &OFFSET, true)
-            .override_global("INODE_SETATTR_ENABLED", &ENABLED, true)
-            .override_global("IATTR_VALID_OFFSET", &OFFSET, true)
-            .override_global("IATTR_ATIME_OFFSET", &OFFSET, true)
-            .override_global("IATTR_MTIME_OFFSET", &OFFSET, true)
-            .override_global("DENTRY_PARENT_OFFSET", &OFFSET, true)
-            .override_global("DENTRY_NAME_PTR_OFFSET", &OFFSET, true)
-            .load(aya::include_bytes_aligned!(concat!(
-                env!("OUT_DIR"),
-                "/sensor-linux-ebpf"
-            )))?;
+        let mut ebpf = sensor_linux::verifier_loader().load(aya::include_bytes_aligned!(
+            concat!(env!("OUT_DIR"), "/sensor-linux-ebpf")
+        ))?;
         let btf = Btf::from_sys_fs()?;
         let mut names: Vec<String> = ebpf.programs().map(|(name, _)| name.to_string()).collect();
         names.sort();
