@@ -308,21 +308,27 @@ mod tests {
         assert_eq!(counters.alerts_dropped, 0);
     }
 
+    /// The four ETW shedding counts, in beacon order.
+    fn etw_shed(counters: &HostCounters) -> (u64, u64, u64, u64) {
+        (
+            counters.etw_pid_cache_evicted,
+            counters.etw_silo_evicted,
+            counters.etw_marks_dropped,
+            counters.etw_quarantine_unremembered,
+        )
+    }
+
     #[test]
-    fn the_etw_shed_reader_feeds_the_counters_and_its_absence_reads_zero() {
-        let without =
+    fn without_an_etw_shed_reader_the_etw_counters_read_zero() {
+        let counters =
             AgentHostCounters::new(sink("etw-shed-none"), WatchdogReport::default(), None)
                 .host_counters();
-        assert_eq!(
-            (
-                without.etw_pid_cache_evicted,
-                without.etw_silo_evicted,
-                without.etw_marks_dropped,
-                without.etw_quarantine_unremembered
-            ),
-            (0, 0, 0, 0)
-        );
-        let with = AgentHostCounters::new(sink("etw-shed"), WatchdogReport::default(), None)
+        assert_eq!(etw_shed(&counters), (0, 0, 0, 0));
+    }
+
+    #[test]
+    fn the_etw_shed_reader_feeds_the_counters() {
+        let counters = AgentHostCounters::new(sink("etw-shed"), WatchdogReport::default(), None)
             .with_etw_shed_reader(Box::new(|| EtwShedCounts {
                 pid_cache_evicted: 1,
                 silo_evicted: 2,
@@ -330,15 +336,7 @@ mod tests {
                 quarantine_unremembered: 4,
             }))
             .host_counters();
-        assert_eq!(
-            (
-                with.etw_pid_cache_evicted,
-                with.etw_silo_evicted,
-                with.etw_marks_dropped,
-                with.etw_quarantine_unremembered
-            ),
-            (1, 2, 3, 4)
-        );
+        assert_eq!(etw_shed(&counters), (1, 2, 3, 4));
     }
 
     #[test]

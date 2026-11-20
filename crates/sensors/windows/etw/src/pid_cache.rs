@@ -240,8 +240,9 @@ mod tests {
         for pid in 0..9 {
             cache.insert(pid, format!(r"C:\img\{pid}.exe"), None, None);
         }
-        assert_eq!(beacon_side.get(), cache.evicted());
-        assert!(beacon_side.get() > 0);
+        // Cap 8 evicts one entry (`cap / 8`) when the 9th arrives.
+        assert_eq!(beacon_side.get(), 1);
+        assert_eq!(cache.evicted(), 1);
     }
 
     #[test]
