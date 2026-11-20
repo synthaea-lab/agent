@@ -640,8 +640,11 @@ impl CorrelationEngine {
     ///     Err(e) => { error!("ML scorer: {e}"); None }  // Fail open
     /// };
     /// // Both errors only mean the score had nowhere to land (see # Errors): this event is
-    /// // scored without ML, it is not a failure of the event's handling.
-    /// let _ = engine.update_belief_with_ml(pid, generation, ml_llr);
+    /// // scored without ML, it is not a failure of the event's handling. Log at debug, as
+    /// // the agent's sink does, rather than drop the error unseen.
+    /// if let Err(error) = engine.update_belief_with_ml(pid, generation, ml_llr) {
+    ///     tracing::debug!(pid, %error, "ML score not folded into the belief");
+    /// }
     /// ```
     pub fn update_belief_with_ml(
         &mut self,
