@@ -6,16 +6,20 @@
 //! # Safety
 //!
 //! Nearly every `unsafe` block here is one of four patterns, so they are documented once here
-//! instead of on each block (AS-029). A block that does anything else carries its own
-//! `// SAFETY:` comment.
+//! instead of on each block (AS-029). A block that does anything else, and every read through
+//! a raw kernel pointer (`task_struct`, `pt_regs`, an LSM hook argument), carries its own
+//! `// SAFETY:` comment (#184).
 //!
-//! - **Tracepoint arguments.** `ctx.read_at::<T>(OFFSET)` reads the raw tracepoint record at
-//!   an offset taken from the tracepoint's `format` file, written next to each `*_OFFSET`
-//!   constant. `read_at` goes through `bpf_probe_read_kernel`, so a wrong offset gives an
-//!   error or a wrong value, never a fault.
+//! - **Syscall arguments.** `ctx.read_at::<T>(OFFSET)` reads a field of the syscall record.
+//!   No program here attaches to a real tracepoint: every `TracePointContext` wraps the
+//!   synthetic `SysEnterRecord`/`SysExitRecord` that `raw.rs` builds in a per-CPU map from
+//!   `pt_regs`, laid out like the tracepoint's `format` file (the `*_OFFSET` constants).
+//!   `read_at` goes through `bpf_probe_read_kernel`, so a wrong offset gives an error or a
+//!   wrong value, never a fault.
 //! - **Probe reads.** `bpf_probe_read_user`, `bpf_probe_read_kernel` and their `_str`/`_buf`
 //!   forms copy from an address the kernel may not map. The helper handles the fault and
-//!   returns an error, which every call site turns into an early return.
+//!   returns an error, which each call site turns into an early return or an explicit
+//!   fallback value (`unwrap_or(0)`, `.ok()?`, `if let Ok`).
 //! - **Per-CPU scratch.** `SCRATCH.get_ptr_mut(0)` gives this CPU's only slot of a
 //!   `PerCpuArray`. A program does not nest on its own CPU, so nothing else writes it between
 //!   the `write_bytes` that zeroes it and the `output` that copies it out. The field writes
