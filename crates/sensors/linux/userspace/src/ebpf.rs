@@ -94,6 +94,8 @@ fn load_embedded(tamper_pin: Option<&std::path::Path>) -> Result<aya::Ebpf, Sens
         .ok();
     let enabled = 1u32;
 
+    // A new optional path gated by a global goes into `examples/verify_probes.rs` as well:
+    // there the global would stay 0 and the verifier would prune the path unchecked (#310).
     let mut loader = aya::EbpfLoader::new();
     loader
         .override_global("TASK_PID_OFFSET", &offsets.task_pid, true)
