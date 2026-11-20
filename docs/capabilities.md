@@ -543,7 +543,7 @@ Totals: 273 capabilities, 153 built, 79 partial, 41 planned.
 
 | Capability | Status | Evidence | Tracking issue | Docs |
 | --- | --- | --- | --- | --- |
-| Offline manifest build and signing (key file, test key, PKCS#11) | partial | tools/release/src/main.rs, sign.rs, pkcs11.rs (tools/test-pkcs11.sh); production keys not yet in place | [#43](https://github.com/synthaea-lab/agent/issues/43) | [architecture.md#binaries](architecture.md#binaries) |
+| Offline manifest build and signing (key file, test key, PKCS#11) | partial | tools/release/src/main.rs (one `cmd_*` per subcommand, parse tests), tools/release/tests/cli.rs (each subcommand's output), sign.rs, pkcs11.rs (tools/test-pkcs11.sh); production keys not yet in place | [#43](https://github.com/synthaea-lab/agent/issues/43) | [architecture.md#binaries](architecture.md#binaries) |
 
 ### release-tool
 
