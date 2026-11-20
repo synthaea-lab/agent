@@ -210,6 +210,7 @@ fn signal_to_es_client(
         target_pid,
         target_image_path: target_path.map(str::to_owned),
         target_unit: None,
+        sender_unit: None,
         sender_unreliable: false,
         signals_lost: 0,
     })

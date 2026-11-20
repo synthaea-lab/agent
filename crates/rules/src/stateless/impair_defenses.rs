@@ -298,10 +298,13 @@ const INIT_PID: u32 = 1;
 ///     the `SIGTERM` itself, not pid 1), is indistinguishable from an attacker's, exactly as
 ///     `systemctl stop auditd` is Medium in `check_security_tool_stop`.
 ///
-/// What it **cannot** tell: whether a sender other than pid 1 is the agent's own
-/// supervisor (the watchdog) or another process of the same unit, since the event has
-/// no sender unit or cgroup. Such a signal still alerts High. Telling them apart needs
-/// the sender's unit in the event, which is a schema change and not made here.
+/// - A signal **to the agent** from a reliable sender in the agent's own unit
+///   ([`schema::AGENT_UNIT`], read from the sender's cgroup, #322) is **Low**: that is its
+///   watchdog, which kills it on a stalled heartbeat or a rollback. Moving a process into the
+///   unit's cgroup takes root, and the alert is still raised.
+///
+/// What it **cannot** tell: which process of the agent's unit sent it (the watchdog or the
+/// agent's own helper), nor the unit of a sender that exited before the drain, which stays High.
 ///
 /// On Linux it is the only record of a `SIGKILL`'s sender: the agent's own
 /// `kill_loudness` can only attribute the catchable signals. The kernel-side
@@ -331,6 +334,7 @@ pub(crate) fn check_security_process_signal(event: &schema::SignalEvent) -> Opti
         .unwrap_or_default();
     // With an unreliable sender, `meta` may be a bystander that happens to be pid 1.
     let from_manager = event.meta.pid == INIT_PID && !event.sender_unreliable;
+    let from_agent_unit = !tool && !event.sender_unreliable && sent_from_agent_unit(event);
     // `si_code` of interrupt or completion context (or forged): `meta` may be a bystander.
     let unreliable = if event.sender_unreliable {
         ": the sender is not reliable (the siginfo carries a code the kernel sets from interrupt \
@@ -340,7 +344,7 @@ pub(crate) fn check_security_process_signal(event: &schema::SignalEvent) -> Opti
     };
     Some(Alert {
         technique: "T1562.001",
-        severity: if from_manager {
+        severity: if from_manager || from_agent_unit {
             Severity::Low
         } else if tool && event.signal != SIGKILL && event.signal != SIGSTOP {
             Severity::Medium
@@ -353,14 +357,27 @@ pub(crate) fn check_security_process_signal(event: &schema::SignalEvent) -> Opti
             event.meta.comm,
             event.signal,
             event.target_pid,
-            if from_manager {
-                ": sent by the service manager, which does not say who asked it (a stop, \
-                 restart or upgrade, or `systemctl kill`)"
-            } else {
-                ""
-            },
+            known_sender_note(from_manager, from_agent_unit),
         ) + unreliable,
     })
+}
+
+/// Whether the sender runs in the agent's own unit, where its watchdog is (#322).
+fn sent_from_agent_unit(event: &schema::SignalEvent) -> bool {
+    event.sender_unit.as_deref() == Some(schema::AGENT_UNIT)
+}
+
+/// Why a signal from a known sender is Low, appended to its alert.
+fn known_sender_note(from_manager: bool, from_agent_unit: bool) -> &'static str {
+    if from_manager {
+        ": sent by the service manager, which does not say who asked it (a stop, restart or \
+         upgrade, or `systemctl kill`)"
+    } else if from_agent_unit {
+        ": sent from the agent's own unit, where its watchdog restarts it (a stalled heartbeat \
+         or a rollback)"
+    } else {
+        ""
+    }
 }
 
 /// T1562.001: signals to security tools were lost to a full ring buffer (Linux, #1103). A flood

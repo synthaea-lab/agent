@@ -265,9 +265,9 @@ why the history skips some values.
 ```text
 crates/schema/tests/fixtures/
   v1/   frozen forever: 7 files, read by tests/v1_compat.rs
-  v2/ … v67/   frozen snapshots of past versions, never edited
+  v2/ … v68/   frozen snapshots of past versions, never edited
                 (numbers that were skipped have no directory)
-  v68/  current snapshot: every golden fixture as it serializes today
+  v69/  current snapshot: every golden fixture as it serializes today
 ```
 
 | Test | What it proves |

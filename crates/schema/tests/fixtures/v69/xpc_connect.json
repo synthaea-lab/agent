@@ -1,0 +1,16 @@
+{
+  "type": "xpc_connect",
+  "meta": {
+    "pid": 7001,
+    "ppid": 1,
+    "user": {
+      "os": "unix",
+      "uid": 501,
+      "gid": 20
+    },
+    "timestamp_ns": 1756900000123456789,
+    "comm": "payload"
+  },
+  "service_name": "com.apple.tccd",
+  "domain_type": 1
+}

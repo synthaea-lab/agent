@@ -1,0 +1,12 @@
+{
+  "type": "assembly_load",
+  "meta": {
+    "pid": 4242,
+    "ppid": 1337,
+    "user": { "os": "windows", "sid": "S-1-5-21-1004336348-1177238915-682003330-512", "integrity_level": 8192 },
+    "timestamp_ns": 1756900060000000000,
+    "comm": "powershell.exe"
+  },
+  "assembly_name": "MyPayload, Version=0.0.0.0, Culture=neutral, PublicKeyToken=null",
+  "flags": 2
+}

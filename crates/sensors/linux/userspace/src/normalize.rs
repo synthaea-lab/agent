@@ -703,24 +703,36 @@ pub fn mount(
     })
 }
 
-/// `target_image_path` is the caller's, not the wire event's — see this module's
-/// `WIRE_VERSION` v12 changelog for why. So is `target_unit` (#1103): the wire event carries
-/// only the pid, and the unit is what the sensor resolved from the cgroup when it put the
-/// target on the watch list.
+/// What the sensor resolved about a signal's two processes, which the wire event carries only as
+/// pids. `target_image_path` is the caller's, not the wire event's — see this module's
+/// `WIRE_VERSION` v12 changelog for why. So is `target_unit` (#1103): the unit the sensor
+/// resolved from the cgroup when it put the target on the watch list. `sender_unit` is read
+/// from the sender's cgroup at drain time (#322).
+#[derive(Debug, Default)]
+pub struct SignalParties {
+    /// The target's executable.
+    pub target_image_path: Option<String>,
+    /// The listed security unit the target belongs to.
+    pub target_unit: Option<String>,
+    /// The systemd unit the sender runs in.
+    pub sender_unit: Option<String>,
+}
+
+/// A wire signal event, with what the sensor resolved about its sender and target.
 #[must_use]
 pub fn signal(
     event: &wire::SignalEvent,
     boot_epoch_offset_ns: u64,
-    target_image_path: Option<String>,
-    target_unit: Option<String>,
+    parties: SignalParties,
     container: Option<ContainerContext>,
 ) -> Event {
     Event::Signal(SignalEvent {
         meta: meta(&event.meta, boot_epoch_offset_ns, container),
         signal: event.signal & !wire::SIGNAL_SENDER_UNRELIABLE,
         target_pid: event.target_pid,
-        target_image_path,
-        target_unit,
+        target_image_path: parties.target_image_path,
+        target_unit: parties.target_unit,
+        sender_unit: parties.sender_unit,
         sender_unreliable: event.signal & wire::SIGNAL_SENDER_UNRELIABLE != 0,
         signals_lost: 0,
     })
@@ -748,6 +760,7 @@ pub fn signals_lost(lost: u64, agent_pid: u32, timestamp_ns: u64) -> Event {
         target_pid: 0,
         target_image_path: None,
         target_unit: None,
+        sender_unit: None,
         sender_unreliable: false,
         signals_lost: lost,
     })
@@ -1773,13 +1786,11 @@ mod tests {
             signal: 9,
             target_pid: 400,
         };
-        let Event::Signal(e) = signal(
-            &event,
-            0,
-            Some("/usr/local/bin/synthaea-agent".to_string()),
-            None,
-            None,
-        ) else {
+        let parties = SignalParties {
+            target_image_path: Some("/usr/local/bin/synthaea-agent".to_string()),
+            ..SignalParties::default()
+        };
+        let Event::Signal(e) = signal(&event, 0, parties, None) else {
             panic!("wrong variant")
         };
         assert_eq!(e.signal, 9);
@@ -1799,13 +1810,17 @@ mod tests {
             signal: 9 | wire::SIGNAL_SENDER_UNRELIABLE,
             target_pid: 612,
         };
-        let Event::Signal(e) = signal(&event, 0, None, Some("auditd".to_string()), None) else {
+        let parties = SignalParties {
+            target_unit: Some("auditd".to_string()),
+            ..SignalParties::default()
+        };
+        let Event::Signal(e) = signal(&event, 0, parties, None) else {
             panic!("wrong variant")
         };
         assert_eq!(e.signal, 9);
         assert!(e.sender_unreliable);
         let plain = wire::SignalEvent { signal: 9, ..event };
-        let Event::Signal(e) = signal(&plain, 0, None, None, None) else {
+        let Event::Signal(e) = signal(&plain, 0, SignalParties::default(), None) else {
             panic!("wrong variant")
         };
         assert!(!e.sender_unreliable);
@@ -1827,19 +1842,36 @@ mod tests {
             signal: 9,
             target_pid: 612,
         };
-        let Event::Signal(e) = signal(
-            &event,
-            0,
-            Some("/usr/sbin/auditd".to_string()),
-            Some("auditd".to_string()),
-            None,
-        ) else {
+        let parties = SignalParties {
+            target_image_path: Some("/usr/sbin/auditd".to_string()),
+            target_unit: Some("auditd".to_string()),
+            ..SignalParties::default()
+        };
+        let Event::Signal(e) = signal(&event, 0, parties, None) else {
             panic!("wrong variant")
         };
         assert_eq!(e.target_pid, 612);
         assert_eq!(e.target_unit.as_deref(), Some("auditd"));
         assert_eq!(e.target_image_path.as_deref(), Some("/usr/sbin/auditd"));
         assert_eq!(e.meta.comm, "pkill", "meta must stay the sender");
+    }
+
+    #[test]
+    fn a_signal_carries_the_unit_its_sender_runs_in() {
+        let event = wire::SignalEvent {
+            meta: wire_meta(b"watchdog"),
+            signal: 9,
+            target_pid: 400,
+        };
+        let parties = SignalParties {
+            sender_unit: Some(schema::AGENT_UNIT.to_string()),
+            ..SignalParties::default()
+        };
+        let Event::Signal(e) = signal(&event, 0, parties, None) else {
+            panic!("wrong variant")
+        };
+        assert_eq!(e.sender_unit.as_deref(), Some(schema::AGENT_UNIT));
+        assert_eq!(e.target_unit, None);
     }
 
     fn wire_kernel_module(name: &[u8]) -> wire::KernelModuleEvent {
