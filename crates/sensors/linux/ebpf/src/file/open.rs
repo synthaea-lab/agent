@@ -19,11 +19,11 @@ static FILE_OPEN_EVENTS: RingBuf = RingBuf::with_byte_size(256 * 1024, 0);
 #[map]
 static OPEN_SCRATCH: PerCpuArray<FileOpenEvent> = PerCpuArray::with_max_entries(1, 0);
 
-/// Offsets of the `syscalls:sys_enter_openat` tracepoint (x86_64). Standard, stable format of
+/// Offsets of the `syscalls:sys_enter_openat` tracepoint (`x86_64`). Standard, stable format of
 /// the `syscalls:*` subsystem (documented, unlike `sched:*` tracepoints whose layout can vary
 /// more): an 8-byte common header, `__syscall_nr` (4 bytes + padding), then the syscall
 /// arguments aligned on 8 bytes each — `dfd`(16), `filename`(24), `flags`(32), `mode`(40).
-/// Verified on 2026-09-16 on Alpine (kernel 6.18.50-0-virt, x86_64) via
+/// Verified on 2026-09-16 on Alpine (kernel 6.18.50-0-virt, `x86_64`) via
 /// `/sys/kernel/tracing/events/syscalls/sys_enter_openat/format`.
 ///
 /// Known limit: `filename` is the raw path passed by the caller, not resolved against `dfd` —
@@ -46,7 +46,7 @@ const OPENAT_FLAGS_OFFSET: usize = 20;
 
 /// Offsets of the `syscalls:sys_enter_open` tracepoint — the plain `open(2)` syscall, one
 /// argument short of `openat` above (no leading `dfd`), so `filename`/`flags` land 8 bytes
-/// (x86_64/aarch64) / 4 bytes (i686) earlier. Needed because musl — and every busybox applet
+/// (`x86_64/aarch64`) / 4 bytes (i686) earlier. Needed because musl — and every busybox applet
 /// linked against it, `cat` included — still issues `open(2)` directly; glibc has rewritten
 /// `open()` to call `openat(AT_FDCWD, ...)` internally since 2.26, which is why this gap did
 /// not show up on the glibc lab machines. Attaching only `sys_enter_openat`
@@ -133,15 +133,14 @@ fn emit_file_open_event(
         fill_event_meta(&mut (*e).meta, pid, uid_gid, &comm);
         (*e).flags = flags as u32;
 
-        if filename_ptr != 0 {
-            if let Ok(path) =
+        if filename_ptr != 0
+            && let Ok(path) =
                 bpf_probe_read_user_str_bytes(filename_ptr as *const u8, &mut (*e).path)
-            {
-                if is_filtered_path(path, flags, false) {
-                    return Ok(0);
-                }
-                (*e).path_len = path.len() as u16;
+        {
+            if is_filtered_path(path, flags, false) {
+                return Ok(0);
             }
+            (*e).path_len = path.len() as u16;
         }
 
         if FILE_OPEN_EVENTS.output::<FileOpenEvent>(&*e, 0).is_err() {

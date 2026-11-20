@@ -43,9 +43,9 @@ struct RecvfromArgs {
 static RECVFROM_ARGS: LruHashMap<u64, RecvfromArgs> = LruHashMap::with_max_entries(1024, 0);
 
 /// Offsets of `addr`(48) and `addr_len`(56) in `syscalls:sys_enter_recvfrom`
-/// (x86_64/aarch64): `fd`(16), `ubuf`(24), `size`(32), `flags`(40), the same layout
+/// (`x86_64`/`aarch64`): `fd`(16), `ubuf`(24), `size`(32), `flags`(40), the same layout
 /// `sys_enter_sendto` reports. Verified on 2026-10-05 on Alpine (kernel 6.18.50-0-virt,
-/// x86_64) via `/sys/kernel/tracing/events/syscalls/sys_enter_recvfrom/format`.
+/// `x86_64`) via `/sys/kernel/tracing/events/syscalls/sys_enter_recvfrom/format`.
 #[cfg(any(bpf_target_arch = "x86_64", bpf_target_arch = "aarch64"))]
 const RECVFROM_ADDR_PTR_OFFSET: usize = 48;
 #[cfg(any(bpf_target_arch = "x86_64", bpf_target_arch = "aarch64"))]
