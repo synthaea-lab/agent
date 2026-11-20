@@ -8,5 +8,7 @@ cd "$(dirname "$0")/.."
 toolchain="$(tr -d '[:space:]' < packaging/toolchain/ebpf-toolchain.txt)"
 for arch in x86_64 aarch64; do
     echo "== clippy sensor-linux-ebpf, bpf_target_arch=$arch"
-    RUSTFLAGS="--cfg bpf_target_arch=\"$arch\"" cargo "+$toolchain" clippy -p sensor-linux-ebpf         --target bpfel-unknown-none -Z build-std=core --target-dir "target/clippy-ebpf-$arch"         -- -D warnings
+    RUSTFLAGS="--cfg bpf_target_arch=\"$arch\"" cargo "+$toolchain" clippy -p sensor-linux-ebpf \
+        --target bpfel-unknown-none -Z build-std=core --target-dir "target/clippy-ebpf-$arch" \
+        -- -D warnings
 done

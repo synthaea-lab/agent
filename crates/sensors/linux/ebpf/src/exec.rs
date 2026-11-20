@@ -134,6 +134,10 @@ pub(crate) fn record_sched_process_exec(pid: u32, filename_ptr: *const u8) -> u3
     let Some(rec) = EXEC_SCRATCH.get_ptr_mut(0) else {
         return 1;
     };
+    // SAFETY: `rec` is this CPU's per-CPU scratch slot and the lineage lookups are map
+    // pointers (crate-level Safety section). `filename_ptr` is the kernel's `bprm->filename`,
+    // read only through `bpf_probe_read_kernel_str_bytes` into the bounded `image` field; a
+    // failed read leaves `image_len` at 0.
     unsafe {
         // Only the fixed part is zeroed: argv bytes past the lengths read below are never
         // emitted, so stale scratch bytes cannot reach userspace.
