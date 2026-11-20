@@ -254,18 +254,18 @@ pub(crate) fn cmd_run(opts: super::RunOptions) -> anyhow::Result<()> {
         alerts,
         events,
         storage,
-        alert_details,
+        alert_details: _,
         enable_kill,
         enable_quarantine,
         enable_tls_capture,
         enable_readline_capture,
         enable_dns_capture,
-        server,
-        ipc_endpoint,
-        content_dir,
+        server: _,
+        ipc_endpoint: _,
+        content_dir: _,
         log_sources,
-        deception,
-        detection,
+        deception: _,
+        detection: _,
         config_path,
     } = opts;
     // Kill-loudness (#71): must run before any other thread exists — the signal mask
@@ -273,25 +273,7 @@ pub(crate) fn cmd_run(opts: super::RunOptions) -> anyhow::Result<()> {
     // own worker threads.
     crate::kill_loudness::block_termination_signals();
 
-    let pipeline = super::common::wire_run_pipeline(
-        seeded_rule_state(),
-        alerts,
-        events,
-        server,
-        ipc_endpoint,
-        content_dir,
-        storage,
-    )?;
-    // #319. Set before any sensor starts; the one alert `wire_run_pipeline` can raise
-    // itself (UPLOAD-DISABLED) is the agent's own text, not an event's.
-    pipeline.sink.alert_log().set_stderr_details(alert_details);
-    super::common::apply_detection(&pipeline.sink, detection);
-    super::common::plant_canaries(
-        &pipeline.sink,
-        deception,
-        storage,
-        pipeline.transport.as_ref(),
-    );
+    let pipeline = super::common::start_pipeline(&opts, seeded_rule_state())?;
     let sink = Arc::clone(&pipeline.sink);
 
     // The watcher thread itself can start any time after the mask above — only the
