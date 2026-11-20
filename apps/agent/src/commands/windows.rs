@@ -464,47 +464,10 @@ pub(crate) fn cmd_status() -> anyhow::Result<()> {
 /// fully inactive on Windows regardless of these flags. `enable_tls_capture`/
 /// `enable_readline_capture` (issue #90) are Linux-uprobe-specific — ETW would need
 /// its own, unrelated mechanism — so they're accepted for parity only, same as the
-/// response flags. `enable_dns_capture` (issue #267) is the same story.
+/// response flags. `enable_dns_capture` (issue #267) is the same story. The rest of `opts`
+/// is read by `start_pipeline`.
 pub(crate) fn cmd_run(opts: super::RunOptions) -> anyhow::Result<()> {
-    let super::RunOptions {
-        alerts,
-        events,
-        storage,
-        alert_details,
-        enable_kill: _,
-        enable_quarantine: _,
-        // uprobes are a Linux mechanism — the capture flags are accepted for CLI
-        // parity and inert here, same as the response flags above.
-        enable_tls_capture: _,
-        enable_readline_capture: _,
-        enable_dns_capture: _,
-        server,
-        ipc_endpoint,
-        content_dir,
-        log_sources: _,
-        deception,
-        detection,
-        config_path: _,
-    } = opts;
-    let pipeline = super::common::wire_run_pipeline(
-        seeded_rule_state(),
-        alerts,
-        events,
-        server,
-        ipc_endpoint,
-        content_dir,
-        storage,
-    )?;
-    // #319. Set before any sensor starts; the one alert `wire_run_pipeline` can raise
-    // itself (UPLOAD-DISABLED) is the agent's own text, not an event's.
-    pipeline.sink.alert_log().set_stderr_details(alert_details);
-    super::common::apply_detection(&pipeline.sink, detection);
-    super::common::plant_canaries(
-        &pipeline.sink,
-        deception,
-        storage,
-        pipeline.transport.as_ref(),
-    );
+    let pipeline = super::common::start_pipeline(&opts, seeded_rule_state())?;
 
     // Sensor-silence detection (#71/#388): the same monitor feeds T1562
     // alerts, `cli health` and the health beacon. Heartbeats are registered
