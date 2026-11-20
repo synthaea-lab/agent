@@ -9,7 +9,7 @@
 use std::sync::{Arc, OnceLock};
 
 use ipc::{
-    DetectionSummary, Handler, PolicyVersionResponse, RecentDetectionsResponse,
+    DetectionSummary, Handler, HandlerError, PolicyVersionResponse, RecentDetectionsResponse,
     ReloadContentResponse, SensorHealth, SensorHealthResponse, SensorState, Server, StatusResponse,
     SuppressionEntry, SuppressionResponse,
 };
@@ -69,7 +69,7 @@ impl AgentHandler {
 }
 
 impl Handler for AgentHandler {
-    async fn status(&self) -> Result<StatusResponse, String> {
+    async fn status(&self) -> Result<StatusResponse, HandlerError> {
         // "Healthy" is derived from real data, not asserted: no attached
         // sensor has gone silent. With no health source wired yet, there is
         // nothing silent, so the pipeline reports healthy.
@@ -94,13 +94,16 @@ impl Handler for AgentHandler {
         })
     }
 
-    async fn sensor_health(&self) -> Result<SensorHealthResponse, String> {
+    async fn sensor_health(&self) -> Result<SensorHealthResponse, HandlerError> {
         Ok(SensorHealthResponse {
             sensors: self.sensor_entries(),
         })
     }
 
-    async fn recent_detections(&self, limit: u32) -> Result<RecentDetectionsResponse, String> {
+    async fn recent_detections(
+        &self,
+        limit: u32,
+    ) -> Result<RecentDetectionsResponse, HandlerError> {
         let limit = usize::try_from(limit).unwrap_or(usize::MAX);
         Ok(RecentDetectionsResponse {
             detections: self
@@ -112,7 +115,7 @@ impl Handler for AgentHandler {
         })
     }
 
-    async fn policy_version(&self) -> Result<PolicyVersionResponse, String> {
+    async fn policy_version(&self) -> Result<PolicyVersionResponse, HandlerError> {
         // The agent does not load a policy document yet (out of scope for
         // #388): report "no policy applied" honestly instead of a made-up
         // version or a claimed signature check.
@@ -124,7 +127,7 @@ impl Handler for AgentHandler {
         })
     }
 
-    async fn reload_content(&self) -> Result<ReloadContentResponse, String> {
+    async fn reload_content(&self) -> Result<ReloadContentResponse, HandlerError> {
         let report = self.sink.reload_content();
         Ok(ReloadContentResponse {
             sigma_rule_count: report.sigma_rule_count,
@@ -137,19 +140,19 @@ impl Handler for AgentHandler {
     async fn suppress_verdict(
         &self,
         entry: SuppressionEntry,
-    ) -> Result<SuppressionResponse, String> {
-        // The IPC trait still answers in text (#153): the refusal's message is what the CLI prints.
+    ) -> Result<SuppressionResponse, HandlerError> {
+        // The refusal's message is what the CLI prints.
         let changed = self
             .sink
             .suppress_verdict(entry.ppid, &entry.comm, &entry.technique)
-            .map_err(|refusal| refusal.to_string())?;
+            .map_err(HandlerError::new)?;
         Ok(SuppressionResponse { changed })
     }
 
     async fn unsuppress_verdict(
         &self,
         entry: SuppressionEntry,
-    ) -> Result<SuppressionResponse, String> {
+    ) -> Result<SuppressionResponse, HandlerError> {
         let changed = self
             .sink
             .unsuppress_verdict(entry.ppid, &entry.comm, &entry.technique);
