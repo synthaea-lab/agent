@@ -68,16 +68,17 @@ pub(crate) fn dns_query(fields: &impl PayloadFields, meta: EventMeta) -> Option<
     })
 }
 
-/// Kernel-Registry EID 4 (`RegSetValueKey`); `None` when the kernel did not resolve the key
-/// name. Only string data is decoded: raw DWORD or binary bytes have no text form for rules.
+/// Kernel-Registry EID 5 (`SetValueKey`); `None` when the kernel did not resolve the key
+/// name (the record then names the key only by its `KeyObject` handle). Only string data is
+/// decoded: raw DWORD or binary bytes have no text form for rules.
 pub(crate) fn registry_set(
     fields: &impl PayloadFields,
     meta: EventMeta,
 ) -> Option<RegistrySetEvent> {
     let raw_key = non_empty(fields.text_or_empty("KeyName"))?;
-    let data_type = fields.u32("DataType").unwrap_or(0);
+    let data_type = fields.u32("Type").unwrap_or(0);
     let data = match data_type {
-        REG_SZ | REG_EXPAND_SZ => decode_reg_string(&fields.bytes("Data").unwrap_or_default()),
+        REG_SZ | REG_EXPAND_SZ => decode_reg_string(&captured_text_bytes(fields)),
         _ => None,
     };
     Some(RegistrySetEvent {
@@ -87,6 +88,20 @@ pub(crate) fn registry_set(
         data_type,
         data,
     })
+}
+
+/// The value bytes to decode as text. `CapturedData` is the part of the value the kernel
+/// captured: when it is shorter than `DataSize` the data is a prefix, cut wherever the
+/// capture limit fell, so a half UTF-16 unit at its end is dropped rather than the value.
+fn captured_text_bytes(fields: &impl PayloadFields) -> Vec<u8> {
+    let mut captured = fields.bytes("CapturedData").unwrap_or_default();
+    let is_prefix = fields
+        .u32("DataSize")
+        .is_some_and(|size| captured.len() < usize::try_from(size).unwrap_or(usize::MAX));
+    if is_prefix {
+        captured.truncate(captured.len() & !1);
+    }
+    captured
 }
 
 /// A `REG_SZ` / `REG_EXPAND_SZ` value: UTF-16 LE, trailing NULs dropped. `None` for an

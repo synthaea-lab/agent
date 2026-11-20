@@ -53,7 +53,7 @@ All providers are enabled on the one session. "Keywords" is the match-any mask p
 | Kernel-Network | all | 42/12 TCP v4, 58/26 TCP v6, 14 UDP send v4 | `Connect`, `UdpSend` | `ConnectDedup` per flow |
 | Kernel-File | `0x80 \| 0x400 \| 0x1000` | 12 create, 30 create-new, 26 delete-path | `FileOpen`, `FileDelete`, `FileQuarantine` (via worker) | tracked pids only, read-only opens dropped, deletes only for Zone.Identifier |
 | DNS-Client | all | 3008 query completed | `DnsQuery` | none |
-| Kernel-Registry | all | 4 `RegSetValueKey` | `RegistrySet` | writes only |
+| Kernel-Registry | `0x100` (`SetValueKey`) | 5 `SetValueKey` | `RegistrySet` | value writes only |
 | PowerShell | all | 4104 script block | `ScriptBlock` | none (each fragment is one event) |
 | AMSI | all | 1101 scan | `AmsiContent` | `AmsiGate` |
 | LDAP-Client | all | 30 search | `LdapSearch` | `PidBudget` 128 per 10 s |
@@ -73,7 +73,7 @@ Provider-specific behavior worth knowing:
 - **Mark-of-the-web.** A create on `file:Zone.Identifier` is queued for a background read-back ([`MarkQueue`](../../../crates/sensors/windows/etw/src/zone_identifier.rs)); a delete of that stream (`Unblock-File`, T1553.005) becomes a `FileDelete` of the stream path ([`forward_mark_removal`](../../../crates/sensors/windows/etw/src/providers.rs)). The stream check runs on the raw path first, so the expensive path normalization and token lookup only run for the rare match. Details in [etw-enrichment.md](etw-enrichment.md#mark-of-the-web).
 - **PowerShell 4104.** Long scripts are split by the provider into fragments sharing a `ScriptBlockId`. Each fragment is its own `ScriptBlock` event; consumers reassemble on `script_block_id` + `message_number`.
 - **AMSI 1101.** The buffer is decoded as UTF-16LE text ([`decode_text`](../../../crates/sensors/windows/etw/src/amsi.rs)), capped at 16 Ki characters with a `text_truncated` flag. Buffers with more than 10 % control characters (assemblies, VBA p-code) are not reported as text.
-- **Registry 4.** Only `REG_SZ` and `REG_EXPAND_SZ` data is decoded ([`registry_set`](../../../crates/sensors/windows/etw/src/payload.rs)); other types carry no value. Key paths are rewritten to `HKLM\...`/`HKU\...` by [`normalize_registry_key`](../../../crates/sensors/windows/etw/src/normalize.rs).
+- **Registry 5.** EID 5 is `SetValueKey`; EID 4 is `QueryKey`, a read, which the sensor took for the write until [#91](https://github.com/synthaea-lab/agent/issues/91). `CapturedData` is what the kernel captured of the value, so long data arrives as a prefix. Only `REG_SZ` and `REG_EXPAND_SZ` data is decoded ([`registry_set`](../../../crates/sensors/windows/etw/src/payload.rs)); other types carry no value. Key paths are rewritten to `HKLM\...`/`HKU\...` by [`normalize_registry_key`](../../../crates/sensors/windows/etw/src/normalize.rs).
 - **BITS.** The BITS service does the network I/O, so the job's *client* process is reported as the actor. See [etw-enrichment.md](etw-enrichment.md#bits-jobs).
 
 ## Threading
@@ -164,12 +164,12 @@ Everything else (provider set, keyword masks, budgets, windows) is a constant in
 
 - **Unit tests on every OS** for the pure modules: `normalize`, `payload`, `budget`, `amsi`, `cross_process`, `bits`, `zone_identifier`, `silo`, `pid_cache`, `long_path`, and the identity helpers in `lib.rs`.
 - **Never-panic suite** [`tests/robustness.rs`](../../../crates/sensors/windows/etw/tests/robustness.rs): seeded pseudo-random bytes into `zone_identifier::parse` and `bits::is_microsoft_update_url`, both of which read attacker-chosen input on the consumer thread.
-- **Real-session tests**, `#[ignore]` because they need an elevated Windows process: [`kernel_process_keyword_mask.rs`](../../../crates/sensors/windows/etw/tests/kernel_process_keyword_mask.rs) and [`kernel_file_keyword_mask.rs`](../../../crates/sensors/windows/etw/tests/kernel_file_keyword_mask.rs) check that the providers honor the keyword masks the sensor relies on.
-- **Payload decoding** of the DNS, registry, PowerShell, WMI, .NET, SMB, LDAP and NTLM records is tested in [`payload`](../../../crates/sensors/windows/etw/src/payload.rs) against an in-memory `PayloadFields`, including a property test that arbitrary field values of any type never panic. What those tests cannot check is that a provider really writes the field names and types they assume: those come from lab captures, recorded as field notes in `providers.rs`.
+- **Real-session tests**, `#[ignore]` because they need an elevated Windows process: [`kernel_process_keyword_mask.rs`](../../../crates/sensors/windows/etw/tests/kernel_process_keyword_mask.rs) and [`kernel_file_keyword_mask.rs`](../../../crates/sensors/windows/etw/tests/kernel_file_keyword_mask.rs) check that the providers honor the keyword masks the sensor relies on; [`kernel_registry_set_value.rs`](../../../crates/sensors/windows/etw/tests/kernel_registry_set_value.rs) that a value write arrives as EID 5 under the `SetValueKey` keyword, with its key path, value name and data.
+- **Payload decoding** of the DNS, registry, PowerShell, WMI, .NET, SMB, LDAP and NTLM records is tested in [`payload`](../../../crates/sensors/windows/etw/src/payload.rs) against an in-memory `PayloadFields`, including a property test that arbitrary field values of any type never panic. What those tests cannot check is that a provider really writes the field names and types they assume: those come from lab captures or, where a field note says so, from the installed manifest only (Kernel-Registry), recorded as field notes in `providers.rs`.
 - Clippy for this crate must be run with `--target x86_64-pc-windows-msvc`; host-only clippy does not compile the Windows-gated modules.
 
 ## Known gaps
 
-- Kernel-Network, Kernel-Registry, DNS-Client, PowerShell, WMI, DotNETRuntime and the other user-mode providers are enabled with every keyword. Filtering happens on the event id in the callback, after the record has been delivered.
+- Kernel-Network, DNS-Client, PowerShell, WMI, DotNETRuntime and the other user-mode providers are enabled with every keyword. Filtering happens on the event id in the callback, after the record has been delivered.
 - Injection without a new thread (APC, thread hijack), handle duplication into LSASS and kernel-mode activity are not visible to ETW from a non-PPL session. They need the driver work tracked in [#32](https://github.com/synthaea-lab/agent/issues/32) and [#27](https://github.com/synthaea-lab/agent/issues/27).
 - The image file identity is taken in the `ProcessStart` callback, so a rename-and-replace faster than ETW delivery still wins: [#46](https://github.com/synthaea-lab/agent/issues/46).
