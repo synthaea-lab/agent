@@ -244,10 +244,8 @@ pub(crate) fn cmd_status() -> anyhow::Result<()> {
 /// Response and uprobe-capture flags are accepted for CLI-signature parity with
 /// the Linux path but not wired here (same posture as Windows): kill/quarantine
 /// is issue #25's Linux-first scope, and TLS/readline capture is a Linux uprobe
-/// mechanism with no ES equivalent.
+/// mechanism with no ES equivalent. The rest of `opts` is read by `start_pipeline`.
 pub(crate) fn cmd_run(opts: super::RunOptions) -> anyhow::Result<()> {
-    // The response and capture flags are accepted for CLI parity and inert here; the rest of
-    // `opts` is read by `start_pipeline`.
     let pipeline = super::common::start_pipeline(&opts, seeded_rule_state())?;
     let mut shutdown = ShutdownPlan::default();
     if let Some(transport) = pipeline.transport {

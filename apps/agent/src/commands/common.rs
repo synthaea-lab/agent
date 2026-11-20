@@ -1,5 +1,5 @@
 //! Platform-independent composition of the `run` pipeline. The platform
-//! modules (`linux`, `windows`) own sensor selection and platform-only wiring
+//! modules (`linux`, `windows`, `macos`) own sensor selection and platform-only wiring
 //! (silence monitors, response, pollers); everything both share — transport,
 //! the detection sink, the banner, the progress heartbeat — is assembled here,
 //! so a new pipeline stage lands once instead of per-platform.
@@ -182,7 +182,7 @@ pub(crate) fn start_pipeline(
     opts: &RunOptions<'_>,
     rule_state: rules::RuleState,
 ) -> anyhow::Result<RunPipeline> {
-    let pipeline = wire_run_pipeline(rule_state, opts)?;
+    let pipeline = wire_run_pipeline(opts, rule_state)?;
     // #319. Set before any sensor starts; the one alert `wire_run_pipeline` can raise
     // itself (UPLOAD-DISABLED) is the agent's own text, not an event's.
     pipeline
@@ -204,8 +204,8 @@ pub(crate) fn start_pipeline(
 /// banner, the progress-backed liveness heartbeat (#102), and the local IPC
 /// control channel served to `cli` (#388).
 fn wire_run_pipeline(
-    rule_state: rules::RuleState,
     opts: &RunOptions<'_>,
+    rule_state: rules::RuleState,
 ) -> anyhow::Result<RunPipeline> {
     let RunOptions {
         alerts,
@@ -663,8 +663,9 @@ mod tests {
                 detection: config::DetectionConfig::default(),
                 alerts: dir.path().join("alerts.ndjson"),
                 content_dir: dir.path().join("content"),
-                // A path under the temp dir: the IPC server is non-fatal and a Windows
-                // named pipe name is not a path, so nothing here is platform-specific.
+                // A path under the temp dir. On Windows the endpoint is a named pipe name,
+                // not a path, so it fails to bind there; that is non-fatal (the agent runs
+                // without the IPC server), so the prelude test is the same on every OS.
                 ipc_endpoint: dir.path().join("agent.sock").display().to_string(),
                 canary_dir,
                 dir,
@@ -714,8 +715,9 @@ mod tests {
     }
 
     /// The one alert the prelude raises itself: an upload that cannot start with
-    /// `offline_fallback` on keeps detection running and says so (#319 sets
-    /// `alert_details` before it, so the text reaches stderr whole).
+    /// `offline_fallback` on keeps detection running and says so. It is raised inside
+    /// `wire_run_pipeline`, before `start_pipeline` sets `alert_details` (#319): the text is
+    /// the agent's own, not an event's, so `--alert-details` does not change it.
     #[test]
     fn the_run_prelude_reports_an_upload_that_could_not_start_and_goes_on() {
         let fixture = PreludeFixture::new();

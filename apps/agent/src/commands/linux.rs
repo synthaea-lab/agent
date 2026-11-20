@@ -250,6 +250,7 @@ fn can_use_ebpf() -> bool {
 /// blanket `EventSink for Arc<T>`) since `LinuxSensor::run` needs to own its sink
 /// for `Sensor`'s lifetime but the poller thread outlives no particular caller.
 pub(crate) fn cmd_run(opts: super::RunOptions) -> anyhow::Result<()> {
+    // The fields bound as `_` are not ignored: `start_pipeline` reads them from `opts` below.
     let super::RunOptions {
         alerts,
         events,

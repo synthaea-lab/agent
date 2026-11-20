@@ -464,10 +464,9 @@ pub(crate) fn cmd_status() -> anyhow::Result<()> {
 /// fully inactive on Windows regardless of these flags. `enable_tls_capture`/
 /// `enable_readline_capture` (issue #90) are Linux-uprobe-specific — ETW would need
 /// its own, unrelated mechanism — so they're accepted for parity only, same as the
-/// response flags. `enable_dns_capture` (issue #267) is the same story.
+/// response flags. `enable_dns_capture` (issue #267) is the same story. The rest of `opts`
+/// is read by `start_pipeline`.
 pub(crate) fn cmd_run(opts: super::RunOptions) -> anyhow::Result<()> {
-    // The response and capture flags (uprobes are a Linux mechanism) are accepted for CLI
-    // parity and inert here; the rest of `opts` is read by `start_pipeline`.
     let pipeline = super::common::start_pipeline(&opts, seeded_rule_state())?;
 
     // Sensor-silence detection (#71/#388): the same monitor feeds T1562

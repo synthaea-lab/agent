@@ -26,12 +26,11 @@ pub(crate) struct RunOptions<'a> {
     pub(crate) alerts: &'a std::path::Path,
     pub(crate) events: Option<&'a std::path::Path>,
     // Read only by `linux::cmd_run` (integrity monitoring, response, uprobes
-    // capture — all Linux-only mechanisms); `windows`/`macos::cmd_run` destructure
-    // and discard them for CLI-signature parity, same "accepted, inert here"
-    // posture the individual parameters had before this struct existed. Bundling
-    // them turns that per-platform inertness into a whole-field dead-code
-    // finding on any target that isn't Linux, unlike a bare unused fn parameter —
-    // hence the explicit allow rather than relying on the `_` destructuring alone.
+    // capture — all Linux-only mechanisms); `windows`/`macos::cmd_run` take the same
+    // struct for CLI-signature parity and never read them, same "accepted, inert
+    // here" posture the individual parameters had before this struct existed. A
+    // struct field nothing reads is a dead-code finding on any target that isn't
+    // Linux, unlike a bare unused fn parameter — hence the explicit allow.
     // The whole `[storage]` section rather than just `state_dir`: the upload spool's
     // cap (`spool_max_mb`, #604) travels with it. Every platform reads it for the
     // spool; only Linux also reads `state_dir` for the integrity monitor.
