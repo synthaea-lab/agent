@@ -27,6 +27,10 @@ on:
         description: "Leave the release as a draft (not visible until published by hand)"
         type: boolean
         default: false
+      allow-temporary-keys:
+        description: "Build although crates/updater/keys still holds the TEMPORARY keys (lab builds only: they have no custody)"
+        type: boolean
+        default: false
   # release-please.yml calls this when it tagged with GITHUB_TOKEN (a tag pushed that way
   # starts no workflow on its own).
   workflow_call:
@@ -211,6 +215,28 @@ jobs:
       - name: Packaged build carries no test signing key (ADR-0027)
         run: tools/check-no-test-key.sh
 
+  # ADR-0027: the keys committed on 2026-11-12 are temporary (no custody, no holders). A release
+  # must not embed them. Only a manual dispatch can override, on purpose, for a lab build; a tag
+  # push and the release-please call cannot.
+  temporary-key-guard:
+    needs: meta
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          ref: ${{ needs.meta.outputs.ref }}
+      - name: The updater keys are not the temporary ones (ADR-0027)
+        env:
+          ALLOW: ${{ github.event_name == 'workflow_dispatch' && inputs.allow-temporary-keys == true }}
+        run: |
+          if [ "$ALLOW" = "true" ]; then
+            echo "::warning::allow-temporary-keys is set: this build embeds keys with no custody and must not reach a customer; the release is left as a draft and is not distributed"
+            exit 0
+          fi
+          tools/check-no-temporary-keys.sh
+
   linux-deb:
     needs: meta
     permissions:
@@ -288,7 +314,7 @@ jobs:
   # Azure dlib). Only when signing-policy found every AZURE_* secret; otherwise the unsigned
   # agent.exe from the build job is what ships.
   sign-windows:
-    needs: [meta, signing-policy, windows]
+    needs: [meta, signing-policy, test-key-guard, temporary-key-guard, windows]
     if: needs.signing-policy.outputs.windows == 'true'
     runs-on: windows-2022
     timeout-minutes: 30
@@ -343,7 +369,7 @@ jobs:
   # ticket up online); a .pkg, once the macOS build produces one, is productsigned with the
   # Developer ID Installer identity, notarized and stapled.
   sign-macos:
-    needs: [meta, signing-policy, macos]
+    needs: [meta, signing-policy, test-key-guard, temporary-key-guard, macos]
     if: needs.signing-policy.outputs.macos == 'true'
     runs-on: macos-15
     timeout-minutes: 60
@@ -441,7 +467,7 @@ jobs:
           retention-days: 7
 
   publish:
-    needs: [meta, signing-policy, test-key-guard, linux-deb, linux-apk, windows, macos, sbom, sign-windows, sign-macos]
+    needs: [meta, signing-policy, test-key-guard, temporary-key-guard, linux-deb, linux-apk, windows, macos, sbom, sign-windows, sign-macos]
     # The sign-* jobs are skipped when their platform has no secrets; publish still runs then,
     # but never after a failure anywhere upstream.
     if: ${{ !cancelled() && !failure() }}
@@ -459,7 +485,9 @@ jobs:
       TAG: ${{ needs.meta.outputs.tag }}
       VERSION: ${{ needs.meta.outputs.version }}
       SUFFIX: ${{ needs.meta.outputs.suffix }}
-      DRAFT: ${{ inputs.draft == true }}
+      # A build that embeds the temporary keys is never published: allow-temporary-keys implies a
+      # draft, so `published` stays false and `distribute` (Homebrew, apt/yum, winget) is skipped.
+      DRAFT: ${{ inputs.draft == true || inputs.allow-temporary-keys == true }}
       WINDOWS_SIGNED: ${{ needs.signing-policy.outputs.windows }}
       MACOS_SIGNED: ${{ needs.signing-policy.outputs.macos }}
       LINUX_SIGNED: ${{ needs.signing-policy.outputs.linux }}

@@ -5,10 +5,6 @@
 //! corpus used for ML training. Raw capture needs no sink of its own: it uses
 //! `sinks::JsonlEventSink` directly.
 
-// Production locks go through `LockExt::lock_recovering` (the agent's poisoned-lock policy,
-// `crate::sync`); a bare `unwrap` here would bring the panic-on-poison back.
-#![cfg_attr(not(test), warn(clippy::unwrap_used))]
-
 use std::{
     path::{Path, PathBuf},
     sync::{
@@ -33,7 +29,7 @@ mod recording;
 mod response;
 
 pub(crate) use baseline::BaselineSink;
-pub(crate) use correlation::model_root;
+pub(crate) use correlation::{correlator_case_id, model_root};
 use recording::{Finding, record_ioc_hit, record_rule_alert, spool_on_worker};
 use response::{DAMAGE_MANIFEST_MAX, ResponseCell};
 
@@ -300,7 +296,7 @@ impl DetectionSink {
                 }
             },
             move |detection| spool_on_worker(worker_spool.as_deref(), detection),
-        );
+        )?;
         let response = Arc::new(ResponseCell::new());
         Ok(Self {
             rule_state: Mutex::new(rule_state),
@@ -418,6 +414,22 @@ impl DetectionSink {
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     pub(crate) fn enrich_queue(&self) -> &EnrichQueue {
         &self.enrich_queue
+    }
+
+    /// The fused verdict of the entity `meta` belongs to, or `None` while no finding was
+    /// recorded for it. `agent replay` reads it to write one case per entity.
+    pub(crate) fn verdict_for(&self, meta: &schema::EventMeta) -> Option<verdict::Verdict> {
+        self.verdict.lock_recovering().peek(&entity_key(meta))
+    }
+
+    /// Stops the YARA file and memory scanners. A replay must not scan anything: the pids
+    /// and paths in a recorded trace name processes and files of the host that captured
+    /// it, not of the one replaying it.
+    pub(crate) fn stop_host_scans(&self) {
+        let yara = self.yara.lock_recovering().take();
+        let memscan = self.memscan.lock_recovering().take();
+        // Dropped after the locks are released, like `reload_content` does.
+        drop((yara, memscan));
     }
 
     /// Hands out the shared progress counter for `agent::heartbeat::start` to
@@ -551,16 +563,29 @@ impl DetectionSink {
         }
     }
 
+    /// Runs one stateful rule step under the rule-state lock, **releases the lock**, then
+    /// records what it returned. Recording can take the lock again (the ransomware damage
+    /// manifest reads `touched_files`), and `std::sync::Mutex` is not reentrant, so a guard
+    /// kept across that call would deadlock. Writing `record_rule_alerts(e, lock().on_x())`
+    /// by hand keeps the guard until the end of the statement; go through this instead.
+    fn rule_alerts(
+        &self,
+        event: &Event,
+        step: impl FnOnce(&mut rules::RuleState) -> Vec<rules::Alert>,
+    ) {
+        let alerts = step(&mut self.rule_state.lock_recovering());
+        self.record_rule_alerts(event, alerts);
+    }
+
     /// Exec events: stateless rules, stateful rules, then Sigma.
     fn detect_exec(&self, wrapped: &Event, event: &schema::ExecEvent) {
         self.own_traffic.record_exec(event);
         self.canary.on_exec(event);
         self.record_rule_alerts(wrapped, rules::evaluate_exec(event));
-        self.record_rule_alerts(wrapped, self.rule_state.lock_recovering().on_exec(event));
+        self.rule_alerts(wrapped, |state| state.on_exec(event));
         // This exec moved the stream clock: identity requests waiting for it may be due (#1041).
-        self.record_due_identity_alerts(
-            self.rule_state.lock_recovering().take_due_identity_alerts(),
-        );
+        let due = self.rule_state.lock_recovering().take_due_identity_alerts();
+        self.record_due_identity_alerts(due);
         self.record_due_unit_stops();
         let sigma_guard = self.sigma.lock_recovering();
         if let Some(sigma) = sigma_guard.as_ref() {
@@ -598,7 +623,7 @@ impl DetectionSink {
         );
         // This event moved the stream clock: a queued unit stop may be due (#1085).
         self.record_due_unit_stops();
-        if event.flags & 0o103 != 0
+        if rules::has_write_intent(event.flags)
             && let Some((yara, _)) = self.yara.lock_recovering().as_ref()
         {
             let meta = wrapped.meta();
@@ -657,7 +682,7 @@ impl DetectionSink {
             self.record_ioc(wrapped, hit);
         }
         self.record_rule_alerts(wrapped, rules::evaluate_connect(event));
-        self.record_rule_alerts(wrapped, self.rule_state.lock_recovering().on_connect(event));
+        self.rule_alerts(wrapped, |state| state.on_connect(event));
     }
 
     /// `DnsQuery` events: the egress-domain join (it never alerts) and, on a listed domain or
@@ -688,38 +713,29 @@ impl DetectionSink {
         {
             self.record_ioc(wrapped, hit);
         }
-        self.record_rule_alerts(
-            wrapped,
-            self.rule_state.lock_recovering().on_network_flow(event),
-        );
+        self.rule_alerts(wrapped, |state| state.on_network_flow(event));
     }
 
     /// `ListenPort` events (`sock_diag` polling, issue #92): LISTENER-DRIFT.
     fn detect_listen_port(&self, wrapped: &Event, event: &schema::ListenPortEvent) {
-        self.record_rule_alerts(
-            wrapped,
-            self.rule_state.lock_recovering().on_listen_port(event),
-        );
+        self.rule_alerts(wrapped, |state| state.on_listen_port(event));
     }
 
     /// `PolicyDenial` events (`SELinux` AVC #297, AppLocker/WDAC #283):
     /// POLICY-DENIAL-DRIFT (issue #774).
     fn detect_policy_denial(&self, wrapped: &Event, event: &schema::PolicyDenialEvent) {
-        self.record_rule_alerts(
-            wrapped,
-            self.rule_state.lock_recovering().on_policy_denial(event),
-        );
+        self.rule_alerts(wrapped, |state| state.on_policy_denial(event));
     }
 
     /// `Auth` events: brute-force/spray burst detection (T1110, pack #377).
     fn detect_auth(&self, wrapped: &Event, event: &schema::AuthEvent) {
-        self.record_rule_alerts(wrapped, self.rule_state.lock_recovering().on_auth(event));
+        self.rule_alerts(wrapped, |state| state.on_auth(event));
     }
 
     /// `Session` events: a disconnected session reconnected from another client
     /// (T1563.002, #285).
     fn detect_session(&self, wrapped: &Event, event: &schema::SessionEvent) {
-        self.record_rule_alerts(wrapped, self.rule_state.lock_recovering().on_session(event));
+        self.rule_alerts(wrapped, |state| state.on_session(event));
     }
 
     /// `FileDelete` events: log-tamper detection (T1070.001/.002, pack #379), then the
@@ -727,8 +743,7 @@ impl DetectionSink {
     /// the creation history `on_file_open` keeps.
     fn detect_file_delete(&self, wrapped: &Event, event: &schema::FileDeleteEvent) {
         self.record_rule_alerts(wrapped, rules::evaluate_file_delete(event));
-        let alerts = self.rule_state.lock_recovering().on_file_delete(event);
-        self.record_rule_alerts(wrapped, alerts);
+        self.rule_alerts(wrapped, |state| state.on_file_delete(event));
     }
 
     /// `Signal` events: security-process tampering (T1562.001, issue #362).
@@ -763,9 +778,7 @@ impl DetectionSink {
     /// `FileRename` events: mass-rename ransomware detection (T1486, issue #262) +
     /// write-volume corroboration (issue #82).
     fn detect_file_rename(&self, wrapped: &Event, event: &schema::FileRenameEvent) {
-        // Bound first: `record_rule_alerts` takes the lock again for the damage manifest.
-        let alerts = self.rule_state.lock_recovering().on_file_rename(event);
-        self.record_rule_alerts(wrapped, alerts);
+        self.rule_alerts(wrapped, |state| state.on_file_rename(event));
     }
 
     /// `FileWrite` events: no alert on their own — tracks per-pid write volume for
@@ -799,10 +812,7 @@ impl DetectionSink {
     /// stored-password searches, then the enumeration-sweep burst.
     fn detect_ldap_search(&self, wrapped: &Event, event: &schema::LdapSearchEvent) {
         self.record_rule_alerts(wrapped, rules::evaluate_ldap_search(event));
-        self.record_rule_alerts(
-            wrapped,
-            self.rule_state.lock_recovering().on_ldap_search(event),
-        );
+        self.rule_alerts(wrapped, |state| state.on_ldap_search(event));
     }
 
     /// Writes one alert to the shared log and highlighted stderr. `pub(crate)`
@@ -895,9 +905,9 @@ impl DetectionSink {
         ppid: u32,
         comm: &str,
         technique: &str,
-    ) -> Result<bool, String> {
+    ) -> Result<bool, SuppressError> {
         if comm.is_empty() || technique.is_empty() {
-            return Err("comm and technique must not be empty".to_string());
+            return Err(SuppressError::EmptyField);
         }
         let outcome = self
             .verdict
@@ -912,10 +922,7 @@ impl DetectionSink {
                 Ok(true)
             }
             verdict::SuppressOutcome::AlreadySuppressed => Ok(false),
-            verdict::SuppressOutcome::Full => Err(format!(
-                "suppression list is full ({} entries): lift one first",
-                verdict::MAX_SUPPRESSIONS
-            )),
+            verdict::SuppressOutcome::Full => Err(SuppressError::Full),
         }
     }
 
@@ -1258,7 +1265,7 @@ fn start_yara(
         Ok(rules) => {
             let rule_count = rules.rule_count();
             tracing::info!(rules = rule_count, "yara: rules loaded");
-            let queue = yara::ScanQueue::start(rules, move |outcome| {
+            let started = yara::ScanQueue::start(rules, move |outcome| {
                 let matched = !outcome.matches.is_empty();
                 // Fuse before the alert lines below: the verdict is the state they
                 // report on, and a reader waiting for the `YARA` line may look at it.
@@ -1287,7 +1294,15 @@ fn start_yara(
                     quarantine_matched_payload(&response, &outcome.path, &alert_log);
                 }
             });
-            Load::Loaded((queue, rule_count))
+            match started {
+                Ok(queue) => Load::Loaded((queue, rule_count)),
+                // A host that cannot start the scan worker runs without file scanning, like a
+                // rule directory that does not load; a reload keeps the previous engine.
+                Err(e) => {
+                    tracing::error!(error = %e, "yara: file scanning not started");
+                    Load::Failed
+                }
+            }
         }
         Err(e) => {
             tracing::error!(error = %e, "yara: load error");
@@ -1311,12 +1326,18 @@ fn start_memscan(
         return Load::Absent;
     }
     match yara::RuleSet::load_dir(&dir) {
-        Ok(rules) => Load::Loaded(yara::MemoryScanQueue::start(
+        Ok(rules) => match yara::MemoryScanQueue::start(
             rules,
             Arc::new(crate::memscan::ProcMemSource),
             yara::MemoryBudget::default(),
             move |outcome| report_memory_matches(&alert_log, &verdict, &outcome),
-        )),
+        ) {
+            Ok(queue) => Load::Loaded(queue),
+            Err(e) => {
+                tracing::error!(error = %e, "yara: memory scanning not started");
+                Load::Failed
+            }
+        },
         // The file scanner reports the same load failure; this one only follows it.
         Err(_) => Load::Failed,
     }
@@ -1471,9 +1492,7 @@ impl EventSink for DetectionSink {
             Event::BitsJob(e) => self.detect_bits_job(e),
             Event::FileRename(e) => self.detect_file_rename(&event, e),
             Event::FileSetTime(e) => {
-                // Bound first: `record_rule_alerts` takes the lock again.
-                let alerts = self.rule_state.lock_recovering().on_file_set_time(e);
-                self.record_rule_alerts(&event, alerts);
+                self.rule_alerts(&event, |state| state.on_file_set_time(e));
             }
             Event::RawVolumeOpen(e) => {
                 self.record_rule_alerts(&event, rules::evaluate_raw_volume_open(e));
@@ -1497,14 +1516,10 @@ impl EventSink for DetectionSink {
                 self.record_rule_alerts(&event, rules::evaluate_package_change(e));
             }
             Event::ProcessAccess(e) => {
-                // Bound first: `record_rule_alerts` takes the lock again.
-                let alerts = self.rule_state.lock_recovering().on_process_access(e);
-                self.record_rule_alerts(&event, alerts);
+                self.rule_alerts(&event, |state| state.on_process_access(e));
             }
             Event::RemoteThread(e) => {
-                // Bound first: `record_rule_alerts` takes the lock again.
-                let alerts = self.rule_state.lock_recovering().on_remote_thread(e);
-                self.record_rule_alerts(&event, alerts);
+                self.rule_alerts(&event, |state| state.on_remote_thread(e));
             }
             // New telemetry categories reach the engines as they land; until a rule
             // consumes them, logging below is the whole treatment.
@@ -1524,6 +1539,21 @@ impl EventSink for DetectionSink {
         // lock, a wedged Sigma/YARA call) stops the heartbeat from advancing.
         self.progress.fetch_add(1, Ordering::Relaxed);
     }
+}
+
+/// Why [`DetectionSink::suppress_verdict`] refused an operator's suppression. The text is
+/// what the CLI prints back.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub(crate) enum SuppressError {
+    /// An empty `comm` or `technique`: the mark could never match a finding.
+    #[error("comm and technique must not be empty")]
+    EmptyField,
+    /// [`verdict::MAX_SUPPRESSIONS`] marks are already active.
+    #[error(
+        "suppression list is full ({} entries): lift one first",
+        verdict::MAX_SUPPRESSIONS
+    )]
+    Full,
 }
 
 #[cfg(test)]

@@ -417,10 +417,9 @@ fn attach_readline_uprobes(
     Ok(())
 }
 
-/// Same contract as [`attach_tls_uprobes`], for `getaddrinfo(3)` (issue #267
-/// Phase 1) — always both the entry and exit probe at the same resolved
-/// offset, no per-library variants (unlike TLS's OpenSSL/BoringSSL/GnuTLS
-/// split — every glibc build exports one `getaddrinfo`).
+/// Same contract as [`attach_tls_uprobes`], for the libc DNS lookups: `getaddrinfo(3)`
+/// (issue #267 Phase 1) and `gethostbyname_r`/`gethostbyname2_r` (agent#240) — always an
+/// entry and an exit probe at the same resolved offset, no per-library variants.
 fn attach_dns_uprobes(
     ebpf: &mut aya::Ebpf,
     loaded_programs: &mut HashSet<String>,
@@ -429,13 +428,23 @@ fn attach_dns_uprobes(
         .map_err(|e| err(format!("DNS symbol resolution failed: {e}")))?;
 
     for symbol in &dns_symbols {
-        for probe_name in ["getaddrinfo_entry", "getaddrinfo_exit"] {
+        for probe_name in dns_probes(&symbol.name) {
             if let Err(e) = attach_uprobe(ebpf, probe_name, symbol, loaded_programs) {
                 warn!(probe = probe_name, error = %e, "sensor-linux-uprobes: failed to attach uprobe");
             }
         }
     }
     Ok(())
+}
+
+/// The entry and exit programs for one resolved DNS symbol; none for an unknown name.
+fn dns_probes(symbol: &str) -> &'static [&'static str] {
+    match symbol {
+        "getaddrinfo" => &["getaddrinfo_entry", "getaddrinfo_exit"],
+        "gethostbyname_r" => &["gethostbyname_r_entry", "gethostbyname_exit"],
+        "gethostbyname2_r" => &["gethostbyname2_r_entry", "gethostbyname_exit"],
+        _ => &[],
+    }
 }
 
 /// Stops a running [`UprobesSensor`] from another thread: `run` holds the sensor mutably for
@@ -660,5 +669,26 @@ impl Sensor for UprobesSensor {
 
     fn stop(&mut self) {
         self.stop.notify_one();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn every_resolved_dns_symbol_has_an_entry_and_an_exit_probe() {
+        // agent#240: a symbol added to the resolver without a probe pair would resolve
+        // and then attach nothing.
+        for symbol in symbol_resolver::DNS_SYMBOLS {
+            assert_eq!(dns_probes(symbol).len(), 2, "{symbol}");
+        }
+    }
+
+    #[test]
+    fn gethostbyname_forms_share_one_exit_program() {
+        assert_eq!(dns_probes("gethostbyname_r")[1], "gethostbyname_exit");
+        assert_eq!(dns_probes("gethostbyname2_r")[1], "gethostbyname_exit");
+        assert!(dns_probes("gethostbyname").is_empty());
     }
 }

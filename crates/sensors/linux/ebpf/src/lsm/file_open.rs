@@ -12,7 +12,7 @@ use crate::into_ret;
 /// Per-CPU hit counter for the `file_open` LSM hook below — issue #91's foundation
 /// slice, observation only. Exists so userspace (`sensor-linux-lsm`) has something
 /// concrete to point at proving the hook actually fires, without yet deciding how an
-/// LSM-sourced open relates to the tracepoint-sourced `FileOpenEvent` above (double-
+/// LSM-sourced open relates to the tracepoint-sourced `FileOpenEvent` (double-
 /// counting the same open two ways needs a real answer, left to the follow-up that
 /// also wires `-EPERM` to a `response` verdict — that plumbing does not exist yet).
 #[map]

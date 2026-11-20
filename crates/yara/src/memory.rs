@@ -31,7 +31,7 @@ use std::{
 
 use store::BoundedMap;
 
-use crate::{RuleSet, ScanContext, YaraMatch};
+use crate::{RuleSet, ScanContext, YaraError, YaraMatch};
 
 /// Permissions of a mapped region.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -301,16 +301,16 @@ pub struct MemoryScanQueue {
 impl MemoryScanQueue {
     /// Starts the worker. `on_match` runs on it for every scan that found a rule.
     ///
-    /// # Panics
+    /// # Errors
     ///
-    /// Panics when the OS refuses to spawn the worker thread, at agent startup, with
-    /// nothing to degrade to (same stance as [`crate::ScanQueue::start`]).
+    /// [`YaraError::Spawn`] when the OS refuses the worker thread (same contract as
+    /// [`crate::ScanQueue::start`]).
     pub fn start(
         rules: RuleSet,
         source: Arc<dyn MemorySource>,
         budget: MemoryBudget,
         on_match: impl Fn(MemoryScanOutcome) + Send + 'static,
-    ) -> Self {
+    ) -> Result<Self, YaraError> {
         let (tx, rx) = mpsc::sync_channel::<Request>(QUEUE_CAP);
         let scanned = Arc::new(AtomicU64::new(0));
         let unreadable = Arc::new(AtomicU64::new(0));
@@ -346,8 +346,11 @@ impl MemoryScanQueue {
                     }
                 }
             })
-            .expect("spawning the yara memory-scan worker thread");
-        Self {
+            .map_err(|source| YaraError::Spawn {
+                thread: "yara-memscan",
+                source,
+            })?;
+        Ok(Self {
             tx,
             gate: Mutex::new(Gate {
                 last_scan: BoundedMap::new(COOLDOWN_ENTRIES),
@@ -358,16 +361,17 @@ impl MemoryScanQueue {
             shed_queue_full: AtomicU64::new(0),
             shed_cooldown: AtomicU64::new(0),
             shed_rate: AtomicU64::new(0),
-        }
+        })
     }
 
     /// Asks for a scan of `pid`, subject to the cooldown, the global cap and the queue.
     /// Returns whether it was queued; a shed request is counted under its reason.
     /// `now_ns` is event time, the clock the rest of the detection state uses.
     ///
-    /// # Panics
-    ///
-    /// Only if the admission lock is poisoned by a panic elsewhere.
+    /// A poisoned admission lock is taken back, cleared and logged once: the gate holds the
+    /// cooldown table and the per-minute rate window, so a half-updated state costs at most one
+    /// missed or repeated scan, which is cheaper than the capture thread panicking on every
+    /// later event (the agent's policy for in-memory detection state, `apps/agent/src/sync.rs`).
     pub fn enqueue(
         &self,
         pid: u32,
@@ -375,7 +379,13 @@ impl MemoryScanQueue {
         now_ns: u64,
         context: Option<ScanContext>,
     ) -> bool {
-        let mut gate = self.gate.lock().unwrap();
+        let mut gate = self.gate.lock().unwrap_or_else(|poisoned| {
+            tracing::warn!(
+                "yara: recovered a memory-scan gate poisoned by a panicking thread; its state may be partially updated"
+            );
+            self.gate.clear_poison();
+            std::sync::PoisonError::into_inner(poisoned)
+        });
         let key = (pid, generation);
         if let Some(&last) = gate.last_scan.peek(&key)
             && now_ns.saturating_sub(last) < COOLDOWN_NS
@@ -689,7 +699,8 @@ rule mem_marker {
         let queue =
             MemoryScanQueue::start(rules(), Arc::new(fake), MemoryBudget::default(), move |o| {
                 hits_w.lock().unwrap().push(o);
-            });
+            })
+            .unwrap();
         (queue, hits)
     }
 
@@ -825,7 +836,8 @@ rule mem_marker {
             Arc::new(Gated { open: open.clone() }),
             MemoryBudget::default(),
             |_| {},
-        );
+        )
+        .unwrap();
         // Event times a minute apart so the global rate cap never bites: only the
         // queue's own capacity can refuse. The worker takes the first request and
         // blocks on it; the channel then holds QUEUE_CAP more.

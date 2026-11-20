@@ -53,6 +53,14 @@ const DELETE_MODULE_FLAGS_OFFSET: usize = arg_offset(1);
 /// fields into `KERNEL_MODULE_SCRATCH`, then emits. Mirrors `emit_mount_event`'s
 /// shape (#362) — one assembly helper for a small family of closely related
 /// syscalls that share almost all of their event fields.
+///
+/// Always inlined, like `emit_mount_event` and for the same reason: with six
+/// parameters LLVM 23 can emit this as a real BPF-to-BPF call that passes the sixth
+/// on the stack, and the 7.2 kernel's verifier rejects `raw_sys_enter` ("callee
+/// expects 6 args, stack arg1 is not initialized"). Main got away with it only
+/// because LLVM happened to inline the call; the AS-008 refactor (#216) changed
+/// that choice and the program stopped loading on 7.2.
+#[inline(always)]
 fn emit_kernel_module_event(
     ctx: &TracePointContext,
     action: u8,

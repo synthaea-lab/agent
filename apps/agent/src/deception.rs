@@ -1094,7 +1094,13 @@ mod tests {
 
     #[test]
     fn a_process_running_an_allowed_system_executable_is_allowed() {
-        let allow = allow_of(&["/usr/bin/updatedb"], |_| Some("/usr/bin/updatedb".into()));
+        // A trusted-location path that exists on no host: both the allow list and the
+        // resolver keep it literal (`canonical_entry` can't resolve it), so they match the
+        // same everywhere. The earlier `/usr/bin/updatedb` made the test depend on the host,
+        // where that path is a symlink on plocate boxes (#255). The symlink/canonicalize
+        // agreement is covered hermetically by `an_entry_that_is_a_symlink_is_compared_by_its_target`.
+        const ALLOWED: &str = "/usr/sbin/synthaea-test-allowed";
+        let allow = allow_of(&[ALLOWED], |_| Some(ALLOWED.into()));
         assert!(allow.allows(10, None));
     }
 

@@ -14,7 +14,7 @@ use schema::Event;
 use crate::{
     client::TransportClient,
     config::TransportConfig,
-    error::Result,
+    error::{Result, TransportError},
     event_limit::{MAX_EVENT_BYTES, fit_batches},
 };
 
@@ -132,16 +132,36 @@ impl<D: EventDrain> EventUploader<D> {
     /// Returns an error if the upload fails. The caller should implement
     /// backoff before retrying.
     pub fn upload_once(&mut self) -> Result<usize> {
-        // Drain events from the source
-        let events: Vec<Event> = self.drain.drain()?;
-
-        if events.is_empty() {
+        let Some(segment) = self.next_segment()? else {
             return Ok(0);
-        }
+        };
 
-        // An event over the body limit is shortened, never dropped (#1131); the batches also
-        // respect the limit in bytes. `count` stays the number the drain returned.
-        let count = events.len();
+        // `consecutive_failures` is NOT reset on a per-batch success (issue #315 regression,
+        // found in PR #349 review): a segment larger than `batch_size` splits into several
+        // batches per call, and resetting mid-call erases the count from every PRIOR failed
+        // call on this same still-unacked segment the moment any later batch happens to land
+        // before the one that keeps failing — `consecutive_failures` never reaches
+        // `max_drain_attempts` unless the poison record happens to sit in the segment's very
+        // first batch. It resets exactly once, only when the whole call succeeds (see
+        // `finish_segment`) — that is the only point at which this segment's attempt history
+        // should be forgotten.
+        for batch in &segment.batches {
+            self.send_batch(batch, &segment)?;
+        }
+        self.finish_segment(&segment)
+    }
+
+    /// Drains the oldest segment and cuts it into batches that respect the body limit; `None`
+    /// for an empty drain.
+    ///
+    /// An event over the body limit is shortened, never dropped (#1131); the batches also respect
+    /// the limit in bytes. `event_count` stays the number the drain returned.
+    fn next_segment(&mut self) -> Result<Option<Segment>> {
+        let events: Vec<Event> = self.drain.drain()?;
+        if events.is_empty() {
+            return Ok(None);
+        }
+        let event_count = events.len();
         let (batches, unsendable) = fit_batches(events, self.config.batch_size, self.event_limit);
         if unsendable > 0 {
             tracing::warn!(
@@ -149,79 +169,102 @@ impl<D: EventDrain> EventUploader<D> {
                 "events that cannot fit the body limit were left out of this upload; the segment will not be acknowledged"
             );
         }
+        Ok(Some(Segment {
+            batches,
+            unsendable,
+            event_count,
+        }))
+    }
 
-        // Upload in batches. `consecutive_failures` is NOT reset here on a
-        // per-batch success (issue #315 regression, found in PR #349 review):
-        // a segment larger than `batch_size` splits into several batches per
-        // call, and resetting mid-call erases the count from every PRIOR
-        // failed call on this same still-unacked segment the moment any
-        // later batch happens to land before the one that keeps failing —
-        // `consecutive_failures` never reaches `max_drain_attempts` unless
-        // the poison record happens to sit in the segment's very first
-        // batch. It resets exactly once, only when the whole call succeeds
-        // (see the `ack()` call below) — that is the only point at which
-        // this segment's attempt history should be forgotten.
-        for batch in &batches {
-            match self.client.upload_events(batch) {
-                Ok(response) => {
-                    tracing::debug!(
-                        accepted = response.accepted,
-                        batch_id = ?response.batch_id,
-                        "uploaded events"
-                    );
-                }
-                Err(e) if !e.is_retryable() => {
-                    tracing::warn!(
-                        error = %e,
-                        dropped = count,
-                        "server rejected batch permanently — skipping poison segment"
-                    );
-                    self.drain.skip()?;
-                    self.reset_failure_counters();
-                    return Err(e);
-                }
-                Err(e) => {
-                    self.consecutive_failures += 1;
-                    let (attempts, max_attempts) = if e.is_network_error() {
-                        self.consecutive_network_failures += 1;
-                        (
-                            self.consecutive_network_failures,
-                            self.config.max_network_drain_attempts,
-                        )
-                    } else {
-                        self.consecutive_server_failures += 1;
-                        (
-                            self.consecutive_server_failures,
-                            self.config.max_drain_attempts,
-                        )
-                    };
-                    tracing::warn!(
-                        attempt = self.consecutive_failures,
-                        network_attempt = self.consecutive_network_failures,
-                        server_attempt = self.consecutive_server_failures,
-                        error = %e,
-                        "upload failed"
-                    );
-                    if attempts >= max_attempts {
-                        tracing::warn!(
-                            attempts,
-                            max_attempts,
-                            dropped = count,
-                            network = e.is_network_error(),
-                            "segment exceeded max drain attempts — skipping to restore forward progress"
-                        );
-                        self.drain.skip()?;
-                        self.reset_failure_counters();
-                    }
-                    return Err(e);
-                }
+    /// Sends one batch of `segment`; a failure goes through [`Self::apply_failure`], which needs
+    /// the segment's size for the loss it logs when it skips the segment.
+    fn send_batch(&mut self, batch: &[Event], segment: &Segment) -> Result<()> {
+        match self.client.upload_events(batch) {
+            Ok(response) => {
+                tracing::debug!(
+                    accepted = response.accepted,
+                    batch_id = ?response.batch_id,
+                    "uploaded events"
+                );
+                Ok(())
             }
+            Err(error) => Err(self.apply_failure(error, segment.event_count)),
         }
+    }
 
-        // An event that could not be made to fit is not acknowledged as sent: the segment stays
-        // in flight and is delivered again, like after a 5xx, until the attempt budget skips it
-        // (with the loss logged). The batches above already went; the server tolerates the
-        // duplicates a redelivery makes (#1131).
+    /// Applies a failed batch to the segment and returns the error to propagate: a permanent
+    /// rejection skips the poison segment; a retryable failure counts toward its attempt budget
+    /// and skips the segment only once that budget is spent. Otherwise the segment stays in
+    /// flight. When the skip itself cannot be persisted, that spool error is returned instead of
+    /// `error`.
+    fn apply_failure(&mut self, error: TransportError, event_count: usize) -> TransportError {
+        if !error.is_retryable() {
+            tracing::warn!(
+                error = %error,
+                dropped = event_count,
+                "server rejected batch permanently — skipping poison segment"
+            );
+            return self.skip_segment().unwrap_or(error);
+        }
+        self.consecutive_failures += 1;
+        let (attempts, max_attempts) = if error.is_network_error() {
+            self.consecutive_network_failures += 1;
+            (
+                self.consecutive_network_failures,
+                self.config.max_network_drain_attempts,
+            )
+        } else {
+            self.consecutive_server_failures += 1;
+            (
+                self.consecutive_server_failures,
+                self.config.max_drain_attempts,
+            )
+        };
+        tracing::warn!(
+            attempt = self.consecutive_failures,
+            network_attempt = self.consecutive_network_failures,
+            server_attempt = self.consecutive_server_failures,
+            error = %error,
+            "upload failed"
+        );
+        if attempts >= max_attempts {
+            tracing::warn!(
+                attempts,
+                max_attempts,
+                dropped = event_count,
+                network = error.is_network_error(),
+                "segment exceeded max drain attempts — skipping to restore forward progress"
+            );
+            return self.skip_segment().unwrap_or(error);
+        }
+        error
+    }
+
+    /// Discards the segment in flight and forgets its attempt history; the spool's error when the
+    /// skip cannot be persisted (the counters are then left as they were).
+    fn skip_segment(&mut self) -> Option<TransportError> {
+        match self.drain.skip() {
+            Ok(()) => {
+                self.reset_failure_counters();
+                None
+            }
+            Err(error) => Some(error.into()),
+        }
+    }
+
+    /// Closes a segment whose every batch went out: acknowledges it, or — when an event could not
+    /// be made to fit — keeps it in flight.
+    ///
+    /// An event that could not be made to fit is not acknowledged as sent: the segment stays in
+    /// flight and is delivered again, like after a 5xx, until the attempt budget skips it (with
+    /// the loss logged). The batches already went; the server tolerates the duplicates a
+    /// redelivery makes (#1131).
+    fn finish_segment(&mut self, segment: &Segment) -> Result<usize> {
+        let Segment {
+            unsendable,
+            event_count,
+            ..
+        } = *segment;
         if unsendable > 0 {
             self.consecutive_failures += 1;
             self.consecutive_server_failures += 1;
@@ -235,13 +278,13 @@ impl<D: EventDrain> EventUploader<D> {
                 self.drain.skip()?;
                 self.reset_failure_counters();
             }
-            return Err(crate::TransportError::Unsendable { count: unsendable });
+            return Err(TransportError::Unsendable { count: unsendable });
         }
 
         self.drain.ack()?;
         self.reset_failure_counters();
-        tracing::info!(count, "uploaded events successfully");
-        Ok(count)
+        tracing::info!(count = event_count, "uploaded events successfully");
+        Ok(event_count)
     }
 
     /// Clears every per-segment failure counter — called once the segment is
@@ -256,19 +299,7 @@ impl<D: EventDrain> EventUploader<D> {
     /// Calculates the backoff duration based on consecutive failures.
     #[must_use]
     pub fn backoff_duration(&self) -> Duration {
-        if self.consecutive_failures == 0 {
-            return Duration::ZERO;
-        }
-
-        let base_ms = self.config.retry_base.as_millis() as u64;
-        let max_ms = self.config.retry_max.as_millis() as u64;
-
-        // Exponential backoff: base * 2^(failures-1), capped at max
-        let backoff_ms = base_ms
-            .saturating_mul(1 << (self.consecutive_failures - 1).min(10))
-            .min(max_ms);
-
-        Duration::from_millis(backoff_ms)
+        backoff_after(&self.config, self.consecutive_failures)
     }
 
     /// Returns true if the uploader is in a failed state (consecutive failures > 0).
@@ -287,6 +318,29 @@ impl<D: EventDrain> EventUploader<D> {
     pub fn reset_failures(&mut self) {
         self.reset_failure_counters();
     }
+}
+
+/// What one drain produced: the batches to send, the events that cannot fit, and the number of
+/// events the drain returned.
+struct Segment {
+    batches: Vec<Vec<Event>>,
+    unsendable: usize,
+    event_count: usize,
+}
+
+/// Exponential backoff after `failures` consecutive failures: `retry_base * 2^(failures-1)`,
+/// capped at `retry_max`; zero when nothing failed. Shared by the event and detection uploaders.
+pub(crate) fn backoff_after(config: &TransportConfig, failures: u32) -> Duration {
+    if failures == 0 {
+        return Duration::ZERO;
+    }
+    let base_ms = config.retry_base.as_millis() as u64;
+    let max_ms = config.retry_max.as_millis() as u64;
+    Duration::from_millis(
+        base_ms
+            .saturating_mul(1 << (failures - 1).min(10))
+            .min(max_ms),
+    )
 }
 
 /// One upload attempt plus the backoff it implies — the two calls
@@ -436,6 +490,20 @@ impl<U: UploadStep> UploadLoop<U> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn backoff_doubles_per_failure_and_is_capped() {
+        let mut config = TransportConfig::new("https://example.com");
+        config.retry_base = Duration::from_millis(100);
+        config.retry_max = Duration::from_millis(1_000);
+        let ms = |failures| backoff_after(&config, failures).as_millis();
+        assert_eq!(ms(0), 0);
+        assert_eq!(ms(1), 100);
+        assert_eq!(ms(2), 200);
+        assert_eq!(ms(3), 400);
+        assert_eq!(ms(5), 1_000);
+        assert_eq!(ms(u32::MAX), 1_000);
+    }
+
     use super::*;
 
     /// Mock drain that returns predefined events.

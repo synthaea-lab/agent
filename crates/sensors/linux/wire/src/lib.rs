@@ -1130,7 +1130,9 @@ pub struct GetAddrInfoEvent {
     /// `getaddrinfo(3)`'s return code: `0` on success, a negative `EAI_*`
     /// constant on failure (`EAI_NONAME`, `EAI_AGAIN`, ...) — not decoded to
     /// a name here, same "sensor reports, detection interprets" split as
-    /// every other raw syscall/libc return value in this crate.
+    /// every other raw syscall/libc return value in this crate. For
+    /// `gethostbyname*_r` (agent#240): `0` with at least one address,
+    /// `EAI_NONAME` with none, `EAI_SYSTEM` for an errno return.
     pub status: i32,
     /// Number of valid IPv4/IPv6 answers in `answers` (at most
     /// [`MAX_DNS_ANSWERS`]); entries with null addresses or unknown families are

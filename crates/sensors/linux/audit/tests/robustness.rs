@@ -73,3 +73,32 @@ fn never_panics_on_non_utf8_and_hostile_payloads() {
         let _ = parse_audit_message(&buf);
     }
 }
+
+#[test]
+fn never_panics_classifying_hostile_execve_pieces() {
+    // #51: argv pieces (`aN_len`, `aN[k]`) are rebuilt from attacker-influenced
+    // values. Out-of-range lengths and counts, gaps, odd or non-hex pieces.
+    let payloads = [
+        "argc=18446744073709551615 a0=\"x\"",
+        "argc=99999999999999999999 a0=\"x\"",
+        "argc=2 a0=\"x\" a1_len=18446744073709551615 a1[0]=4",
+        "argc=2 a0=\"x\" a1_len=-1 a1[0]=ZZ a1[1]=\"\"",
+        "argc=2 a0=\"x\" a1[1]=41 a1[3]=42",
+        "argc=2 a0=\"x\" a1[0]=FFFE a1_len=4",
+        "argc=1 a0[0]=FF a0_len=2",
+        "argc=1 a0[18446744073709551615]=41",
+        "argc=0",
+        "argc=1",
+    ];
+    for payload in payloads {
+        let mut raw = Vec::new();
+        let body = format!("audit(1.2:3): {payload}");
+        raw.extend_from_slice(&((16 + body.len()) as u32).to_ne_bytes());
+        raw.extend_from_slice(&1309u16.to_ne_bytes());
+        raw.extend_from_slice(&[0u8; 10]);
+        raw.extend_from_slice(body.as_bytes());
+        if let Ok(record) = parse_audit_message(&raw) {
+            let _ = sensor_linux_audit::classify(&record);
+        }
+    }
+}
