@@ -5,15 +5,16 @@
 //! uninitialized padding, an LSM hook with fewer arguments). The agent then only logs a warning
 //! and runs without that probe, so the loss is silent. This loads each program once, prints the
 //! kernel's processed-instruction count (`verified_insns`, kernel 5.16 and later) and translated
-//! size, and exits 1 if any was refused or has a type this check cannot load. A build without
-//! the embedded probes exits 2.
+//! size, and exits 1 if any was refused, has a type this check cannot load, or processed more
+//! instructions than the ceiling (`--max-verified-insns`, default 700 000; kernels without the
+//! count are not checked against it). A build without the embedded probes exits 2.
 //!
 //! `inode_setattr` is expected to be refused where the LSM hook has fewer arguments (5.15, 6.1):
 //! the loader treats it as optional (#1044). Pass `--allow inode_setattr` to accept that.
 //!
 //! Build with the eBPF toolchain, then run as root on a Linux lab host:
 //! `cargo build -p sensor-linux --example verify_probes`
-//! `sudo target/debug/examples/verify_probes [--allow <program>]...`
+//! `sudo target/debug/examples/verify_probes [--allow <program>]... [--max-verified-insns <n>]`
 //!
 //! The counts also let a refactor of the probes show what it cost the verifier: compare the
 //! output before and after (AS-003).
@@ -29,8 +30,26 @@ mod linux {
 
     use aya::{Btf, programs::Program};
 
+    /// The kernel refuses a program whose verification processes more than 1M instructions
+    /// (`BPF_COMPLEXITY_LIMIT_INSNS`), and the count for the same program moves a lot between
+    /// kernels: `getaddrinfo_exit` processed 456 673 on 6.1 and 353 781 on RHEL 9.9's 5.14
+    /// (2026-11-20). A program over this ceiling fails the check while there is still room on
+    /// the kernels CI loads, instead of on the first one that tips it over the limit.
+    const DEFAULT_MAX_VERIFIED_INSNS: u32 = 700_000;
+
+    /// The command line: `[--allow <program>]... [--max-verified-insns <n>]`.
+    struct Args {
+        /// Programs that may be refused (or exceed the ceiling) without failing the run.
+        allowed: BTreeSet<String>,
+        /// Verified-instruction ceiling per program (kernel 5.16 and later report the count).
+        max_verified_insns: u32,
+    }
+
     pub(crate) fn run() -> Result<ExitCode, Box<dyn Error>> {
-        let allowed = allowed_refusals(std::env::args().skip(1))?;
+        let Args {
+            allowed,
+            max_verified_insns,
+        } = parse_args(std::env::args().skip(1))?;
         let mut ebpf = sensor_linux::verifier_loader().load(aya::include_bytes_aligned!(
             concat!(env!("OUT_DIR"), "/sensor-linux-ebpf")
         ))?;
@@ -67,11 +86,25 @@ mod linux {
             match loaded {
                 Ok(()) => {
                     let info = program.info()?;
-                    println!(
-                        "OK {name} verified_insns={:?} xlated_bytes={:?}",
-                        info.verified_instruction_count(),
-                        info.size_translated()
-                    );
+                    let verified = info.verified_instruction_count();
+                    match verified {
+                        Some(count) if count > max_verified_insns => {
+                            if allowed.contains(name.as_str()) {
+                                println!(
+                                    "ALLOWED {name}: verified_insns={count} over {max_verified_insns}"
+                                );
+                            } else {
+                                refused += 1;
+                                println!(
+                                    "FAIL {name}: verified_insns={count} over {max_verified_insns}"
+                                );
+                            }
+                        }
+                        _ => println!(
+                            "OK {name} verified_insns={verified:?} xlated_bytes={:?}",
+                            info.size_translated()
+                        ),
+                    }
                 }
                 Err(error) if allowed.contains(name.as_str()) => {
                     println!("ALLOWED {name}: {error:?}");
@@ -90,23 +123,38 @@ mod linux {
         })
     }
 
-    /// The programs named by `--allow`, which may be refused without failing the run. Any
-    /// other argument, or a trailing `--allow` with no name, is an error rather than ignored:
-    /// a mistyped flag must not quietly turn a refusal into a pass.
-    fn allowed_refusals(
-        mut args: impl Iterator<Item = String>,
-    ) -> Result<BTreeSet<String>, Box<dyn Error>> {
-        let mut allowed = BTreeSet::new();
+    /// The programs named by `--allow`, which may be refused (or exceed the ceiling) without
+    /// failing the run, and the ceiling. Any other argument, a flag with no value, or a ceiling
+    /// that is not a positive integer is an error rather than ignored: a mistyped flag must not
+    /// quietly turn a refusal into a pass.
+    fn parse_args(mut args: impl Iterator<Item = String>) -> Result<Args, Box<dyn Error>> {
+        let mut parsed = Args {
+            allowed: BTreeSet::new(),
+            max_verified_insns: DEFAULT_MAX_VERIFIED_INSNS,
+        };
         while let Some(arg) = args.next() {
-            if arg != "--allow" {
-                return Err(
-                    format!("unknown argument `{arg}` (usage: [--allow <program>]...)").into(),
-                );
+            match arg.as_str() {
+                "--allow" => {
+                    let name = args.next().ok_or("--allow needs a program name")?;
+                    parsed.allowed.insert(name);
+                }
+                "--max-verified-insns" => {
+                    let value = args.next().ok_or("--max-verified-insns needs a number")?;
+                    parsed.max_verified_insns =
+                        value.parse().ok().filter(|&n: &u32| n > 0).ok_or_else(|| {
+                            format!("--max-verified-insns `{value}`: not a positive integer")
+                        })?;
+                }
+                _ => {
+                    return Err(format!(
+                        "unknown argument `{arg}` (usage: [--allow <program>]... \
+                         [--max-verified-insns <n>])"
+                    )
+                    .into());
+                }
             }
-            let name = args.next().ok_or("--allow needs a program name")?;
-            allowed.insert(name);
         }
-        Ok(allowed)
+        Ok(parsed)
     }
 }
 
