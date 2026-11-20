@@ -12,12 +12,13 @@ use store::BoundedMap;
 use crate::{
     Alert,
     exclusions::{
-        BITS_EXEC_WINDOW_NS, DOWNLOAD_EXEC_WINDOW_NS, DOWNLOADER_COMMS,
-        MAIL_CLIENT_QUARANTINE_AGENTS, QUARANTINE_EXEC_WINDOW_NS,
+        BITS_EXEC_WINDOW_NS, BROWSER_PARTIAL_SUFFIXES, DOWNLOAD_EXEC_WINDOW_NS, DOWNLOADER_COMMS,
+        MAIL_CLIENT_QUARANTINE_AGENTS, QUARANTINE_EXEC_WINDOW_NS, is_browser_download_image,
+        is_chromium_snap_image,
     },
     has_write_intent,
     signature_gate::SignatureGatedAlert,
-    state::written_file_is,
+    state::{PidFact, written_file_is},
 };
 
 /// Bound of each path table below.
@@ -41,6 +42,10 @@ struct RecentQuarantine {
     origin_url: Option<String>,
     /// Set by the first exec that alerted: one alert per mark, not per run.
     alerted: bool,
+    /// The key (lowercased path) of the other record the same download was recorded under:
+    /// the Chromium Snap's rename path and the real Downloads path are one mark. An alert on
+    /// either sets `alerted` on both, so one download is one finding, not one per path.
+    twin: Option<String>,
 }
 
 /// A file a BITS job downloads, as [`crate::RuleState::on_bits_job`] saw it.
@@ -181,14 +186,14 @@ impl DownloadState {
         event: &ExecEvent,
     ) -> Option<SignatureGatedAlert> {
         let now = event.meta.timestamp_ns;
-        let mark = self
-            .recent_quarantines
-            .get_mut(&event.image_path.to_lowercase())?;
+        let key = event.image_path.to_lowercase();
+        let mark = self.recent_quarantines.get_mut(&key)?;
         let age = now.saturating_sub(mark.timestamp_ns);
         if mark.alerted || age > QUARANTINE_EXEC_WINDOW_NS {
             return None;
         }
         mark.alerted = true;
+        let twin = mark.twin.clone();
         // A mail client's mark is the one thing that says how the file arrived:
         // the finding names the attachment vector as well, and still only says
         // "marked by", since a person who saved an attachment on purpose and
@@ -198,7 +203,7 @@ impl DownloadState {
                 .iter()
                 .any(|client| agent.eq_ignore_ascii_case(client))
         });
-        Some(SignatureGatedAlert::new(Alert {
+        let alert = Alert {
             technique: if by_mail_client {
                 MAIL_ATTACHMENT_TECHNIQUE
             } else {
@@ -214,7 +219,17 @@ impl DownloadState {
                 mark.origin_url.as_deref().unwrap_or("unrecorded"),
                 mark.agent.as_deref().unwrap_or("unknown"),
             ),
-        }))
+        };
+        // Only a mark that points back is the twin: the record at that key may since have been
+        // replaced by another download of the same name (a stale one-way pointer, e.g. after a
+        // snap refresh), and that one is a different file that must still alert.
+        if let Some(twin) = twin
+            && let Some(other) = self.recent_quarantines.get_mut(&twin)
+            && other.twin.as_deref() == Some(key.as_str())
+        {
+            other.alerted = true;
+        }
+        Some(SignatureGatedAlert::new(alert))
     }
 
     /// T1197 — BITS Jobs. A file a BITS job downloaded is executed within
@@ -271,8 +286,62 @@ impl DownloadState {
                 agent: event.agent.clone(),
                 origin_url: event.origin_url.clone(),
                 alerted: false,
+                twin: None,
             },
         );
+    }
+
+    /// Linux browser downloads carry no usable xattr mark, so the finished download is
+    /// marked from the browser's own rename of its partial file (#221): a `FileRename`
+    /// whose `old_path` ends in `.crdownload`, `.opdownload` or `.part` and whose `new_path` does not,
+    /// by a process whose image is a browser image ([`is_browser_download_image`]). The mark is
+    /// the same one [`Self::on_file_quarantine`] records, with the browser's file name as
+    /// the agent and no origin URL, so [`Self::check_quarantined_exec`] joins it.
+    ///
+    /// Keyed on the image, never on `comm` (a thread-pool worker name). The image is the
+    /// event's own `executable_path`; when the sensor lost the `/proc/<pid>/exe` race (it is
+    /// `None` or empty) the lineage fallback of [`renaming_image`] reads it from the exec the
+    /// agent recorded for the pid, or, for a process forked without an exec (a Chromium
+    /// zygote child), from its parent's. Chromium's first rename (`/tmp/... -> .crdownload`, fails with
+    /// `EXDEV` across devices) and cache renames have no partial-suffix `old_path` and
+    /// are ignored.
+    pub(crate) fn on_browser_download_rename(
+        &mut self,
+        event: &FileRenameEvent,
+        images: &BoundedMap<u32, PidFact>,
+    ) {
+        let Some(image) =
+            renaming_image(event, images).filter(|image| is_browser_download_image(image))
+        else {
+            return;
+        };
+        let is_partial = |path: &str| BROWSER_PARTIAL_SUFFIXES.iter().any(|s| path.ends_with(s));
+        if !is_partial(&event.old_path) || is_partial(&event.new_path) {
+            return;
+        }
+        let mark = |twin: Option<String>| RecentQuarantine {
+            timestamp_ns: event.meta.timestamp_ns,
+            agent: Some(image.rsplit('/').next().unwrap_or(image).to_string()),
+            origin_url: None,
+            alerted: false,
+            twin,
+        };
+        let path_key = event.new_path.to_lowercase();
+        // The Chromium Snap reports the path it sees, through its own home; the file is at
+        // the real Downloads path, and that is the one a user runs. Mark both, as twins: an
+        // exec from either is the same download. Only that snap's image: another browser
+        // renaming into a `snap/chromium` directory is not evidence of the symlink.
+        let real_key = is_chromium_snap_image(image)
+            .then(|| chromium_snap_real_download_path(&event.new_path))
+            .flatten()
+            .map(|real| real.to_lowercase());
+        // A snap download takes two slots of the bounded map, evicted separately; they are
+        // inserted back to back, so in practice they leave the map together.
+        if let Some(real_key) = &real_key {
+            self.recent_quarantines
+                .insert(real_key.clone(), mark(Some(path_key.clone())));
+        }
+        self.recent_quarantines.insert(path_key, mark(real_key));
     }
 
     /// Arms, re-arms or drops the path of a BITS job's file for
@@ -464,4 +533,47 @@ fn strip_suffix_ignore_ascii_case<'a>(s: &'a str, suffix: &str) -> Option<&'a st
 
 fn format_delta(delta_ns: u64) -> String {
     format!("{:.1}s", delta_ns as f64 / 1_000_000_000.0)
+}
+
+/// The image of the process behind a `FileRename`: the event's own `executable_path` when the
+/// sensor resolved one (it wins even when it is not a browser, no fallback then), otherwise the
+/// image of the exec the agent recorded for this pid and incarnation, otherwise the one recorded
+/// for its parent and the parent's incarnation. The parent case is a process forked without an
+/// exec, which runs its parent's image (a Chromium zygote child); a pid the agent never saw exec
+/// and whose parent it never saw either gives `None`, so it marks nothing. A recycled pid is
+/// refused by the incarnation stamp, where the sensor gives one.
+fn renaming_image<'a>(
+    event: &'a FileRenameEvent,
+    images: &'a BoundedMap<u32, PidFact>,
+) -> Option<&'a str> {
+    if let Some(path) = event.executable_path.as_deref().filter(|p| !p.is_empty()) {
+        return Some(path);
+    }
+    // Each lookup is filtered before the next is tried: an exec recorded with an empty image is
+    // "lost" too, and must fall through to the parent rather than stop the chain.
+    let known = |pid: u32, generation: Option<u64>| {
+        PidFact::current(images, pid, generation).filter(|image| !image.is_empty())
+    };
+    known(event.meta.pid, event.meta.process_generation)
+        .or_else(|| known(event.meta.ppid, event.meta.parent_process_generation))
+}
+
+/// The real path of a file the Chromium Snap saved, from the path its rename reports:
+/// `<home>/snap/chromium/<revision>/Downloads/<file>` becomes `<home>/Downloads/<file>`.
+///
+/// Captured 2026-11-16 on Ubuntu 26.04.1 (Chromium 157 rev 3593, #267): the snap's
+/// `~/snap/chromium/<rev>/Downloads` is a symlink to `~/Downloads`, the sensor reports the
+/// rename under the snap path, and an exec of the file from `~/Downloads` (how a user runs
+/// it) never matched the mark. Only this layout, and only the default `Downloads` name: a
+/// user whose download directory has another name (or whose symlink points elsewhere) is not
+/// covered, and the alias is a guess about where the symlink leads, not a resolved path.
+fn chromium_snap_real_download_path(new_path: &str) -> Option<String> {
+    let (home, rest) = new_path.split_once("/snap/chromium/")?;
+    let (rev, tail) = rest.split_once('/')?;
+    let file = tail.strip_prefix("Downloads/")?;
+    (!home.is_empty()
+        && !rev.is_empty()
+        && rev.bytes().all(|b| b.is_ascii_digit())
+        && !file.is_empty())
+    .then(|| format!("{home}/Downloads/{file}"))
 }

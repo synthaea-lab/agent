@@ -43,6 +43,64 @@ pub(crate) const MAX_DEPTH: usize = 8;
 /// Most distinct blocks one condition may refer to, directly or through `of`.
 pub(crate) const MAX_BLOCKS: usize = 64;
 
+/// Why a condition is refused at load. The text names the offending token or bound, and reaches
+/// operators through [`crate::SigmaError::Unsupported`].
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub(crate) enum ConditionError {
+    #[error("the condition is empty")]
+    Empty,
+    #[error("the condition is longer than {MAX_CONDITION_BYTES} bytes")]
+    TooLong,
+    #[error("the condition has more than {MAX_TOKENS} tokens")]
+    TooManyTokens,
+    #[error("parentheses and `not` nest more than {MAX_DEPTH} deep")]
+    TooDeep,
+    #[error("the condition refers to {count} blocks (at most {MAX_BLOCKS})")]
+    TooManyBlocks { count: usize },
+    #[error("`{token}`: a pipe (aggregation such as `| count()`) is not supported")]
+    Pipe { token: String },
+    #[error("`{token}`: aggregations (`count()`, `near`, ...) are not supported")]
+    Aggregation { token: String },
+    #[error("`{token}(`: aggregations (`count()`, `min()`, `near`, ...) are not supported")]
+    AggregationFunction { token: String },
+    #[error(
+        "`{token}`: only block names, `*`, `and`, `or`, `not`, `1 of`, `all of`, `them` and \
+         parentheses are supported"
+    )]
+    UnsupportedCharacter { token: String },
+    #[error("unexpected `{token}` after a complete expression")]
+    TrailingToken { token: String },
+    #[error("the condition ends where an operand is expected")]
+    MissingOperand,
+    #[error("expected `)` and found `{found}`")]
+    ExpectedClose { found: String },
+    #[error("a `(` is never closed")]
+    Unclosed,
+    #[error("a `)` closes nothing")]
+    UnmatchedClose,
+    #[error("`{token}` where a block name is expected")]
+    KeywordAsName { token: String },
+    #[error("`{token}`: a `*` pattern is only valid after `1 of` or `all of`")]
+    PatternOutsideQuantifier { token: String },
+    #[error("`any of` is not supported (write `1 of`)")]
+    AnyOf,
+    #[error("`{quantifier} of` is not supported (only `1 of` and `all of`)")]
+    UnsupportedQuantifier { quantifier: String },
+    #[error("`{quantifier} of` has nothing after it")]
+    QuantifierWithoutTarget { quantifier: String },
+    #[error("`{target}`: a pattern may only have one `*`, at its end")]
+    BadPattern { target: String },
+    #[error("`{quantifier} of {target}`: not a block name or pattern")]
+    NotATarget { quantifier: String, target: String },
+    #[error(
+        "`{quantifier} of {target}` matches no block of this rule (an empty set would make the \
+         rule match vacuously or never)"
+    )]
+    EmptyMatch { quantifier: String, target: String },
+    #[error("unknown block `{name}` (no such key in `detection`)")]
+    UnknownBlock { name: String },
+}
+
 /// A parsed condition: the expression and the blocks it refers to, in the order the expression
 /// indexes them.
 #[derive(Debug)]
@@ -69,19 +127,17 @@ enum Expr {
 ///
 /// # Errors
 ///
-/// A message naming what is unsupported or wrong, for [`crate::SigmaError::Unsupported`].
+/// A [`ConditionError`] naming what is unsupported or wrong.
 pub(crate) fn compile(
     condition: &str,
     available: &HashMap<String, Selection>,
-) -> Result<Compiled, String> {
+) -> Result<Compiled, ConditionError> {
     let condition = condition.trim();
     if condition.is_empty() {
-        return Err("the condition is empty".to_string());
+        return Err(ConditionError::Empty);
     }
     if condition.len() > MAX_CONDITION_BYTES {
-        return Err(format!(
-            "the condition is longer than {MAX_CONDITION_BYTES} bytes"
-        ));
+        return Err(ConditionError::TooLong);
     }
     let tokens = tokenize(condition)?;
     let mut names: Vec<&str> = available.keys().map(String::as_str).collect();
@@ -94,13 +150,14 @@ pub(crate) fn compile(
     };
     let expr = parser.parse_or(0)?;
     if let Some(token) = parser.peek() {
-        return Err(format!("unexpected `{token}` after a complete expression"));
+        return Err(ConditionError::TrailingToken {
+            token: token.to_owned(),
+        });
     }
     if parser.referenced.len() > MAX_BLOCKS {
-        return Err(format!(
-            "the condition refers to {} blocks (at most {MAX_BLOCKS})",
-            parser.referenced.len()
-        ));
+        return Err(ConditionError::TooManyBlocks {
+            count: parser.referenced.len(),
+        });
     }
     Ok(Compiled {
         expr,
@@ -139,7 +196,7 @@ fn eval_expr(
 /// Splits on whitespace, with `(` and `)` as tokens of their own, and refuses any character that
 /// is not part of a name, a pattern or a keyword. The token cap is applied while splitting, so a
 /// hostile condition is cut off before it is parsed.
-fn tokenize(condition: &str) -> Result<Vec<&str>, String> {
+fn tokenize(condition: &str) -> Result<Vec<&str>, ConditionError> {
     let mut tokens = Vec::new();
     let mut start = None;
     for (at, c) in condition.char_indices() {
@@ -161,37 +218,38 @@ fn tokenize(condition: &str) -> Result<Vec<&str>, String> {
     Ok(tokens)
 }
 
-fn push_token<'a>(tokens: &mut Vec<&'a str>, token: &'a str) -> Result<(), String> {
+fn push_token<'a>(tokens: &mut Vec<&'a str>, token: &'a str) -> Result<(), ConditionError> {
     if let Some(unsupported) = unsupported_token(token) {
         return Err(unsupported);
     }
     if tokens.len() == MAX_TOKENS {
-        return Err(format!("the condition has more than {MAX_TOKENS} tokens"));
+        return Err(ConditionError::TooManyTokens);
     }
     tokens.push(token);
     Ok(())
 }
 
 /// The refusal for a token that cannot be part of the grammar, naming what it is.
-fn unsupported_token(token: &str) -> Option<String> {
+fn unsupported_token(token: &str) -> Option<ConditionError> {
+    let token_owned = || token.to_owned();
     if token.contains('|') {
-        return Some(format!(
-            "`{token}`: a pipe (aggregation such as `| count()`) is not supported"
-        ));
+        return Some(ConditionError::Pipe {
+            token: token_owned(),
+        });
     }
     if ["count", "near"]
         .iter()
         .any(|word| token.eq_ignore_ascii_case(word))
     {
-        return Some(format!(
-            "`{token}`: aggregations (`count()`, `near`, ...) are not supported"
-        ));
+        return Some(ConditionError::Aggregation {
+            token: token_owned(),
+        });
     }
     let name_char = |c: char| c.is_alphanumeric() || matches!(c, '_' | '-' | '*' | '.');
     if token != "(" && token != ")" && !token.chars().all(name_char) {
-        return Some(format!(
-            "`{token}`: only block names, `*`, `and`, `or`, `not`, `1 of`, `all of`, `them` and parentheses are supported"
-        ));
+        return Some(ConditionError::UnsupportedCharacter {
+            token: token_owned(),
+        });
     }
     None
 }
@@ -227,7 +285,7 @@ impl<'a> Parser<'a> {
     }
 
     /// `depth` counts the parentheses and `not`s entered; it is what bounds the recursion.
-    fn parse_or(&mut self, depth: usize) -> Result<Expr, String> {
+    fn parse_or(&mut self, depth: usize) -> Result<Expr, ConditionError> {
         let mut terms = vec![self.parse_and(depth)?];
         while self.peek_is("or") {
             self.at += 1;
@@ -240,7 +298,7 @@ impl<'a> Parser<'a> {
         })
     }
 
-    fn parse_and(&mut self, depth: usize) -> Result<Expr, String> {
+    fn parse_and(&mut self, depth: usize) -> Result<Expr, ConditionError> {
         let mut terms = vec![self.parse_not(depth)?];
         while self.peek_is("and") {
             self.at += 1;
@@ -253,7 +311,7 @@ impl<'a> Parser<'a> {
         })
     }
 
-    fn parse_not(&mut self, depth: usize) -> Result<Expr, String> {
+    fn parse_not(&mut self, depth: usize) -> Result<Expr, ConditionError> {
         if self.peek_is("not") {
             self.at += 1;
             let depth = enter(depth)?;
@@ -262,21 +320,24 @@ impl<'a> Parser<'a> {
         self.parse_atom(depth)
     }
 
-    fn parse_atom(&mut self, depth: usize) -> Result<Expr, String> {
+    fn parse_atom(&mut self, depth: usize) -> Result<Expr, ConditionError> {
         let Some(token) = self.next() else {
-            return Err("the condition ends where an operand is expected".to_string());
+            return Err(ConditionError::MissingOperand);
         };
+        let token_owned = || token.to_owned();
         if token == "(" {
             let depth = enter(depth)?;
             let inner = self.parse_or(depth)?;
             return match self.next() {
                 Some(")") => Ok(inner),
-                Some(other) => Err(format!("expected `)` and found `{other}`")),
-                None => Err("a `(` is never closed".to_string()),
+                Some(other) => Err(ConditionError::ExpectedClose {
+                    found: other.to_owned(),
+                }),
+                None => Err(ConditionError::Unclosed),
             };
         }
         if token == ")" {
-            return Err("a `)` closes nothing".to_string());
+            return Err(ConditionError::UnmatchedClose);
         }
         // `min(`, `max(`, `avg(`, `sum(`: aggregation functions. A bare `min` is a block name.
         if self.peek() == Some("(")
@@ -284,48 +345,54 @@ impl<'a> Parser<'a> {
                 .iter()
                 .any(|word| token.eq_ignore_ascii_case(word))
         {
-            return Err(format!(
-                "`{token}(`: aggregations (`count()`, `min()`, `near`, ...) are not supported"
-            ));
+            return Err(ConditionError::AggregationFunction {
+                token: token_owned(),
+            });
         }
         if self.peek_is("of") {
             return self.parse_quantifier(token);
         }
         if is_keyword(token) {
-            return Err(format!("`{token}` where a block name is expected"));
+            return Err(ConditionError::KeywordAsName {
+                token: token_owned(),
+            });
         }
         if token.contains('*') {
-            return Err(format!(
-                "`{token}`: a `*` pattern is only valid after `1 of` or `all of`"
-            ));
+            return Err(ConditionError::PatternOutsideQuantifier {
+                token: token_owned(),
+            });
         }
         self.reference(token).map(Expr::Block)
     }
 
     /// `1 of X*`, `all of X*`, `1 of them`, `all of them`, after the quantifier token.
-    fn parse_quantifier(&mut self, quantifier: &str) -> Result<Expr, String> {
+    fn parse_quantifier(&mut self, quantifier: &str) -> Result<Expr, ConditionError> {
+        let quantifier_owned = || quantifier.to_owned();
         let all = if quantifier.eq_ignore_ascii_case("all") {
             true
         } else if quantifier == "1" {
             false
         } else if quantifier.eq_ignore_ascii_case("any") {
-            return Err("`any of` is not supported (write `1 of`)".to_string());
+            return Err(ConditionError::AnyOf);
         } else {
-            return Err(format!(
-                "`{quantifier} of` is not supported (only `1 of` and `all of`)"
-            ));
+            return Err(ConditionError::UnsupportedQuantifier {
+                quantifier: quantifier_owned(),
+            });
         };
         self.at += 1; // `of`
         let Some(target) = self.next() else {
-            return Err(format!("`{quantifier} of` has nothing after it"));
+            return Err(ConditionError::QuantifierWithoutTarget {
+                quantifier: quantifier_owned(),
+            });
+        };
+        let bad_pattern = || ConditionError::BadPattern {
+            target: target.to_owned(),
         };
         let matched: Vec<&'a str> = if target.eq_ignore_ascii_case("them") {
             self.available.to_vec()
         } else if let Some(prefix) = target.strip_suffix('*') {
             if prefix.contains('*') {
-                return Err(format!(
-                    "`{target}`: a pattern may only have one `*`, at its end"
-                ));
+                return Err(bad_pattern());
             }
             self.available
                 .iter()
@@ -333,13 +400,12 @@ impl<'a> Parser<'a> {
                 .filter(|name| name.starts_with(prefix))
                 .collect()
         } else if target.contains('*') {
-            return Err(format!(
-                "`{target}`: a pattern may only have one `*`, at its end"
-            ));
+            return Err(bad_pattern());
         } else if is_keyword(target) || target == "(" || target == ")" {
-            return Err(format!(
-                "`{quantifier} of {target}`: not a block name or pattern"
-            ));
+            return Err(ConditionError::NotATarget {
+                quantifier: quantifier_owned(),
+                target: target.to_owned(),
+            });
         } else {
             self.available
                 .iter()
@@ -348,10 +414,10 @@ impl<'a> Parser<'a> {
                 .collect()
         };
         if matched.is_empty() {
-            return Err(format!(
-                "`{quantifier} of {target}` matches no block of this rule (an empty set would \
-                 make the rule match vacuously or never)"
-            ));
+            return Err(ConditionError::EmptyMatch {
+                quantifier: quantifier_owned(),
+                target: target.to_owned(),
+            });
         }
         let indices: Vec<usize> = matched
             .into_iter()
@@ -365,12 +431,12 @@ impl<'a> Parser<'a> {
     }
 
     /// A reference to one block by name: it must exist.
-    fn reference(&mut self, name: &str) -> Result<usize, String> {
+    fn reference(&mut self, name: &str) -> Result<usize, ConditionError> {
         match self.available.iter().find(|n| **n == name) {
             Some(found) => Ok(self.index_of(found)),
-            None => Err(format!(
-                "unknown block `{name}` (no such key in `detection`)"
-            )),
+            None => Err(ConditionError::UnknownBlock {
+                name: name.to_owned(),
+            }),
         }
     }
 
@@ -383,11 +449,9 @@ impl<'a> Parser<'a> {
     }
 }
 
-fn enter(depth: usize) -> Result<usize, String> {
+fn enter(depth: usize) -> Result<usize, ConditionError> {
     if depth >= MAX_DEPTH {
-        return Err(format!(
-            "parentheses and `not` nest more than {MAX_DEPTH} deep"
-        ));
+        return Err(ConditionError::TooDeep);
     }
     Ok(depth + 1)
 }

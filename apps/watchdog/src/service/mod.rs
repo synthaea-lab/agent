@@ -11,7 +11,9 @@ mod macos;
 pub(crate) mod windows;
 
 #[cfg(target_os = "linux")]
-pub(crate) use linux::{cmd_install, cmd_uninstall, drift_report, snapshot_definition};
+pub(crate) use linux::{
+    DefinitionSnapshot, cmd_install, cmd_uninstall, drift_report, snapshot_definition,
+};
 #[cfg(target_os = "macos")]
 pub(crate) use macos::{cmd_install, cmd_uninstall};
 #[cfg(windows)]

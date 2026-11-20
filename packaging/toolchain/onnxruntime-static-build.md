@@ -27,7 +27,12 @@ sudo apt-get install -y build-essential cmake git python3
 
 1. **Clone onnxruntime:**
 ```bash
-git clone --depth 1 --branch v1.30.0 https://github.com/microsoft/onnxruntime.git
+# github.com/microsoft/onnxruntime answers 404 since 2026-11-18: the source of the pinned commit
+# is a release asset of this repository (a shallow clone with its .git, ~500 MB), which
+# build-onnxruntime-static.sh downloads and checks. By hand:
+curl -fLO https://github.com/synthaea-lab/agent/releases/download/deps-onnxruntime-v1.30.0/onnxruntime-v1.30.0.tar.gz
+echo "cc001656879b0c464fca55dbe65834f7adc569b585284a4e1e353c058c00a701  onnxruntime-v1.30.0.tar.gz" | sha256sum -c -
+tar -xzf onnxruntime-v1.30.0.tar.gz
 cd onnxruntime
 ```
 
@@ -258,5 +263,6 @@ changes that can break the link, not on every PR.
 
 - Issue #110: ML crate static linking tracking issue
 - Script #197: `packaging/toolchain/ort-static-link-flags.sh`
-- onnxruntime: https://github.com/microsoft/onnxruntime
+- onnxruntime: https://github.com/microsoft/onnxruntime (404 since 2026-11-18; source of v1.30.0 at
+  commit `f2c39fe2`: release `deps-onnxruntime-v1.30.0` of this repository)
 - ort crate: https://github.com/pykeio/ort

@@ -20,13 +20,14 @@ pub fn exec_event(evt: &AuditEvent, timestamp_ns: u64) -> Event {
         gid,
         image_path,
         argv,
+        argv_incomplete,
     } = evt
     else {
         panic!("normalize::exec_event called on non-Exec event");
     };
 
     let mut argv = argv.clone();
-    let cmdline_truncated = schema::bound_argv(&mut argv);
+    let cmdline_truncated = schema::bound_argv(&mut argv) || *argv_incomplete;
 
     Event::Exec(ExecEvent {
         meta: EventMeta {
@@ -46,8 +47,8 @@ pub fn exec_event(evt: &AuditEvent, timestamp_ns: u64) -> Event {
         cmdline: argv.join(" "),
         argv,
         cmdline_truncated,
-        // The EXECVE record carries every argument (https://github.com/synthaea-lab/agent/issues/51: a split one drops the exec before
-        // this), so the block is whole unless the budget cut it, by an unmeasured amount.
+        // Whole unless the budget cut it or a piece never arrived (#51), either way by an
+        // unmeasured amount.
         argv_omitted_bytes: (!cmdline_truncated).then_some(0),
         parent_comm: None, // HONEST: audit doesn't track parent
         parent_image_path: None,
@@ -159,6 +160,7 @@ mod tests {
             gid: 1000,
             image_path: "/bin/ls".to_string(),
             argv: vec!["/bin/ls".to_string(), "-la".to_string()],
+            argv_incomplete: false,
         };
 
         let schema_evt = exec_event(&audit_evt, 1_234_567_890_000_000_000);
@@ -187,6 +189,7 @@ mod tests {
             gid: 1000,
             image_path: "/bin/sh".to_string(),
             argv: vec!["/bin/sh".into(), "-c".into(), "Q".repeat(2 * 1024 * 1024)],
+            argv_incomplete: false,
         };
         let Event::Exec(e) = exec_event(&audit_evt, 0) else {
             panic!("expected Event::Exec");
@@ -194,6 +197,25 @@ mod tests {
         assert!(e.cmdline_truncated);
         assert_eq!(e.argv[..2], ["/bin/sh", "-c"], "the head is kept");
         assert!(e.cmdline.len() < schema::ARGV_CAPTURE_BUDGET);
+    }
+
+    #[test]
+    fn an_exec_missing_argv_pieces_is_flagged_truncated() {
+        // #51: the head of a split argv still makes an event, marked as cut.
+        let audit_evt = AuditEvent::Exec {
+            pid: 1234,
+            uid: 1000,
+            gid: 1000,
+            image_path: "sh".to_string(),
+            argv: vec!["sh".into(), "-c".into(), "true".into()],
+            argv_incomplete: true,
+        };
+        let Event::Exec(e) = exec_event(&audit_evt, 0) else {
+            panic!("expected Event::Exec");
+        };
+        assert!(e.cmdline_truncated);
+        assert_eq!(e.argv_omitted_bytes, None, "the missing part is unmeasured");
+        assert_eq!(e.cmdline, "sh -c true");
     }
 
     #[test]
