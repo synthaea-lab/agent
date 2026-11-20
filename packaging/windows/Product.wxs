@@ -38,7 +38,7 @@
   <Product Id="*"
            Name="Synthaea Agent"
            Language="1033"
-           Version="0.0.1.0"
+           Version="0.0.2.0"
            Manufacturer="Synthaea"
            UpgradeCode="D79BAF8F-91AC-4018-8274-297161F7F57F">
   <!-- x-release-please-end -->
