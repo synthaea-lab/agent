@@ -13,14 +13,9 @@
 
 use std::collections::BTreeMap;
 
-use ring::signature::{self, UnparsedPublicKey};
 use serde::{Deserialize, Serialize};
 
-use crate::{
-    error::UpdaterError,
-    hash::{hex_decode, hex_encode},
-    key::CONTENT_PUBLIC_KEY,
-};
+use crate::{error::UpdaterError, key::CONTENT_PUBLIC_KEY, signed::SignedDocument};
 
 /// The only `schema_version` this build accepts — same anti-drift stance as
 /// [`crate::manifest::MANIFEST_SCHEMA_VERSION`], a separate constant because the
@@ -166,32 +161,23 @@ pub struct ContentManifest {
     pub signature: String,
 }
 
-impl ContentManifest {
-    /// The canonical bytes this manifest signs and verifies over: 2-space-indented
-    /// JSON with `signature` forced to `""`, fields in the alphabetical order
-    /// they are declared in the struct. Same scheme as
-    /// [`crate::manifest::ReleaseManifest::canonical_bytes`] (ADR-0015 Decision 2,
-    /// reused by ADR-0016 for consistency) — kept as a private, independent
-    /// implementation rather than shared code, since the two manifest shapes
-    /// differ and a shared helper would need to take the signature-bearing
-    /// struct by trait object for no real savings.
-    fn canonical_bytes(&self) -> Vec<u8> {
-        let unsigned = Self {
-            signature: String::new(),
-            ..self.clone()
-        };
-        serde_json::to_vec_pretty(&unsigned)
-            .expect("ContentManifest has no non-serializable content")
+impl SignedDocument for ContentManifest {
+    fn signature(&self) -> &str {
+        &self.signature
     }
 
+    fn signature_mut(&mut self) -> &mut String {
+        &mut self.signature
+    }
+}
+
+impl ContentManifest {
     /// Signs this manifest in place with `key_pair`, replacing whatever
     /// `signature` holds, over the same canonical bytes [`Self::verify_signature`]
     /// checks. Production signing is offline (ADR-0015); `release-tool sign` is the
     /// operator-facing way to call this.
     pub fn sign(&mut self, key_pair: &ring::signature::Ed25519KeyPair) {
-        self.signature.clear();
-        let sig = key_pair.sign(&self.canonical_bytes());
-        self.signature = hex_encode(sig.as_ref());
+        self.sign_with_key_pair(key_pair);
     }
 
     /// Signs this manifest in place with `sign`, which receives the canonical bytes
@@ -206,10 +192,7 @@ impl ContentManifest {
         &mut self,
         sign: impl FnOnce(&[u8]) -> Result<Vec<u8>, E>,
     ) -> Result<(), E> {
-        self.signature.clear();
-        let sig = sign(&self.canonical_bytes())?;
-        self.signature = hex_encode(&sig);
-        Ok(())
+        self.sign_via(sign)
     }
 
     /// Verifies this manifest's `schema_version` and Ed25519 signature against
@@ -242,15 +225,7 @@ impl ContentManifest {
                 expected: CONTENT_MANIFEST_SCHEMA_VERSION,
             });
         }
-        let sig_bytes = hex_decode(&self.signature).ok_or(UpdaterError::SignatureInvalid)?;
-        let msg = self.canonical_bytes();
-        let public_key = UnparsedPublicKey::new(
-            &signature::ED25519,
-            key.ok_or(UpdaterError::SigningKeyUnprovisioned)?.as_slice(),
-        );
-        public_key
-            .verify(&msg, &sig_bytes)
-            .map_err(|_| UpdaterError::SignatureInvalid)
+        self.verify_against(key)
     }
 
     /// Rejects a manifest whose `ring` does not match `requested` — a valid
@@ -344,7 +319,7 @@ impl ContentManifest {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::key::test_key_pair;
+    use crate::{hash::hex_encode, key::test_key_pair};
 
     fn entry(path: &str, sha256: &str) -> ContentEntry {
         ContentEntry {

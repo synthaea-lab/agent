@@ -29,6 +29,8 @@ map maps FILE_SETXATTR_EVENTS
 map maps FILE_SET_TIME_EVENTS
 map maps FILE_WRITE_EVENTS
 map maps GETADDRINFO_ARGS
+map maps GETHOSTBYNAME_ARGS
+map maps GETHOSTBYNAME_SCRATCH
 map maps IDENTITY_CHANGE_EVENTS
 map maps IDENTITY_CHANGE_SCRATCH
 map maps KERNEL_MODULE_EVENTS
@@ -95,6 +97,8 @@ program raw_tp/sys_enter raw_dns_udp_enter
 program raw_tp/sys_enter raw_sys_enter
 program raw_tp/sys_exit raw_sys_exit
 program uprobe getaddrinfo_entry
+program uprobe gethostbyname2_r_entry
+program uprobe gethostbyname_r_entry
 program uprobe ssl_read_entry_boringssl
 program uprobe ssl_read_entry_gnutls
 program uprobe ssl_read_entry_openssl
@@ -102,6 +106,7 @@ program uprobe ssl_write_boringssl
 program uprobe ssl_write_gnutls
 program uprobe ssl_write_openssl
 program uretprobe getaddrinfo_exit
+program uretprobe gethostbyname_exit
 program uretprobe readline_exit
 program uretprobe ssl_read_exit_boringssl
 program uretprobe ssl_read_exit_gnutls

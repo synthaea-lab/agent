@@ -20,6 +20,7 @@
 //! that host. See its module doc for why a second socket doesn't lose records.
 
 mod classify;
+mod execve;
 mod normalize;
 mod parse;
 
@@ -38,4 +39,4 @@ pub use parse::{AuditRecord, parse_audit_message};
 #[cfg(target_os = "linux")]
 pub use sensor::AuditSensor;
 #[cfg(target_os = "linux")]
-pub use socket::{AuditError, AuditSocket};
+pub use socket::{AuditError, AuditSocket, Received};

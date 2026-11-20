@@ -41,12 +41,15 @@ pub struct SigmaRule {
     /// The condition, parsed once (at validation, or on first evaluation of a rule that was
     /// never validated): what evaluation runs, so the text is never re-parsed per event.
     #[serde(skip)]
-    compiled: std::sync::OnceLock<Result<crate::condition::Compiled, String>>,
+    compiled:
+        std::sync::OnceLock<Result<crate::condition::Compiled, crate::condition::ConditionError>>,
 }
 
 impl SigmaRule {
     /// The parsed condition, or the reason it is outside the grammar.
-    pub(crate) fn compiled(&self) -> &Result<crate::condition::Compiled, String> {
+    pub(crate) fn compiled(
+        &self,
+    ) -> &Result<crate::condition::Compiled, crate::condition::ConditionError> {
         self.compiled.get_or_init(|| {
             crate::condition::compile(&self.detection.condition, &self.detection.selections)
         })
