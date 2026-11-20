@@ -9,7 +9,11 @@ use aya_ebpf::{
 use aya_log_ebpf::warn;
 use sensor_linux_wire::{FileOpenEvent, is_filtered_path};
 
-use crate::{fill_event_meta, into_ret, mount_signal::signal::is_agent_own_pid};
+use crate::{
+    arch::{SyscallRecord, arg_offset},
+    fill_event_meta, into_ret,
+    mount_signal::signal::is_agent_own_pid,
+};
 
 /// Ring buffer shared with userspace for `open` events.
 #[map]
@@ -29,20 +33,15 @@ static OPEN_SCRATCH: PerCpuArray<FileOpenEvent> = PerCpuArray::with_max_entries(
 /// Known limit: `filename` is the raw path passed by the caller, not resolved against `dfd` —
 /// a path relative to a non-standard directory descriptor will appear as-is, without the
 /// absolute prefix. Known accepted limitation; conformance reports it.
-#[cfg(any(bpf_target_arch = "x86_64", bpf_target_arch = "aarch64"))]
-const OPENAT_FILENAME_PTR_OFFSET: usize = 24;
-#[cfg(any(bpf_target_arch = "x86_64", bpf_target_arch = "aarch64"))]
-const OPENAT_FLAGS_OFFSET: usize = 32;
-
+///
 /// On i686, no padding between arguments (all 4-byte `int`s/pointers, packed
 /// consecutively): `dfd`(12), `filename`(16), `flags`(20), `mode`(24) — verified on
 /// 2026-08-19 via `/sys/kernel/debug/tracing/events/syscalls/sys_enter_openat/format` on the
-/// target i686 kernel (Debian 12 Bookworm, `6.1.0-52-686-pae`). Unlike x86_64 above, the raw
-/// value at this offset occupies 4 bytes, not 8 — see the `u32` read below.
-#[cfg(bpf_target_arch = "x86")]
-const OPENAT_FILENAME_PTR_OFFSET: usize = 16;
-#[cfg(bpf_target_arch = "x86")]
-const OPENAT_FLAGS_OFFSET: usize = 20;
+/// target i686 kernel (Debian 12 Bookworm, `6.1.0-52-686-pae`). Unlike `x86_64` above, the raw
+/// value at this offset occupies 4 bytes, not 8: `arch::CULong` is `u32` there, and
+/// `read_ulong_arg` widens it.
+const OPENAT_FILENAME_PTR_OFFSET: usize = arg_offset(1);
+const OPENAT_FLAGS_OFFSET: usize = arg_offset(2);
 
 /// Offsets of the `syscalls:sys_enter_open` tracepoint — the plain `open(2)` syscall, one
 /// argument short of `openat` above (no leading `dfd`), so `filename`/`flags` land 8 bytes
@@ -56,32 +55,20 @@ const OPENAT_FLAGS_OFFSET: usize = 20;
 /// above): `filename`(16), `flags`(24), `mode`(32). i686 offsets are inferred by the same
 /// 4-byte shift from the verified `sys_enter_openat` i686 layout, not independently confirmed
 /// on hardware.
-#[cfg(any(bpf_target_arch = "x86_64", bpf_target_arch = "aarch64"))]
-const OPEN_FILENAME_PTR_OFFSET: usize = 16;
-#[cfg(any(bpf_target_arch = "x86_64", bpf_target_arch = "aarch64"))]
-const OPEN_FLAGS_OFFSET: usize = 24;
-#[cfg(bpf_target_arch = "x86")]
-const OPEN_FILENAME_PTR_OFFSET: usize = 12;
-#[cfg(bpf_target_arch = "x86")]
-const OPEN_FLAGS_OFFSET: usize = 16;
+const OPEN_FILENAME_PTR_OFFSET: usize = arg_offset(0);
+const OPEN_FLAGS_OFFSET: usize = arg_offset(1);
 
 pub fn sys_enter_openat(ctx: TracePointContext) -> u32 {
     into_ret(try_sys_enter_openat(ctx))
 }
 
 fn try_sys_enter_openat(ctx: TracePointContext) -> Result<u32, u32> {
-    #[cfg(any(bpf_target_arch = "x86_64", bpf_target_arch = "aarch64"))]
-    let filename_ptr: u64 = unsafe { ctx.read_at(OPENAT_FILENAME_PTR_OFFSET).map_err(|_| 1u32)? };
-    #[cfg(bpf_target_arch = "x86")]
     let filename_ptr: u64 = unsafe {
-        ctx.read_at::<u32>(OPENAT_FILENAME_PTR_OFFSET)
-            .map_err(|_| 1u32)? as u64
+        ctx.read_ulong_arg(OPENAT_FILENAME_PTR_OFFSET)
+            .map_err(|_| 1u32)?
     };
 
-    #[cfg(any(bpf_target_arch = "x86_64", bpf_target_arch = "aarch64"))]
-    let flags: i64 = unsafe { ctx.read_at(OPENAT_FLAGS_OFFSET).map_err(|_| 1u32)? };
-    #[cfg(bpf_target_arch = "x86")]
-    let flags: i64 = unsafe { ctx.read_at::<i32>(OPENAT_FLAGS_OFFSET).map_err(|_| 1u32)? as i64 };
+    let flags: i64 = unsafe { ctx.read_long_arg(OPENAT_FLAGS_OFFSET).map_err(|_| 1u32)? };
 
     emit_file_open_event(&ctx, filename_ptr, flags)
 }
@@ -91,18 +78,12 @@ pub fn sys_enter_open(ctx: TracePointContext) -> u32 {
 }
 
 fn try_sys_enter_open(ctx: TracePointContext) -> Result<u32, u32> {
-    #[cfg(any(bpf_target_arch = "x86_64", bpf_target_arch = "aarch64"))]
-    let filename_ptr: u64 = unsafe { ctx.read_at(OPEN_FILENAME_PTR_OFFSET).map_err(|_| 1u32)? };
-    #[cfg(bpf_target_arch = "x86")]
     let filename_ptr: u64 = unsafe {
-        ctx.read_at::<u32>(OPEN_FILENAME_PTR_OFFSET)
-            .map_err(|_| 1u32)? as u64
+        ctx.read_ulong_arg(OPEN_FILENAME_PTR_OFFSET)
+            .map_err(|_| 1u32)?
     };
 
-    #[cfg(any(bpf_target_arch = "x86_64", bpf_target_arch = "aarch64"))]
-    let flags: i64 = unsafe { ctx.read_at(OPEN_FLAGS_OFFSET).map_err(|_| 1u32)? };
-    #[cfg(bpf_target_arch = "x86")]
-    let flags: i64 = unsafe { ctx.read_at::<i32>(OPEN_FLAGS_OFFSET).map_err(|_| 1u32)? as i64 };
+    let flags: i64 = unsafe { ctx.read_long_arg(OPEN_FLAGS_OFFSET).map_err(|_| 1u32)? };
 
     emit_file_open_event(&ctx, filename_ptr, flags)
 }
