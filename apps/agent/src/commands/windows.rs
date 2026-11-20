@@ -247,15 +247,19 @@ fn run_windows_sensors(
     sink: Box<dyn EventSink>,
     silence: Option<&Mutex<SilenceMonitor>>,
     redact_commands: bool,
+    shedding: sensor_windows::EtwShedding,
 ) -> anyhow::Result<()> {
     // Run and both capture commands funnel through here, so this is the one
     // place credential redaction has to sit in front of (#440).
     let sink = crate::redact::redacting(sink, redact_commands);
 
-    let mut etw_sensor = sensor_windows::WindowsSensor::new(sensor_windows::EtwNames {
-        session_prefix: config::identity::ETW_SESSION_PREFIX.to_string(),
-        canary_prefix: config::identity::ETW_CANARY_PREFIX.to_string(),
-    });
+    let mut etw_sensor = sensor_windows::WindowsSensor::with_shedding(
+        sensor_windows::EtwNames {
+            session_prefix: config::identity::ETW_SESSION_PREFIX.to_string(),
+            canary_prefix: config::identity::ETW_CANARY_PREFIX.to_string(),
+        },
+        shedding,
+    );
     let etw_stop = etw_sensor.stop_handle();
 
     // No policy-loading/distribution mechanism exists in this workspace yet
@@ -513,6 +517,9 @@ pub(crate) fn cmd_run(opts: super::RunOptions) -> anyhow::Result<()> {
     let silence_monitor = Arc::new(Mutex::new(SilenceMonitor::new()));
     crate::silence::spawn_monitor(Arc::clone(&silence_monitor), Arc::clone(&pipeline.sink))?;
 
+    // What the ETW sensor's caches shed (#178): the sensor counts into it, the beacon reads it.
+    let shedding = sensor_windows::EtwShedding::default();
+
     // Health beacon (#134/#317): without it the control plane never hears from
     // a Windows agent, and its silent-agent detection flags every one of them.
     // Wound down by `finish_run` once the sensors return (#147).
@@ -520,11 +527,14 @@ pub(crate) fn cmd_run(opts: super::RunOptions) -> anyhow::Result<()> {
         &pipeline,
         Arc::clone(&silence_monitor),
         Vec::new(),
-        Arc::new(crate::host_counters::AgentHostCounters::new(
-            Arc::clone(&pipeline.sink),
-            crate::host_counters::WatchdogReport::from_env(),
-            None,
-        )),
+        Arc::new(
+            crate::host_counters::AgentHostCounters::new(
+                Arc::clone(&pipeline.sink),
+                crate::host_counters::WatchdogReport::from_env(),
+                None,
+            )
+            .with_etw_shedding(shedding.clone()),
+        ),
     );
     let (health_handle, health_stop) = health.spawn()?;
     let mut shutdown = ShutdownPlan::default();
@@ -538,6 +548,7 @@ pub(crate) fn cmd_run(opts: super::RunOptions) -> anyhow::Result<()> {
         Box::new(SharedSink(pipeline.sink)),
         Some(&silence_monitor),
         false,
+        shedding,
     );
     // The enrichment flush and the upload loops' last drain, as on Linux (#147).
     super::common::finish_run(&sink, shutdown);
@@ -548,14 +559,24 @@ pub(crate) fn cmd_capture_events(output: &std::path::Path) -> anyhow::Result<()>
     let sink = sinks::JsonlEventSink::open(output)?;
     eprintln!("Synthaea — raw event capture (Ctrl-C to stop)");
     eprintln!("Output: {}", output.display());
-    run_windows_sensors(Box::new(sink), None, true)
+    run_windows_sensors(
+        Box::new(sink),
+        None,
+        true,
+        sensor_windows::EtwShedding::default(),
+    )
 }
 
 pub(crate) fn cmd_capture_baseline(output: &std::path::Path) -> anyhow::Result<()> {
     let sink = crate::sink::BaselineSink::new(seeded_rule_state(), output)?;
     eprintln!("Synthaea — baseline capture (Ctrl-C to stop)");
     eprintln!("Output: {}", output.display());
-    run_windows_sensors(Box::new(sink), None, true)
+    run_windows_sensors(
+        Box::new(sink),
+        None,
+        true,
+        sensor_windows::EtwShedding::default(),
+    )
 }
 
 #[cfg(test)]

@@ -51,7 +51,7 @@ impl LongPathCache {
     }
 
     /// Times the cap forced a clear since creation.
-    #[cfg_attr(not(test), allow(dead_code))] // read by a future health surface
+    #[cfg(test)]
     pub(crate) fn cleared(&self) -> u64 {
         self.cleared
     }
