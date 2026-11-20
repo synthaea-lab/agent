@@ -64,64 +64,76 @@ struct Cli {
 #[derive(Subcommand)]
 enum Command {
     /// Hash a directory of release files into an unsigned release manifest.
-    Manifest {
-        /// The release's `release_version` (strictly greater than the installed one).
-        #[arg(long)]
-        release_version: u64,
-        /// Directory holding the release files (`agent`, `watchdog`, `cli`, ...).
-        #[arg(long)]
-        dir: PathBuf,
-        /// Write here instead of stdout.
-        #[arg(long)]
-        out: Option<PathBuf>,
-    },
+    Manifest(ManifestArgs),
     /// Rebuild an earlier content manifest as a newer, unsigned one: the corrective release that
     /// withdraws content from agents that already applied a later release (ADR-0032).
-    RollForward {
-        /// The earlier content manifest to restore (its signature is dropped).
-        #[arg(long)]
-        from: PathBuf,
-        /// The corrective release's `release_version`: the next number the control plane will assign,
-        /// one above the highest release of the ring (rolled-back ones included).
-        #[arg(long)]
-        release_version: u64,
-        /// When it is released, UTC, `YYYY-MM-DDTHH:MM:SSZ`.
-        #[arg(long)]
-        released_at: String,
-        /// The manifest of the release the ring is on now (the one being withdrawn). Optional:
-        /// prints what the corrective release removes and which paths need their earlier
-        /// bytes put back in the artifact store first.
-        #[arg(long)]
-        current: Option<PathBuf>,
-        /// Write here instead of stdout.
-        #[arg(long)]
-        out: Option<PathBuf>,
-    },
+    RollForward(RollForwardArgs),
     /// Build an unsigned key-rotation manifest: a new `release` and/or `content` key and the key
     /// each replaces, to be signed with the `recovery` key (`sign --kind rotation`).
     Rotation(RotationArgs),
     /// Sign a manifest file.
-    Sign {
-        /// Which manifest shape the file holds.
-        #[arg(long, value_enum)]
-        kind: sign::Kind,
-        #[command(flatten)]
-        key: KeySource,
-        #[command(flatten)]
-        token: Pkcs11Options,
-        /// The manifest to sign.
-        manifest: PathBuf,
-        /// Write here instead of stdout.
-        #[arg(long)]
-        out: Option<PathBuf>,
-    },
+    Sign(SignArgs),
     /// Print the public key (hex) of a signing key: the value to commit under `crates/updater/keys/`.
-    PublicKey {
-        #[command(flatten)]
-        key: KeySource,
-        #[command(flatten)]
-        token: Pkcs11Options,
-    },
+    PublicKey(PublicKeyArgs),
+}
+
+#[derive(Args)]
+struct ManifestArgs {
+    /// The release's `release_version` (strictly greater than the installed one).
+    #[arg(long)]
+    release_version: u64,
+    /// Directory holding the release files (`agent`, `watchdog`, `cli`, ...).
+    #[arg(long)]
+    dir: PathBuf,
+    /// Write here instead of stdout.
+    #[arg(long)]
+    out: Option<PathBuf>,
+}
+
+#[derive(Args)]
+struct RollForwardArgs {
+    /// The earlier content manifest to restore (its signature is dropped).
+    #[arg(long)]
+    from: PathBuf,
+    /// The corrective release's `release_version`: the next number the control plane will assign,
+    /// one above the highest release of the ring (rolled-back ones included).
+    #[arg(long)]
+    release_version: u64,
+    /// When it is released, UTC, `YYYY-MM-DDTHH:MM:SSZ`.
+    #[arg(long)]
+    released_at: String,
+    /// The manifest of the release the ring is on now (the one being withdrawn). Optional:
+    /// prints what the corrective release removes and which paths need their earlier
+    /// bytes put back in the artifact store first.
+    #[arg(long)]
+    current: Option<PathBuf>,
+    /// Write here instead of stdout.
+    #[arg(long)]
+    out: Option<PathBuf>,
+}
+
+#[derive(Args)]
+struct SignArgs {
+    /// Which manifest shape the file holds.
+    #[arg(long, value_enum)]
+    kind: sign::Kind,
+    #[command(flatten)]
+    key: KeySource,
+    #[command(flatten)]
+    token: Pkcs11Options,
+    /// The manifest to sign.
+    manifest: PathBuf,
+    /// Write here instead of stdout.
+    #[arg(long)]
+    out: Option<PathBuf>,
+}
+
+#[derive(Args)]
+struct PublicKeyArgs {
+    #[command(flatten)]
+    key: KeySource,
+    #[command(flatten)]
+    token: Pkcs11Options,
 }
 
 #[derive(Args)]
@@ -274,74 +286,63 @@ fn emit(text: &str, out: Option<&Path>) -> anyhow::Result<()> {
     }
 }
 
-fn cmd_manifest(release_version: u64, dir: &Path, out: Option<&Path>) -> anyhow::Result<()> {
-    let manifest = manifest_dir::build(dir, release_version)?;
+/// The text of `path`, or an error that names it.
+fn read_text(path: &Path) -> anyhow::Result<String> {
+    std::fs::read_to_string(path).with_context(|| format!("cannot read {}", path.display()))
+}
+
+fn cmd_manifest(args: ManifestArgs) -> anyhow::Result<()> {
+    let ManifestArgs {
+        release_version,
+        dir,
+        out,
+    } = args;
+    let manifest = manifest_dir::build(&dir, release_version)?;
     eprintln!(
         "unsigned release manifest v{release_version}: {} entries",
         manifest.entries.len()
     );
-    emit(&serde_json::to_string_pretty(&manifest)?, out)
+    emit(&serde_json::to_string_pretty(&manifest)?, out.as_deref())
 }
 
-fn cmd_roll_forward(
-    from: &Path,
-    release_version: u64,
-    released_at: &str,
-    current: Option<&Path>,
-    out: Option<&Path>,
-) -> anyhow::Result<()> {
-    let text =
-        std::fs::read_to_string(from).with_context(|| format!("cannot read {}", from.display()))?;
-    let manifest = roll_forward::roll_forward(&text, release_version, released_at)?;
+fn cmd_roll_forward(args: RollForwardArgs) -> anyhow::Result<()> {
+    let RollForwardArgs {
+        from,
+        release_version,
+        released_at,
+        current,
+        out,
+    } = args;
+    let earlier = roll_forward::parse_earlier(&read_text(&from)?)?;
+    let manifest = roll_forward::roll_forward(&earlier, release_version, &released_at)?;
     eprintln!(
         "unsigned corrective content manifest v{release_version} for ring {} ({} entries, \
          the content of v{}); sign it with `release-tool sign --kind content`",
         manifest.ring,
         manifest.entries.len(),
-        serde_json::from_str::<updater::ContentManifest>(&text)
-            .map_or(0, |earlier| earlier.release_version)
+        earlier.release_version
     );
     if let Some(current) = current {
-        let text = std::fs::read_to_string(current)
-            .with_context(|| format!("cannot read {}", current.display()))?;
-        let now: updater::ContentManifest =
-            serde_json::from_str(&text).context("--current is not a content manifest")?;
-        let earlier: updater::ContentManifest = serde_json::from_str(
-            &std::fs::read_to_string(from)
-                .with_context(|| format!("cannot read {}", from.display()))?,
-        )?;
+        let now: updater::ContentManifest = serde_json::from_str(&read_text(&current)?)
+            .context("--current is not a content manifest")?;
         report_change(&roll_forward::compare(&earlier, &now), now.release_version);
     }
-    emit(&serde_json::to_string_pretty(&manifest)?, out)
+    emit(&serde_json::to_string_pretty(&manifest)?, out.as_deref())
 }
 
-fn cmd_rotation(args: RotationArgs) -> anyhow::Result<()> {
-    let RotationArgs {
-        release_version,
-        new_release_key,
-        retire_release_key,
-        new_content_key,
-        retire_content_key,
-        reason,
-        valid_for_days,
-        issued_at,
-        out,
-    } = args;
-    let issued_at = match issued_at {
-        Some(at) => at,
-        None => std::time::SystemTime::now()
+/// `issued_at` as given, or the clock's Unix seconds.
+fn issued_at_or_now(issued_at: Option<u64>) -> anyhow::Result<u64> {
+    match issued_at {
+        Some(at) => Ok(at),
+        None => Ok(std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .context("the clock is before 1970")?
-            .as_secs(),
-    };
-    let manifest = rotation::build(rotation::Request {
-        release_version,
-        release: new_release_key.zip(retire_release_key),
-        content: new_content_key.zip(retire_content_key),
-        reason,
-        issued_at,
-        valid_for_secs: valid_for_days.saturating_mul(24 * 60 * 60),
-    })?;
+            .as_secs()),
+    }
+}
+
+/// What the rotation does, for the operator: its expiry and each key it swaps.
+fn report_rotation(manifest: &updater::KeyRotationManifest, release_version: u64) {
     eprintln!(
         "unsigned key rotation v{release_version}, valid until {}; sign it with the \
          recovery key: `release-tool sign --kind rotation`",
@@ -363,22 +364,36 @@ fn cmd_rotation(args: RotationArgs) -> anyhow::Result<()> {
             eprintln!("  {role}: {retired} (retired) -> {new} (new)");
         }
     }
+}
+
+fn cmd_rotation(args: RotationArgs) -> anyhow::Result<()> {
+    let RotationArgs {
+        release_version,
+        new_release_key,
+        retire_release_key,
+        new_content_key,
+        retire_content_key,
+        reason,
+        valid_for_days,
+        issued_at,
+        out,
+    } = args;
+    let manifest = rotation::build(rotation::Request {
+        release_version,
+        release: new_release_key.zip(retire_release_key),
+        content: new_content_key.zip(retire_content_key),
+        reason,
+        issued_at: issued_at_or_now(issued_at)?,
+        valid_for_secs: valid_for_days.saturating_mul(24 * 60 * 60),
+    })?;
+    report_rotation(&manifest, release_version);
     emit(&serde_json::to_string_pretty(&manifest)?, out.as_deref())
 }
 
-fn cmd_sign(
-    kind: sign::Kind,
-    key: &KeySource,
-    token: &Pkcs11Options,
-    manifest: &Path,
-    out: Option<&Path>,
-) -> anyhow::Result<()> {
-    let signer = key.load(token)?;
-    let text = std::fs::read_to_string(manifest)
-        .with_context(|| format!("cannot read {}", manifest.display()))?;
-    let signed = sign::sign(kind, &text, signer.as_ref())?;
+/// What was signed, with which public key, and whether this build's embedded key accepts it.
+fn report_signature(signed: &sign::Signed, signer: &dyn signer::Signer) {
     eprintln!("signed {}", signed.summary);
-    eprintln!("public key: {}", signer::public_key_hex(signer.as_ref()));
+    eprintln!("public key: {}", signer::public_key_hex(signer));
     if signed.accepted_by_embedded_key {
         eprintln!("the key embedded in this build of the updater accepts this signature");
     } else {
@@ -387,42 +402,34 @@ fn cmd_sign(
              signature; agents built with that key will refuse it (embed the public key above first)"
         );
     }
-    emit(&signed.json, out)
 }
 
-fn cmd_public_key(key: &KeySource, token: &Pkcs11Options) -> anyhow::Result<()> {
-    emit(&signer::public_key_hex(key.load(token)?.as_ref()), None)
+fn cmd_sign(args: SignArgs) -> anyhow::Result<()> {
+    let SignArgs {
+        kind,
+        key,
+        token,
+        manifest,
+        out,
+    } = args;
+    let signer = key.load(&token)?;
+    let signed = sign::sign(kind, &read_text(&manifest)?, signer.as_ref())?;
+    report_signature(&signed, signer.as_ref());
+    emit(&signed.json, out.as_deref())
+}
+
+fn cmd_public_key(args: PublicKeyArgs) -> anyhow::Result<()> {
+    let PublicKeyArgs { key, token } = args;
+    emit(&signer::public_key_hex(key.load(&token)?.as_ref()), None)
 }
 
 fn main() -> anyhow::Result<()> {
     match Cli::parse().command {
-        Command::Manifest {
-            release_version,
-            dir,
-            out,
-        } => cmd_manifest(release_version, &dir, out.as_deref()),
-        Command::RollForward {
-            from,
-            release_version,
-            released_at,
-            current,
-            out,
-        } => cmd_roll_forward(
-            &from,
-            release_version,
-            &released_at,
-            current.as_deref(),
-            out.as_deref(),
-        ),
+        Command::Manifest(args) => cmd_manifest(args),
+        Command::RollForward(args) => cmd_roll_forward(args),
         Command::Rotation(args) => cmd_rotation(args),
-        Command::Sign {
-            kind,
-            key,
-            token,
-            manifest,
-            out,
-        } => cmd_sign(kind, &key, &token, &manifest, out.as_deref()),
-        Command::PublicKey { key, token } => cmd_public_key(&key, &token),
+        Command::Sign(args) => cmd_sign(args),
+        Command::PublicKey(args) => cmd_public_key(args),
     }
 }
 
@@ -445,11 +452,11 @@ mod tests {
     fn manifest_takes_a_version_a_directory_and_an_optional_out() {
         let Ok(Cli {
             command:
-                Command::Manifest {
+                Command::Manifest(ManifestArgs {
                     release_version,
                     dir,
                     out,
-                },
+                }),
         }) = parse(&["manifest", "--release-version", "3", "--dir", "dist"])
         else {
             panic!("manifest did not parse");
@@ -467,13 +474,13 @@ mod tests {
     fn roll_forward_takes_the_earlier_manifest_and_an_optional_current() {
         let Ok(Cli {
             command:
-                Command::RollForward {
+                Command::RollForward(RollForwardArgs {
                     from,
                     release_version,
                     released_at,
                     current,
                     out,
-                },
+                }),
         }) = parse(&[
             "roll-forward",
             "--from",
@@ -508,7 +515,7 @@ mod tests {
     }
 
     #[test]
-    fn rotation_defaults_to_seven_days_and_needs_its_keys_in_pairs() {
+    fn rotation_defaults_to_seven_days_and_the_clock() {
         let hex = "a".repeat(64);
         let Ok(Cli {
             command:
@@ -539,12 +546,17 @@ mod tests {
         assert_eq!(new_release_key.as_deref(), Some(hex.as_str()));
         assert_eq!(retire_release_key.as_deref(), Some(hex.as_str()));
         assert_eq!(new_content_key, None);
+    }
 
-        // A new key without the key it replaces (and the reverse) is refused.
+    #[test]
+    fn a_rotation_key_without_the_key_it_replaces_is_refused() {
+        // A new key without the key it replaces (and the reverse), for both roles.
+        let hex = "a".repeat(64);
         for lone in [
             "--new-release-key",
             "--retire-release-key",
             "--new-content-key",
+            "--retire-content-key",
         ] {
             assert_eq!(
                 rejected(&[
@@ -560,24 +572,27 @@ mod tests {
                 "{lone}"
             );
         }
+    }
+
+    #[test]
+    fn a_rotation_needs_a_reason() {
         assert_eq!(
             rejected(&["rotation", "--release-version", "9"]),
-            clap::error::ErrorKind::MissingRequiredArgument,
-            "a reason is required"
+            clap::error::ErrorKind::MissingRequiredArgument
         );
     }
 
     #[test]
-    fn sign_needs_a_kind_a_key_source_and_a_manifest() {
+    fn sign_takes_a_kind_a_key_source_and_a_manifest() {
         let Ok(Cli {
             command:
-                Command::Sign {
+                Command::Sign(SignArgs {
                     kind,
                     key,
                     manifest,
                     out,
                     ..
-                },
+                }),
         }) = parse(&[
             "sign",
             "--kind",
@@ -593,13 +608,28 @@ mod tests {
         assert_eq!(key.key_file, Some(PathBuf::from("release.key")));
         assert_eq!(manifest, PathBuf::from("manifest.json"));
         assert_eq!(out, None);
+    }
 
+    #[test]
+    fn sign_accepts_every_kind() {
         for kind in ["release", "content", "rotation"] {
             assert!(
                 parse(&["sign", "--kind", kind, "--key-file", "k", "m.json"]).is_ok(),
                 "{kind}"
             );
         }
+    }
+
+    #[test]
+    fn sign_refuses_a_kind_it_does_not_know() {
+        assert_eq!(
+            rejected(&["sign", "--kind", "nonsense", "--key-file", "k", "m.json"]),
+            clap::error::ErrorKind::InvalidValue
+        );
+    }
+
+    #[test]
+    fn sign_refuses_a_missing_kind_key_source_or_manifest() {
         assert_eq!(
             rejected(&["sign", "--kind", "release", "m.json"]),
             clap::error::ErrorKind::MissingRequiredArgument,
@@ -614,10 +644,6 @@ mod tests {
             rejected(&["sign", "--kind", "release", "--key-file", "k"]),
             clap::error::ErrorKind::MissingRequiredArgument,
             "no manifest"
-        );
-        assert_eq!(
-            rejected(&["sign", "--kind", "nonsense", "--key-file", "k", "m.json"]),
-            clap::error::ErrorKind::InvalidValue
         );
     }
 
@@ -642,7 +668,7 @@ mod tests {
     #[test]
     fn a_token_needs_its_module_and_a_module_needs_the_token_and_key_labels() {
         let Ok(Cli {
-            command: Command::PublicKey { key, token },
+            command: Command::PublicKey(PublicKeyArgs { key, token }),
         }) = parse(&[
             "public-key",
             "--pkcs11",

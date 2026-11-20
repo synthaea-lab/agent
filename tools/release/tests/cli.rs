@@ -10,7 +10,9 @@ use std::{
 
 use updater::{ContentEntry, ContentManifest, key::test_key_pair};
 
+#[cfg(feature = "test-key")]
 const TEST_PUBLIC_KEY: &str = "2152f8d19b791d24453242e15f2eab6cb7cffa7b6a5ed30097960e069881db12";
+#[cfg(feature = "test-key")]
 const TEST_KEY_WARNING: &str =
     "warning: signing with the PUBLIC test key; this release is for a lab, not for production\n";
 
@@ -25,11 +27,11 @@ fn text(bytes: &[u8]) -> String {
     String::from_utf8(bytes.to_vec()).expect("utf-8 output")
 }
 
-fn path(p: &Path) -> &str {
-    p.to_str().expect("utf-8 path")
+fn utf8_path(path: &Path) -> &str {
+    path.to_str().expect("utf-8 path")
 }
 
-fn release_dir(dir: &Path) {
+fn write_release_files(dir: &Path) {
     std::fs::write(dir.join("agent"), "agentbytes\n").unwrap();
     std::fs::write(dir.join("cli"), "clibytes\n").unwrap();
 }
@@ -45,7 +47,7 @@ const RELEASE_MANIFEST: &str = r#"{
 }
 "#;
 
-fn content_manifest(release_version: u64, paths: &[&str], signed: bool) -> String {
+fn signed_content_manifest(release_version: u64, paths: &[&str]) -> String {
     let mut manifest = ContentManifest {
         entries: paths
             .iter()
@@ -63,9 +65,7 @@ fn content_manifest(release_version: u64, paths: &[&str], signed: bool) -> Strin
         schema_version: updater::content::CONTENT_MANIFEST_SCHEMA_VERSION,
         signature: String::new(),
     };
-    if signed {
-        manifest.sign(&test_key_pair());
-    }
+    manifest.sign(&test_key_pair());
     serde_json::to_string(&manifest).unwrap()
 }
 
@@ -74,7 +74,7 @@ fn manifest_writes_the_hashes_to_out_and_says_how_many_on_stderr() {
     let dir = tempfile::tempdir().unwrap();
     let files = dir.path().join("dist");
     std::fs::create_dir(&files).unwrap();
-    release_dir(&files);
+    write_release_files(&files);
     let out = dir.path().join("manifest.json");
 
     let result = run(&[
@@ -82,9 +82,9 @@ fn manifest_writes_the_hashes_to_out_and_says_how_many_on_stderr() {
         "--release-version",
         "3",
         "--dir",
-        path(&files),
+        utf8_path(&files),
         "--out",
-        path(&out),
+        utf8_path(&out),
     ]);
 
     assert!(result.status.success(), "{}", text(&result.stderr));
@@ -99,14 +99,14 @@ fn manifest_writes_the_hashes_to_out_and_says_how_many_on_stderr() {
 #[test]
 fn manifest_without_out_prints_the_same_text_on_stdout() {
     let dir = tempfile::tempdir().unwrap();
-    release_dir(dir.path());
+    write_release_files(dir.path());
 
     let result = run(&[
         "manifest",
         "--release-version",
         "3",
         "--dir",
-        path(dir.path()),
+        utf8_path(dir.path()),
     ]);
 
     assert!(result.status.success());
@@ -123,9 +123,9 @@ fn manifest_of_a_missing_directory_fails_and_writes_nothing() {
         "--release-version",
         "3",
         "--dir",
-        path(&dir.path().join("no-such-dir")),
+        utf8_path(&dir.path().join("no-such-dir")),
         "--out",
-        path(&out),
+        utf8_path(&out),
     ]);
 
     assert!(!result.status.success());
@@ -152,7 +152,7 @@ fn rotation_with_a_fixed_issue_time_is_reproducible() {
         "--issued-at",
         "1700000000",
         "--out",
-        path(&out),
+        utf8_path(&out),
     ]);
 
     assert!(result.status.success(), "{}", text(&result.stderr));
@@ -214,6 +214,7 @@ fn rotation_without_an_issue_time_uses_the_clock() {
     );
 }
 
+#[cfg(feature = "test-key")]
 #[test]
 fn sign_with_the_test_key_reports_the_key_and_writes_a_signed_manifest() {
     let dir = tempfile::tempdir().unwrap();
@@ -226,9 +227,9 @@ fn sign_with_the_test_key_reports_the_key_and_writes_a_signed_manifest() {
         "--kind",
         "release",
         "--test-key",
-        path(&manifest),
+        utf8_path(&manifest),
         "--out",
-        path(&out),
+        utf8_path(&out),
     ]);
 
     assert!(result.status.success(), "{}", text(&result.stderr));
@@ -247,12 +248,19 @@ fn sign_with_the_test_key_reports_the_key_and_writes_a_signed_manifest() {
     assert_eq!(signed["signature"].as_str().unwrap().len(), 128);
 }
 
+#[cfg(feature = "test-key")]
 #[test]
 fn sign_of_a_missing_manifest_names_the_file() {
     let dir = tempfile::tempdir().unwrap();
     let missing = dir.path().join("no-such.json");
 
-    let result = run(&["sign", "--kind", "release", "--test-key", path(&missing)]);
+    let result = run(&[
+        "sign",
+        "--kind",
+        "release",
+        "--test-key",
+        utf8_path(&missing),
+    ]);
 
     assert!(!result.status.success());
     assert!(
@@ -262,6 +270,7 @@ fn sign_of_a_missing_manifest_names_the_file() {
     );
 }
 
+#[cfg(feature = "test-key")]
 #[test]
 fn public_key_prints_the_hex_on_stdout_only() {
     let result = run(&["public-key", "--test-key"]);
@@ -271,6 +280,7 @@ fn public_key_prints_the_hex_on_stdout_only() {
     assert_eq!(text(&result.stderr), TEST_KEY_WARNING);
 }
 
+#[cfg(feature = "test-key")]
 #[test]
 fn a_key_file_that_is_not_a_public_test_key_is_refused() {
     // `--key-file` is reserved to the checked-in test keys (ADR-0027): any other seed in a
@@ -284,7 +294,7 @@ fn a_key_file_that_is_not_a_public_test_key_is_refused() {
         std::fs::set_permissions(&key_file, std::fs::Permissions::from_mode(0o600)).unwrap();
     }
 
-    let result = run(&["public-key", "--key-file", path(&key_file)]);
+    let result = run(&["public-key", "--key-file", utf8_path(&key_file)]);
 
     assert!(!result.status.success());
     assert_eq!(text(&result.stdout), "");
@@ -300,18 +310,18 @@ fn roll_forward_rebuilds_the_earlier_content_under_a_new_number() {
     let dir = tempfile::tempdir().unwrap();
     let from = dir.path().join("v2.json");
     let out = dir.path().join("v5.json");
-    std::fs::write(&from, content_manifest(2, &["rules/a.yml"], true)).unwrap();
+    std::fs::write(&from, signed_content_manifest(2, &["rules/a.yml"])).unwrap();
 
     let result = run(&[
         "roll-forward",
         "--from",
-        path(&from),
+        utf8_path(&from),
         "--release-version",
         "5",
         "--released-at",
         "2026-10-12T09:30:00Z",
         "--out",
-        path(&out),
+        utf8_path(&out),
     ]);
 
     assert!(result.status.success(), "{}", text(&result.stderr));
@@ -332,23 +342,23 @@ fn roll_forward_with_current_lists_what_it_removes() {
     let dir = tempfile::tempdir().unwrap();
     let from = dir.path().join("v2.json");
     let current = dir.path().join("v4.json");
-    std::fs::write(&from, content_manifest(2, &["rules/a.yml"], true)).unwrap();
+    std::fs::write(&from, signed_content_manifest(2, &["rules/a.yml"])).unwrap();
     std::fs::write(
         &current,
-        content_manifest(4, &["rules/a.yml", "rules/b.yml"], true),
+        signed_content_manifest(4, &["rules/a.yml", "rules/b.yml"]),
     )
     .unwrap();
 
     let result = run(&[
         "roll-forward",
         "--from",
-        path(&from),
+        utf8_path(&from),
         "--release-version",
         "5",
         "--released-at",
         "2026-10-12T09:30:00Z",
         "--current",
-        path(&current),
+        utf8_path(&current),
     ]);
 
     assert!(result.status.success(), "{}", text(&result.stderr));
@@ -371,7 +381,7 @@ fn roll_forward_from_a_missing_file_names_it() {
     let result = run(&[
         "roll-forward",
         "--from",
-        path(&missing),
+        utf8_path(&missing),
         "--release-version",
         "5",
         "--released-at",
@@ -391,19 +401,19 @@ fn roll_forward_with_a_current_that_is_not_a_content_manifest_says_so() {
     let dir = tempfile::tempdir().unwrap();
     let from = dir.path().join("v2.json");
     let current = dir.path().join("current.json");
-    std::fs::write(&from, content_manifest(2, &["rules/a.yml"], true)).unwrap();
+    std::fs::write(&from, signed_content_manifest(2, &["rules/a.yml"])).unwrap();
     std::fs::write(&current, "{}").unwrap();
 
     let result = run(&[
         "roll-forward",
         "--from",
-        path(&from),
+        utf8_path(&from),
         "--release-version",
         "5",
         "--released-at",
         "2026-10-12T09:30:00Z",
         "--current",
-        path(&current),
+        utf8_path(&current),
     ]);
 
     assert!(!result.status.success());
