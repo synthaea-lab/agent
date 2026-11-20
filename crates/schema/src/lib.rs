@@ -360,7 +360,11 @@ pub mod time;
 /// Linux exec probe reads a head and a tail window of the argument block and says
 /// how much of it lies between them. First claimed 67;
 /// <https://github.com/synthaea-lab/agent/issues/41> merged first and took it, so this takes 68.
-pub const SCHEMA_VERSION: u32 = 68;
+///
+/// Bumped 68 → 69 for [`SignalEvent::sender_unit`] (<https://github.com/synthaea-lab/agent/issues/322>): the
+/// systemd unit of the sender, so a signal from the agent's own watchdog (same unit) is told
+/// from an intruder's.
+pub const SCHEMA_VERSION: u32 = 69;
 
 /// Bytes of argv, one separator per token included, a sensor keeps for one exec
 /// ([`bound_argv`], #1112).
@@ -587,6 +591,12 @@ pub const SECURITY_SERVICES: &[&str] = &[
     "sentinelagent",
     "cbdefense",
 ];
+
+/// The agent's own systemd unit (`<name>.service`), as `packaging/linux` installs it. Its watchdog
+/// runs in it and supervises the agent, so a signal whose [`SignalEvent::sender_unit`] is this one
+/// came from inside the agent's own service. Lives here, not in `config`, because the rules read
+/// it from the event's point of view; `config::identity::LINUX_SERVICE` is this same value.
+pub const AGENT_UNIT: &str = "synthaea-agent";
 
 /// Every synthetic `FLAG_*` bit above, checked pairwise-disjoint at compile time.
 /// A new flag goes here in the same edit (a unit test fails if a `pub const
@@ -2411,6 +2421,14 @@ pub struct SignalEvent {
     /// agent's own pid.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub target_unit: Option<String>,
+    /// The systemd unit the sender belongs to (lowercase, no `.service`), read from its cgroup
+    /// when the event is drained (Linux, <https://github.com/synthaea-lab/agent/issues/322>).
+    /// [`AGENT_UNIT`] means the sender runs in the agent's own unit: its watchdog, which kills
+    /// the agent on a stalled heartbeat or a rollback. `None` where the platform has no unit,
+    /// for a sender not in a `.service`, one that exited before the drain, and in an older
+    /// event.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sender_unit: Option<String>,
     /// The sender in `meta` may not be the process that sent the signal (Linux, #1103): the
     /// siginfo's `si_code` was `SI_TIMER`, `SI_MESGQ` or `SI_ASYNCIO`, which the kernel sets from
     /// interrupt or completion context, where the current task is a bystander. A process can also

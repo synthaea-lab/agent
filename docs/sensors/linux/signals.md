@@ -12,6 +12,17 @@ forward, so the sensor only reports signals aimed at two kinds of target, and fi
 Both produce `SignalEvent` on the `SIGNAL_EVENTS` ring (64 KiB). The sender is `meta` (so the
 container resolved is the sender's), the target is `target_pid`.
 
+### The sender's unit
+
+When the event is drained, userspace reads the sender's systemd unit from
+`/proc/<pid>/cgroup` ([`sender_unit`](../../../crates/sensors/linux/userspace/src/sender_unit.rs),
+[#322](https://github.com/synthaea-lab/agent/issues/322)) into `sender_unit`. A signal to the agent
+from a reliable sender in the agent's own unit (`synthaea-agent`) is its watchdog, which kills the
+agent on a stalled heartbeat or a rollback: the T1562.001 rule reports it at Low and says so,
+instead of High as tampering. The unit only lowers the severity of a signal to the agent itself;
+a signal from that unit to a security tool stays as it was. Putting a process in the agent's unit
+takes root (a write to its `cgroup.procs`), and the alert is still raised.
+
 ## Signals to the agent
 
 Userspace writes its own pid into [`SIGNAL_WATCH_PID`](../../../crates/sensors/linux/ebpf/src/mount_signal/signal.rs)
@@ -135,3 +146,7 @@ gets the agent's exe; any other target gets neither, so it cannot read as a sign
   [#49](https://github.com/synthaea-lab/agent/issues/49)).
 - Only the agent's own pid is watched on the `kill`/`tgkill` path; the watchdog process is not. That
   path compares the pid argument as the sender wrote it, in the sender's pid namespace.
+- The sender's unit is read at drain time. A sender that exited first has none and its signal stays
+  High; for the replayed `SIGKILL` it is read one restart late, which still finds the watchdog (it
+  outlives the agent it restarts) but could name another process that reused the pid. A host
+  without systemd (OpenRC) has no units, so a watchdog restart alerts High there.

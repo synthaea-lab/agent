@@ -6,7 +6,7 @@
 //! reuses them for the preflight (loads each program without attaching it), which is
 //! not part of the `Sensor` contract.
 
-use std::{sync::Arc, time::Duration};
+use std::{path::Path, sync::Arc, time::Duration};
 
 use schema::sensor::{Capabilities, EventSink, Sensor, SensorError};
 use sensor_linux_container::ContainerResolver;
@@ -25,8 +25,12 @@ use crate::{
     parent_image::{ExecStamps, IMAGE_CACHE_CAP, ParentImageEvictions, ParentImages},
     proc::{exec_argv, read_proc_environ_security, read_proc_images},
     rings::{RingBuffers, drain_ready, drain_wire, readable_or_pending},
+    sender_unit::unit_of_pid,
     unit_procs::{ToolProcs, ToolWatch, UnitResolver},
 };
+
+/// Where a live host's process table is mounted.
+const PROC_ROOT: &str = "/proc";
 
 /// The file a `finit_module(2)` event's fd points at (#457), read from
 /// `/proc/<pid>/fd/<fd>` while the event is drained. Racy by nature: the
@@ -88,26 +92,36 @@ fn sweep_survived_sigkill(slot: &mut TamperSlot, own_pid: u32, boot_epoch_offset
     }
 }
 
-/// The image and unit reported for a signal's target. A target on the watch list is a security
+/// What is reported about a signal's sender and target. A target on the watch list is a security
 /// tool: its unit and the exe read at scan time (the process may be gone by now). Anything else
 /// is the agent itself (`SIGNAL_WATCH_PID`). A target that is neither (a tool gone from every
 /// scan) gets no image and no unit, never the agent's: it must not read as a signal to the agent.
-fn signal_target(
+/// The sender's unit is read now, from its cgroup (#322).
+fn signal_parties(
     event: &wire::SignalEvent,
     tool_procs: &ToolProcs,
     own_pid: u32,
     self_exe: Option<&String>,
-) -> (Option<String>, Option<String>) {
+) -> normalize::SignalParties {
     let tool = tool_procs
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .get(&event.target_pid)
         .cloned();
-    match tool {
+    let (target_image_path, target_unit) = match tool {
         Some(tool) => (tool.exe, Some(tool.unit)),
         None if event.target_pid == own_pid => (self_exe.cloned(), None),
         None => (None, None),
+    };
+    normalize::SignalParties {
+        target_image_path,
+        target_unit,
+        sender_unit: sender_unit_of(event),
     }
+}
+
+fn sender_unit_of(event: &wire::SignalEvent) -> Option<String> {
+    unit_of_pid(Path::new(PROC_ROOT), event.meta.pid)
 }
 
 /// Linux sensor (eBPF). `run` blocks until Ctrl-C or [`Sensor::stop`].
@@ -285,11 +299,17 @@ impl LinuxSensor {
                 target_pid = previous.target_pid,
                 "sensor-linux: the previous agent instance was sent SIGKILL, reporting it"
             );
+            // The sender's unit is read now, one restart late: still right for the watchdog,
+            // which outlives the agent it restarts.
+            let parties = normalize::SignalParties {
+                target_image_path: self_exe.clone(),
+                target_unit: None,
+                sender_unit: sender_unit_of(&previous),
+            };
             sink.on_event(normalize::signal(
                 &previous,
                 offset,
-                self_exe.clone(),
-                None,
+                parties,
                 containers.resolve(previous.meta.cgroup_id),
             ));
             clear_tamper_slot(&mut tamper_slot)?;
@@ -369,8 +389,8 @@ impl LinuxSensor {
                 // The container is the SENDER's (meta is the sender, as for every event type):
                 // it attributes e.g. a container-escape kill attempt to the container it came from.
                 guard = rings.signal.readable_mut() => drain_wire(guard, sink, own_pid, |e: &wire::SignalEvent| {
-                    let (image, unit) = signal_target(e, &tool_procs, own_pid, self_exe.as_ref());
-                    normalize::signal(e, offset, image, unit, containers.resolve(e.meta.cgroup_id))
+                    let parties = signal_parties(e, &tool_procs, own_pid, self_exe.as_ref());
+                    normalize::signal(e, offset, parties, containers.resolve(e.meta.cgroup_id))
                 })?,
                 guard = rings.kernel_module.readable_mut() => drain_wire(guard, sink, own_pid, |e: &wire::KernelModuleEvent| normalize::kernel_module(e, finit_module_path(e), offset, containers.resolve(e.meta.cgroup_id)))?,
                 guard = rings.bpf.readable_mut() => drain_wire(guard, sink, own_pid, |e: &wire::BpfEvent| normalize::bpf_operation(e, offset, containers.resolve(e.meta.cgroup_id)))?,

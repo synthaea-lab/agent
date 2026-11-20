@@ -1,0 +1,12 @@
+{
+  "type": "file_chmod",
+  "meta": {
+    "pid": 9001,
+    "ppid": 9000,
+    "user": { "os": "unix", "uid": 0, "gid": 0 },
+    "timestamp_ns": 1756900014000000000,
+    "comm": "chmod"
+  },
+  "path": "/tmp/backdoor",
+  "mode": 2541
+}

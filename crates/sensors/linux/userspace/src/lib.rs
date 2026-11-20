@@ -30,6 +30,10 @@ mod parent_image;
 mod proc;
 #[cfg(target_os = "linux")]
 mod rings;
+// The sender's systemd unit, for `SignalEvent::sender_unit` (#322). Pure file reading, so its
+// tests run on every platform.
+#[cfg(any(target_os = "linux", test))]
+mod sender_unit;
 #[cfg(target_os = "linux")]
 mod sensor;
 #[cfg(all(target_os = "linux", any(ebpf_embedded, test)))]

@@ -1,0 +1,12 @@
+{
+  "type": "raw_volume_open",
+  "meta": {
+    "pid": 7004,
+    "ppid": 0,
+    "user": { "os": "unknown" },
+    "timestamp_ns": 1760000000000000000,
+    "comm": ""
+  },
+  "volume": "\\Device\\HarddiskVolume3",
+  "desired_access": 2147483650
+}

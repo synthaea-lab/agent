@@ -1,0 +1,13 @@
+{
+  "type": "signal",
+  "meta": {
+    "pid": 900,
+    "ppid": 0,
+    "user": { "os": "unknown" },
+    "timestamp_ns": 1756900000123456789,
+    "comm": "signal_generate"
+  },
+  "signal": 0,
+  "target_pid": 0,
+  "signals_lost": 19182
+}

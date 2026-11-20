@@ -1,0 +1,18 @@
+{
+  "type": "signal",
+  "meta": {
+    "pid": 5000,
+    "ppid": 1,
+    "user": {
+      "os": "unix",
+      "uid": 0,
+      "gid": 0
+    },
+    "timestamp_ns": 1756900000123456789,
+    "comm": "watchdog"
+  },
+  "signal": 9,
+  "target_pid": 400,
+  "target_image_path": "/usr/local/bin/synthaea-agent",
+  "sender_unit": "synthaea-agent"
+}

@@ -1,0 +1,19 @@
+{
+  "type": "mount",
+  "meta": {
+    "pid": 941,
+    "ppid": 1,
+    "user": {
+      "os": "unix",
+      "uid": 501,
+      "gid": 20
+    },
+    "timestamp_ns": 1756900000123456789,
+    "comm": "diskimagesiod"
+  },
+  "mount_point": "/Volumes/Installer",
+  "source": "/dev/disk4s1",
+  "fs_type": "hfs",
+  "readonly": true,
+  "mounted": true
+}
