@@ -74,12 +74,8 @@ mod linux {
                 // new kprobe or socket filter would ship without the verifier ever seeing it
                 // (#226). `--allow` still accepts it by name.
                 other => {
-                    if allowed.contains(name.as_str()) {
-                        println!("ALLOWED {name}: unsupported type {:?}", other.prog_type());
-                    } else {
-                        refused += 1;
-                        println!("FAIL {name}: unsupported type {:?}", other.prog_type());
-                    }
+                    let reason = format!("unsupported type {:?}", other.prog_type());
+                    refused += report_failure(&allowed, name, &reason);
                     continue;
                 }
             };
@@ -89,16 +85,9 @@ mod linux {
                     let verified = info.verified_instruction_count();
                     match verified {
                         Some(count) if count > max_verified_insns => {
-                            if allowed.contains(name.as_str()) {
-                                println!(
-                                    "ALLOWED {name}: verified_insns={count} over {max_verified_insns}"
-                                );
-                            } else {
-                                refused += 1;
-                                println!(
-                                    "FAIL {name}: verified_insns={count} over {max_verified_insns}"
-                                );
-                            }
+                            let reason =
+                                format!("verified_insns={count} over {max_verified_insns}");
+                            refused += report_failure(&allowed, name, &reason);
                         }
                         _ => println!(
                             "OK {name} verified_insns={verified:?} xlated_bytes={:?}",
@@ -106,13 +95,7 @@ mod linux {
                         ),
                     }
                 }
-                Err(error) if allowed.contains(name.as_str()) => {
-                    println!("ALLOWED {name}: {error:?}");
-                }
-                Err(error) => {
-                    refused += 1;
-                    println!("FAIL {name}: {error:?}");
-                }
+                Err(error) => refused += report_failure(&allowed, name, &format!("{error:?}")),
             }
         }
         println!("failed={refused}");
@@ -121,6 +104,18 @@ mod linux {
         } else {
             ExitCode::FAILURE
         })
+    }
+
+    /// Prints a failed program and returns 1, or prints it as allowed and returns 0 when
+    /// `--allow` names it.
+    fn report_failure(allowed: &BTreeSet<String>, name: &str, reason: &str) -> usize {
+        if allowed.contains(name) {
+            println!("ALLOWED {name}: {reason}");
+            0
+        } else {
+            println!("FAIL {name}: {reason}");
+            1
+        }
     }
 
     /// The programs named by `--allow`, which may be refused (or exceed the ceiling) without
