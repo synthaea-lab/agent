@@ -17,19 +17,23 @@
 //!
 //! The counts also let a refactor of the probes show what it cost the verifier: compare the
 //! output before and after (AS-003).
+//!
+//! The optional code paths are loaded enabled through `sensor_linux::verifier_loader`, from the
+//! same list of gated paths the agent enables when BTF resolves their offsets: a gating global
+//! left at 0 is a constant in `.rodata`, and the verifier then prunes everything behind it, so
+//! the check would pass code it never saw (#310).
 
 #[cfg(all(target_os = "linux", ebpf_embedded))]
 mod linux {
     use std::{collections::BTreeSet, error::Error, process::ExitCode};
 
-    use aya::{Btf, Ebpf, programs::Program};
+    use aya::{Btf, programs::Program};
 
     pub(crate) fn run() -> Result<ExitCode, Box<dyn Error>> {
         let allowed = allowed_refusals(std::env::args().skip(1))?;
-        let mut ebpf = Ebpf::load(aya::include_bytes_aligned!(concat!(
-            env!("OUT_DIR"),
-            "/sensor-linux-ebpf"
-        )))?;
+        let mut ebpf = sensor_linux::verifier_loader().load(aya::include_bytes_aligned!(
+            concat!(env!("OUT_DIR"), "/sensor-linux-ebpf")
+        ))?;
         let btf = Btf::from_sys_fs()?;
         let mut names: Vec<String> = ebpf.programs().map(|(name, _)| name.to_string()).collect();
         names.sort();
