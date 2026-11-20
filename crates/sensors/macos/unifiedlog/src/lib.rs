@@ -22,7 +22,7 @@ pub use normalize::normalize;
 pub use record::{LogRecord, parse_record};
 #[cfg(target_os = "macos")]
 pub use stream::process::spawn_stream;
-pub use stream::{NormalizedLogStream, PREDICATE};
+pub use stream::{NormalizedLogStream, PREDICATE, StreamCounters, StreamTotals};
 pub use tcc::TccJoiner;
 
 /// Errors from parsing a unified-log record or driving `log stream`.
