@@ -147,3 +147,21 @@ pub enum ClientError {
     #[error("connection closed by agent before a response arrived")]
     UnexpectedClose,
 }
+
+/// Why a [`crate::server::Handler`] could not answer a request: the
+/// implementor's own error, kept typed up to the one place
+/// ([`crate::server`]'s dispatch) that turns it into the
+/// [`crate::protocol::WireError::HandlerFailed`] message the client sees.
+/// That message is the source's `Display`, so it must be fit for an
+/// operator to read.
+#[derive(Debug, thiserror::Error)]
+#[error(transparent)]
+pub struct HandlerError(Box<dyn std::error::Error + Send + Sync + 'static>);
+
+impl HandlerError {
+    /// Wrap the implementor's error.
+    #[must_use]
+    pub fn new(source: impl std::error::Error + Send + Sync + 'static) -> Self {
+        Self(Box::new(source))
+    }
+}

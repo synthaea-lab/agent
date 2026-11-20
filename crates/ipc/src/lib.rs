@@ -48,7 +48,7 @@ pub mod server;
 pub mod stream;
 
 pub use client::Client;
-pub use error::{ClientError, ServerError};
+pub use error::{ClientError, HandlerError, ServerError};
 pub use protocol::{
     ClientHello, DetectionSummary, PROTOCOL_VERSION, PolicyVersionResponse,
     RecentDetectionsResponse, ReloadContentResponse, Request, Response, SensorHealth,
