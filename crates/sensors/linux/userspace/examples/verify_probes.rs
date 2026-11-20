@@ -11,6 +11,7 @@
 //!
 //! `inode_setattr` is expected to be refused where the LSM hook has fewer arguments (5.15, 6.1):
 //! the loader treats it as optional (#1044). Pass `--allow inode_setattr` to accept that.
+//! `--allow` only covers a refusal: a program over the ceiling fails even when allowed.
 //!
 //! Build with the eBPF toolchain, then run as root on a Linux lab host:
 //! `cargo build -p sensor-linux --example verify_probes`
@@ -39,7 +40,7 @@ mod linux {
 
     /// The command line: `[--allow <program>]... [--max-verified-insns <n>]`.
     struct Args {
-        /// Programs that may be refused (or exceed the ceiling) without failing the run.
+        /// Programs that may be refused without failing the run; the ceiling still applies.
         allowed: BTreeSet<String>,
         /// Verified-instruction ceiling per program (kernel 5.16 and later report the count).
         max_verified_insns: u32,
@@ -84,10 +85,14 @@ mod linux {
                     let info = program.info()?;
                     let verified = info.verified_instruction_count();
                     match verified {
+                        // Not subject to `--allow`: CI allows `inode_setattr` to be refused on
+                        // 5.15/6.1, and that must not also let it grow past the ceiling where
+                        // it does load. Raise `--max-verified-insns` instead.
                         Some(count) if count > max_verified_insns => {
-                            let reason =
-                                format!("verified_insns={count} over {max_verified_insns}");
-                            refused += report_failure(&allowed, name, &reason);
+                            refused += 1;
+                            println!(
+                                "FAIL {name}: verified_insns={count} over {max_verified_insns}"
+                            );
                         }
                         _ => println!(
                             "OK {name} verified_insns={verified:?} xlated_bytes={:?}",
@@ -118,8 +123,8 @@ mod linux {
         }
     }
 
-    /// The programs named by `--allow`, which may be refused (or exceed the ceiling) without
-    /// failing the run, and the ceiling. Any other argument, a flag with no value, or a ceiling
+    /// The programs named by `--allow`, which may be refused (or have a type this check cannot
+    /// load) without failing the run, and the ceiling. Any other argument, a flag with no value, or a ceiling
     /// that is not a positive integer is an error rather than ignored: a mistyped flag must not
     /// quietly turn a refusal into a pass.
     fn parse_args(mut args: impl Iterator<Item = String>) -> Result<Args, Box<dyn Error>> {
