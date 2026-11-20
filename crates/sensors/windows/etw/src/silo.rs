@@ -15,7 +15,7 @@ use std::{
 
 use schema::ContainerContext;
 
-use crate::sync::LockExt;
+use crate::{shed::ShedCounter, sync::LockExt};
 
 /// Silos remembered at once. A container host runs tens of containers; the cap
 /// only bounds a host that churns through far more than that.
@@ -60,7 +60,7 @@ struct SiloEntry {
 pub(crate) struct SiloDirectory {
     entries: HashMap<u32, SiloEntry>,
     tick: u64,
-    evicted: u64,
+    evicted: ShedCounter,
     /// Counts every [`SiloDirectory::forget`]; a resolver pass notes it when it starts.
     epoch: u64,
     /// The last forgets, `(epoch, silo)`, oldest first.
@@ -69,10 +69,15 @@ pub(crate) struct SiloDirectory {
 
 impl SiloDirectory {
     pub(crate) fn new() -> Self {
+        Self::counting(ShedCounter::default())
+    }
+
+    /// A directory whose evictions are counted into `evicted`, which the health beacon reads.
+    pub(crate) fn counting(evicted: ShedCounter) -> Self {
         Self {
             entries: HashMap::new(),
             tick: 0,
-            evicted: 0,
+            evicted,
             epoch: 0,
             forgotten: VecDeque::new(),
         }
@@ -196,9 +201,9 @@ impl SiloDirectory {
     }
 
     /// Entries dropped by the cap since creation.
-    #[cfg_attr(not(test), allow(dead_code))] // read by a future health surface
+    #[cfg(test)]
     pub(crate) fn evicted(&self) -> u64 {
-        self.evicted
+        self.evicted.get()
     }
 
     fn make_room(&mut self) {
@@ -212,9 +217,9 @@ impl SiloDirectory {
             .map(|(silo, _)| *silo)
         {
             self.entries.remove(&oldest);
-            self.evicted += 1;
+            let evicted_total = self.evicted.add();
             tracing::warn!(
-                evicted_total = self.evicted,
+                evicted_total,
                 "silo directory hit its cap: least recently used silo forgotten"
             );
         }

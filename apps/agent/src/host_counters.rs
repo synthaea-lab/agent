@@ -51,12 +51,26 @@ impl WatchdogReport {
 /// Reads the parent-image cache totals as `(live, dead)`. Linux only: other platforms pass none.
 pub(crate) type EvictionReader = Box<dyn Fn() -> (u64, u64) + Send + Sync>;
 
+/// What the Windows ETW sensor's caches and queues shed (#178). Zero where there is no such
+/// sensor.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct EtwShedCounts {
+    pub(crate) pid_cache_evicted: u64,
+    pub(crate) silo_evicted: u64,
+    pub(crate) marks_dropped: u64,
+    pub(crate) quarantine_unremembered: u64,
+}
+
+/// Reads the [`EtwShedCounts`]. Windows only: other platforms pass none.
+pub(crate) type EtwShedReader = Box<dyn Fn() -> EtwShedCounts + Send + Sync>;
+
 /// The agent's [`HostCountersSource`]: the sink's tamper count, what the watchdog reported, and
 /// the eviction totals when the platform has them.
 pub(crate) struct AgentHostCounters {
     sink: Arc<DetectionSink>,
     watchdog: WatchdogReport,
     evictions: Option<EvictionReader>,
+    etw_shed: Option<EtwShedReader>,
 }
 
 impl AgentHostCounters {
@@ -69,13 +83,37 @@ impl AgentHostCounters {
             sink,
             watchdog,
             evictions,
+            etw_shed: None,
         }
+    }
+
+    /// Reports what `read` says the Windows ETW sensor shed.
+    #[cfg(any(windows, test))]
+    pub(crate) fn with_etw_shed_reader(mut self, read: EtwShedReader) -> Self {
+        self.etw_shed = Some(read);
+        self
+    }
+
+    /// Reports what the Windows ETW sensor counted into `shedding`.
+    #[cfg(windows)]
+    pub(crate) fn with_etw_shedding(self, shedding: sensor_windows::EtwShedding) -> Self {
+        self.with_etw_shed_reader(Box::new(move || EtwShedCounts {
+            pid_cache_evicted: shedding.pid_cache_evicted(),
+            silo_evicted: shedding.silo_evicted(),
+            marks_dropped: shedding.marks_dropped(),
+            quarantine_unremembered: shedding.quarantine_unremembered(),
+        }))
     }
 }
 
 impl HostCountersSource for AgentHostCounters {
     fn host_counters(&self) -> HostCounters {
         let (live, dead) = self.evictions.as_ref().map_or((0, 0), |read| read());
+        let etw_shed = self
+            .etw_shed
+            .as_ref()
+            .map(|read| read())
+            .unwrap_or_default();
         let (ioc_indicators, ioc_findings, ioc_cooled_down) = self.sink.ioc_counts();
         let (ioc_own_skipped, ioc_sibling_skipped) = self.sink.ioc_own_skips();
         HostCounters {
@@ -92,6 +130,10 @@ impl HostCountersSource for AgentHostCounters {
             ioc_own_skipped,
             ioc_sibling_skipped,
             alerts_dropped: self.sink.alert_log().dropped_writes(),
+            etw_pid_cache_evicted: etw_shed.pid_cache_evicted,
+            etw_silo_evicted: etw_shed.silo_evicted,
+            etw_marks_dropped: etw_shed.marks_dropped,
+            etw_quarantine_unremembered: etw_shed.quarantine_unremembered,
         }
     }
 }
@@ -264,6 +306,39 @@ mod tests {
         let counters =
             AgentHostCounters::new(sink, WatchdogReport::default(), None).host_counters();
         assert_eq!(counters.alerts_dropped, 0);
+    }
+
+    #[test]
+    fn the_etw_shed_reader_feeds_the_counters_and_its_absence_reads_zero() {
+        let without =
+            AgentHostCounters::new(sink("etw-shed-none"), WatchdogReport::default(), None)
+                .host_counters();
+        assert_eq!(
+            (
+                without.etw_pid_cache_evicted,
+                without.etw_silo_evicted,
+                without.etw_marks_dropped,
+                without.etw_quarantine_unremembered
+            ),
+            (0, 0, 0, 0)
+        );
+        let with = AgentHostCounters::new(sink("etw-shed"), WatchdogReport::default(), None)
+            .with_etw_shed_reader(Box::new(|| EtwShedCounts {
+                pid_cache_evicted: 1,
+                silo_evicted: 2,
+                marks_dropped: 3,
+                quarantine_unremembered: 4,
+            }))
+            .host_counters();
+        assert_eq!(
+            (
+                with.etw_pid_cache_evicted,
+                with.etw_silo_evicted,
+                with.etw_marks_dropped,
+                with.etw_quarantine_unremembered
+            ),
+            (1, 2, 3, 4)
+        );
     }
 
     #[test]

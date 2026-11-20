@@ -329,6 +329,10 @@ pub(crate) fn health_collector(
                 ioc_own_skipped = beacon.ioc_own_skipped,
                 ioc_sibling_skipped = beacon.ioc_sibling_skipped,
                 alerts_dropped = beacon.alerts_dropped,
+                etw_pid_cache_evicted = beacon.etw_pid_cache_evicted,
+                etw_silo_evicted = beacon.etw_silo_evicted,
+                etw_marks_dropped = beacon.etw_marks_dropped,
+                etw_quarantine_unremembered = beacon.etw_quarantine_unremembered,
                 "health beacon"
             );
             // #24/#134: the dedicated health channel — best-effort, an

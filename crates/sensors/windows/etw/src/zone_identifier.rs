@@ -14,13 +14,12 @@ use std::{
     collections::HashMap,
     fmt::Write as _,
     hash::{BuildHasher, RandomState},
-    sync::{
-        atomic::{AtomicU64, Ordering},
-        mpsc::{self, Receiver, SyncSender, TrySendError},
-    },
+    sync::mpsc::{self, Receiver, SyncSender, TrySendError},
 };
 
 use schema::{Event, EventMeta, FileDeleteEvent, FileQuarantineEvent};
+
+use crate::shed::ShedCounter;
 
 /// Stream suffix on the path Kernel-File reports. Matched case-insensitively;
 /// an explicit `:$DATA` stream type is accepted too.
@@ -209,18 +208,24 @@ pub(crate) struct QuarantineDedup {
     digest_key: RandomState,
     window_ns: u64,
     cap: usize,
-    unremembered: u64,
+    unremembered: ShedCounter,
 }
 
 #[cfg_attr(not(windows), allow(dead_code))]
 impl QuarantineDedup {
     pub(crate) fn new(window_ns: u64, cap: usize) -> Self {
+        Self::counting(window_ns, cap, ShedCounter::default())
+    }
+
+    /// A dedup whose unremembered paths are counted into `unremembered`, which the health
+    /// beacon reads.
+    pub(crate) fn counting(window_ns: u64, cap: usize, unremembered: ShedCounter) -> Self {
         Self {
             seen: HashMap::new(),
             digest_key: RandomState::new(),
             window_ns,
             cap,
-            unremembered: 0,
+            unremembered,
         }
     }
 
@@ -247,12 +252,12 @@ impl QuarantineDedup {
             return Some(zone);
         }
         if self.seen.len() >= self.cap {
-            self.unremembered += 1;
+            let unremembered = self.unremembered.add();
             // Powers of two only: a burst must not flood the log.
-            if self.unremembered.is_power_of_two() {
+            if unremembered.is_power_of_two() {
                 tracing::warn!(
                     cap = self.cap,
-                    unremembered_total = self.unremembered,
+                    unremembered_total = unremembered,
                     "quarantine dedup at its cap — marks reported without dedup"
                 );
             }
@@ -263,9 +268,9 @@ impl QuarantineDedup {
     }
 
     /// New paths reported without being remembered because the cap was hit.
-    #[cfg_attr(not(test), allow(dead_code))] // read by a future health surface
+    #[cfg(test)]
     pub(crate) fn unremembered(&self) -> u64 {
-        self.unremembered
+        self.unremembered.get()
     }
 }
 
@@ -302,7 +307,7 @@ pub(crate) struct MarkWrite {
 #[cfg_attr(not(windows), allow(dead_code))]
 pub(crate) struct MarkQueue {
     tx: SyncSender<MarkWrite>,
-    dropped: AtomicU64,
+    dropped: ShedCounter,
 }
 
 #[cfg_attr(not(windows), allow(dead_code))]
@@ -310,14 +315,14 @@ impl MarkQueue {
     /// A queue holding up to `capacity` pending marks, and the receiving end
     /// for [`run_mark_reader`].
     pub(crate) fn bounded(capacity: usize) -> (Self, Receiver<MarkWrite>) {
+        Self::counting(capacity, ShedCounter::default())
+    }
+
+    /// Like [`Self::bounded`], with the dropped marks counted into `dropped`, which the health
+    /// beacon reads.
+    pub(crate) fn counting(capacity: usize, dropped: ShedCounter) -> (Self, Receiver<MarkWrite>) {
         let (tx, rx) = mpsc::sync_channel(capacity);
-        (
-            Self {
-                tx,
-                dropped: AtomicU64::new(0),
-            },
-            rx,
-        )
+        (Self { tx, dropped }, rx)
     }
 
     /// Queues `mark` for the worker, or drops and counts it if the queue is
@@ -328,7 +333,7 @@ impl MarkQueue {
             Err(TrySendError::Full(_)) => "queue full",
             Err(TrySendError::Disconnected(_)) => "reader gone",
         };
-        let dropped = self.dropped.fetch_add(1, Ordering::Relaxed) + 1;
+        let dropped = self.dropped.add();
         // Powers of two only: a burst must not flood the log.
         if dropped.is_power_of_two() {
             tracing::warn!(
@@ -340,9 +345,9 @@ impl MarkQueue {
     }
 
     /// Marks dropped so far.
-    #[cfg_attr(not(test), allow(dead_code))] // read by a future health surface
+    #[cfg(test)]
     pub(crate) fn dropped(&self) -> u64 {
-        self.dropped.load(Ordering::Relaxed)
+        self.dropped.get()
     }
 }
 
