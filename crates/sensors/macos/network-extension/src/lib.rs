@@ -12,9 +12,9 @@ pub mod receiver;
 pub mod wire;
 
 pub use normalize::normalize;
-pub use receiver::NormalizedNeStream;
 #[cfg(unix)]
 pub use receiver::socket::{accept_loop, listen};
+pub use receiver::{NormalizedNeStream, SkewCounters, SkewTotals};
 
 /// Errors from the receiver path.
 #[derive(Debug, thiserror::Error)]
