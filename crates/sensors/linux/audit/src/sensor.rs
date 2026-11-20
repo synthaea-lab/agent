@@ -77,9 +77,8 @@ impl AuditSensor {
     /// reads the tail of each audit log file (2 x 16 MiB at most per file). The walk ends at the file
     /// holding the marker's anchor, refreshed every few seconds so that it is the newest file or one
     /// behind it, or, without an anchor, at the first file older than the previous instance; either is
-    /// brief next to the start. It
-    /// is not moved to `spawn_blocking`: the sink is borrowed, and the replay must have been
-    /// emitted before the first live record.
+    /// brief next to the start. It is not moved to `spawn_blocking`: the sink is borrowed, and the
+    /// replay must have been emitted before the first live record.
     fn replay_previous_sigkill(&self, sink: &dyn EventSink) -> ReplayOutcome {
         self.replay_previous_sigkill_with(sink, &crate::killrec::STOPPING)
     }

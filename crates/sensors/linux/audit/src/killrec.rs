@@ -102,13 +102,22 @@ pub struct SigkillRecord {
     pub target: KillTarget,
 }
 
+/// The record of a log line without the `node=<name> ` prefix auditd adds when `name_format` is not
+/// `NONE` (`hostname`, `fqd`, `numeric` or `user`; STIG-hardened RHEL requires `hostname`).
+fn without_node(line: &str) -> &str {
+    match line.strip_prefix("node=") {
+        Some(rest) => rest.split_once(' ').map_or(line, |(_, record)| record),
+        None => line,
+    }
+}
+
 /// Parses one `audit.log` line, `None` unless it is a successful `SIGKILL` by the [`KILL_KEY`]
 /// rule. Never panics, whatever the line holds.
 #[must_use]
 pub fn parse_kill_log_line(line: &str) -> Option<SigkillRecord> {
     // ENRICHED log lines append a `\x1d`-separated block of resolved names to the kernel's
     // record; only the kernel part is read.
-    let line = line.split('\u{1d}').next()?;
+    let line = without_node(line.split('\u{1d}').next()?);
     if !line.starts_with("type=SYSCALL ") {
         return None;
     }
@@ -293,7 +302,7 @@ fn last_sigkill_in<'a>(
 /// The header of a kernel record line, `None` for any other line and for auditd's own
 /// `type=DAEMON_*` records.
 fn kernel_header(line: &str) -> Option<Anchor> {
-    if line.starts_with("type=DAEMON_") {
+    if without_node(line).starts_with("type=DAEMON_") {
         return None;
     }
     let (sec, ms, serial) = parse_msg_header(line).ok()?;
@@ -1153,6 +1162,38 @@ mod tests {
             at_serial(6100, 40_000, "ff"),
         ];
         assert_eq!(replay_of(&agent, &[&log]), Some(40_000));
+    }
+
+    #[test]
+    fn a_node_prefixed_line_is_parsed_like_the_bare_one() {
+        let bare = parse_kill_log_line(REAL).expect("the captured line parses");
+        let prefixed = format!("node=rocky9.lab {REAL}");
+        assert_eq!(parse_kill_log_line(&prefixed), Some(bare));
+        // Only one prefix is stripped, and a line that is only the prefix is no record.
+        assert!(parse_kill_log_line(&format!("node=a node=b {REAL}")).is_none());
+        assert!(parse_kill_log_line("node=rocky9.lab").is_none());
+    }
+
+    #[test]
+    fn a_node_prefixed_daemon_line_is_never_the_anchor() {
+        let daemon = "node=rocky9.lab type=DAEMON_ROTATE msg=audit(5100.000:9999): op=rotate-logs res=success";
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("audit.log");
+        std::fs::write(
+            &path,
+            format!(
+                "node=rocky9.lab {}\n{daemon}\n",
+                at_serial(5000, 1500, "aa")
+            ),
+        )
+        .unwrap();
+        assert_eq!(
+            newest_anchor(&[path]),
+            Some(Anchor {
+                timestamp_ns: ns(5000),
+                serial: 1500
+            })
+        );
     }
 
     #[test]

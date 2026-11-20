@@ -73,13 +73,13 @@ old pid, the log files it read, the ones it could not read and the ones longer t
 (a record in the head of such a file, possible with `max_log_file` above 16 MiB, is not looked at), instead of
 staying silent.
 
-**Limits.** No rule, no attribution. Ways to SIGKILL the agent that these rules do not record, so are not
+**Limits.** No rule, no attribution. The agent's own watchdog also sends SIGKILL (a heartbeat stall, a probation rollback): the restarted agent reports it like any other kill (High, T1562.001, `exe=…/watchdog`), so read the `exe` before taking a watchdog restart for tampering (the eBPF path has the same gap, #1103). Ways to SIGKILL the agent that these rules do not record, so are not
 attributed: `systemctl kill` (no record, as captured), `rt_sigqueueinfo`, `rt_tgsigqueueinfo` and
 `pidfd_send_signal`. A kill of a thread started less than 5 s earlier, not yet in the marker, is not
 attributed. A default Fedora ships `-a never,task`, which removes syscall auditing from every task:
 with `synthaea-kill.rules` loaded next to it nothing is recorded, not even a plain `kill -9`; the rule needs no
 `never,task` ahead of it (reproduced on Fedora 43, kernel 7.2, by the reviewer of #287; Rocky 9.8 has none). Needs `/var/log/audit/audit.log` readable by the agent (root) and auditd writing
-to it (`write_logs = yes`, `log_format = ENRICHED` or `RAW`; the key is read from the kernel part of the line). Residual
+to it (`write_logs = yes`, `log_format = ENRICHED` or `RAW`, any `name_format`: a `node=<name> ` prefix, which STIG-hardened RHEL sets with `name_format = hostname`, is stripped before the line is read; the key is read from the kernel part of the line). Residual
 gaps of the marker: a pid or thread id reused within the same boot by a process that is then killed can be
 taken for the agent (the boot id bounds it to one boot; a record aimed at an unrelated process whose pid later
 becomes one of the agent's thread ids, a blocking-pool thread say, is read as a kill of the agent if the agent
@@ -94,7 +94,7 @@ with T1562.001 and the sender's `comm`; `systemctl kill -s KILL` was not attribu
 the marker. An agent that is not root and has no capability cannot start in the audit fallback (`audit socket open: netlink socket error: 1`, EPERM, exit 1). Volume, one lab host:
 3000 `kill -KILL` in one second added 3000 `synthaea-kill` records (about 780 bytes each, `audit.log` +2.35 MB), cost the agent 0.11 s of CPU and lost none. On Rocky 9.8 at `e1567838` (2026-11-20, agent forced onto the fallback with `SystemCallFilter=~bpf`), `tkill` of a worker thread (tid different from the pid) was reported by the restarted agent (T1562.001, `comm=python3`); a kill in boot 1 followed by a reboot and a restart attributed nothing (a marker from another boot attributes nothing, by design); and a kill in boot 2, with `audit.log` still holding boot 1 serials above boot 2's first ones (986 against 177), was attributed (T1562.001, `comm=kill`). Not run on a lab host:
 commit `609fc24a` (a stop signal that beats the marker write no longer leaves the predecessor's kill to be reported twice: unit tests only),
-other kernels and distributions, aarch64, an agent that is not root with `CAP_AUDIT_READ`, and the volume on a loaded real host (one poste, 3000 kills of `sleep`).
+other kernels and distributions, aarch64, an agent that is not root with `CAP_AUDIT_READ`, and the volume on a loaded real host (one host, 3000 kills of `sleep`).
 Earlier, tested on the captured line and on files and run end to end on Rocky 9.8 (2026-11-16, agent built without eBPF probes, rule loaded, agent started as a systemd unit, killed,
 restarted on the same state directory): same result for `kill -KILL` from bash (`comm=bash`) and `/usr/bin/kill` (`comm=kill`), nothing for `systemctl kill -s KILL` and after a clean stop.
 
