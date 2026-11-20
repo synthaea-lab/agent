@@ -39,6 +39,7 @@ impl PidCache {
     /// # Panics
     ///
     /// Panics when `cap` is 0 — a configuration bug, not a runtime condition.
+    #[cfg(test)]
     pub(crate) fn new(cap: usize) -> Self {
         Self::counting(cap, ShedCounter::default())
     }

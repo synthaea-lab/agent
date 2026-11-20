@@ -213,6 +213,7 @@ pub(crate) struct QuarantineDedup {
 
 #[cfg_attr(not(windows), allow(dead_code))]
 impl QuarantineDedup {
+    #[cfg(test)]
     pub(crate) fn new(window_ns: u64, cap: usize) -> Self {
         Self::counting(window_ns, cap, ShedCounter::default())
     }
@@ -314,6 +315,7 @@ pub(crate) struct MarkQueue {
 impl MarkQueue {
     /// A queue holding up to `capacity` pending marks, and the receiving end
     /// for [`run_mark_reader`].
+    #[cfg(test)]
     pub(crate) fn bounded(capacity: usize) -> (Self, Receiver<MarkWrite>) {
         Self::counting(capacity, ShedCounter::default())
     }

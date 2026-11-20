@@ -68,6 +68,7 @@ pub(crate) struct SiloDirectory {
 }
 
 impl SiloDirectory {
+    #[cfg(test)]
     pub(crate) fn new() -> Self {
         Self::counting(ShedCounter::default())
     }
