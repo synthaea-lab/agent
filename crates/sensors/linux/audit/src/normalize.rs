@@ -146,6 +146,38 @@ pub fn policy_denial_event(evt: &AuditEvent, timestamp_ns: u64) -> Event {
     })
 }
 
+/// The `SIGKILL` of the previous agent instance, as an `Event::Signal`: `meta` is the sender, the
+/// target `target_pid`, the old instance's pid (the record may name its group or every process). The same shape the eBPF sensor replays from its pinned map, so the same
+/// rule attributes it (#275). `target_image_path` is this agent's own executable.
+#[must_use]
+pub fn sigkill_event(
+    record: &crate::killrec::SigkillRecord,
+    target_pid: u32,
+    target_image_path: Option<String>,
+) -> Event {
+    Event::Signal(schema::SignalEvent {
+        meta: EventMeta {
+            timestamp_ns: record.timestamp_ns,
+            pid: record.sender_pid,
+            ppid: record.sender_ppid,
+            user: User::Unix {
+                uid: record.uid,
+                gid: record.gid,
+            },
+            comm: record.comm.clone(),
+            container: None,
+            process_generation: None,
+            parent_process_generation: None,
+        },
+        signal: 9,
+        target_pid,
+        target_image_path,
+        target_unit: None,
+        sender_unreliable: false,
+        signals_lost: 0,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};

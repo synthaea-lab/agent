@@ -250,8 +250,12 @@ libtest's main thread does not block the signals, which the real agent never has
 `SIGKILL` and `SIGSTOP` cannot be caught or attributed by the dying process. The eBPF
 sensor covers that from the kernel side: its signal probes record a `SIGKILL` aimed
 at the agent, and the restarted agent reports the sender through a rule. Under the
-audit fallback sensor that gap remains: no test covers it, and whether it is a permanent
-limit is open until a lab capture (tracked by [#275](https://github.com/synthaea-lab/agent/issues/275)).
+audit fallback sensor the same replay reads auditd's log instead
+([audit-fallback.md](sensors/linux/audit-fallback.md#sigkill-of-the-agent)): the restarted agent
+finds the `SIGKILL` record aimed at its predecessor's pid and reports the sender, **only when the
+operator loaded** [`synthaea-kill.rules`](../packaging/linux/audit/synthaea-kill.rules), which the
+packages neither install nor load. A `systemctl kill` leaves no such record and is not attributed
+([#275](https://github.com/synthaea-lab/agent/issues/275)).
 Kernel-mediated stops that involve no signal
 from a process (a CPU rlimit, a cgroup memory limit, `cgroup.freeze`) are read from how
 they are set: the command (`systemctl freeze|set-property`, a memory or task limit, or a

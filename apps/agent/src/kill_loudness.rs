@@ -6,7 +6,8 @@
 //! sensor closes that gap from the kernel side (issue #362): its `kill`/`tgkill`
 //! probes record a SIGKILL aimed at the agent in a pinned map before delivery, and
 //! the restarted agent reports the sender through the T1562.001 rule. Under the
-//! audit fallback sensor the gap remains.
+//! audit fallback sensor the same replay reads auditd's log, but only when the operator loaded
+//! `packaging/linux/audit/synthaea-kill.rules` (#275); a `systemctl kill` is not attributed.
 //!
 //! Mechanism: the catchable termination signals (SIGTERM/SIGHUP/SIGQUIT — **not**
 //! SIGINT, deliberately: `sensor_linux::LinuxSensor::run` already owns Ctrl-C via
@@ -31,9 +32,11 @@
 //! `exit` flow terminates the process, so `termination_signal_flow_records_sender_and_exits`
 //! runs it in a child: the test re-executes its own binary, the child blocks the
 //! signals and spawns the watcher, and the parent sends each watched signal and checks
-//! the exit status (`128 + signo`) and the alert line (sender pid = the parent). The
-//! audit-fallback SIGKILL gap is not covered by any test: it needs a lab capture (see
-//! `docs/self-protection.md#kill-loudness`).
+//! the exit status (`128 + signo`) and the alert line (sender pid = the parent). A SIGKILL
+//! cannot be caught, so it is not read here: under the audit fallback the next start reports it
+//! from auditd's log (`sensor-linux-audit`'s `killrec`, unit-tested, and run end to end on a Rocky
+//! 9.8 VM on 2026-11-19; see `docs/sensors/linux/audit-fallback.md` for what that run did and did
+//! not cover).
 
 #![cfg_attr(not(target_os = "linux"), allow(dead_code))]
 
@@ -84,9 +87,15 @@ pub(crate) fn block_termination_signals() {
 /// who sent it, gives `enrich_queue` a bounded chance to drain (issue #341) before
 /// actually terminating the process (blocking suppressed the signal's own default
 /// disposition, so nothing else will end it).
+///
+/// `on_exit` runs just before that exit, after the sender was recorded: this is a stop the agent
+/// attributed itself, so whatever a successor would otherwise read as a crash (the audit
+/// fallback's instance marker) is removed here, since the process never returns to the code that
+/// would remove it.
 pub(crate) fn spawn_watcher(
     alerts_path: PathBuf,
     enrich_queue: EnrichQueue,
+    on_exit: impl FnOnce() + Send + 'static,
 ) -> std::io::Result<()> {
     crate::spawn::spawn_named("kill-loudness", move || {
         let set = watched_signal_set();
@@ -114,6 +123,7 @@ pub(crate) fn spawn_watcher(
                 "kill-loudness: enrich queue did not fully drain within the shutdown budget"
             );
         }
+        on_exit();
         std::process::exit(128 + signo);
     })?;
     Ok(())
@@ -246,7 +256,11 @@ mod tests {
         if pid == 0 {
             block_termination_signals();
             let queue = EnrichQueue::start(enrich::Enricher::new(), |_, _| {});
-            spawn_watcher(alerts, queue).expect("spawning the kill-loudness watcher");
+            let hook = ready.with_extension("exit-hook");
+            spawn_watcher(alerts, queue, move || {
+                std::fs::write(hook, "ran").expect("exit hook marker");
+            })
+            .expect("spawning the kill-loudness watcher");
             std::fs::write(ready, std::process::id().to_string()).expect("ready marker");
             // The watcher thread ends the process; reaching the end of this sleep
             // means the signal was not taken, which the parent reports as a timeout.
@@ -329,6 +343,10 @@ mod tests {
                 "died by a signal instead of exiting"
             );
 
+            assert!(
+                ready.with_extension("exit-hook").exists(),
+                "the exit hook must run before the process exits"
+            );
             let line = std::fs::read_to_string(&alerts).expect("alert line written");
             assert!(line.contains("\"technique\":\"T1562\""), "{line}");
             assert!(line.contains(signal_name(signo)), "{line}");
