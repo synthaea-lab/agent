@@ -14,5 +14,5 @@
   "signal": 9,
   "target_pid": 400,
   "target_image_path": "/usr/local/bin/synthaea-agent",
-  "sender_unit": "synthaea-agent"
+  "sender_is_watchdog": true
 }

@@ -173,6 +173,13 @@ fn has_bpf_capabilities() -> bool {
     has(CAP_SYS_ADMIN) || (has(CAP_BPF) && has(CAP_PERFMON))
 }
 
+/// The pid of the watchdog that started this agent, or `None` when nothing did: the watchdog
+/// sets `WATCHDOG_RESTARTS_ENV` on every agent it spawns, and is that agent's parent (#322).
+fn supervising_watchdog_pid() -> Option<u32> {
+    std::env::var_os(config::identity::WATCHDOG_RESTARTS_ENV)?;
+    Some(std::os::unix::process::parent_id())
+}
+
 /// Selects sensor: eBPF if available, audit fallback otherwise.
 /// Returns (sensor, `sensor_name`) for correct telemetry.
 ///
@@ -188,7 +195,9 @@ fn select_sensor(
     if can_use_ebpf() {
         tracing::info!("Using eBPF sensor (primary)");
         // `--enable-dns-capture` also turns on the socket-level query capture (#458 part 3).
-        let sensor = sensor_linux::LinuxSensor::new().with_dns_udp_capture(enable_dns_capture);
+        let sensor = sensor_linux::LinuxSensor::new()
+            .with_dns_udp_capture(enable_dns_capture)
+            .with_watchdog_pid(supervising_watchdog_pid());
         let evictions = sensor.parent_image_evictions();
         return (
             Box::new(sensor),

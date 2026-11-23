@@ -25,8 +25,8 @@ use crate::{
     parent_image::{ExecStamps, IMAGE_CACHE_CAP, ParentImageEvictions, ParentImages},
     proc::{exec_argv, read_proc_environ_security, read_proc_images},
     rings::{RingBuffers, drain_ready, drain_wire, readable_or_pending},
-    sender_unit::unit_of_pid,
     unit_procs::{ToolProcs, ToolWatch, UnitResolver},
+    watchdog::Watchdog,
 };
 
 /// Where a live host's process table is mounted.
@@ -96,12 +96,11 @@ fn sweep_survived_sigkill(slot: &mut TamperSlot, own_pid: u32, boot_epoch_offset
 /// tool: its unit and the exe read at scan time (the process may be gone by now). Anything else
 /// is the agent itself (`SIGNAL_WATCH_PID`). A target that is neither (a tool gone from every
 /// scan) gets no image and no unit, never the agent's: it must not read as a signal to the agent.
-/// The sender's unit is read now, from its cgroup (#322).
+/// The sender is checked against the agent's watchdog (#322).
 fn signal_parties(
     event: &wire::SignalEvent,
     tool_procs: &ToolProcs,
-    own_pid: u32,
-    self_exe: Option<&String>,
+    own: &OwnProcess,
 ) -> normalize::SignalParties {
     let tool = tool_procs
         .lock()
@@ -110,18 +109,40 @@ fn signal_parties(
         .cloned();
     let (target_image_path, target_unit) = match tool {
         Some(tool) => (tool.exe, Some(tool.unit)),
-        None if event.target_pid == own_pid => (self_exe.cloned(), None),
+        None if event.target_pid == own.pid => (own.exe.clone(), None),
         None => (None, None),
     };
     normalize::SignalParties {
         target_image_path,
         target_unit,
-        sender_unit: sender_unit_of(event),
+        sender_is_watchdog: own.sent_by_watchdog(event),
     }
 }
 
-fn sender_unit_of(event: &wire::SignalEvent) -> Option<String> {
-    unit_of_pid(Path::new(PROC_ROOT), event.meta.pid)
+/// What the signal path knows about the agent's own process: the target it watches, and the
+/// watchdog that may legitimately kill it.
+struct OwnProcess {
+    pid: u32,
+    exe: Option<String>,
+    watchdog: Option<Watchdog>,
+}
+
+impl OwnProcess {
+    fn sent_by_watchdog(&self, event: &wire::SignalEvent) -> bool {
+        self.watchdog
+            .is_some_and(|watchdog| watchdog.sent(event.meta.pid, event.meta.timestamp_ns))
+    }
+}
+
+/// The watchdog with `pid`, read from the live process table; `None` without one.
+fn read_watchdog(pid: Option<u32>) -> Option<Watchdog> {
+    // SAFETY: `sysconf` reads a constant system value and touches no memory of ours.
+    let ticks_per_second = unsafe { libc::sysconf(libc::_SC_CLK_TCK) };
+    Watchdog::read(
+        Path::new(PROC_ROOT),
+        pid?,
+        u64::try_from(ticks_per_second).ok()?,
+    )
 }
 
 /// Linux sensor (eBPF). `run` blocks until Ctrl-C or [`Sensor::stop`].
@@ -131,6 +152,8 @@ pub struct LinuxSensor {
     /// Whether the UDP/53 DNS capture program is attached (#458 part 3). Fixed for the life of the
     /// sensor.
     dns_udp: bool,
+    /// The pid of the watchdog that started this agent, if one did (#322).
+    watchdog_pid: Option<u32>,
 }
 
 impl Default for LinuxSensor {
@@ -146,7 +169,17 @@ impl LinuxSensor {
             stop: Arc::new(Notify::new()),
             evictions: Arc::new(ParentImageEvictions::default()),
             dns_udp: false,
+            watchdog_pid: None,
         }
+    }
+
+    /// The pid of the watchdog supervising this agent (its parent), so a signal it sends the
+    /// agent is reported as the watchdog's (#322). `None`, the default, for an agent started
+    /// without its watchdog: then no sender is taken for it. Fixed at start.
+    #[must_use]
+    pub fn with_watchdog_pid(mut self, pid: Option<u32>) -> Self {
+        self.watchdog_pid = pid;
+        self
     }
 
     /// Attaches the UDP/53 DNS capture program (#458 part 3): the first bytes of a
@@ -181,9 +214,13 @@ impl LinuxSensor {
         // The signal filter only ever watches this process (v1 scope), so this is
         // resolved once rather than per event — see `normalize::signal`'s doc
         // comment.
-        let self_exe = std::env::current_exe()
-            .ok()
-            .map(|p| p.display().to_string());
+        let own = OwnProcess {
+            pid: own_pid,
+            exe: std::env::current_exe()
+                .ok()
+                .map(|p| p.display().to_string()),
+            watchdog: read_watchdog(self.watchdog_pid),
+        };
 
         match aya_log::EbpfLogger::init(&mut ebpf) {
             Err(e) => {
@@ -299,12 +336,12 @@ impl LinuxSensor {
                 target_pid = previous.target_pid,
                 "sensor-linux: the previous agent instance was sent SIGKILL, reporting it"
             );
-            // The sender's unit is read now, one restart late: still right for the watchdog,
-            // which outlives the agent it restarts.
+            // The watchdog that restarted this agent is the one that killed the previous one,
+            // if it was already running at the kill: `sent_by_watchdog` checks both.
             let parties = normalize::SignalParties {
-                target_image_path: self_exe.clone(),
+                target_image_path: own.exe.clone(),
                 target_unit: None,
-                sender_unit: sender_unit_of(&previous),
+                sender_is_watchdog: own.sent_by_watchdog(&previous),
             };
             sink.on_event(normalize::signal(
                 &previous,
@@ -389,7 +426,7 @@ impl LinuxSensor {
                 // The container is the SENDER's (meta is the sender, as for every event type):
                 // it attributes e.g. a container-escape kill attempt to the container it came from.
                 guard = rings.signal.readable_mut() => drain_wire(guard, sink, own_pid, |e: &wire::SignalEvent| {
-                    let parties = signal_parties(e, &tool_procs, own_pid, self_exe.as_ref());
+                    let parties = signal_parties(e, &tool_procs, &own);
                     normalize::signal(e, offset, parties, containers.resolve(e.meta.cgroup_id))
                 })?,
                 guard = rings.kernel_module.readable_mut() => drain_wire(guard, sink, own_pid, |e: &wire::KernelModuleEvent| normalize::kernel_module(e, finit_module_path(e), offset, containers.resolve(e.meta.cgroup_id)))?,

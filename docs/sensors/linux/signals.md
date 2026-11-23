@@ -12,16 +12,21 @@ forward, so the sensor only reports signals aimed at two kinds of target, and fi
 Both produce `SignalEvent` on the `SIGNAL_EVENTS` ring (64 KiB). The sender is `meta` (so the
 container resolved is the sender's), the target is `target_pid`.
 
-### The sender's unit
+### A signal from the agent's watchdog
 
-When the event is drained, userspace reads the sender's systemd unit from
-`/proc/<pid>/cgroup` ([`sender_unit`](../../../crates/sensors/linux/userspace/src/sender_unit.rs),
-[#322](https://github.com/synthaea-lab/agent/issues/322)) into `sender_unit`. A signal to the agent
-from a reliable sender in the agent's own unit (`synthaea-agent`) is its watchdog, which kills the
-agent on a stalled heartbeat or a rollback: the T1562.001 rule reports it at Low and says so,
-instead of High as tampering. The unit only lowers the severity of a signal to the agent itself;
-a signal from that unit to a security tool stays as it was. Putting a process in the agent's unit
-takes root (a write to its `cgroup.procs`), and the alert is still raised.
+The watchdog kills the agent on a stalled heartbeat or a rollback, so its `SIGKILL` is not
+tampering ([#322](https://github.com/synthaea-lab/agent/issues/322)). The watchdog spawns the agent
+and sets `SYNTHAEA_WATCHDOG_RESTARTS` in its environment; an agent started that way takes its parent
+pid for the watchdog's and reads the watchdog's `starttime` once at start
+([`watchdog`](../../../crates/sensors/linux/userspace/src/watchdog.rs)). A signal sets
+`sender_is_watchdog` when its sender has that pid **and** was sent after the watchdog started: a
+pid is not reused while its process lives, so no other process can have held it at that moment.
+The T1562.001 rule then reports a reliable signal to the agent at Low and says so, instead of High.
+A signal from the watchdog to a security tool stays as it was.
+
+The sender's name and cgroup are not used: a root sender chooses both (one write to the agent
+unit's `cgroup.procs` moves it there, and that move is not detected). The check works the same
+without systemd (OpenRC), since it relies only on the process tree.
 
 ## Signals to the agent
 
@@ -146,7 +151,7 @@ gets the agent's exe; any other target gets neither, so it cannot read as a sign
   [#49](https://github.com/synthaea-lab/agent/issues/49)).
 - Only the agent's own pid is watched on the `kill`/`tgkill` path; the watchdog process is not. That
   path compares the pid argument as the sender wrote it, in the sender's pid namespace.
-- The sender's unit is read at drain time. A sender that exited first has none and its signal stays
-  High; for the replayed `SIGKILL` it is read one restart late, which still finds the watchdog (it
-  outlives the agent it restarts) but could name another process that reused the pid. A host
-  without systemd (OpenRC) has no units, so a watchdog restart alerts High there.
+- A watchdog restarted between the kill and the replay (a restart of the whole unit) has started
+  after the replayed `SIGKILL`, so that kill stays High even when the old watchdog sent it. After a
+  suspend, `starttime` (which counts suspended time) can look later than the signal's `ktime`
+  (which does not), with the same fail-safe result.

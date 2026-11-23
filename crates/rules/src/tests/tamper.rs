@@ -16,7 +16,7 @@ fn signal_event(signal: u32) -> SignalEvent {
         target_pid: 400,
         target_image_path: Some("/usr/local/bin/synthaea-agent".into()),
         target_unit: None,
-        sender_unit: None,
+        sender_is_watchdog: false,
         sender_unreliable: false,
         signals_lost: 0,
     }
@@ -89,7 +89,7 @@ fn signal_from(sender_pid: u32, comm: &str, signal: u32, target_pid: u32) -> Sig
         target_pid,
         target_image_path: Some("/usr/local/bin/synthaea-agent".into()),
         target_unit: None,
-        sender_unit: None,
+        sender_is_watchdog: false,
         sender_unreliable: false,
         signals_lost: 0,
     }
@@ -151,47 +151,44 @@ fn a_different_pid_with_the_same_comm_is_not_a_self_signal() {
 }
 
 #[test]
-fn a_sender_named_like_the_watchdog_but_outside_the_agents_unit_alerts_high() {
-    // The name is the sender's own choice; only its unit says it is the watchdog (#322).
+fn a_sender_named_like_the_watchdog_but_not_identified_as_it_alerts_high() {
+    // The name is the sender's own choice; only the sensor's pid check says it is the watchdog.
     let mut event = signal_from(5000, "synthaea-watchdog", 9, 400);
     event.meta.ppid = 1;
-    let alert = check_security_process_signal(&event).unwrap();
-    assert_eq!(alert.severity, crate::Severity::High);
-    event.sender_unit = Some("cron".into());
     let alert = check_security_process_signal(&event).unwrap();
     assert_eq!(alert.severity, crate::Severity::High);
 }
 
 #[test]
-fn a_sigkill_from_inside_the_agents_own_unit_alerts_low_and_says_so() {
+fn a_sigkill_from_the_agents_own_watchdog_alerts_low_and_says_so() {
     // The watchdog kills the agent on a stalled heartbeat or a rollback (#322): still reported,
     // not as tampering.
     let mut event = signal_from(5000, "watchdog", 9, 400);
-    event.sender_unit = Some(schema::AGENT_UNIT.into());
+    event.sender_is_watchdog = true;
     let alert = check_security_process_signal(&event).expect("still reported");
     assert_eq!(alert.severity, crate::Severity::Low);
     assert!(
-        alert.message.contains("from the agent's own unit"),
+        alert.message.contains("by the agent's own watchdog"),
         "{}",
         alert.message
     );
 }
 
 #[test]
-fn an_unreliable_sender_in_the_agents_unit_is_not_lowered() {
-    // `meta` may be a bystander (#1103): its unit says nothing about who sent the signal.
+fn an_unreliable_sender_matching_the_watchdog_is_not_lowered() {
+    // `meta` may be a bystander (#1103): matching the watchdog says nothing about who sent it.
     let mut event = signal_from(5000, "watchdog", 9, 400);
-    event.sender_unit = Some(schema::AGENT_UNIT.into());
+    event.sender_is_watchdog = true;
     event.sender_unreliable = true;
     let alert = check_security_process_signal(&event).unwrap();
     assert_eq!(alert.severity, crate::Severity::High);
 }
 
 #[test]
-fn the_agents_unit_signalling_a_security_tool_is_not_lowered() {
-    // Only the agent is supervised from its unit; nothing there has a reason to kill auditd.
+fn the_watchdog_signalling_a_security_tool_is_not_lowered() {
+    // The watchdog supervises the agent only; it has no reason to kill auditd.
     let mut event = signal_to_tool(5000, "watchdog", 9);
-    event.sender_unit = Some(schema::AGENT_UNIT.into());
+    event.sender_is_watchdog = true;
     let alert = check_security_process_signal(&event).unwrap();
     assert_eq!(alert.severity, crate::Severity::High);
 }

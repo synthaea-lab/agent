@@ -32,7 +32,7 @@ pub const SERVICE_DESCRIPTION: &str =
 /// The Linux service name: the systemd unit `<name>.service` and the `OpenRC`
 /// script `/etc/init.d/<name>`. `packaging/linux` ships a unit file with the
 /// same name.
-pub const LINUX_SERVICE: &str = schema::AGENT_UNIT;
+pub const LINUX_SERVICE: &str = "synthaea-agent";
 
 /// The launchd label of the macOS daemon; its plist is
 /// `/Library/LaunchDaemons/<label>.plist`.

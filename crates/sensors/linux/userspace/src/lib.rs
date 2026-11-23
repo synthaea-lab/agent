@@ -30,10 +30,6 @@ mod parent_image;
 mod proc;
 #[cfg(target_os = "linux")]
 mod rings;
-// The sender's systemd unit, for `SignalEvent::sender_unit` (#322). Pure file reading, so its
-// tests run on every platform.
-#[cfg(any(target_os = "linux", test))]
-mod sender_unit;
 #[cfg(target_os = "linux")]
 mod sensor;
 #[cfg(all(target_os = "linux", any(ebpf_embedded, test)))]
@@ -41,6 +37,9 @@ mod syscall;
 // Which processes belong to a listed security unit, for the `signal_generate` probe (#1103).
 #[cfg(target_os = "linux")]
 mod unit_procs;
+// Whether a signal's sender is the agent's own watchdog (#322).
+#[cfg(target_os = "linux")]
+mod watchdog;
 #[cfg(all(target_os = "linux", ebpf_embedded))]
 pub use ebpf::verifier_loader;
 #[cfg(target_os = "linux")]

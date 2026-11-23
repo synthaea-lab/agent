@@ -706,16 +706,16 @@ pub fn mount(
 /// What the sensor resolved about a signal's two processes, which the wire event carries only as
 /// pids. `target_image_path` is the caller's, not the wire event's — see this module's
 /// `WIRE_VERSION` v12 changelog for why. So is `target_unit` (#1103): the unit the sensor
-/// resolved from the cgroup when it put the target on the watch list. `sender_unit` is read
-/// from the sender's cgroup at drain time (#322).
+/// resolved from the cgroup when it put the target on the watch list. `sender_is_watchdog` is
+/// the sensor's check of the sender against the agent's watchdog (#322).
 #[derive(Debug, Default)]
 pub struct SignalParties {
     /// The target's executable.
     pub target_image_path: Option<String>,
     /// The listed security unit the target belongs to.
     pub target_unit: Option<String>,
-    /// The systemd unit the sender runs in.
-    pub sender_unit: Option<String>,
+    /// The sender is the agent's own watchdog.
+    pub sender_is_watchdog: bool,
 }
 
 /// A wire signal event, with what the sensor resolved about its sender and target.
@@ -732,7 +732,7 @@ pub fn signal(
         target_pid: event.target_pid,
         target_image_path: parties.target_image_path,
         target_unit: parties.target_unit,
-        sender_unit: parties.sender_unit,
+        sender_is_watchdog: parties.sender_is_watchdog,
         sender_unreliable: event.signal & wire::SIGNAL_SENDER_UNRELIABLE != 0,
         signals_lost: 0,
     })
@@ -760,7 +760,7 @@ pub fn signals_lost(lost: u64, agent_pid: u32, timestamp_ns: u64) -> Event {
         target_pid: 0,
         target_image_path: None,
         target_unit: None,
-        sender_unit: None,
+        sender_is_watchdog: false,
         sender_unreliable: false,
         signals_lost: lost,
     })
@@ -1857,20 +1857,20 @@ mod tests {
     }
 
     #[test]
-    fn a_signal_carries_the_unit_its_sender_runs_in() {
+    fn a_signal_says_whether_its_sender_is_the_watchdog() {
         let event = wire::SignalEvent {
             meta: wire_meta(b"watchdog"),
             signal: 9,
             target_pid: 400,
         };
         let parties = SignalParties {
-            sender_unit: Some(schema::AGENT_UNIT.to_string()),
+            sender_is_watchdog: true,
             ..SignalParties::default()
         };
         let Event::Signal(e) = signal(&event, 0, parties, None) else {
             panic!("wrong variant")
         };
-        assert_eq!(e.sender_unit.as_deref(), Some(schema::AGENT_UNIT));
+        assert!(e.sender_is_watchdog);
         assert_eq!(e.target_unit, None);
     }
 
