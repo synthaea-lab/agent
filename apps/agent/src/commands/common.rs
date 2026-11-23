@@ -1,5 +1,5 @@
 //! Platform-independent composition of the `run` pipeline. The platform
-//! modules (`linux`, `windows`) own sensor selection and platform-only wiring
+//! modules (`linux`, `windows`, `macos`) own sensor selection and platform-only wiring
 //! (silence monitors, response, pollers); everything both share — transport,
 //! the detection sink, the banner, the progress heartbeat — is assembled here,
 //! so a new pipeline stage lands once instead of per-platform.
@@ -8,7 +8,7 @@ use std::sync::{Arc, Mutex};
 
 use tamper::heartbeat::SilenceMonitor;
 
-use super::localzone;
+use super::{RunOptions, localzone};
 use crate::{
     health::{
         DroppedCounter, HealthCollector, HealthCollectorConfig, HostCountersSource, NoopSpoolStats,
@@ -172,19 +172,50 @@ fn apply_platform_zone(sink: &DetectionSink) {
     }
 }
 
+/// What every platform's `cmd_run` does before its sensors, in this order: build the shared
+/// pipeline ([`wire_run_pipeline`]), set `--alert-details` (#319), hand the rules the host's
+/// time ([`apply_detection`]), and plant the canaries ([`plant_canaries`]).
+///
+/// `rule_state` is the platform's seeded process table (`seeded_rule_state`), the one thing
+/// that differs between the platforms here.
+pub(crate) fn start_pipeline(
+    opts: &RunOptions<'_>,
+    rule_state: rules::RuleState,
+) -> anyhow::Result<RunPipeline> {
+    let pipeline = wire_run_pipeline(opts, rule_state)?;
+    // #319. Set before any sensor starts; the one alert `wire_run_pipeline` can raise
+    // itself (UPLOAD-DISABLED) is the agent's own text, not an event's.
+    pipeline
+        .sink
+        .alert_log()
+        .set_stderr_details(opts.alert_details);
+    apply_detection(&pipeline.sink, opts.detection);
+    plant_canaries(
+        &pipeline.sink,
+        opts.deception,
+        opts.storage,
+        pipeline.transport.as_ref(),
+    );
+    Ok(pipeline)
+}
+
 /// Builds the shared pipeline: optional transport (spool + upload thread),
 /// the detection sink (spooling into it when transport is on), the operator
 /// banner, the progress-backed liveness heartbeat (#102), and the local IPC
 /// control channel served to `cli` (#388).
-pub(crate) fn wire_run_pipeline(
+fn wire_run_pipeline(
+    opts: &RunOptions<'_>,
     rule_state: rules::RuleState,
-    alerts: &std::path::Path,
-    events: Option<&std::path::Path>,
-    server: Option<crate::upload::ControlPlane<'_>>,
-    ipc_endpoint: &str,
-    content_dir: &std::path::Path,
-    storage: &config::StorageConfig,
 ) -> anyhow::Result<RunPipeline> {
+    let RunOptions {
+        alerts,
+        events,
+        server,
+        ipc_endpoint,
+        content_dir,
+        storage,
+        ..
+    } = *opts;
     // Transport first: the sink needs the spool handle at construction.
     let spool_cap = crate::upload::spool_cap_bytes(storage.spool_max_mb);
     let (transport, upload_disabled) = match server {
@@ -606,5 +637,111 @@ mod tests {
             1,
             "the uploaders were told to stop before the queued finding was delivered"
         );
+    }
+
+    struct PreludeFixture {
+        dir: tempfile::TempDir,
+        storage: config::StorageConfig,
+        deception: config::DeceptionConfig,
+        detection: config::DetectionConfig,
+        canary_dir: std::path::PathBuf,
+        alerts: std::path::PathBuf,
+        content_dir: std::path::PathBuf,
+        ipc_endpoint: String,
+    }
+
+    impl PreludeFixture {
+        fn new() -> Self {
+            let dir = tempfile::tempdir().unwrap();
+            let canary_dir = dir.path().join("canaries");
+            std::fs::create_dir_all(&canary_dir).unwrap();
+            Self {
+                storage: config::StorageConfig {
+                    state_dir: dir.path().join("state"),
+                    spool_max_mb: 1,
+                },
+                deception: config::DeceptionConfig {
+                    canary_dirs: vec![canary_dir.clone()],
+                    ..Default::default()
+                },
+                detection: config::DetectionConfig::default(),
+                alerts: dir.path().join("alerts.ndjson"),
+                content_dir: dir.path().join("content"),
+                // A path under the temp dir. On Windows the endpoint is a named pipe name,
+                // not a path, so it fails to bind there; that is non-fatal (the agent runs
+                // without the IPC server), so the prelude test is the same on every OS.
+                ipc_endpoint: dir.path().join("agent.sock").display().to_string(),
+                canary_dir,
+                dir,
+            }
+        }
+
+        fn options<'a>(
+            &'a self,
+            server: Option<crate::upload::ControlPlane<'a>>,
+        ) -> RunOptions<'a> {
+            RunOptions {
+                alerts: &self.alerts,
+                events: None,
+                storage: &self.storage,
+                alert_details: true,
+                enable_kill: false,
+                enable_quarantine: false,
+                enable_tls_capture: false,
+                enable_readline_capture: false,
+                enable_dns_capture: false,
+                server,
+                ipc_endpoint: &self.ipc_endpoint,
+                content_dir: &self.content_dir,
+                log_sources: &[],
+                deception: &self.deception,
+                detection: &self.detection,
+                config_path: self.dir.path(),
+            }
+        }
+    }
+
+    #[test]
+    fn the_run_prelude_builds_the_sink_and_plants_the_canaries() {
+        let fixture = PreludeFixture::new();
+        let pipeline = start_pipeline(&fixture.options(None), rules::RuleState::new())
+            .expect("the standalone prelude");
+
+        assert!(pipeline.transport.is_none(), "no server, no transport");
+        assert!(
+            std::fs::read_dir(&fixture.canary_dir)
+                .unwrap()
+                .next()
+                .is_some(),
+            "a canary file was planted in the configured directory"
+        );
+        drop(pipeline);
+    }
+
+    /// The one alert the prelude raises itself: an upload that cannot start with
+    /// `offline_fallback` on keeps detection running and says so. It is raised inside
+    /// `wire_run_pipeline`, before `start_pipeline` sets `alert_details` (#319): the text is
+    /// the agent's own, not an event's, so `--alert-details` does not change it.
+    #[test]
+    fn the_run_prelude_reports_an_upload_that_could_not_start_and_goes_on() {
+        let fixture = PreludeFixture::new();
+        let missing_ca = fixture.dir.path().join("no-such-ca.pem");
+        let server = crate::upload::ControlPlane {
+            url: "https://127.0.0.1:1",
+            ca_cert: Some(&missing_ca),
+            client_cert: None,
+            offline_fallback: true,
+        };
+        let pipeline = start_pipeline(&fixture.options(Some(server)), rules::RuleState::new())
+            .expect("offline fallback keeps running");
+
+        assert!(pipeline.transport.is_none(), "the upload did not start");
+        let recent = pipeline.sink.alert_log().latest(10);
+        assert!(
+            recent.iter().any(|a| a.technique == "UPLOAD-DISABLED"),
+            "UPLOAD-DISABLED was not raised: {:?}",
+            recent.iter().map(|a| &a.technique).collect::<Vec<_>>()
+        );
+        drop(pipeline);
     }
 }
