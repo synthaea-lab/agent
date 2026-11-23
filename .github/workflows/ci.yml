@@ -306,7 +306,8 @@ jobs:
   # The verifier differs a lot between kernels, and the agent only logs a warning when a
   # probe is refused, then runs without it. #204 (three `ssl_read_entry_*` programs refused
   # on 5.15 and 6.1, accepted on 6.18) passed every other job. This loads every program on
-  # the oldest kernels we support, in a VM, and fails on any refusal (#226).
+  # the oldest kernels we support and on the newest stable series, in a VM, and fails on
+  # any refusal (#226).
   linux-ebpf-verify:
     name: linux-ebpf-verify (${{ matrix.kernel-version || matrix.image }})
     needs: linux-ebpf
@@ -330,6 +331,11 @@ jobs:
           - image: "6.1-20261021.083220"
             kernel: "old"
             kernel-version: "6.1-20231220.153727"
+          # The newest series too: 7.2's verifier checks stack-passed arguments of a
+          # BPF-to-BPF call that 5.15 and 6.1 do not, and refused `raw_sys_enter` when a
+          # six-parameter helper stopped being inlined (`emit_kernel_module_event`).
+          - image: "7.2-20261021.083220"
+            kernel: ""
     steps:
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:

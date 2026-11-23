@@ -70,7 +70,12 @@ fn terminate_process(pid: u32) -> std::io::Result<()> {
 /// the netlink poller itself.
 fn seeded_rule_state() -> rules::RuleState {
     let mut rule_state = rules::RuleState::new();
-    rule_state.seed_from_proc();
+    // The sensor's own scan, so a seeded fact carries the stamp its events do (#17).
+    rule_state.seed_processes(
+        sensor_linux::read_seed_processes()
+            .into_iter()
+            .map(|p| (p.pid, p.comm, p.image, p.generation)),
+    );
     // T1574.006 (#363): trust the library directories this host's ld.so.conf
     // declares, on top of the built-in baseline.
     rule_state.seed_ld_trust_from_system();

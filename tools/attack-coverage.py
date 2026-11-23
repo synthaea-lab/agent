@@ -290,7 +290,7 @@ UNVERIFIED_NOTES = [
     "image paths until captured; a Snap revision other than the two captured; "
     "a non-English desktop locale (the Snap's Downloads link is named after the localized "
     "directory, e.g. `Téléchargements`, so no mark is recorded there: **not covered**); "
-    "a download through a Save-as dialog. "
+    "a download through a Save-as dialog; an executable that is signed (every run so far executed an unsigned file, and the alert says `[signature not verified]`). "
     "**Wayland, captured 2026-11-16** (Fedora 43 lab VM, kernel 7.2.9, "
     "`weston --backend=headless`, no X server, agent built from main `b2648c10`): "
     "Firefox 160 (`MOZ_ENABLE_WAYLAND=1`) and Chromium 156 (`--ozone-platform=wayland`), "
@@ -307,10 +307,16 @@ UNVERIFIED_NOTES = [
     "downloads were captured: Chrome resumes by itself, and after a browser kill and "
     "relaunch a manual Resume ends with the same single `.crdownload` -> final rename "
     "(same `executable_path`); Firefox's manual retry ends with the same `.part` -> "
-    "final rename. An empty `executable_path` marks nothing: the "
-    "process-lineage fallback is not implemented, and the capture ran under `strace` "
-    "so its lineage was not real "
-    "(https://github.com/synthaea-lab/agent/issues/221).",
+    "final rename. An empty `executable_path` (the sensor lost the `/proc/<pid>/exe` race) is read from the lineage: "
+    "the image of the exec the agent recorded for that pid and incarnation, otherwise its parent's (a process forked without an exec, "
+    "such as a Chromium zygote child); a process already running at start-up is read from `/proc/<pid>/exe` by `seed_processes` (an unreadable link, or one ending in \" (deleted)\", is left out); a pid with no recorded image and no known parent marks nothing. The fallback was run on a lab VM on 2026-11-19 (Debian 13, kernel 6.12, agent built from `8d77eab0`) with a synthetic renamer, not a browser: "
+    "a small helper bind-mounted over `/usr/lib/firefox-esr/firefox-esr` in a private mount namespace renamed 60 `.part` files and exited at once; "
+    "56 of the 60 renames reached the agent with an empty `executable_path`, and 32 execs of the renamed files raised T1204.002 "
+    "(`marked by firefox-esr`), 28 of them on a rename with an empty path. The same helper run from a non-browser path raised none (60 renames). "
+    "Of the 28 files that raised nothing, 26 were executed within 200 microseconds and their exec was logged before the rename (a sensor ordering effect of the test loop, not of the fallback), "
+    "and 2 had the renamer's own exec logged after the rename, which the lineage cannot read. No capture shows a real browser losing the race, "
+    "and the seeded `pid_image_path` is read by other rules (impact, network flow, LSASS, set-time) that no test pins one by one "
+    "(https://github.com/synthaea-lab/agent/issues/17, https://github.com/synthaea-lab/agent/issues/221).",
 ]
 
 

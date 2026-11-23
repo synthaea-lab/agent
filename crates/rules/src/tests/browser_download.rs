@@ -252,6 +252,181 @@ fn a_path_that_only_looks_like_firefox_is_not_marked() {
     assert!(!marked(None));
 }
 
+// ── The lineage fallback: the sensor lost the `/proc/<pid>/exe` race (#17, #221) ─────────
+
+/// An exec of `image` by `pid`, incarnation `generation`, as the agent records it for the
+/// lineage fallback.
+fn exec_of(pid: u32, generation: Option<u64>, image: &str) -> ExecEvent {
+    ExecEvent {
+        meta: schema::EventMeta {
+            pid,
+            process_generation: generation,
+            comm: "x".into(),
+            ..meta()
+        },
+        image_path: image.into(),
+        ..schema::fixtures::exec()
+    }
+}
+
+/// A rename with no `executable_path`, by `pid` (child of `ppid`), with the stamps given.
+fn lost_rename(
+    pid: u32,
+    generation: Option<u64>,
+    ppid: u32,
+    parent_generation: Option<u64>,
+) -> FileRenameEvent {
+    FileRenameEvent {
+        meta: schema::EventMeta {
+            pid,
+            ppid,
+            process_generation: generation,
+            parent_process_generation: parent_generation,
+            ..rename("/d/x.bin.part", FINAL, None, 0).meta
+        },
+        ..rename("/d/x.bin.part", FINAL, None, 0)
+    }
+}
+
+fn marked_by_lineage(state: &mut RuleState, event: &FileRenameEvent) -> bool {
+    state.on_file_rename(event);
+    exec(state, &run(FINAL, 1)).len() == 1
+}
+
+#[test]
+fn a_rename_without_an_image_is_marked_from_the_pids_own_exec() {
+    let mut state = RuleState::new();
+    state.on_exec(&exec_of(900, Some(7), FIREFOX));
+    assert!(marked_by_lineage(
+        &mut state,
+        &lost_rename(900, Some(7), 1, None)
+    ));
+}
+
+#[test]
+fn an_empty_image_is_read_as_lost() {
+    let mut state = RuleState::new();
+    state.on_exec(&exec_of(900, Some(7), CHROMIUM));
+    let mut event = lost_rename(900, Some(7), 1, None);
+    event.executable_path = Some(String::new());
+    assert!(marked_by_lineage(&mut state, &event));
+}
+
+#[test]
+fn an_own_exec_with_an_empty_image_falls_back_to_the_parent() {
+    // The pid's own exec was recorded but its image path is empty (the sensor lost it there
+    // too): the lookup that comes back empty is not an answer, so the browser parent is tried.
+    let mut state = RuleState::new();
+    state.on_exec(&exec_of(800, Some(3), CHROMIUM));
+    state.on_exec(&exec_of(901, Some(9), ""));
+    assert!(marked_by_lineage(
+        &mut state,
+        &lost_rename(901, Some(9), 800, Some(3))
+    ));
+}
+
+#[test]
+fn a_fact_seeded_at_startup_matches_its_own_incarnation_only() {
+    // `seed_processes` records the image with the stamp the sensor gives that process's events:
+    // a browser that started before the agent is found; a pid that died and was reused by a
+    // process that forks without an exec (another stamp) does not inherit the seeded image and
+    // falls back to its parent, as for an image the agent saw exec.
+    let seed = |state: &mut RuleState| {
+        state.seed_processes([(900, "firefox".into(), Some(FIREFOX.into()), Some(8))]);
+    };
+    let mut state = RuleState::new();
+    seed(&mut state);
+    assert!(
+        marked_by_lineage(&mut state, &lost_rename(900, Some(8), 1, None)),
+        "the seeded incarnation"
+    );
+    let mut state = RuleState::new();
+    seed(&mut state);
+    assert!(
+        !marked_by_lineage(&mut state, &lost_rename(900, Some(9), 1, None)),
+        "a reused pid inherits nothing, and its parent (pid 1) is unknown"
+    );
+    // The fall back goes to the parent: a browser parent of the reused pid marks it.
+    let mut state = RuleState::new();
+    seed(&mut state);
+    state.on_exec(&exec_of(800, Some(3), CHROMIUM));
+    assert!(marked_by_lineage(
+        &mut state,
+        &lost_rename(900, Some(9), 800, Some(3))
+    ));
+    // No stamp on the event (macOS): cannot tell, the seeded fact answers.
+    let mut state = RuleState::new();
+    seed(&mut state);
+    assert!(marked_by_lineage(
+        &mut state,
+        &lost_rename(900, None, 1, None)
+    ));
+}
+
+#[test]
+fn a_child_forked_without_an_exec_takes_its_parents_image() {
+    // A Chromium zygote child: no exec of its own, the parent (the browser) has one.
+    let mut state = RuleState::new();
+    state.on_exec(&exec_of(800, Some(3), CHROMIUM));
+    assert!(marked_by_lineage(
+        &mut state,
+        &lost_rename(901, Some(9), 800, Some(3))
+    ));
+}
+
+#[test]
+fn a_recycled_pid_does_not_take_the_old_images() {
+    // pid 900 ran Firefox as incarnation 7; the rename comes from incarnation 8 of the same pid.
+    let mut state = RuleState::new();
+    state.on_exec(&exec_of(900, Some(7), FIREFOX));
+    assert!(!marked_by_lineage(
+        &mut state,
+        &lost_rename(900, Some(8), 1, None)
+    ));
+}
+
+#[test]
+fn a_parent_of_another_incarnation_is_not_used() {
+    let mut state = RuleState::new();
+    state.on_exec(&exec_of(800, Some(3), CHROMIUM));
+    assert!(!marked_by_lineage(
+        &mut state,
+        &lost_rename(901, Some(9), 800, Some(4))
+    ));
+}
+
+#[test]
+fn the_pids_own_non_browser_exec_wins_over_a_browser_parent() {
+    // `cp` run from the browser (an extension's helper) renames a .part file: its own image is
+    // `cp`, so the browser parent is not used.
+    let mut state = RuleState::new();
+    state.on_exec(&exec_of(800, Some(3), FIREFOX));
+    state.on_exec(&exec_of(901, Some(9), "/usr/bin/cp"));
+    assert!(!marked_by_lineage(
+        &mut state,
+        &lost_rename(901, Some(9), 800, Some(3))
+    ));
+}
+
+#[test]
+fn a_process_nobody_saw_exec_marks_nothing() {
+    let mut state = RuleState::new();
+    assert!(!marked_by_lineage(
+        &mut state,
+        &lost_rename(901, Some(9), 800, Some(3))
+    ));
+}
+
+#[test]
+fn a_resolved_non_browser_image_is_not_overridden_by_the_lineage() {
+    // The sensor gave `/usr/bin/mv`: it stands, even though the pid's recorded exec was Firefox.
+    let mut state = RuleState::new();
+    state.on_exec(&exec_of(900, Some(7), FIREFOX));
+    let mut event = lost_rename(900, Some(7), 1, None);
+    event.executable_path = Some("/usr/bin/mv".into());
+    assert!(!marked_by_lineage(&mut state, &event));
+}
+
 #[test]
 fn the_chromium_snap_is_marked() {
     // Captured 2026-11-16 on Ubuntu 26.04.1 (Chromium 157, rev 3593), X11 and Wayland, #267.

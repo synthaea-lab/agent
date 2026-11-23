@@ -200,7 +200,7 @@ These are called once, before the sensors start
 
 | Method | Fills | Why |
 | --- | --- | --- |
-| `seed_from_proc` (Unix) / `seed_pid_comm` (Windows) | `pid_comm` | services started before the agent (nginx at boot) must be known as parents |
+| `seed_processes` (Linux, fed by the agent binary from `/proc`) / `seed_pid_comm` (Windows) | `pid_comm`, `pid_image_path` | services started before the agent (nginx at boot) must be known as parents |
 | `seed_listen_ports` | `known_listeners` | existing listeners are the baseline |
 | `seed_ld_trust_from_system` | extra trusted library dirs from `/etc/ld.so.conf` (`include`s followed) | `LD_PRELOAD` of an `ldconfig`-registered vendor directory is not a hijack (T1574.006) |
 | `seed_own_pid` | `own_pid` | the Event Log sensor's own `wevtutil`/`auditpol` children are excluded narrowly, still requiring a trusted image path |
@@ -253,7 +253,34 @@ same signature gate applies.
   and the vendor packages of Chrome (`/opt/google/chrome/chrome`), Edge
   (`/opt/microsoft/msedge/msedge`), Brave (`/opt/brave.com/brave/brave`), Opera
   (`/usr/lib64/opera-stable/opera`) and Vivaldi (`/opt/vivaldi/vivaldi-bin`).
-- An empty or absent `executable_path` marks nothing. What is still unchecked is listed under
+- An empty or absent `executable_path` (the sensor lost the `/proc/<pid>/exe` race) is read from the
+  lineage, in this order: the image of the exec the agent recorded for the renaming pid, if its
+  incarnation stamp matches; otherwise the image recorded for the parent, if the parent's stamp matches
+  (a process forked without an exec, such as a Chromium zygote child). A process already running when the
+  agent started has no exec event: `seed_processes` records its `/proc/<pid>/exe` at start-up, with the
+  incarnation stamp the sensor puts on that process's events (a link the agent cannot read, or one ending in
+  ` (deleted)` because the file was replaced, is left out). A recorded
+  image that is empty counts as lost, at each step: it falls through to the parent. A pid with
+  no recorded image and no known parent marks nothing.
+  Two consequences of seeding, both outside T1204.002. The seeded image fills `pid_image_path`, which the
+  credential-read, impact, network-flow, LSASS and set-time rules also read: for a process that started
+  before the agent, their image-based exclusions now apply, where the name alone decided before
+  (pinned for the credential read by `an_image_seeded_at_startup_applies_the_image_based_exclusion`; the other
+  readers share the lookup and are not pinned one by one). And a seeded fact carries the stamp of its process, derived once, by the
+  sensor's `primed_generation` (the agent binary reads `/proc` with the sensor's `read_seed_processes`, and
+  `rules` takes the result without reading `/proc` itself), so it answers for that incarnation only: a seeded
+  pid that dies and is reused by a process that forks without an exec inherits neither the image nor the
+  comm, and falls back to its parent (`a_fact_seeded_at_startup_matches_its_own_incarnation_only`); a seeded
+  auth-stack pid (`sshd`, `su`, `unix_chkpwd`) keeps no `/etc/shadow` exclusion for a reused pid
+  (`a_seeded_auth_stack_pid_is_not_inherited_by_a_reused_pid_that_reads_etc_shadow`). Where a stamp is
+  unreadable (`starttime` missing) or the event has none (macOS), the lookup cannot tell and the seeded fact
+  answers, as for the other pid tables. A resolved image always wins, even when it is not a browser, and
+  the pid's own non-browser exec wins over a browser parent (a helper such as `cp` run from the browser
+  marks nothing). Unit-tested, and run on a lab VM on 2026-11-19 with a synthetic
+  renamer at the Firefox ESR path (Debian 13): 56 of 60 renames arrived with an empty image, 32 execs raised
+  T1204.002 (28 of them on such a rename) and the same helper from a non-browser path raised none. The fallback
+  needs the renamer's exec to be recorded before its rename, and the downloaded file's exec to come after
+  the rename. No capture shows a real browser losing the race. What is still unchecked is listed under
   "Not verified" in [attack-coverage.md](../attack-coverage.md).
 
 ## Signature-gated findings
@@ -313,7 +340,7 @@ verification and window calibration are tracked in
 | A table reaches its cap | LRU eviction. A forgotten key can re-alert once; first-seen tables log each eviction rise |
 | Parent not in the cache and gone from `/proc` | parent-name rules cannot fire for that exec |
 | Linux `comm` truncated to 15 bytes | T1105 compares `comm` to the downloaded file's basename, so a longer name does not match |
-| Linux browser download, `executable_path` empty or not a browser image (`is_browser_download_image`) | no T1204.002 mark: the join is keyed on the renaming process's image, never `comm`, and there is no lineage fallback (not validated: the capture ran under `strace`) |
+| Linux browser download, resolved image not a browser image (`is_browser_download_image`), or no image anywhere in the lineage | no T1204.002 mark: the join is keyed on the renaming process's image, never `comm`. An empty image falls back to the lineage (the pid's own recorded exec, then its parent's); a pid nobody saw exec marks nothing |
 | A downloaded script run through an interpreter | image is the interpreter; T1204.002 and T1105 do not join |
 | Events out of order across sensor threads | windows tolerate it; deferred findings wait for the clock |
 | No generation stamp (macOS) | pid-only behaviour, recycled pids possible |
