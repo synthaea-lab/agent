@@ -47,4 +47,6 @@ pub use parent_image::ParentImageEvictions;
 #[cfg(target_os = "linux")]
 pub use proc::{SeedProcess, read_seed_processes};
 #[cfg(target_os = "linux")]
+pub use ring_drops::RingDropTotals;
+#[cfg(target_os = "linux")]
 pub use sensor::LinuxSensor;

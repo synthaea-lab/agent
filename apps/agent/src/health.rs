@@ -156,6 +156,10 @@ pub struct HostCounters {
     pub ioc_sibling_skipped: u64,
     /// Alerts that could not be written to `alerts.ndjson`.
     pub alerts_dropped: u64,
+    /// Events the Linux eBPF probes lost to full ring buffers, every ring (#335).
+    pub ring_dropped: u64,
+    /// The part of it lost from the exec ring.
+    pub exec_ring_dropped: u64,
 }
 
 /// Reads the [`HostCounters`].
@@ -367,6 +371,8 @@ impl HealthCollector {
             ioc_own_skipped: host.ioc_own_skipped,
             ioc_sibling_skipped: host.ioc_sibling_skipped,
             alerts_dropped: host.alerts_dropped,
+            ring_dropped: host.ring_dropped,
+            exec_ring_dropped: host.exec_ring_dropped,
         }
     }
 }
@@ -464,6 +470,8 @@ mod tests {
             ioc_own_skipped: 6,
             ioc_sibling_skipped: 2,
             alerts_dropped: 8,
+            ring_dropped: 51_064_213,
+            exec_ring_dropped: 7,
         }));
 
         let (tx, rx) = mpsc::channel();
@@ -538,6 +546,11 @@ mod tests {
         assert_eq!(
             beacon.alerts_dropped, 8,
             "the alerts the log file refused ride the beacon (#167)"
+        );
+        assert_eq!(
+            (beacon.ring_dropped, beacon.exec_ring_dropped),
+            (51_064_213, 7),
+            "the eBPF ring losses ride the beacon (#335)"
         );
     }
 

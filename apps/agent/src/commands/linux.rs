@@ -176,24 +176,31 @@ fn has_bpf_capabilities() -> bool {
 /// Selects sensor: eBPF if available, audit fallback otherwise.
 /// Returns (sensor, `sensor_name`) for correct telemetry.
 ///
-/// The third value reads what the eBPF sensor's parent-image cache has dropped, for the health
-/// beacon (#863); the audit fallback has no such cache.
+/// The third value reads the eBPF sensor's loss totals for the health beacon: what its
+/// parent-image cache dropped (#863) and what its probes lost to full rings (#335). The audit
+/// fallback has neither.
 fn select_sensor(
     enable_dns_capture: bool,
 ) -> (
     Box<dyn schema::sensor::Sensor>,
     &'static str,
-    Option<crate::host_counters::EvictionReader>,
+    Option<crate::host_counters::SensorTotalsReader>,
 ) {
     if can_use_ebpf() {
         tracing::info!("Using eBPF sensor (primary)");
         // `--enable-dns-capture` also turns on the socket-level query capture (#458 part 3).
         let sensor = sensor_linux::LinuxSensor::new().with_dns_udp_capture(enable_dns_capture);
         let evictions = sensor.parent_image_evictions();
+        let ring_drops = sensor.ring_drop_totals();
         return (
             Box::new(sensor),
             "linux-ebpf",
-            Some(Box::new(move || (evictions.live(), evictions.dead()))),
+            Some(Box::new(move || crate::host_counters::SensorTotals {
+                parent_image_evicted_live: evictions.live(),
+                parent_image_evicted_dead: evictions.dead(),
+                ring_dropped: ring_drops.all(),
+                exec_ring_dropped: ring_drops.exec(),
+            })),
         );
     }
 

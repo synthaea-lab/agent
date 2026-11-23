@@ -329,6 +329,8 @@ pub(crate) fn health_collector(
                 ioc_own_skipped = beacon.ioc_own_skipped,
                 ioc_sibling_skipped = beacon.ioc_sibling_skipped,
                 alerts_dropped = beacon.alerts_dropped,
+                ring_dropped = beacon.ring_dropped,
+                exec_ring_dropped = beacon.exec_ring_dropped,
                 "health beacon"
             );
             // #24/#134: the dedicated health channel — best-effort, an
