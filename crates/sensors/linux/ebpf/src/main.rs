@@ -65,8 +65,12 @@ static RING_DROPS: PerCpuArray<u64> =
 #[inline(always)]
 pub(crate) fn count_ring_drop(ring: u32) {
     if let Some(drops) = RING_DROPS.get_ptr_mut(ring) {
-        // SAFETY: `drops` is this CPU's own slot of a per-CPU array (a program does not nest on
-        // its own CPU), so the increment races with nothing.
+        // SAFETY: `drops` is this CPU's own slot of a per-CPU array, valid for the whole program.
+        // A program does not nest on its own CPU, but three slots are shared by several programs
+        // (`SIGNAL`: the kill/tgkill tracepoints and the `signal_generate` raw tracepoint, which
+        // can fire from interrupt context; `DNS_QUERY` and `TLS_CAPTURE`: two uprobes each). One
+        // of them interrupting another's read-add-write on the same CPU loses one count, never
+        // memory safety: an accepted error for a diagnostic counter.
         unsafe { *drops += 1 };
     }
 }
