@@ -190,7 +190,7 @@ hold, never kills, because its pid may already belong to another process.
 | Limit | Consequence |
 | --- | --- |
 | The Linux sensor drops read-only opens under `/tmp`, `/var/tmp`, `/dev/shm`, `/dev`, `/sys`, `/proc` | a canary there fires on delete, rename and write, not on a read; the agent warns at start (`read_blind_dirs`) |
-| Ring-buffer overflow under heavy open load | touches can be missed (measured: 9 of 20 caught under a synthetic flood, 20 of 20 on a quiet host), and these drops are not in the health beacon |
+| Ring-buffer overflow under heavy open load | touches can be missed (measured: 9 of 20 caught under a synthetic flood, 20 of 20 on a quiet host); the beacon counts them only in the aggregate `ring_dropped`, and the per-ring figure is in the agent log |
 | Packaged Linux unit (`ProtectSystem=strict`) | a canary directory must be in `ReadWritePaths` and writable by the agent user, or planting fails for that directory only |
 | A pid reused within the 500 ms hold by an allowed image | could excuse a held touch with no image (narrow) |
 | Honeypot listeners | not built |

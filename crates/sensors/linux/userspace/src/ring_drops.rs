@@ -22,23 +22,24 @@ pub struct RingDropTotals {
 }
 
 impl RingDropTotals {
-    /// Events lost to a full ring, summed over every ring.
+    /// Both totals as one consistent pair, `(all, exec)`: the events lost to a full ring summed
+    /// over every ring, and those lost from the exec ring alone, with `exec <= all`.
+    ///
+    /// Both only grow. `publish` stores `all` before `exec` (`Release`), and this loads `exec`
+    /// first (`Acquire`), so the `all` it then reads is from the same report or a later one,
+    /// never an older one: a beacon read across a report cannot show more exec losses than losses.
     #[must_use]
-    pub fn all(&self) -> u64 {
-        self.all.load(Ordering::Relaxed)
+    pub fn snapshot(&self) -> (u64, u64) {
+        let exec = self.exec.load(Ordering::Acquire);
+        let all = self.all.load(Ordering::Relaxed);
+        (all, exec)
     }
 
-    /// Events lost to a full `EXEC_EVENTS` ring alone: process starts the rules never saw.
-    #[must_use]
-    pub fn exec(&self) -> u64 {
-        self.exec.load(Ordering::Relaxed)
-    }
-
-    fn publish(&self, totals: &[u64]) {
+    fn publish(&self, totals: &[u64; ring::COUNT as usize]) {
         let all = totals.iter().fold(0u64, |sum, n| sum.saturating_add(*n));
         self.all.store(all, Ordering::Relaxed);
         self.exec
-            .store(totals[ring::EXEC as usize], Ordering::Relaxed);
+            .store(totals[ring::EXEC as usize], Ordering::Release);
     }
 }
 
@@ -138,9 +139,9 @@ mod tests {
         slots[ring::FILE_OPEN as usize] = 1_000;
         slots[ring::NAMESPACE as usize] = u64::MAX;
         totals.publish(&slots);
-        assert_eq!((totals.all(), totals.exec()), (u64::MAX, 4));
+        assert_eq!(totals.snapshot(), (u64::MAX, 4));
         slots[ring::NAMESPACE as usize] = 0;
         totals.publish(&slots);
-        assert_eq!((totals.all(), totals.exec()), (1_004, 4));
+        assert_eq!(totals.snapshot(), (1_004, 4));
     }
 }

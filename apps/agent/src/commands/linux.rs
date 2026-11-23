@@ -195,11 +195,14 @@ fn select_sensor(
         return (
             Box::new(sensor),
             "linux-ebpf",
-            Some(Box::new(move || crate::host_counters::SensorTotals {
-                parent_image_evicted_live: evictions.live(),
-                parent_image_evicted_dead: evictions.dead(),
-                ring_dropped: ring_drops.all(),
-                exec_ring_dropped: ring_drops.exec(),
+            Some(Box::new(move || {
+                let (ring_dropped, exec_ring_dropped) = ring_drops.snapshot();
+                crate::host_counters::SensorTotals {
+                    parent_image_evicted_live: evictions.live(),
+                    parent_image_evicted_dead: evictions.dead(),
+                    ring_dropped,
+                    exec_ring_dropped,
+                }
             })),
         );
     }
