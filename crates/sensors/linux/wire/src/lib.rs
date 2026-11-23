@@ -301,6 +301,142 @@ pub const TASK_COMM_LEN: usize = 16;
 /// removals that failed.
 pub const SIGNAL_WATCH_TOOLS_ENTRIES: u32 = 8192;
 
+/// Slots of the eBPF map `RING_DROPS` (#304): one per-CPU `u64` per ring buffer, counting the
+/// events its probes could not output because the ring was full. A probe bumps its ring's slot
+/// instead of logging each drop (a full ring is the moment the sensor is overloaded, and a log
+/// line per lost event was 11.5 M lines in 20 minutes on a 2-vCPU host); userspace sums the CPUs
+/// on a timer and logs one line per ring that lost events. Both sides are built from this table,
+/// so a slot means the same ring on each; the map is not pinned, so adding a ring needs no
+/// `WIRE_VERSION` bump.
+pub mod ring {
+    pub const EXEC: u32 = 0;
+    pub const FILE_OPEN: u32 = 1;
+    pub const FILE_WRITE: u32 = 2;
+    pub const FILE_DELETE: u32 = 3;
+    pub const FILE_RENAME: u32 = 4;
+    pub const FILE_CHMOD: u32 = 5;
+    pub const FILE_CHOWN: u32 = 6;
+    pub const FILE_SETXATTR: u32 = 7;
+    pub const FILE_REMOVEXATTR: u32 = 8;
+    pub const FILE_SET_TIME: u32 = 9;
+    pub const CONNECT: u32 = 10;
+    pub const SOCKET_BIND: u32 = 11;
+    pub const SOCKET_LISTEN: u32 = 12;
+    pub const SOCKET_ACCEPT: u32 = 13;
+    pub const SOCKET_CREATE: u32 = 14;
+    pub const UDP_SEND: u32 = 15;
+    pub const UDP_RECV: u32 = 16;
+    pub const DNS_UDP: u32 = 17;
+    pub const DNS_QUERY: u32 = 18;
+    pub const TLS_CAPTURE: u32 = 19;
+    pub const READLINE: u32 = 20;
+    pub const MOUNT: u32 = 21;
+    pub const SIGNAL: u32 = 22;
+    pub const KERNEL_MODULE: u32 = 23;
+    pub const BPF: u32 = 24;
+    pub const PRCTL: u32 = 25;
+    pub const PTRACE: u32 = 26;
+    pub const PROCESS_VM_READ: u32 = 27;
+    pub const PROCESS_VM_WRITE: u32 = 28;
+    pub const MEMFD_CREATE: u32 = 29;
+    pub const IDENTITY_CHANGE: u32 = 30;
+    pub const CAPSET: u32 = 31;
+    pub const NAMESPACE: u32 = 32;
+
+    /// Entries of `RING_DROPS`.
+    pub const COUNT: u32 = 33;
+
+    /// The ring of each slot, as userspace names it in the drop summary; index = slot.
+    pub const NAMES: [&str; COUNT as usize] = [
+        "exec",
+        "file_open",
+        "file_write",
+        "file_delete",
+        "file_rename",
+        "file_chmod",
+        "file_chown",
+        "file_setxattr",
+        "file_removexattr",
+        "file_set_time",
+        "connect",
+        "socket_bind",
+        "socket_listen",
+        "socket_accept",
+        "socket_create",
+        "udp_send",
+        "udp_recv",
+        "dns_udp",
+        "dns_query",
+        "tls_capture",
+        "readline",
+        "mount",
+        "signal",
+        "kernel_module",
+        "bpf",
+        "prctl",
+        "ptrace",
+        "process_vm_read",
+        "process_vm_write",
+        "memfd_create",
+        "identity_change",
+        "capset",
+        "namespace",
+    ];
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        /// Each slot constant names its own ring: a reordered `NAMES` entry would report one
+        /// ring's drops under another's name.
+        #[test]
+        fn each_ring_slot_is_named_after_its_ring() {
+            let slots = [
+                (EXEC, "exec"),
+                (FILE_OPEN, "file_open"),
+                (FILE_WRITE, "file_write"),
+                (FILE_DELETE, "file_delete"),
+                (FILE_RENAME, "file_rename"),
+                (FILE_CHMOD, "file_chmod"),
+                (FILE_CHOWN, "file_chown"),
+                (FILE_SETXATTR, "file_setxattr"),
+                (FILE_REMOVEXATTR, "file_removexattr"),
+                (FILE_SET_TIME, "file_set_time"),
+                (CONNECT, "connect"),
+                (SOCKET_BIND, "socket_bind"),
+                (SOCKET_LISTEN, "socket_listen"),
+                (SOCKET_ACCEPT, "socket_accept"),
+                (SOCKET_CREATE, "socket_create"),
+                (UDP_SEND, "udp_send"),
+                (UDP_RECV, "udp_recv"),
+                (DNS_UDP, "dns_udp"),
+                (DNS_QUERY, "dns_query"),
+                (TLS_CAPTURE, "tls_capture"),
+                (READLINE, "readline"),
+                (MOUNT, "mount"),
+                (SIGNAL, "signal"),
+                (KERNEL_MODULE, "kernel_module"),
+                (BPF, "bpf"),
+                (PRCTL, "prctl"),
+                (PTRACE, "ptrace"),
+                (PROCESS_VM_READ, "process_vm_read"),
+                (PROCESS_VM_WRITE, "process_vm_write"),
+                (MEMFD_CREATE, "memfd_create"),
+                (IDENTITY_CHANGE, "identity_change"),
+                (CAPSET, "capset"),
+                (NAMESPACE, "namespace"),
+            ];
+            assert_eq!(slots.len(), COUNT as usize);
+            let mut seen = [false; COUNT as usize];
+            for (slot, name) in slots {
+                assert_eq!(NAMES[slot as usize], name);
+                assert!(!seen[slot as usize], "slot {slot} used twice");
+                seen[slot as usize] = true;
+            }
+        }
+    }
+}
+
 /// Set in [`SignalEvent::signal`] by the `signal_generate` probe when the siginfo's `si_code` is
 /// `SI_TIMER`, `SI_MESGQ` or `SI_ASYNCIO` (-2..=-4): codes the kernel sets from interrupt or
 /// completion context, where `current` is a bystander. A process can also **forge** them with

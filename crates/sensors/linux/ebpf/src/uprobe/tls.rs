@@ -10,7 +10,6 @@ use aya_ebpf::{
     maps::{HashMap, PerCpuArray, RingBuf},
     programs::{ProbeContext, RetProbeContext},
 };
-use aya_log_ebpf::warn;
 use sensor_linux_wire::{MAX_TLS_CAPTURE, TASK_COMM_LEN, TlsCaptureEvent};
 
 use crate::{fill_lineage, into_ret};
@@ -110,10 +109,7 @@ fn try_ssl_write(ctx: ProbeContext, lib_type: u8) -> Result<u32, u32> {
             .output::<TlsCaptureEvent>(&*e, 0)
             .is_err()
         {
-            warn!(
-                &ctx,
-                "sensor-linux-ebpf: ring buffer full, dropping TLS write event"
-            );
+            crate::count_ring_drop(sensor_linux_wire::ring::TLS_CAPTURE);
         }
     }
 
@@ -230,10 +226,7 @@ fn try_ssl_read_exit(ctx: RetProbeContext) -> Result<u32, u32> {
             .output::<TlsCaptureEvent>(&*e, 0)
             .is_err()
         {
-            warn!(
-                &ctx,
-                "sensor-linux-ebpf: ring buffer full, dropping TLS read event"
-            );
+            crate::count_ring_drop(sensor_linux_wire::ring::TLS_CAPTURE);
         }
     }
 

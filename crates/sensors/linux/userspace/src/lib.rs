@@ -28,6 +28,9 @@ mod parent_image;
 mod proc;
 #[cfg(target_os = "linux")]
 mod rings;
+// Events the probes lost to a full ring, counted kernel-side and logged per ring (#304).
+#[cfg(target_os = "linux")]
+mod ring_drops;
 #[cfg(target_os = "linux")]
 mod sensor;
 #[cfg(all(target_os = "linux", any(ebpf_embedded, test)))]

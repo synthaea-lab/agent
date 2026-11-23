@@ -6,7 +6,6 @@ use aya_ebpf::{
     maps::{PerCpuArray, RingBuf},
     programs::TracePointContext,
 };
-use aya_log_ebpf::warn;
 use sensor_linux_wire::IdentityChangeEvent;
 
 use crate::{
@@ -72,13 +71,7 @@ const RES_ID_REAL_OFFSET: usize = arg_offset(0);
 /// call hands the verifier a return/argument path it can't always prove,
 /// and this has several call sites (one per probe below).
 #[inline(always)]
-fn emit_identity_change_event(
-    ctx: &TracePointContext,
-    kind: u8,
-    real: u32,
-    effective: u32,
-    saved: u32,
-) -> Result<u32, u32> {
+fn emit_identity_change_event(kind: u8, real: u32, effective: u32, saved: u32) -> Result<u32, u32> {
     let comm = bpf_get_current_comm().map_err(|_| 1u32)?;
     let uid_gid = aya_ebpf::helpers::bpf_get_current_uid_gid();
 
@@ -101,10 +94,7 @@ fn emit_identity_change_event(
             .output::<IdentityChangeEvent>(&*e, 0)
             .is_err()
         {
-            warn!(
-                ctx,
-                "sensor-linux-ebpf: ring buffer full, dropping identity change event"
-            );
+            crate::count_ring_drop(sensor_linux_wire::ring::IDENTITY_CHANGE);
         }
     }
 
@@ -126,7 +116,7 @@ fn read_single_id(ctx: &TracePointContext) -> Result<u32, u32> {
 
 pub fn sys_enter_setuid(ctx: TracePointContext) -> u32 {
     match read_single_id(&ctx) {
-        Ok(uid) => match emit_identity_change_event(&ctx, IDENTITY_KIND_SETUID, uid, 0, 0) {
+        Ok(uid) => match emit_identity_change_event(IDENTITY_KIND_SETUID, uid, 0, 0) {
             Ok(ret) | Err(ret) => ret,
         },
         Err(ret) => ret,
@@ -135,7 +125,7 @@ pub fn sys_enter_setuid(ctx: TracePointContext) -> u32 {
 
 pub fn sys_enter_setgid(ctx: TracePointContext) -> u32 {
     match read_single_id(&ctx) {
-        Ok(gid) => match emit_identity_change_event(&ctx, IDENTITY_KIND_SETGID, gid, 0, 0) {
+        Ok(gid) => match emit_identity_change_event(IDENTITY_KIND_SETGID, gid, 0, 0) {
             Ok(ret) | Err(ret) => ret,
         },
         Err(ret) => ret,
@@ -144,7 +134,7 @@ pub fn sys_enter_setgid(ctx: TracePointContext) -> u32 {
 
 pub fn sys_enter_setfsuid(ctx: TracePointContext) -> u32 {
     match read_single_id(&ctx) {
-        Ok(fsuid) => match emit_identity_change_event(&ctx, IDENTITY_KIND_SETFSUID, fsuid, 0, 0) {
+        Ok(fsuid) => match emit_identity_change_event(IDENTITY_KIND_SETFSUID, fsuid, 0, 0) {
             Ok(ret) | Err(ret) => ret,
         },
         Err(ret) => ret,
@@ -153,7 +143,7 @@ pub fn sys_enter_setfsuid(ctx: TracePointContext) -> u32 {
 
 pub fn sys_enter_setfsgid(ctx: TracePointContext) -> u32 {
     match read_single_id(&ctx) {
-        Ok(fsgid) => match emit_identity_change_event(&ctx, IDENTITY_KIND_SETFSGID, fsgid, 0, 0) {
+        Ok(fsgid) => match emit_identity_change_event(IDENTITY_KIND_SETFSGID, fsgid, 0, 0) {
             Ok(ret) | Err(ret) => ret,
         },
         Err(ret) => ret,
@@ -163,8 +153,7 @@ pub fn sys_enter_setfsgid(ctx: TracePointContext) -> u32 {
 pub fn sys_enter_setresuid(ctx: TracePointContext) -> u32 {
     match try_sys_enter_setres(&ctx) {
         Ok((real, effective, saved)) => {
-            match emit_identity_change_event(&ctx, IDENTITY_KIND_SETRESUID, real, effective, saved)
-            {
+            match emit_identity_change_event(IDENTITY_KIND_SETRESUID, real, effective, saved) {
                 Ok(ret) | Err(ret) => ret,
             }
         }
@@ -175,8 +164,7 @@ pub fn sys_enter_setresuid(ctx: TracePointContext) -> u32 {
 pub fn sys_enter_setresgid(ctx: TracePointContext) -> u32 {
     match try_sys_enter_setres(&ctx) {
         Ok((real, effective, saved)) => {
-            match emit_identity_change_event(&ctx, IDENTITY_KIND_SETRESGID, real, effective, saved)
-            {
+            match emit_identity_change_event(IDENTITY_KIND_SETRESGID, real, effective, saved) {
                 Ok(ret) | Err(ret) => ret,
             }
         }

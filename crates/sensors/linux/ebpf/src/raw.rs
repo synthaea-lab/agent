@@ -279,7 +279,7 @@ pub fn raw_signal_generate(ctx: RawTracePointContext) -> u32 {
     if (aya_ebpf::helpers::bpf_get_current_pid_tgid() >> 32) as u32 == target {
         return 0;
     }
-    into_ret(emit_tool_signal_event(&ctx, target, sig))
+    into_ret(emit_tool_signal_event(target, sig))
 }
 
 // Keeping these synthetic tracepoint records in per-CPU maps avoids adding their

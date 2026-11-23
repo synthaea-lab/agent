@@ -22,7 +22,6 @@ use aya_ebpf::{
     maps::{PerCpuArray, RingBuf},
     programs::LsmContext,
 };
-use aya_log_ebpf::warn;
 use sensor_linux_wire::{
     FileSetTimeEvent, SET_TIME_ATIME, SET_TIME_COMPONENT_LEN, SET_TIME_COMPONENTS, SET_TIME_MTIME,
     SET_TIME_TRUNCATED,
@@ -194,10 +193,7 @@ fn try_inode_setattr(ctx: LsmContext) -> Result<i32, i32> {
             .output::<FileSetTimeEvent>(&*e, 0)
             .is_err()
         {
-            warn!(
-                &ctx,
-                "sensor-linux-ebpf: ring buffer full, dropping set-time event"
-            );
+            crate::count_ring_drop(sensor_linux_wire::ring::FILE_SET_TIME);
         }
     }
     Ok(0)

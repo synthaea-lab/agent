@@ -5,7 +5,7 @@ use aya_ebpf::{
     helpers::{bpf_get_current_comm, bpf_get_current_pid_tgid},
     macros::map,
     maps::{Array, HashMap, PerCpuArray, RingBuf},
-    programs::{RawTracePointContext, TracePointContext},
+    programs::TracePointContext,
 };
 use aya_log_ebpf::warn;
 use sensor_linux_wire::SignalEvent;
@@ -145,10 +145,7 @@ fn emit_signal_event(ctx: &TracePointContext, target_pid: u32, sig: u32) -> Resu
         }
 
         if SIGNAL_EVENTS.output::<SignalEvent>(&*e, 0).is_err() {
-            warn!(
-                ctx,
-                "sensor-linux-ebpf: ring buffer full, dropping signal event"
-            );
+            crate::count_ring_drop(sensor_linux_wire::ring::SIGNAL);
         }
     }
 
@@ -205,11 +202,7 @@ pub(crate) fn watched_tool_sigcgt(tgid: u32) -> Option<u64> {
 /// a process (not the kernel): `raw_signal_generate` checked both. A kill of a tool does not take
 /// the agent down, so the ring buffer is enough: nothing goes to `SIGNAL_TAMPER_LAST`.
 #[inline(always)]
-pub(crate) fn emit_tool_signal_event(
-    ctx: &RawTracePointContext,
-    target_tgid: u32,
-    sig: u32,
-) -> Result<u32, u32> {
+pub(crate) fn emit_tool_signal_event(target_tgid: u32, sig: u32) -> Result<u32, u32> {
     let e = SIGNAL_SCRATCH.get_ptr_mut(0).ok_or(1u32)?;
     // SAFETY: `e` is this CPU's scratch slot (one per CPU, and a probe does not nest on its
     // own CPU), valid for a `SignalEvent`; `fill_signal_event` initialises it before `output`
@@ -220,10 +213,7 @@ pub(crate) fn emit_tool_signal_event(
             if let Some(drops) = SIGNAL_TOOL_DROPS.get_ptr_mut(0) {
                 *drops += 1;
             }
-            warn!(
-                ctx,
-                "sensor-linux-ebpf: ring buffer full, dropping signal event"
-            );
+            crate::count_ring_drop(sensor_linux_wire::ring::SIGNAL);
         }
     }
     Ok(0)

@@ -6,7 +6,6 @@ use aya_ebpf::{
     maps::{PerCpuArray, RingBuf},
     programs::TracePointContext,
 };
-use aya_log_ebpf::warn;
 use sensor_linux_wire::UdpSendEvent;
 
 use crate::{
@@ -96,10 +95,7 @@ fn try_sys_enter_sendto(ctx: TracePointContext) -> Result<u32, u32> {
         (*e).size = len as u32;
 
         if UDP_SEND_EVENTS.output::<UdpSendEvent>(&*e, 0).is_err() {
-            warn!(
-                &ctx,
-                "sensor-linux-ebpf: ring buffer full, dropping udp send event"
-            );
+            crate::count_ring_drop(sensor_linux_wire::ring::UDP_SEND);
         }
     }
 

@@ -6,7 +6,6 @@ use aya_ebpf::{
     maps::{PerCpuArray, RingBuf},
     programs::TracePointContext,
 };
-use aya_log_ebpf::warn;
 use sensor_linux_wire::{ProcessVmReadEvent, ProcessVmWriteEvent};
 
 use crate::{
@@ -105,10 +104,7 @@ fn try_sys_enter_process_vm_readv(ctx: TracePointContext) -> Result<u32, u32> {
             .output::<ProcessVmReadEvent>(&*e, 0)
             .is_err()
         {
-            warn!(
-                &ctx,
-                "sensor-linux-ebpf: ring buffer full, dropping process_vm_readv event"
-            );
+            crate::count_ring_drop(sensor_linux_wire::ring::PROCESS_VM_READ);
         }
     }
 
@@ -159,10 +155,7 @@ fn try_sys_enter_process_vm_writev(ctx: TracePointContext) -> Result<u32, u32> {
             .output::<ProcessVmWriteEvent>(&*e, 0)
             .is_err()
         {
-            warn!(
-                &ctx,
-                "sensor-linux-ebpf: ring buffer full, dropping process_vm_writev event"
-            );
+            crate::count_ring_drop(sensor_linux_wire::ring::PROCESS_VM_WRITE);
         }
     }
 

@@ -6,7 +6,6 @@ use aya_ebpf::{
     maps::{PerCpuArray, RingBuf},
     programs::TracePointContext,
 };
-use aya_log_ebpf::warn;
 use sensor_linux_wire::{FileOpenEvent, is_filtered_path};
 
 use crate::{
@@ -70,7 +69,7 @@ fn try_sys_enter_openat(ctx: TracePointContext) -> Result<u32, u32> {
 
     let flags: i64 = unsafe { ctx.read_long_arg(OPENAT_FLAGS_OFFSET).map_err(|_| 1u32)? };
 
-    emit_file_open_event(&ctx, filename_ptr, flags)
+    emit_file_open_event(filename_ptr, flags)
 }
 
 pub fn sys_enter_open(ctx: TracePointContext) -> u32 {
@@ -85,17 +84,13 @@ fn try_sys_enter_open(ctx: TracePointContext) -> Result<u32, u32> {
 
     let flags: i64 = unsafe { ctx.read_long_arg(OPEN_FLAGS_OFFSET).map_err(|_| 1u32)? };
 
-    emit_file_open_event(&ctx, filename_ptr, flags)
+    emit_file_open_event(filename_ptr, flags)
 }
 
 /// Shared by `sys_enter_openat` and `sys_enter_open` above: both land on the same
 /// `FileOpenEvent` shape/`FILE_OPEN_EVENTS` ring buffer, and differ only in where
 /// `filename`/`flags` sit in the tracepoint record.
-fn emit_file_open_event(
-    ctx: &TracePointContext,
-    filename_ptr: u64,
-    flags: i64,
-) -> Result<u32, u32> {
+fn emit_file_open_event(filename_ptr: u64, flags: i64) -> Result<u32, u32> {
     let pid = (bpf_get_current_pid_tgid() >> 32) as u32;
     if is_agent_own_pid(pid) {
         return Ok(0);
@@ -125,10 +120,7 @@ fn emit_file_open_event(
         }
 
         if FILE_OPEN_EVENTS.output::<FileOpenEvent>(&*e, 0).is_err() {
-            warn!(
-                ctx,
-                "sensor-linux-ebpf: ring buffer full, dropping open event"
-            );
+            crate::count_ring_drop(sensor_linux_wire::ring::FILE_OPEN);
         }
     }
 
