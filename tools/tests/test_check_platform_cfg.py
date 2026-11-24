@@ -53,6 +53,111 @@ class CountPlatformCfg(unittest.TestCase):
         self.assertEqual(tool.count_platform_cfg(text), 1)
 
 
+class CfgTestItems(unittest.TestCase):
+    """What a column-0 `#[cfg(test)]` hides, and what it must not."""
+
+    def test_a_cfg_test_use_does_not_hide_the_code_after_it(self) -> None:
+        text = "\n".join([
+            "#[cfg(test)]",
+            "use ring::signature::KeyPair;",
+            "",
+            "#[cfg(windows)]",
+            "fn platform_branch() {}",
+        ])
+        self.assertEqual(tool.count_platform_cfg(text), 1)
+
+    def test_a_cfg_test_mod_declaration_does_not_hide_the_code_after_it(self) -> None:
+        text = "\n".join([
+            "#[cfg(test)]",
+            "mod tests;",
+            "#[cfg(target_os = \"linux\")]",
+            "fn platform_branch() {}",
+        ])
+        self.assertEqual(tool.count_platform_cfg(text), 1)
+
+    def test_a_test_module_in_the_middle_hides_only_itself(self) -> None:
+        text = "\n".join([
+            "#[cfg(test)]",
+            "mod first {",
+            "    #[cfg(unix)]",
+            "    fn fixture() {}",
+            "}",
+            "",
+            "#[cfg(windows)]",
+            "fn between() {}",
+            "",
+            "#[cfg(test)]",
+            "mod second {",
+            "    #[cfg(unix)]",
+            "    fn fixture() {}",
+            "}",
+            "#[cfg(unix)]",
+            "fn after() {}",
+        ])
+        self.assertEqual(tool.count_platform_cfg(text), 2)
+
+    def test_a_brace_at_column_zero_inside_a_raw_string_does_not_end_the_module(self) -> None:
+        text = "\n".join([
+            "#[cfg(test)]",
+            "mod tests {",
+            '    const RULE: &str = r#"',
+            "rule x {",
+            "}",
+            '"#;',
+            "    #[cfg(unix)]",
+            "    fn fixture() {}",
+            "}",
+            "#[cfg(windows)]",
+            "fn real() {}",
+        ])
+        self.assertEqual(tool.count_platform_cfg(text), 1)
+
+    def test_a_cfg_test_module_with_attributes_and_blank_lines_is_skipped(self) -> None:
+        text = "\n".join([
+            "#[cfg(test)]",
+            "#[allow(clippy::unwrap_used)]",
+            "",
+            "mod tests {",
+            "    #[cfg(windows)]",
+            "    fn fixture() {}",
+            "}",
+        ])
+        self.assertEqual(tool.count_platform_cfg(text), 0)
+
+
+class MultiLineCfg(unittest.TestCase):
+    def test_a_cfg_split_over_several_lines_counts_once(self) -> None:
+        text = "\n".join([
+            "#[cfg(any(",
+            '    target_os = "linux",',
+            '    target_os = "macos",',
+            "))]",
+            "fn platform_branch() {}",
+        ])
+        self.assertEqual(tool.count_platform_cfg(text), 1)
+
+    def test_a_split_cfg_without_a_platform_does_not_count(self) -> None:
+        text = "\n".join([
+            "#[cfg(all(",
+            '    feature = "tls",',
+            "    not(test),",
+            "))]",
+            "fn gated() {}",
+        ])
+        self.assertEqual(tool.count_platform_cfg(text), 0)
+
+    def test_a_platform_word_after_the_closing_parenthesis_does_not_count(self) -> None:
+        text = "\n".join([
+            '#[cfg(feature = "tls")]',
+            "fn linux() {}",
+        ])
+        self.assertEqual(tool.count_platform_cfg(text), 0)
+
+    def test_an_unbalanced_cfg_does_not_run_away(self) -> None:
+        text = "\n".join(["#[cfg(any("] + ["let x = 1;"] * 100 + ["#[cfg(windows)]", "fn f() {}"])
+        self.assertGreaterEqual(tool.count_platform_cfg(text), 1)
+
+
 def tree(extra: dict[str, int]) -> dict[str, int]:
     """A tree where every exception sits at its ceiling, plus `extra` files."""
     counts = {path: ceiling for path, (ceiling, _) in tool.EXCEPTIONS.items()}

@@ -10,19 +10,27 @@ Three kinds of path:
 
 - **Allowed**: `crates/sensors/`, `crates/updater/`, `crates/response/src/quarantine.rs`
   (CLAUDE.md), `apps/` (each binary owns its OS entry point), `tools/` (the release tool is
-  an operator binary) and test code (any `tests` directory, `tests.rs`, a file's own `#[cfg(test)]` module). No limit.
+  an operator binary) and test code (any `tests` directory, `tests.rs`, and the items a
+  `#[cfg(test)]` at column 0 opens). No limit.
 - **Exceptions**: the core-crate files in `EXCEPTIONS`, each with the number of platform
   branches it holds today and the reason. The number is a ceiling: a file may lose branches
   (lower the number in the same change), never gain them. A new exception needs a line here
   with its reason, and the same reason in CLAUDE.md.
 - **Everything else**: no platform branch at all.
 
-Counting is by source line: a non-comment line with `cfg(`, `cfg!(` or `cfg_attr(` followed by
+Counting is by attribute or macro: a `cfg(`, `cfg!(` or `cfg_attr(` in a non-comment line,
+read up to its closing parenthesis (rustfmt splits a long one over several lines), that names
 `target_os`, `target_family`, `windows`, `unix`, `macos` or `linux`. A `cfg(test)` or
-`cfg(feature = ...)` line does not count.
+`cfg(feature = ...)` does not count. An item behind a column-0 `#[cfg(test)]` is skipped:
+a one-line item (`use`, `mod tests;`) alone, a block (`mod tests { ... }`) up to the `}` at
+column 0 that closes it (the next line must start another item, since a raw-string fixture can
+hold a `}` at column 0). Code after it is counted.
+
+Not checked: the other half of the CLAUDE.md rule, that platform dependencies are
+target-gated (`[target.'cfg(windows)'.dependencies]`) in `Cargo.toml`.
 
 Run from the repository root: `python3 tools/check-platform-cfg.py`
-Exits non-zero listing every offender. CI runs this in the `content` job.
+Exits non-zero listing every offender. CI runs this in the `lint` job.
 """
 
 from __future__ import annotations
@@ -72,20 +80,79 @@ def is_test_path(path: str) -> bool:
     return "tests" in parts[:-1] or parts[-1] == "tests.rs"
 
 
-def count_platform_cfg(text: str) -> int:
-    """Source lines of `text` that hold a platform `cfg`, comments and unit tests left out.
+_LOOKAHEAD = 20  # lines an attribute may span; an unbalanced one is not chased further
 
-    The unit tests of a file are its `#[cfg(test)]` module, which by convention starts at
-    column 0 and runs to the end of the file; platform branches in it are test fixtures.
+
+def _cfg_text(lines: list[str], index: int, start: int) -> str:
+    """The `cfg(...)` that begins at `lines[index][start:]`, up to its closing parenthesis."""
+    text = lines[index][start:]
+    depth = text.count("(") - text.count(")")
+    following = index + 1
+    while depth > 0 and following < min(len(lines), index + _LOOKAHEAD):
+        text += " " + lines[following].strip()
+        depth += lines[following].count("(") - lines[following].count(")")
+        following += 1
+    return text
+
+
+def _skip_test_item(lines: list[str], index: int) -> int:
+    """Index of the first line after the item a column-0 `#[cfg(test)]` at `index` opens.
+
+    A one-line item or one that ends in `;` is skipped alone; an item with a body runs to the
+    `}` at column 0 that rustfmt puts at its end.
     """
+    i = index + 1
+    while i < len(lines):
+        line = lines[i].strip()
+        if line.startswith("#[") or line == "":
+            i += 1
+            continue
+        if line.endswith(";"):
+            return i + 1
+        if "{" in line:
+            while i < len(lines) and not _closes_item(lines, i):
+                i += 1
+            return i + 1
+        i += 1
+    return i
+
+
+_ITEM_START = re.compile(
+    r"(?:#\[|#!\[|//|/\*|pub\b|use\b|mod\b|fn\b|const\b|static\b|struct\b|enum\b|"
+    r"union\b|trait\b|impl\b|type\b|extern\b|unsafe\b|async\b|macro_rules!)"
+)
+
+
+def _closes_item(lines: list[str], index: int) -> bool:
+    """Whether `lines[index]` is the `}` at column 0 that ends a top-level item.
+
+    A `}` at column 0 can also sit inside a raw string (a test fixture), so the next non-blank
+    line must be the end of the file or start another item.
+    """
+    if lines[index] != "}":
+        return False
+    for following in lines[index + 1:]:
+        if following.strip() == "":
+            continue
+        return _ITEM_START.match(following) is not None
+    return True
+
+
+def count_platform_cfg(text: str) -> int:
+    """Platform `cfg` attributes and macros in `text`, comments and `#[cfg(test)]` items left out."""
+    lines = text.splitlines()
     count = 0
-    for line in text.splitlines():
+    i = 0
+    while i < len(lines):
+        line = lines[i]
         if line.startswith("#[cfg(test)]"):
-            break
+            i = _skip_test_item(lines, i)
+            continue
+        i += 1
         if line.lstrip().startswith("//"):
             continue
         found = _CFG.search(line)
-        if found and _PLATFORM.search(line, found.end()):
+        if found and _PLATFORM.search(_cfg_text(lines, i - 1, found.start())):
             count += 1
     return count
 

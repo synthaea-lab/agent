@@ -71,8 +71,10 @@ New crate? Add it to the rules in `tools/check-deps.py` in the same change.
   Platform deps must be target-gated: `[target.'cfg(windows)'.dependencies]`, never
   unconditional.
 - `tools/check-platform-cfg.py` enforces this in CI (`lint` job). It counts source lines with a
-  platform `cfg` (`target_os`, `target_family`, `windows`, `unix`, `macos`, `linux`), leaving out
-  comments and a file's own `#[cfg(test)]` module. Not counted at all: the places above, `apps/`
+  platform `cfg` (`target_os`, `target_family`, `windows`, `unix`, `macos`, `linux`; an attribute
+  split over several lines counts once), leaving out comments and the items a column-0
+  `#[cfg(test)]` opens (a `use`, `mod tests;`, a test module). It does not look at
+  `Cargo.toml`: that platform dependencies are target-gated is not enforced by it. Not counted at all: the places above, `apps/`
   (each binary owns its OS entry point), `tools/` and test code. Everywhere else the count is
   zero, except the core-crate files in the script's `EXCEPTIONS` table, which hold a ceiling
   that may go down, never up. The exceptions, each with its reason:
