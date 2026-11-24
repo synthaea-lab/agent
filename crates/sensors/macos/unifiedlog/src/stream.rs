@@ -96,7 +96,7 @@ impl<R: BufRead> NormalizedLogStream<R> {
     }
 
     /// A stream that adds to `counters`, created by the agent and injected, like
-    /// [`sensor_macos_network_extension`]'s `NormalizedNeStream::with_counters` and the Windows
+    /// `sensor-macos-network-extension`'s `NormalizedNeStream::with_counters` and the Windows
     /// `EtwShedding`: the macOS health beacon (#34) reads the handle the agent already holds.
     pub fn with_counters(reader: R, counters: Arc<StreamCounters>) -> Self {
         Self {
