@@ -1,7 +1,7 @@
 //! Explicit timestamp requests: `inode_setattr` LSM hook (#1036, #1044)
 //!
 //! Fires for every attribute change that reaches `notify_change`, whichever syscall (or
-//! io_uring op) asked: `utimensat`, `utimes`, `futimens`. `ia_valid` tells which attributes
+//! `io_uring` op) asked: `utimensat`, `utimes`, `futimens`. `ia_valid` tells which attributes
 //! the caller named; `ATTR_ATIME_SET`/`ATTR_MTIME_SET` mean the caller chose the time itself,
 //! as opposed to `ATTR_ATIME`/`ATTR_MTIME` alone, which the kernel fills with "now" (a write,
 //! `touch` without `-d`, `UTIME_NOW`). Only the former is timestomping.
@@ -63,8 +63,13 @@ static SET_TIME_SCRATCH: PerCpuArray<FileSetTimeEvent> = PerCpuArray::with_max_e
 /// Reads a `struct timespec64` (`tv_sec` at 0, `tv_nsec` at 8) at `base + offset`.
 #[inline(always)]
 fn read_timespec(base: *const u8, offset: u32) -> Option<(i64, i64)> {
+    // SAFETY: `base` is the hook's `struct iattr *`, never dereferenced here: `at` and
+    // `at + 8` only feed `bpf_probe_read_kernel`, which fails on a bad address instead of
+    // faulting. `offset` is a BTF-resolved field offset inside that struct.
     let at = unsafe { base.add(offset as usize) };
+    // SAFETY: as above, a checked kernel read at a computed address.
     let sec: i64 = unsafe { bpf_probe_read_kernel(at.cast::<i64>()) }.ok()?;
+    // SAFETY: as above.
     let nsec: i64 = unsafe { bpf_probe_read_kernel(at.add(8).cast::<i64>()) }.ok()?;
     Some((sec, nsec))
 }
@@ -91,6 +96,9 @@ fn try_inode_setattr(ctx: LsmContext) -> Result<i32, i32> {
         return Ok(0);
     }
 
+    // SAFETY: `attr` is the hook's `struct iattr *` (null checked above) and
+    // `IATTR_VALID_OFFSET` its BTF-resolved `ia_valid` offset; the read goes through
+    // `bpf_probe_read_kernel`, which fails (handled below) on a bad address.
     let ia_valid: u32 = match unsafe {
         bpf_probe_read_kernel(attr.add(IATTR_VALID_OFFSET.load() as usize).cast::<u32>())
     } {
@@ -111,6 +119,11 @@ fn try_inode_setattr(ctx: LsmContext) -> Result<i32, i32> {
     let comm = bpf_get_current_comm().map_err(|_| 0i32)?;
     let uid_gid = aya_ebpf::helpers::bpf_get_current_uid_gid();
     let e = SET_TIME_SCRATCH.get_ptr_mut(0).ok_or(0i32)?;
+    // SAFETY: `e` is this CPU's per-CPU scratch slot (crate-level Safety section). The dentry
+    // walk reads `d_parent` and the `d_name.name` pointer of kernel `struct dentry` pointers
+    // (the hook's `dentry`, null checked above, then each parent) only through
+    // `bpf_probe_read_kernel`/`_str_bytes`, at BTF-resolved offsets; a failed read ends the
+    // walk.
     unsafe {
         core::ptr::write_bytes(e, 0, 1);
         fill_event_meta(

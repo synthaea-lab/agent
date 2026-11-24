@@ -76,7 +76,7 @@ const SIGKILL: u32 = 9;
 static SIGNAL_SCRATCH: PerCpuArray<SignalEvent> = PerCpuArray::with_max_entries(1, 0);
 
 /// Offsets of the `syscalls:sys_enter_kill` tracepoint: `pid`(16), `sig`(24) on
-/// x86_64/aarch64 — same inferred-not-verified status as the mount offsets above.
+/// `x86_64/aarch64` — same inferred-not-verified status as the mount offsets above.
 #[cfg(any(bpf_target_arch = "x86_64", bpf_target_arch = "aarch64"))]
 const KILL_PID_OFFSET: usize = 16;
 #[cfg(any(bpf_target_arch = "x86_64", bpf_target_arch = "aarch64"))]
@@ -87,7 +87,7 @@ const KILL_PID_OFFSET: usize = 12;
 const KILL_SIG_OFFSET: usize = 16;
 
 /// Offsets of the `syscalls:sys_enter_tgkill` tracepoint: `tgid`(16), `tid`(24),
-/// `sig`(32) on x86_64/aarch64 — same inferred-not-verified status as the mount
+/// `sig`(32) on `x86_64/aarch64` — same inferred-not-verified status as the mount
 /// offsets above. `tgid` is the field compared against `SIGNAL_WATCH_PID`, the
 /// same whole-process identity `kill(2)`'s `pid` argument carries — `tid` (the
 /// specific thread within that group) is read but not otherwise used.

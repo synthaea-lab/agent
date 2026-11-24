@@ -30,7 +30,7 @@ const MS_RDONLY: u64 = 1;
 /// Offsets of the `syscalls:sys_enter_mount` tracepoint: `dev_name`(16, the
 /// `source` arg), `dir_name`(24, `target`), `type`(32, `filesystemtype`),
 /// `flags`(40, `mountflags`), `data`(48, unread). Verified on 2026-09-23 on Ubuntu
-/// 22.04 (kernel 5.15.0-91-generic, x86_64) via
+/// 22.04 (kernel 5.15.0-91-generic, `x86_64`) via
 /// `/sys/kernel/tracing/events/syscalls/sys_enter_mount/format` — matched the
 /// standard `syscalls:*` layout inferred here on first write, no offset changes
 /// needed.
@@ -58,7 +58,7 @@ const MOUNT_FLAGS_OFFSET: usize = 24;
 /// below keep saying "`umount2(2)`" for the libc call itself, which IS
 /// `umount2()`, while the identifiers here match the kernel's own name).
 /// Offsets: `name`(16, the target path), `flags`(24). Verified on 2026-09-23 on
-/// Ubuntu 22.04 (kernel 5.15.0-91-generic, x86_64) via
+/// Ubuntu 22.04 (kernel 5.15.0-91-generic, `x86_64`) via
 /// `/sys/kernel/tracing/events/syscalls/sys_enter_umount/format`.
 #[cfg(any(bpf_target_arch = "x86_64", bpf_target_arch = "aarch64"))]
 const UMOUNT_TARGET_PTR_OFFSET: usize = 16;
@@ -145,25 +145,22 @@ fn emit_mount_event(
             &comm,
         );
 
-        if mount_point_ptr != 0 {
-            if let Ok(path) =
+        if mount_point_ptr != 0
+            && let Ok(path) =
                 bpf_probe_read_user_str_bytes(mount_point_ptr as *const u8, &mut (*e).mount_point)
-            {
-                (*e).mount_point_len = path.len() as u16;
-            }
+        {
+            (*e).mount_point_len = path.len() as u16;
         }
-        if source_ptr != 0 {
-            if let Ok(path) =
+        if source_ptr != 0
+            && let Ok(path) =
                 bpf_probe_read_user_str_bytes(source_ptr as *const u8, &mut (*e).source)
-            {
-                (*e).source_len = path.len() as u16;
-            }
+        {
+            (*e).source_len = path.len() as u16;
         }
-        if fstype_ptr != 0 {
-            if let Ok(s) = bpf_probe_read_user_str_bytes(fstype_ptr as *const u8, &mut (*e).fs_type)
-            {
-                (*e).fs_type_len = s.len() as u8;
-            }
+        if fstype_ptr != 0
+            && let Ok(s) = bpf_probe_read_user_str_bytes(fstype_ptr as *const u8, &mut (*e).fs_type)
+        {
+            (*e).fs_type_len = s.len() as u8;
         }
         (*e).readonly = mounted && (flags & MS_RDONLY) != 0;
         (*e).mounted = mounted;

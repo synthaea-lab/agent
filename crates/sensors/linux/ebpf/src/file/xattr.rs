@@ -27,9 +27,9 @@ static FILE_REMOVEXATTR_EVENTS: RingBuf = RingBuf::with_byte_size(256 * 1024, 0)
 #[map]
 static REMOVEXATTR_SCRATCH: PerCpuArray<FileRemovexattrEvent> = PerCpuArray::with_max_entries(1, 0);
 
-/// Offsets of the `syscalls:sys_enter_setxattr` tracepoint (x86_64/aarch64):
+/// Offsets of the `syscalls:sys_enter_setxattr` tracepoint (`x86_64`/`aarch64`):
 /// `pathname`(16), `name`(24), `value`(32, unused), `size`(40, unused), `flags`(48,
-/// unused). Verified on 2026-09-22 on Alpine (kernel 6.18.50-0-virt, x86_64) via
+/// unused). Verified on 2026-09-22 on Alpine (kernel 6.18.50-0-virt, `x86_64`) via
 /// `/sys/kernel/tracing/events/syscalls/sys_enter_setxattr/format`.
 #[cfg(any(bpf_target_arch = "x86_64", bpf_target_arch = "aarch64"))]
 const SETXATTR_PATHNAME_PTR_OFFSET: usize = 16;
@@ -78,20 +78,19 @@ fn try_sys_enter_setxattr(ctx: TracePointContext) -> Result<u32, u32> {
             &comm,
         );
 
-        if pathname_ptr != 0 {
-            if let Ok(path) =
+        if pathname_ptr != 0
+            && let Ok(path) =
                 bpf_probe_read_user_str_bytes(pathname_ptr as *const u8, &mut (*e).path)
-            {
-                if is_filtered_path(path, 0, true) {
-                    return Ok(0);
-                }
-                (*e).path_len = path.len() as u16;
+        {
+            if is_filtered_path(path, 0, true) {
+                return Ok(0);
             }
+            (*e).path_len = path.len() as u16;
         }
-        if name_ptr != 0 {
-            if let Ok(name) = bpf_probe_read_user_str_bytes(name_ptr as *const u8, &mut (*e).name) {
-                (*e).name_len = name.len() as u16;
-            }
+        if name_ptr != 0
+            && let Ok(name) = bpf_probe_read_user_str_bytes(name_ptr as *const u8, &mut (*e).name)
+        {
+            (*e).name_len = name.len() as u16;
         }
 
         if FILE_SETXATTR_EVENTS
@@ -108,9 +107,9 @@ fn try_sys_enter_setxattr(ctx: TracePointContext) -> Result<u32, u32> {
     Ok(0)
 }
 
-/// Offsets of the `syscalls:sys_enter_removexattr` tracepoint (x86_64/aarch64):
+/// Offsets of the `syscalls:sys_enter_removexattr` tracepoint (`x86_64`/`aarch64`):
 /// `pathname`(16), `name`(24). Verified on 2026-09-22 on Alpine (kernel
-/// 6.18.50-0-virt, x86_64) via
+/// 6.18.50-0-virt, `x86_64`) via
 /// `/sys/kernel/tracing/events/syscalls/sys_enter_removexattr/format`.
 #[cfg(any(bpf_target_arch = "x86_64", bpf_target_arch = "aarch64"))]
 const REMOVEXATTR_PATHNAME_PTR_OFFSET: usize = 16;
@@ -159,20 +158,19 @@ fn try_sys_enter_removexattr(ctx: TracePointContext) -> Result<u32, u32> {
             &comm,
         );
 
-        if pathname_ptr != 0 {
-            if let Ok(path) =
+        if pathname_ptr != 0
+            && let Ok(path) =
                 bpf_probe_read_user_str_bytes(pathname_ptr as *const u8, &mut (*e).path)
-            {
-                if is_filtered_path(path, 0, true) {
-                    return Ok(0);
-                }
-                (*e).path_len = path.len() as u16;
+        {
+            if is_filtered_path(path, 0, true) {
+                return Ok(0);
             }
+            (*e).path_len = path.len() as u16;
         }
-        if name_ptr != 0 {
-            if let Ok(name) = bpf_probe_read_user_str_bytes(name_ptr as *const u8, &mut (*e).name) {
-                (*e).name_len = name.len() as u16;
-            }
+        if name_ptr != 0
+            && let Ok(name) = bpf_probe_read_user_str_bytes(name_ptr as *const u8, &mut (*e).name)
+        {
+            (*e).name_len = name.len() as u16;
         }
 
         if FILE_REMOVEXATTR_EVENTS
