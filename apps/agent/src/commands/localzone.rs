@@ -132,13 +132,17 @@ mod imp {
     }
 }
 
+/// `TZ` is process-wide: every test that sets it holds this lock for its whole body.
+#[cfg(all(test, unix))]
+pub(super) static TZ_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 #[cfg(all(test, unix))]
 mod tests {
-    use super::{configured, utc_offset_minutes_at};
+    use super::{TZ_LOCK, configured, utc_offset_minutes_at};
 
     // POSIX `TZ` rules are used instead of zoneinfo names so the result does not depend on the
     // host's tzdata. Windows reads the machine's zone setting, which a test cannot change.
-    // `TZ` is process-wide: this is the only test in the agent that reads or sets it.
+    // `TZ` is process-wide: the tests that set it (here and in `common::tests`) hold `TZ_LOCK`.
     // 2026 transitions. Europe (CET/CEST): UTC 01:00 on 29 March and on 25 October.
     // US Eastern: 07:00 UTC on 8 March (02:00 local), 06:00 UTC on 1 November.
     const EU_SPRING: i64 = 1_774_746_000;
@@ -146,13 +150,16 @@ mod tests {
     const US_SPRING: i64 = 1_772_953_200;
 
     fn set_tz(rule: &str) {
-        // SAFETY: the only test in this binary that touches `TZ`, and no other test converts
+        // SAFETY: every test that touches `TZ` holds `TZ_LOCK`, and no other test converts
         // local time, so nothing reads or writes it concurrently.
         unsafe { std::env::set_var("TZ", rule) };
     }
 
     #[test]
     fn the_offset_follows_the_zones_daylight_saving_rules_at_each_instant() {
+        let _tz = TZ_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         set_tz("CET-1CEST,M3.5.0,M10.5.0/3");
         assert!(configured());
         assert_eq!(

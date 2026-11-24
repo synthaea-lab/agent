@@ -744,4 +744,68 @@ mod tests {
         );
         drop(pipeline);
     }
+
+    /// #15: the agent's own wiring of the platform zone. `localzone` and the rules each have
+    /// tests; this one runs `apply_detection` and reads what the rules then decide.
+    #[cfg(unix)]
+    mod zone_wiring {
+        use super::*;
+
+        const MIDNIGHT_UTC: u64 = 1_793_318_400 * 1_000_000_000;
+        const HOUR: u64 = 3_600_000_000_000;
+
+        fn sink(name: &str) -> (Arc<DetectionSink>, std::path::PathBuf) {
+            finish_run_sink(name)
+        }
+
+        fn odd_hour_alerts(sink: &DetectionSink, hour_utc: u64) -> usize {
+            let event = schema::AuthEvent {
+                target_user: "mallory".into(),
+                meta: schema::EventMeta {
+                    timestamp_ns: MIDNIGHT_UTC + hour_utc * HOUR,
+                    ..schema::fixtures::meta()
+                },
+                ..schema::fixtures::auth()
+            };
+            sink.auth_alerts_for_test(&event)
+                .iter()
+                .filter(|a| a.message.contains("outside the working hours"))
+                .count()
+        }
+
+        fn set_tz(rule: &str) {
+            // SAFETY: the caller holds `TZ_LOCK`, which every test touching `TZ` takes.
+            unsafe { std::env::set_var("TZ", rule) };
+        }
+
+        #[test]
+        fn the_platform_zone_turns_the_rule_on_and_the_operator_offset_wins_over_it() {
+            let _tz = super::super::localzone::TZ_LOCK
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+            // Zone only: UTC+9 (no daylight saving). 12:00 UTC is 21:00 on the host, after the
+            // working day; 02:00 UTC is 11:00, inside it.
+            set_tz("JST-9");
+            let (zone_only, dir_a) = sink("zone-only");
+            apply_detection(&zone_only, &config::DetectionConfig::default());
+            assert_eq!(odd_hour_alerts(&zone_only, 12), 1, "21:00 host time");
+            assert_eq!(odd_hour_alerts(&zone_only, 2), 0, "11:00 host time");
+
+            // The same zone, and an operator offset of UTC-5: the offset decides. 12:00 UTC is
+            // now 07:00 on the host (inside), 02:00 UTC is 21:00 the day before (outside).
+            let (overridden, dir_b) = sink("zone-overridden");
+            let operator = config::DetectionConfig {
+                utc_offset_minutes: Some(-300),
+                ..config::DetectionConfig::default()
+            };
+            apply_detection(&overridden, &operator);
+            assert_eq!(odd_hour_alerts(&overridden, 12), 0, "07:00 host time");
+            assert_eq!(odd_hour_alerts(&overridden, 2), 1, "21:00 host time");
+
+            drop((zone_only, overridden));
+            let _ = std::fs::remove_dir_all(dir_a);
+            let _ = std::fs::remove_dir_all(dir_b);
+        }
+    }
 }
