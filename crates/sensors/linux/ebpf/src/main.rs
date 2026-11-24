@@ -116,9 +116,10 @@ pub(crate) fn fill_event_meta(
     meta.uid = uid_gid as u32;
     meta.gid = (uid_gid >> 32) as u32;
     // SAFETY: neither helper takes an argument; both only read the clock or the current task.
-    meta.timestamp_ns = unsafe { aya_ebpf::helpers::bpf_ktime_get_ns() };
-    // SAFETY: as above.
-    meta.cgroup_id = unsafe { aya_ebpf::helpers::bpf_get_current_cgroup_id() };
+    unsafe {
+        meta.timestamp_ns = aya_ebpf::helpers::bpf_ktime_get_ns();
+        meta.cgroup_id = aya_ebpf::helpers::bpf_get_current_cgroup_id();
+    }
     let mut i = 0usize;
     while i < TASK_COMM_LEN {
         meta.comm[i] = comm[i];

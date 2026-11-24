@@ -260,6 +260,49 @@ fn a_metadata_only_volume_open_does_not_enter_the_raw_volume_route() {
 }
 
 #[test]
+fn a_sigma_detection_carries_its_attack_ids_not_its_raw_tags() {
+    let dir = tmp("sigma-technique-ids");
+    let platform_dir = sigma::Platform::host()
+        .expect("supported CI platform")
+        .dir_name();
+    let sigma_dir = dir.join("content/rules/sigma").join(platform_dir);
+    std::fs::create_dir_all(&sigma_dir).unwrap();
+    std::fs::write(
+        sigma_dir.join("tagged.yml"),
+        "title: Tagged rule\ndescription: test\ntags:\n  - attack.execution\n  - attack.t1059.004\n  - attack.defense_evasion\n  - attack.t1027\nlevel: high\nfalsepositives:\n  - none\ndetection:\n  selection:\n    CommandLine|contains: 'tagged-marker'\n  condition: selection\n",
+    )
+    .unwrap();
+    let spool = Arc::new(Mutex::new(
+        store::EventSpool::open(&dir.join("detection-spool"), u64::MAX).unwrap(),
+    ));
+    let sink = Arc::new(
+        DetectionSink::new(
+            rules::RuleState::new(),
+            &dir.join("alerts.ndjson"),
+            None,
+            None,
+            Some(Arc::clone(&spool)),
+            &dir.join("content"),
+            &dir.join("ml-registry"),
+        )
+        .unwrap(),
+    );
+    let mut exec = schema::fixtures::exec();
+    exec.cmdline = "/usr/bin/true tagged-marker".into();
+    sink.on_event(Event::Exec(exec));
+    assert!(sink.enrich_queue.flush(std::time::Duration::from_secs(10)));
+
+    let detections: Vec<transport::QueuedDetection> = spool.lock().unwrap().drain_oldest().unwrap();
+    let sigma = detections
+        .iter()
+        .find(|queued| queued.detection.title == "Tagged rule")
+        .unwrap_or_else(|| panic!("the Sigma rule should detect: {detections:?}"));
+    // Not `attack.execution`/`attack.t1059.004`/...: the server's case grouping reduces
+    // each id to its base before the first `.`, and every raw tag reduces to `attack`.
+    assert_eq!(sigma.detection.techniques, vec!["T1059.004", "T1027"]);
+}
+
+#[test]
 fn sigma_sees_raw_exec_but_alert_and_event_outputs_are_redacted() {
     let dir = tmp("cmdline-redaction-e2e");
     // The engine only loads the running host's own platform directory (#980) -- write the

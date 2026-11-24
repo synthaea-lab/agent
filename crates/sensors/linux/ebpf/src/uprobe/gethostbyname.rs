@@ -17,10 +17,10 @@ use aya_ebpf::{
     maps::{HashMap, PerCpuArray},
     programs::{ProbeContext, RetProbeContext},
 };
-use sensor_linux_wire::{GetAddrInfoEvent, MAX_DNS_ANSWERS, TASK_COMM_LEN};
+use sensor_linux_wire::{GetAddrInfoEvent, MAX_DNS_ANSWERS};
 
 use super::getaddrinfo::DNS_QUERY_EVENTS;
-use crate::{AF_INET, AF_INET6, fill_lineage};
+use crate::{AF_INET, AF_INET6, fill_event_meta};
 
 /// Per-CPU scratch for one event, separate from `DNS_SCRATCH` so the two exit programs
 /// never share a buffer.
@@ -161,16 +161,7 @@ fn try_gethostbyname_exit(ctx: RetProbeContext) -> Result<u32, u32> {
     let uid_gid = aya_ebpf::helpers::bpf_get_current_uid_gid();
 
     unsafe {
-        (*e).meta.pid = (pid_tgid >> 32) as u32;
-        fill_lineage(&mut (*e).meta);
-        (*e).meta.uid = uid_gid as u32;
-        (*e).meta.gid = (uid_gid >> 32) as u32;
-        (*e).meta.timestamp_ns = aya_ebpf::helpers::bpf_ktime_get_ns();
-        let mut i = 0usize;
-        while i < TASK_COMM_LEN {
-            (*e).meta.comm[i] = comm[i];
-            i += 1;
-        }
+        fill_event_meta(&mut (*e).meta, (pid_tgid >> 32) as u32, uid_gid, &comm);
 
         if let Ok(query) = bpf_probe_read_user_str_bytes(name_ptr as *const u8, &mut (*e).query) {
             (*e).query_len = query.len() as u16;

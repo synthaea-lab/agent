@@ -151,8 +151,7 @@ only, permission, timeout) leaves them `None`. That cache is not bounded; the nu
 over a host's uptime is expected to stay small.
 
 Limits: cgroup v2 only (`bpf_get_current_cgroup_id` reads the v2 hierarchy); Kubernetes pod and
-namespace context is not extracted; rootless podman and the podman socket are not covered; uprobe
-events carry no cgroup id at all ([uprobes](uprobes.md#limits)).
+namespace context is not extracted; rootless podman and the podman socket are not covered.
 
 ## Other per-event context
 

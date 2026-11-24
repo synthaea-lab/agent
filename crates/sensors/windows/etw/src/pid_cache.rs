@@ -7,6 +7,8 @@
 
 use std::collections::HashMap;
 
+use crate::shed::ShedCounter;
+
 /// pid → full image path, process sequence number and server silo, never
 /// larger than its cap. Explicit [`Self::remove`] on
 /// `ProcessEnd` is the correctness path (PID recycling); LRU eviction is only the
@@ -16,7 +18,7 @@ pub(crate) struct PidCache {
     entries: HashMap<u32, Entry>,
     cap: usize,
     tick: u64,
-    evicted: u64,
+    evicted: ShedCounter,
 }
 
 struct Entry {
@@ -37,13 +39,23 @@ impl PidCache {
     /// # Panics
     ///
     /// Panics when `cap` is 0 — a configuration bug, not a runtime condition.
+    #[cfg(test)]
     pub(crate) fn new(cap: usize) -> Self {
+        Self::counting(cap, ShedCounter::default())
+    }
+
+    /// A cache whose evictions are counted into `evicted`, which the health beacon reads.
+    ///
+    /// # Panics
+    ///
+    /// Panics when `cap` is 0.
+    pub(crate) fn counting(cap: usize, evicted: ShedCounter) -> Self {
         assert!(cap >= 1, "PidCache cap must be >= 1");
         Self {
             entries: HashMap::new(),
             cap,
             tick: 0,
-            evicted: 0,
+            evicted,
         }
     }
 
@@ -135,9 +147,9 @@ impl PidCache {
 
     /// Entries dropped by the cap since creation — non-zero means `ProcessEnd`
     /// events were lost (or the cap is too small for this host).
-    #[cfg_attr(not(test), allow(dead_code))] // read by a future health surface
+    #[cfg(test)]
     pub(crate) fn evicted(&self) -> u64 {
-        self.evicted
+        self.evicted.get()
     }
 
     fn evict_batch(&mut self) {
@@ -150,11 +162,11 @@ impl PidCache {
         by_age.sort_unstable();
         for (_, pid) in by_age.into_iter().take(batch) {
             self.entries.remove(&pid);
-            self.evicted += 1;
+            self.evicted.add();
         }
         tracing::warn!(
             size = self.entries.len(),
-            evicted_total = self.evicted,
+            evicted_total = self.evicted.get(),
             "pid cache hit its cap — ProcessEnd events were likely lost"
         );
     }
@@ -219,6 +231,18 @@ mod tests {
         assert_eq!(cache.silo(42), Some(7));
         assert_eq!(cache.generation(42), Some(9));
         assert!(cache.get(42).is_none());
+    }
+
+    #[test]
+    fn evictions_are_counted_into_the_counter_a_reader_holds() {
+        let beacon_side = ShedCounter::default();
+        let mut cache = PidCache::counting(8, beacon_side.clone());
+        for pid in 0..9 {
+            cache.insert(pid, format!(r"C:\img\{pid}.exe"), None, None);
+        }
+        // Cap 8 evicts one entry (`cap / 8`) when the 9th arrives.
+        assert_eq!(beacon_side.get(), 1);
+        assert_eq!(cache.evicted(), 1);
     }
 
     #[test]
