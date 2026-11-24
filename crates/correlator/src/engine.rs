@@ -3,7 +3,7 @@
 
 use std::{collections::VecDeque, time::Duration};
 
-use schema::{Event, ExecEvent, HttpRequestEvent, detection::Severity};
+use schema::{Event, EventMeta, ExecEvent, HttpRequestEvent, detection::Severity};
 use store::BoundedMap;
 
 use crate::{
@@ -18,6 +18,23 @@ use crate::{
         rule_web_request_shell, web_request_is_after_shell, web_request_key,
     },
 };
+
+/// Why [`CorrelationEngine::update_belief_with_ml`] could not add an ML score.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum MlUpdateError {
+    /// The bus holds no event for this incarnation of the pid.
+    #[error("no event for pid {pid} in the correlation window")]
+    UnknownPid {
+        /// The pid the score was for.
+        pid: u32,
+    },
+    /// The pid's entity has no belief for this incarnation of its parent.
+    #[error("no belief for the entity of pid {pid}")]
+    NoBelief {
+        /// The pid the score was for.
+        pid: u32,
+    },
+}
 
 /// Processes excluded from the correlation engine — legitimate system activity that
 /// generates noise (spawn + connection) under normal conditions. Same logic as the
@@ -232,13 +249,7 @@ impl CorrelationEngine {
         // An access-log request has no pid: it only joins a web server's shell by time.
         // Record it, look for that pairing, and skip every pid-keyed step below.
         if let Event::HttpRequest(request) = &event {
-            self.bus.push(event.clone());
-            if self.recent_web_requests.len() == MAX_RECENT_WEB_REQUESTS {
-                self.recent_web_requests.pop_front();
-                self.web_shell_shedding.requests_evicted += 1;
-            }
-            self.recent_web_requests.push_back(request.clone());
-            self.observe_web_request(request);
+            self.record_web_request(request);
             return self.flush_web_shells();
         }
         let web_shell_event = match &event {
@@ -248,101 +259,16 @@ impl CorrelationEngine {
         let pid = event.meta().pid;
         let generation = event.meta().process_generation;
         let comm = event.meta().comm.clone();
-        let ppid = event.meta().ppid;
-        let parent_generation = event.meta().parent_process_generation;
-
-        // Record pid → (ppid, comm) as soon as the ExecEvent arrives.
-        // On Windows (ETW), the sensor does not fill in ppid for ConnectEvent
-        // (ppid=0 in EventMeta) — this table compensates. On Linux (eBPF), ppid
-        // is filled in on all events, so the table is redundant but harmless.
-        if let Event::Exec(exec) = &event {
-            if ppid != 0 {
-                self.pid_entities.insert(
-                    pid,
-                    Stamped {
-                        generation,
-                        value: EntityRef {
-                            ppid,
-                            comm: comm.clone(),
-                            parent_generation,
-                        },
-                    },
-                );
-            }
-            // Masquerade detection: an IGNORED-list or BAYES_NAME_EXCLUSIONS name is
-            // suspicious when EITHER the image path is not in a trusted system
-            // location (rename in %TEMP%/tmp) OR the parent is not the expected one
-            // (e.g. svchost.exe spawned by cmd.exe instead of services.exe). Either
-            // failure alone is enough — both conditions must hold for the exclusion
-            // to apply. Shared between both lists: a name only in one of them is
-            // simply never looked up by the other's gate below.
-            if (is_ignored(&comm) || is_bayes_excluded(&comm))
-                && (!policy::name_exclusion_applies(Some(exec.image_path.as_str()))
-                    || !policy::parent_exclusion_applies(&comm, exec.parent_comm.as_deref()))
-            {
-                self.masquerading.insert(pid, generation);
-            }
-        }
 
         if let Event::Exec(exec) = &event {
-            if ppid == 1
-                && !exec.image_path.is_empty()
-                && policy::service_main_path_is_trusted(exec.image_path.as_str())
-            {
-                self.service_mains.insert(pid, generation);
-            } else {
-                // Re-exec clears a stale entry (#755 review, Sollykhan 2026-10-19):
-                // `service_mains` was insert-only, so a pid once recorded as a
-                // service main (e.g. NetworkManager) kept that status on `self`
-                // forever, even after an `Exec` to an image that no longer
-                // qualifies — a compromised daemon's `execve("/tmp/x")` stayed
-                // immune to the BAYES kill on its new image. Any exec that does
-                // not (re-)qualify drops the pid's entry; a no-op when it was
-                // never a service main (`BoundedMap::remove` on an absent key).
-                self.service_mains.remove(&pid);
-            }
-            // The parent's image, not `service_mains`: the listener starts at boot,
-            // before the agent, so its exec is never seen (the 2026-11-05 e2e run:
-            // `parent_image_path` resolved from /proc, no exec for pid 2529). A copy
-            // of the real binary exec'd from a user's shell has that shell as parent
-            // and qualifies for nothing; the listener's parent is init, so it stays
-            // only a service main. Re-exec clears, as for `service_mains`.
-            if policy::is_login_session(exec.image_path.as_str(), exec.parent_image_path.as_deref())
-            {
-                self.login_sessions.insert(pid, generation);
-            } else {
-                self.login_sessions.remove(&pid);
-            }
+            self.record_pid_entity(event.meta());
+            self.record_exec_flags(exec, event.meta());
         }
 
         self.bus.push(event);
 
-        // Bayesian entity key: (ppid, comm) if known, otherwise (pid, comm).
-        // Keying by (ppid, comm) lets the belief survive respawns:
-        // fork+exec = new pid, same (ppid, comm) → same BeliefState.
-        let entity_key = self
-            .pid_entities
-            .get(&pid)
-            .filter(|entry| entry.current(generation))
-            .map(|entry| entry.value.clone())
-            .unwrap_or_else(|| EntityRef {
-                ppid: pid,
-                comm: comm.clone(),
-                parent_generation: generation,
-            });
-
-        // Bayesian update with the pid's current BehaviorVector.
-        if let Some(bv) = self.behavior_vector_for_pid(pid, generation) {
-            let now_ns = self
-                .bus
-                .events_for_pid(pid, generation)
-                .map(|e| e.meta().timestamp_ns)
-                .max()
-                .unwrap_or(0);
-            let state = self.belief_or_insert(&entity_key, now_ns);
-            // No ML LLR in internal path — external callers use `update_belief_with_ml`.
-            update_belief(state, &bv, None, now_ns);
-        }
+        let entity_key = self.entity_key_for(pid, generation, &comm);
+        self.update_belief_for(pid, generation, &entity_key);
 
         let mut web_alerts =
             web_shell_event.map_or_else(Vec::new, |shell_event| self.queue_web_shell(shell_event));
@@ -350,24 +276,142 @@ impl CorrelationEngine {
         // and request vectors for every incoming telemetry event.
         web_alerts.extend(self.flush_web_shells());
 
-        if is_ignored(&comm) && !self.is_masquerading(pid, generation) {
-            return web_alerts;
+        web_alerts.extend(self.evaluate_rules_for(pid, generation, &comm, &entity_key));
+        web_alerts
+    }
+
+    /// Pushes an access-log request on the bus and into the bounded recent-request window
+    /// (counting an eviction when it is full), then looks for a web-shell pairing.
+    fn record_web_request(&mut self, request: &HttpRequestEvent) {
+        self.bus.push(Event::HttpRequest(request.clone()));
+        if self.recent_web_requests.len() == MAX_RECENT_WEB_REQUESTS {
+            self.recent_web_requests.pop_front();
+            self.web_shell_shedding.requests_evicted += 1;
+        }
+        self.recent_web_requests.push_back(request.clone());
+        self.observe_web_request(request);
+    }
+
+    /// Records pid → (ppid, comm) as soon as the `ExecEvent` arrives.
+    /// On Windows (ETW), the sensor does not fill in ppid for `ConnectEvent`
+    /// (ppid=0 in `EventMeta`) — this table compensates. On Linux (eBPF), ppid
+    /// is filled in on all events, so the table is redundant but harmless.
+    fn record_pid_entity(&mut self, meta: &EventMeta) {
+        if meta.ppid != 0 {
+            self.pid_entities.insert(
+                meta.pid,
+                Stamped {
+                    generation: meta.process_generation,
+                    value: EntityRef {
+                        ppid: meta.ppid,
+                        comm: meta.comm.clone(),
+                        parent_generation: meta.parent_process_generation,
+                    },
+                },
+            );
+        }
+    }
+
+    /// Updates the per-pid masquerade, service-main and login-session tables from an exec.
+    fn record_exec_flags(&mut self, exec: &ExecEvent, meta: &EventMeta) {
+        let (pid, generation, comm) = (meta.pid, meta.process_generation, &meta.comm);
+        // Masquerade detection: an IGNORED-list or BAYES_NAME_EXCLUSIONS name is
+        // suspicious when EITHER the image path is not in a trusted system
+        // location (rename in %TEMP%/tmp) OR the parent is not the expected one
+        // (e.g. svchost.exe spawned by cmd.exe instead of services.exe). Either
+        // failure alone is enough — both conditions must hold for the exclusion
+        // to apply. Shared between both lists: a name only in one of them is
+        // simply never looked up by the other's gate below.
+        if (is_ignored(comm) || is_bayes_excluded(comm))
+            && (!policy::name_exclusion_applies(Some(exec.image_path.as_str()))
+                || !policy::parent_exclusion_applies(comm, exec.parent_comm.as_deref()))
+        {
+            self.masquerading.insert(pid, generation);
         }
 
-        let now_ns = self
-            .bus
-            .events_for_pid(pid, generation)
-            .map(|e| e.meta().timestamp_ns)
-            .max()
-            .unwrap_or(0);
-        let mut alerts = web_alerts;
-        alerts.extend(self.evaluate(pid, generation, now_ns));
-        if !is_bayes_excluded(&comm) || self.is_masquerading(pid, generation) {
-            alerts.extend(self.bayes_alert(pid, &comm, &entity_key));
+        if meta.ppid == 1
+            && !exec.image_path.is_empty()
+            && policy::service_main_path_is_trusted(exec.image_path.as_str())
+        {
+            self.service_mains.insert(pid, generation);
+        } else {
+            // Re-exec clears a stale entry (#755 review, Sollykhan 2026-10-19):
+            // `service_mains` was insert-only, so a pid once recorded as a
+            // service main (e.g. NetworkManager) kept that status on `self`
+            // forever, even after an `Exec` to an image that no longer
+            // qualifies — a compromised daemon's `execve("/tmp/x")` stayed
+            // immune to the BAYES kill on its new image. Any exec that does
+            // not (re-)qualify drops the pid's entry; a no-op when it was
+            // never a service main (`BoundedMap::remove` on an absent key).
+            self.service_mains.remove(&pid);
+        }
+        // The parent's image, not `service_mains`: the listener starts at boot,
+        // before the agent, so its exec is never seen (the 2026-11-05 e2e run:
+        // `parent_image_path` resolved from /proc, no exec for pid 2529). A copy
+        // of the real binary exec'd from a user's shell has that shell as parent
+        // and qualifies for nothing; the listener's parent is init, so it stays
+        // only a service main. Re-exec clears, as for `service_mains`.
+        if policy::is_login_session(exec.image_path.as_str(), exec.parent_image_path.as_deref()) {
+            self.login_sessions.insert(pid, generation);
+        } else {
+            self.login_sessions.remove(&pid);
+        }
+    }
+
+    /// The entity a pid belongs to: the recorded (ppid, comm) when the pid's exec was
+    /// seen for the current incarnation, otherwise the fallback (pid, comm).
+    /// Keying by (ppid, comm) lets the belief survive respawns: fork+exec = new pid,
+    /// same (ppid, comm) → same `BeliefState`.
+    fn entity_key_for(&mut self, pid: u32, generation: Option<u64>, comm: &str) -> EntityRef {
+        self.pid_entities
+            .get(&pid)
+            .filter(|entry| entry.current(generation))
+            .map(|entry| entry.value.clone())
+            .unwrap_or_else(|| EntityRef {
+                ppid: pid,
+                comm: comm.to_owned(),
+                parent_generation: generation,
+            })
+    }
+
+    /// Updates the belief of `entity_key` with the pid's current `BehaviorVector`.
+    fn update_belief_for(&mut self, pid: u32, generation: Option<u64>, entity_key: &EntityRef) {
+        if let Some(bv) = self.behavior_vector_for_pid(pid, generation) {
+            let now_ns = self.latest_timestamp_ns(pid, generation);
+            let state = self.belief_or_insert(entity_key, now_ns);
+            // No ML LLR in internal path — external callers use `update_belief_with_ml`.
+            update_belief(state, &bv, None, now_ns);
+        }
+    }
+
+    /// Evaluates the correlation rules and the Bayesian alert for the pid.
+    /// IGNORED-list processes evaluate nothing (empty result) unless they are
+    /// masquerading.
+    fn evaluate_rules_for(
+        &mut self,
+        pid: u32,
+        generation: Option<u64>,
+        comm: &str,
+        entity_key: &EntityRef,
+    ) -> Vec<CorrelationAlert> {
+        if is_ignored(comm) && !self.is_masquerading(pid, generation) {
+            return Vec::new();
+        }
+        let now_ns = self.latest_timestamp_ns(pid, generation);
+        let mut alerts = self.evaluate(pid, generation, now_ns);
+        if !is_bayes_excluded(comm) || self.is_masquerading(pid, generation) {
+            alerts.extend(self.bayes_alert(pid, comm, entity_key));
         }
         alerts
     }
 
+    fn latest_timestamp_ns(&self, pid: u32, generation: Option<u64>) -> u64 {
+        self.bus
+            .events_for_pid(pid, generation)
+            .map(|e| e.meta().timestamp_ns)
+            .max()
+            .unwrap_or(0)
+    }
     /// What the bounded web-shell pairing state has dropped since start.
     #[must_use]
     pub fn web_shell_shedding(&self) -> WebShellShedding {
@@ -575,11 +619,15 @@ impl CorrelationEngine {
     ///
     /// # Errors
     ///
-    /// Returns `Err(())` when `ml_llr` is `Some` but [`Self::on_event`] never created
-    /// a belief state for this pid this cycle (no `BehaviorVector` yet — not enough
-    /// events in the correlator window). This is a normal condition for newly seen
-    /// pids and should be handled silently by the caller. `ml_llr = None` always
-    /// returns `Ok(())`: there is nothing to add either way.
+    /// Only when `ml_llr` is `Some`; `None` always returns `Ok(())`, there is nothing to add
+    /// either way. Both errors mean the score has no belief to land on, and a caller that
+    /// scores right after [`Self::on_event`] for the same pid can ignore them:
+    ///
+    /// - [`MlUpdateError::UnknownPid`] when the bus holds no event for this incarnation of
+    ///   the pid (never seen, or its events have aged out of the window);
+    /// - [`MlUpdateError::NoBelief`] when the pid's entity has no belief for this
+    ///   incarnation of its parent: another incarnation's child with the same `comm`
+    ///   replaced it (#592), or the belief map evicted it at its cap.
     ///
     /// # Example
     ///
@@ -591,25 +639,34 @@ impl CorrelationEngine {
     ///     Err(ScorerError::FeatureOutOfBounds { .. }) => None,  // OOD
     ///     Err(e) => { error!("ML scorer: {e}"); None }  // Fail open
     /// };
-    /// engine.update_belief_with_ml(pid, generation, ml_llr)?;
+    /// // Both errors only mean the score had nowhere to land (see # Errors): this event is
+    /// // scored without ML, it is not a failure of the event's handling. Log at debug, as
+    /// // the agent's sink does, rather than drop the error unseen.
+    /// if let Err(error) = engine.update_belief_with_ml(pid, generation, ml_llr) {
+    ///     tracing::debug!(pid, %error, "ML score not folded into the belief");
+    /// }
     /// ```
-    #[allow(clippy::result_unit_err)]
     pub fn update_belief_with_ml(
         &mut self,
         pid: u32,
         generation: Option<u64>,
         ml_llr: Option<f32>,
-    ) -> Result<(), ()> {
+    ) -> Result<(), MlUpdateError> {
         let Some(llr) = ml_llr else {
             return Ok(());
         };
 
-        let entity_key = self.entity_of_pid(pid, generation).ok_or(())?;
+        let entity_key = self
+            .entity_of_pid(pid, generation)
+            .ok_or(MlUpdateError::UnknownPid { pid })?;
 
-        // `on_event` creates this entity's belief state in the same cycle whenever a
-        // `BehaviorVector` is available; if it isn't there yet either, there is no
-        // base update to add the ML term to.
-        let state = self.belief_mut(&entity_key).ok_or(())?;
+        // `on_event` creates this entity's belief in the same cycle (`BehaviorVector::from_window`
+        // is `None` only on an empty window, and the pid's own event is in it), so a miss here
+        // means the belief was replaced by another incarnation's child (#592) or evicted at the
+        // map's cap.
+        let state = self
+            .belief_mut(&entity_key)
+            .ok_or(MlUpdateError::NoBelief { pid })?;
         apply_ml_llr(state, llr);
         Ok(())
     }
@@ -648,17 +705,7 @@ impl CorrelationEngine {
             .events_for_pid(pid, generation)
             .last()
             .map(|e| e.meta().comm.clone())?;
-        Some(
-            self.pid_entities
-                .get(&pid)
-                .filter(|entry| entry.current(generation))
-                .map(|entry| entry.value.clone())
-                .unwrap_or(EntityRef {
-                    ppid: pid,
-                    comm,
-                    parent_generation: generation,
-                }),
-        )
+        Some(self.entity_key_for(pid, generation, &comm))
     }
 
     /// The belief for `entity`, created if absent. A stored belief built for a

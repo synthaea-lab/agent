@@ -5,7 +5,7 @@
 //! panics are not. (The crate's own byte-by-byte rule — "no explicit panic
 //! point to document" — is exactly what these tests pin from the outside.)
 
-use sensor_linux_netlink::{ConntrackFlow, DiagMsg, ProcEvent};
+use sensor_linux_netlink::{ConntrackFlow, DiagMsg, ProcEvent, netlink_messages};
 
 /// Minimal deterministic PRNG (Knuth LCG) — reproducible corpus, no deps.
 fn lcg(state: &mut u64) -> u64 {
@@ -67,4 +67,17 @@ fn conntrack_flow_never_panics_on_arbitrary_bytes() {
     zero.extend_from_slice(&0u16.to_ne_bytes());
     zero.extend_from_slice(&1u16.to_ne_bytes());
     let _ = ConntrackFlow::parse(&zero);
+}
+
+#[test]
+fn netlink_framing_never_panics_on_arbitrary_bytes() {
+    // The framing walks every buffer the sockets receive, so it sees every other parser's input
+    // first. Walk each result to the end: a panic, or a walk that never ends, is the bug.
+    for buf in random_corpus(0xF4A3, 2_000, 256) {
+        for _ in netlink_messages(&buf) {}
+    }
+    for len in 0..=96 {
+        for _ in netlink_messages(&vec![0x00; len]) {}
+        for _ in netlink_messages(&vec![0xFF; len]) {}
+    }
 }

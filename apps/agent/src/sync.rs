@@ -13,7 +13,20 @@
 //! The poison is cleared on recovery, so each panic is logged once (with the call site
 //! that found it) rather than on every later lock.
 
-use std::sync::{Mutex, MutexGuard, PoisonError};
+use std::{
+    panic::Location,
+    sync::{Condvar, Mutex, MutexGuard, PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard},
+    time::Duration,
+};
+
+/// Logs a recovered poison once, with the call site that found it.
+fn log_recovery(site: &Location<'_>) {
+    tracing::warn!(
+        file = site.file(),
+        line = site.line(),
+        "recovered a lock poisoned by a panicking thread; its state may be partially updated"
+    );
+}
 
 /// [`Mutex::lock`] under the agent's poisoned-lock policy (see the module docs).
 pub(crate) trait LockExt<T: ?Sized> {
@@ -29,23 +42,75 @@ impl<T: ?Sized> LockExt<T> for Mutex<T> {
     #[track_caller]
     fn lock_recovering(&self) -> MutexGuard<'_, T> {
         self.lock().unwrap_or_else(|poisoned| {
-            let site = std::panic::Location::caller();
-            tracing::warn!(
-                file = site.file(),
-                line = site.line(),
-                "recovered a lock poisoned by a panicking thread; its state may be partially updated"
-            );
+            log_recovery(Location::caller());
             self.clear_poison();
             PoisonError::into_inner(poisoned)
         })
     }
 }
 
+/// [`RwLock::read`] and [`RwLock::write`] under the same policy as [`LockExt`].
+pub(crate) trait RwLockExt<T: ?Sized> {
+    /// Takes a read guard, taking it back if a writer panicked.
+    fn read_recovering(&self) -> RwLockReadGuard<'_, T>;
+    /// Takes the write guard, taking it back if a previous holder panicked.
+    fn write_recovering(&self) -> RwLockWriteGuard<'_, T>;
+}
+
+impl<T: ?Sized> RwLockExt<T> for RwLock<T> {
+    #[track_caller]
+    fn read_recovering(&self) -> RwLockReadGuard<'_, T> {
+        self.read().unwrap_or_else(|poisoned| {
+            log_recovery(Location::caller());
+            self.clear_poison();
+            PoisonError::into_inner(poisoned)
+        })
+    }
+
+    #[track_caller]
+    fn write_recovering(&self) -> RwLockWriteGuard<'_, T> {
+        self.write().unwrap_or_else(|poisoned| {
+            log_recovery(Location::caller());
+            self.clear_poison();
+            PoisonError::into_inner(poisoned)
+        })
+    }
+}
+
+/// [`Condvar::wait_timeout`] under the same policy: the guard comes back even if the
+/// mutex was poisoned while the caller waited. The poison itself is left for the next
+/// [`LockExt::lock_recovering`] to clear and log, since a guard cannot reach its mutex.
+pub(crate) trait CondvarExt {
+    /// Waits for a notification or `timeout`, recovering a poisoned mutex instead of
+    /// panicking. Returns the guard only: callers re-check their own deadline.
+    fn wait_timeout_recovering<'a, T>(
+        &self,
+        guard: MutexGuard<'a, T>,
+        timeout: Duration,
+    ) -> MutexGuard<'a, T>;
+}
+
+impl CondvarExt for Condvar {
+    fn wait_timeout_recovering<'a, T>(
+        &self,
+        guard: MutexGuard<'a, T>,
+        timeout: Duration,
+    ) -> MutexGuard<'a, T> {
+        self.wait_timeout(guard, timeout)
+            .unwrap_or_else(PoisonError::into_inner)
+            .0
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use std::{sync::Mutex, thread};
+    use std::{
+        sync::{Arc, Condvar, Mutex, RwLock},
+        thread,
+        time::Duration,
+    };
 
-    use super::LockExt;
+    use super::{CondvarExt, LockExt, RwLockExt};
 
     fn poisoned(value: u32) -> Mutex<u32> {
         let lock = Mutex::new(value);
@@ -82,5 +147,53 @@ mod tests {
         drop(lock.lock_recovering());
         assert!(!lock.is_poisoned());
         assert_eq!(*lock.lock().unwrap(), 2);
+    }
+    #[test]
+    fn a_poisoned_rwlock_is_recovered_for_readers_and_writers() {
+        let lock = RwLock::new(1u32);
+        thread::scope(|s| {
+            let _ = s
+                .spawn(|| {
+                    let mut guard = lock.write().unwrap();
+                    *guard += 1;
+                    panic!("poison the rwlock while holding it");
+                })
+                .join();
+        });
+        assert!(lock.is_poisoned());
+        assert_eq!(*lock.read_recovering(), 2);
+        assert!(!lock.is_poisoned());
+        *lock.write_recovering() += 1;
+        assert_eq!(*lock.read_recovering(), 3);
+    }
+
+    /// Spawns a thread that blocks on `lock` until the caller's guard is released by a
+    /// condvar wait, then notifies and panics while holding the guard, which poisons the
+    /// mutex while the caller is inside the wait. The caller holds a plain `lock()` guard
+    /// taken before this call, so the poisoner cannot run before the wait begins.
+    fn poison_during_wait(lock: &Arc<Mutex<u32>>, cv: &Arc<Condvar>) -> thread::JoinHandle<()> {
+        let lock = Arc::clone(lock);
+        let cv = Arc::clone(cv);
+        thread::spawn(move || {
+            let mut guard = lock.lock().unwrap();
+            *guard = 1;
+            cv.notify_all();
+            panic!("poison the mutex the waiter sleeps on");
+        })
+    }
+
+    #[test]
+    fn a_timed_wait_on_a_mutex_poisoned_while_waiting_returns_the_guard() {
+        let lock = Arc::new(Mutex::new(0u32));
+        let cv = Arc::new(Condvar::new());
+        let guard = lock.lock().unwrap();
+        assert!(!lock.is_poisoned());
+        let poisoner = poison_during_wait(&lock, &cv);
+        // Long timeout: the poisoner's notify ends the wait, not the clock.
+        let guard = cv.wait_timeout_recovering(guard, Duration::from_secs(30));
+        assert!(lock.is_poisoned());
+        assert_eq!(*guard, 1);
+        drop(guard);
+        assert!(poisoner.join().is_err());
     }
 }

@@ -349,6 +349,15 @@ fn readonly_bashrc_does_not_alert() {
 }
 
 #[test]
+fn a_read_only_truncating_open_of_a_persistence_path_alerts() {
+    // #233: `open(O_RDONLY | O_TRUNC)` empties the file on Linux, so it modifies the
+    // persistence path like any write. It used to read as a pure read.
+    let event = file_open_event("/etc/cron.d/backup", O_RDONLY | schema::O_TRUNC);
+    let alert = check_persistence_write(&event).expect("a truncation is a write");
+    assert_eq!(alert.technique, "T1053.003");
+}
+
+#[test]
 fn write_outside_persistence_paths_does_not_alert() {
     let event = file_open_event("/tmp/test.txt", 577);
     assert!(check_persistence_write(&event).is_none());
@@ -650,17 +659,29 @@ fn resolve_comm_falls_back_to_live_proc_when_not_cached() {
 
 #[test]
 #[cfg(target_os = "linux")]
-fn seed_from_proc_finds_own_pid_comm() {
+fn seed_processes_records_comm_with_its_stamp() {
     let mut state = RuleState::new();
-    state.seed_from_proc();
-    let own_pid = std::process::id();
-    let expected_comm = std::fs::read_to_string("/proc/self/comm")
-        .unwrap()
-        .trim_end()
-        .to_string();
+    state.seed_processes([(4242, "nginx".into(), None, Some(5))]);
+    assert_eq!(state.resolve_comm(4242, Some(5)).as_deref(), Some("nginx"));
+    assert_eq!(state.resolve_comm(4242, None).as_deref(), Some("nginx"));
+    // Another incarnation of the pid does not inherit it (it falls through to /proc, where a
+    // pid this high is unlikely to exist).
     assert_eq!(
-        state.pid_comm.peek(&own_pid).map(|f| f.value.as_str()),
-        Some(expected_comm.as_str())
+        state.pid_comm.peek(&4242).map(|f| f.value.as_str()),
+        Some("nginx")
+    );
+    assert_ne!(state.resolve_comm(4242, Some(6)).as_deref(), Some("nginx"));
+    assert!(state.pid_image_path.peek(&4242).is_none(), "no image given");
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+fn seed_processes_records_the_image_when_there_is_one() {
+    let mut state = RuleState::new();
+    state.seed_processes([(4243, "x".into(), Some("/usr/bin/x".into()), Some(5))]);
+    assert_eq!(
+        state.pid_image_path.peek(&4243).map(|f| f.value.as_str()),
+        Some("/usr/bin/x")
     );
 }
 

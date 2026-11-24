@@ -360,7 +360,14 @@ pub mod time;
 /// Linux exec probe reads a head and a tail window of the argument block and says
 /// how much of it lies between them. First claimed 67;
 /// <https://github.com/synthaea-lab/agent/issues/41> merged first and took it, so this takes 68.
-pub const SCHEMA_VERSION: u32 = 68;
+///
+/// Bumped 68 → 69 for [`RegistrySetEvent::key`] becoming a [`RegistryKey`]
+/// (<https://github.com/synthaea-lab/agent/issues/91>): a write through a key the Windows
+/// sensor cannot name in full (opened relative to a root handle that predates its session,
+/// about 80% of a live host's writes) is emitted with the part of the name it knows instead
+/// of being dropped. Whichever of this and agent#323 (also claiming 69) merges second
+/// renumbers, same coordination note as above.
+pub const SCHEMA_VERSION: u32 = 69;
 
 /// Bytes of argv, one separator per token included, a sensor keeps for one exec
 /// ([`bound_argv`], #1112).
@@ -862,9 +869,18 @@ pub const O_WRONLY: u32 = 0o1;
 pub const O_RDWR: u32 = 0o2;
 /// `open(2)` create-if-absent flag.
 pub const O_CREAT: u32 = 0o100;
+/// `open(2)` truncate-to-zero flag.
+pub const O_TRUNC: u32 = 0o1000;
 
-/// Write intent on [`FileOpenEvent::flags`]: a write access mode, or creation
-/// (`O_CREAT` — creating a file is write intent even with `O_RDONLY`).
+/// Write intent on [`FileOpenEvent::flags`]: a write access mode, creation
+/// (`O_CREAT` — creating a file is write intent even with `O_RDONLY`), or
+/// truncation (`O_TRUNC`).
+///
+/// `O_TRUNC` counts whatever the access mode: Linux adds `MAY_WRITE` for it in
+/// `build_open_flags`, and `open(path, O_RDONLY | O_TRUNC)` empties a regular file
+/// the caller may write (verified on Debian 12, kernel 6.1.0-17: a 12-byte file
+/// became 0 bytes, #233). Without it, a process could wipe a file through an open
+/// no write-side rule saw as a write.
 ///
 /// The ONE definition of this predicate. It used to exist five times (rules,
 /// correlator, `crates/ml`, and two Python mirrors) with two different
@@ -875,9 +891,8 @@ pub const O_CREAT: u32 = 0o100;
 /// (`O_ACCMODE`), not independent bits, and the `0o3` combination is invalid —
 /// `open(2)` refuses it with `EINVAL`, so no write can result and counting it
 /// would let crafted always-failing opens inflate behavioral write counts.
-/// The Python mirrors (`synthaea_ml.features.correlation._is_file_write`,
-/// `behavior._is_write`) must match this exactly — parity-tested against
-/// shared fixtures.
+/// The Python mirror (`synthaea_ml.features.posix.has_write_intent`) must match
+/// this exactly — parity-tested against shared fixtures.
 ///
 /// Lives in `schema` deliberately: a pure helper on a field this crate
 /// defines, additive to the semi-frozen surface (no serialization impact),
@@ -885,7 +900,7 @@ pub const O_CREAT: u32 = 0o100;
 #[must_use]
 pub fn has_write_intent(flags: u32) -> bool {
     let access_mode = flags & O_ACCMODE;
-    access_mode == O_WRONLY || access_mode == O_RDWR || (flags & O_CREAT) != 0
+    access_mode == O_WRONLY || access_mode == O_RDWR || (flags & (O_CREAT | O_TRUNC)) != 0
 }
 
 /// File open/create.
@@ -1710,13 +1725,13 @@ pub struct ProcessAccessEvent {
 /// provider. Only writes are emitted; the sensor reads key opens and closes only to
 /// name the key a write went to.
 ///
-/// Key path is normalized from NT registry format (`\REGISTRY\MACHINE\...`) to
+/// A resolved key path is normalized from NT registry format (`\REGISTRY\MACHINE\...`) to
 /// the familiar Win32 hive prefix (`HKLM\...`) by the sensor.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RegistrySetEvent {
     pub meta: EventMeta,
-    /// Normalized registry key path (e.g. `HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Run`).
-    pub key: String,
+    /// The key the value was written under, in full or only in the part the sensor saw.
+    pub key: RegistryKey,
     /// Name of the value being written. Empty string means the default value `(Default)`.
     pub value_name: String,
     /// Registry data type (`1=REG_SZ`, `2=REG_EXPAND_SZ`, `3=REG_BINARY`, `4=REG_DWORD`, ...).
@@ -1725,6 +1740,25 @@ pub struct RegistrySetEvent {
     /// `None` for binary or DWORD types where string decoding is not meaningful.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub data: Option<String>,
+}
+
+/// The key a [`RegistrySetEvent`] wrote under.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum RegistryKey {
+    /// The full key path, hive-prefixed (e.g.
+    /// `HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Run`).
+    Resolved { path: String },
+    /// The sensor did not see where the key's name starts: the key was opened relative to
+    /// a key opened before the sensor started (a process's cached `HKEY_CURRENT_USER` or
+    /// `HKEY_LOCAL_MACHINE` root), or the sensor's key table had dropped it. The write is
+    /// still reported, so rules on the value, the data and the process keep firing.
+    Unresolved {
+        /// The name the process opened the key by, below that unknown key (e.g.
+        /// `Software\Microsoft\Windows\CurrentVersion\Run`): a rule on a key path can match
+        /// its suffix. Empty when the sensor knows no part of the name.
+        relative_name: String,
+    },
 }
 
 /// In-memory .NET assembly load — the primary signal for execute-assembly /
@@ -2116,6 +2150,43 @@ pub struct HealthBeacon {
     /// beacon.
     #[serde(default)]
     pub ioc_sibling_skipped: u64,
+    /// Cumulative alerts that could not be written to `alerts.ndjson` (a full disk, a
+    /// serialization failure) since the agent started: the audit trail's loss, counted. The
+    /// alert still reached stderr and `cli detections`. Zero in an older beacon (#167).
+    #[serde(default)]
+    pub alerts_dropped: u64,
+    /// Cumulative entries the Windows ETW sensor's pid cache dropped at its cap: a later event of
+    /// such a process misses its image path (issue #178). Zero on other platforms and in a
+    /// beacon from an older agent.
+    #[serde(default)]
+    pub etw_pid_cache_evicted: u64,
+    /// Cumulative entries the Windows ETW sensor's silo directory dropped at its cap: a container
+    /// event is named again by a lookup. Zero on other platforms and in an older beacon.
+    #[serde(default)]
+    pub etw_silo_evicted: u64,
+    /// Cumulative `Zone.Identifier` marks the Windows ETW read-back queue dropped: each one is a
+    /// lost `FileQuarantine`. Zero on other platforms and in an older beacon.
+    #[serde(default)]
+    pub etw_marks_dropped: u64,
+    /// Cumulative quarantine paths reported without dedup because the dedup map was full: a
+    /// possible duplicate, never a lost mark. Zero on other platforms and in an older beacon.
+    #[serde(default)]
+    pub etw_quarantine_unremembered: u64,
+    /// Cumulative registry value writes the Windows ETW sensor reported with their key
+    /// unresolved ([`RegistryKey::Unresolved`]): the key was opened relative to one opened
+    /// before the session, or the key table had dropped it (#91). Zero on other platforms and
+    /// in an older beacon.
+    #[serde(default)]
+    pub etw_registry_unresolved_writes: u64,
+    /// Cumulative key objects the Windows ETW sensor's registry key table dropped at its cap or
+    /// at one process's share of it: a later write through one is reported unresolved. Zero on
+    /// other platforms and in an older beacon.
+    #[serde(default)]
+    pub etw_registry_keys_evicted: u64,
+    /// Cumulative registry key names the Windows ETW sensor cut to its length bound. Zero on
+    /// other platforms and in an older beacon.
+    #[serde(default)]
+    pub etw_registry_names_truncated: u64,
 }
 
 /// A logon/authentication outcome, or a privileged-session assignment — shared
@@ -2990,6 +3061,19 @@ mod write_intent_tests {
     fn creat_is_write_intent_even_with_rdonly() {
         // Creating a file mutates the filesystem regardless of the access mode.
         assert!(has_write_intent(super::O_CREAT));
+    }
+
+    #[test]
+    fn trunc_is_write_intent_even_with_rdonly() {
+        // `open(O_RDONLY | O_TRUNC)` empties the file on Linux (#233).
+        assert!(has_write_intent(super::O_TRUNC));
+        assert!(has_write_intent(
+            super::O_TRUNC | 0o2000000 /* O_CLOEXEC */
+        ));
+        assert!(
+            has_write_intent(0o3 | super::O_TRUNC),
+            "truncation still counts"
+        );
     }
 
     #[test]

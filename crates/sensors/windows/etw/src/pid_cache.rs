@@ -1,7 +1,7 @@
 //! The bounded pid -> (image path, incarnation, server silo) cache behind
 //! `SharedState::pids`, with the explicit `remove` a pid cache needs for PID recycling.
 
-use crate::bounded_lru::BoundedLru;
+use crate::{bounded_lru::BoundedLru, shed::ShedCounter};
 
 /// pid → full image path, process sequence number and server silo, never
 /// larger than its cap. Explicit [`Self::remove`] on
@@ -29,9 +29,19 @@ impl PidCache {
     /// # Panics
     ///
     /// Panics when `cap` is 0 — a configuration bug, not a runtime condition.
+    #[cfg(test)]
     pub(crate) fn new(cap: usize) -> Self {
+        Self::counting(cap, ShedCounter::default())
+    }
+
+    /// A cache whose evictions are counted into `evicted`, which the health beacon reads.
+    ///
+    /// # Panics
+    ///
+    /// Panics when `cap` is 0.
+    pub(crate) fn counting(cap: usize, evicted: ShedCounter) -> Self {
         Self {
-            entries: BoundedLru::new("pid cache", cap),
+            entries: BoundedLru::counting("pid cache", cap, evicted),
         }
     }
 
@@ -107,7 +117,7 @@ impl PidCache {
 
     /// Entries dropped by the cap since creation — non-zero means `ProcessEnd`
     /// events were lost (or the cap is too small for this host).
-    #[cfg_attr(not(test), allow(dead_code))] // read by a future health surface
+    #[cfg(test)]
     pub(crate) fn evicted(&self) -> u64 {
         self.entries.evicted()
     }
@@ -172,6 +182,18 @@ mod tests {
         assert_eq!(cache.silo(42), Some(7));
         assert_eq!(cache.generation(42), Some(9));
         assert!(cache.get(42).is_none());
+    }
+
+    #[test]
+    fn evictions_are_counted_into_the_counter_a_reader_holds() {
+        let beacon_side = ShedCounter::default();
+        let mut cache = PidCache::counting(8, beacon_side.clone());
+        for pid in 0..9 {
+            cache.insert(pid, format!(r"C:\img\{pid}.exe"), None, None);
+        }
+        // Cap 8 evicts one entry (`cap / 8`) when the 9th arrives.
+        assert_eq!(beacon_side.get(), 1);
+        assert_eq!(cache.evicted(), 1);
     }
 
     #[test]

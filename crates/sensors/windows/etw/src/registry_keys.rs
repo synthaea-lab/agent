@@ -1,14 +1,23 @@
 //! Which registry key a value write went to. Kernel-Registry's `SetValueKey` names its key by
 //! `KeyObject` only (Windows 11 26300: `KeyName` empty on every record of a live capture), so
-//! the sensor learns each key object's path from the create or open that returned it and
+//! the sensor learns each key object's name from the create or open that returned it and
 //! forgets it on close. See `docs/sensors/windows/etw.md#registry-key-paths`.
 
-use schema::{EventMeta, RegistrySetEvent};
+use std::collections::HashMap;
+
+use schema::{EventMeta, RegistryKey, RegistrySetEvent};
 
 use crate::{
     bounded_lru::BoundedLru,
+    normalize,
     payload::{self, KeyOpen, PayloadFields, ValueWrite},
+    shed::RegistryKeyShedding,
 };
+
+/// The longest key name the table keeps, in bytes. Names are caller-chosen, so a process can
+/// build deep chains of long names; a longer one is cut, never refused, since refusing it
+/// would hide the write.
+pub(crate) const MAX_KEY_NAME_BYTES: usize = 1024;
 
 /// The Kernel-Registry operations the sensor reads.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -38,116 +47,200 @@ impl RegistryOperation {
     }
 }
 
-/// A value write and the NT path of the key it went to.
+/// A key's name, as far as the table knows it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum KeyName {
+    /// The key's NT path (`\REGISTRY\...`).
+    Absolute(String),
+    /// The name below a key the table never saw opened; empty when no part is known.
+    BelowUnknownKey(String),
+}
+
+impl KeyName {
+    fn joined(&self, relative: &str) -> Self {
+        match self {
+            Self::Absolute(base) => Self::Absolute(join(base, relative)),
+            Self::BelowUnknownKey(base) => Self::BelowUnknownKey(join(base, relative)),
+        }
+    }
+
+    fn text_mut(&mut self) -> &mut String {
+        match self {
+            Self::Absolute(name) | Self::BelowUnknownKey(name) => name,
+        }
+    }
+
+    fn into_schema(self) -> RegistryKey {
+        match self {
+            Self::Absolute(path) => RegistryKey::Resolved {
+                path: normalize::normalize_registry_key(&path),
+            },
+            Self::BelowUnknownKey(relative_name) => RegistryKey::Unresolved { relative_name },
+        }
+    }
+}
+
+/// A value write and the name of the key it went to.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct KeyedWrite {
-    pub(crate) key_path: String,
+    pub(crate) key: KeyName,
     pub(crate) write: ValueWrite,
 }
 
 impl KeyedWrite {
     pub(crate) fn into_event(self, meta: EventMeta) -> RegistrySetEvent {
-        self.write.into_event(&self.key_path, meta)
+        self.write.into_event(self.key.into_schema(), meta)
     }
 }
 
-/// Key object → the key's NT path, for every key opened since the session started and not
-/// closed yet, within a cap. A write through a key object opened before the session started,
-/// or evicted, has no path: it is counted, not emitted.
+struct KeyEntry {
+    name: KeyName,
+    /// The process that opened the key: its entries count against its share of the table.
+    opener: u32,
+}
+
+/// Key object → the key's name, for every key opened since the session started and not
+/// closed yet, within a cap. Each process holds at most a share of the cap, so one process
+/// opening keys cannot evict another's. A write through a key object the table does not
+/// hold is still returned, its key unresolved, and counted.
 pub(crate) struct RegistryKeys {
-    paths: BoundedLru<u64, String>,
-    unresolved_writes: u64,
+    names: BoundedLru<u64, KeyEntry>,
+    entries_by_opener: HashMap<u32, usize>,
+    share: usize,
+    shedding: RegistryKeyShedding,
 }
 
 impl RegistryKeys {
     /// # Panics
     ///
     /// Panics when `cap` is 0 — a configuration bug, not a runtime condition.
+    #[cfg(test)]
     pub(crate) fn new(cap: usize) -> Self {
+        Self::counting(cap, RegistryKeyShedding::default())
+    }
+
+    /// A table counting what it sheds into `shedding`, which the health beacon reads. Each
+    /// process may hold an eighth of `cap`.
+    ///
+    /// # Panics
+    ///
+    /// Panics when `cap` is 0.
+    pub(crate) fn counting(cap: usize, shedding: RegistryKeyShedding) -> Self {
         Self {
-            paths: BoundedLru::new("registry key objects", cap),
-            unresolved_writes: 0,
+            names: BoundedLru::counting("registry key objects", cap, shedding.evicted.clone()),
+            entries_by_opener: HashMap::new(),
+            share: (cap / 8).max(1),
+            shedding,
         }
     }
 
-    /// Applies one record to the table and returns the write it carries, with its key's
-    /// path. Creates, opens and closes return `None`, and so does a write whose key is
-    /// unknown.
+    /// Applies one record of process `pid` to the table and returns the write it carries,
+    /// with its key's name. Creates, opens and closes return `None`.
     pub(crate) fn on_record(
         &mut self,
         operation: RegistryOperation,
+        pid: u32,
         fields: &impl PayloadFields,
     ) -> Option<KeyedWrite> {
         match operation {
             RegistryOperation::Create | RegistryOperation::Open => {
                 if let Some(open) = payload::key_open(fields) {
-                    self.opened(&open);
+                    self.opened(&open, pid);
                 }
                 None
             }
             RegistryOperation::Close => {
                 if let Some(key_object) = payload::key_object(fields) {
-                    self.paths.remove(&key_object);
+                    self.forget(key_object);
                 }
                 None
             }
-            RegistryOperation::SetValue => self.keyed(payload::value_write(fields)),
+            RegistryOperation::SetValue => Some(self.keyed(payload::value_write(fields))),
         }
     }
 
-    /// Writes dropped because their key object had no known path.
-    #[cfg_attr(not(test), allow(dead_code))] // read by a future health surface
-    pub(crate) fn unresolved_writes(&self) -> u64 {
-        self.unresolved_writes
+    fn opened(&mut self, open: &KeyOpen, opener: u32) {
+        let name = self.name_of(open);
+        let name = self.bounded(name);
+        self.remember(open.key_object, KeyEntry { name, opener });
     }
 
-    fn opened(&mut self, open: &KeyOpen) {
-        match self.full_path(open) {
-            Some(path) => self.paths.insert(open.key_object, path),
-            // A path the table no longer holds for the object would be a stale one.
-            None => {
-                self.paths.remove(&open.key_object);
+    /// The name an open gives its key: its relative name when absolute, else joined to its
+    /// base key's name, from the record or from the table; below an unknown key when neither
+    /// knows the base.
+    fn name_of(&mut self, open: &KeyOpen) -> KeyName {
+        if is_absolute(&open.relative_name) {
+            return KeyName::Absolute(open.relative_name.clone());
+        }
+        if is_absolute(&open.base_name) {
+            return KeyName::Absolute(join(&open.base_name, &open.relative_name));
+        }
+        match self.names.get(&open.base_object) {
+            Some(base) => base.name.joined(&open.relative_name),
+            None => KeyName::BelowUnknownKey(open.relative_name.clone()),
+        }
+    }
+
+    fn remember(&mut self, key_object: u64, entry: KeyEntry) {
+        self.forget(key_object);
+        let opener = entry.opener;
+        if self.entries_held_by(opener) >= self.share {
+            let batch = (self.share / 8).max(1);
+            let evicted = self
+                .names
+                .evict_least_recent(batch, |held| held.opener == opener);
+            self.release(&evicted);
+        }
+        let evicted = self.names.insert(key_object, entry);
+        self.release(&evicted);
+        *self.entries_by_opener.entry(opener).or_default() += 1;
+    }
+
+    fn forget(&mut self, key_object: u64) {
+        if let Some(entry) = self.names.remove(&key_object) {
+            self.release(&[entry]);
+        }
+    }
+
+    fn release(&mut self, entries: &[KeyEntry]) {
+        for entry in entries {
+            if let Some(held) = self.entries_by_opener.get_mut(&entry.opener) {
+                *held -= 1;
+                if *held == 0 {
+                    self.entries_by_opener.remove(&entry.opener);
+                }
             }
         }
     }
 
-    /// The NT path an open names: its relative name when absolute, else joined to its base
-    /// key's path, from the record or from the table.
-    fn full_path(&mut self, open: &KeyOpen) -> Option<String> {
-        if is_absolute(&open.relative_name) {
-            return Some(open.relative_name.clone());
-        }
-        let base = if is_absolute(&open.base_name) {
-            open.base_name.clone()
-        } else {
-            self.paths.get(&open.base_object)?.clone()
-        };
-        Some(join(&base, &open.relative_name))
+    fn entries_held_by(&self, opener: u32) -> usize {
+        self.entries_by_opener.get(&opener).copied().unwrap_or(0)
     }
 
-    fn keyed(&mut self, write: ValueWrite) -> Option<KeyedWrite> {
-        let known = write.key_name.clone().or_else(|| {
-            write
-                .key_object
-                .and_then(|key_object| self.paths.get(&key_object).cloned())
-        });
-        let Some(key_path) = known else {
-            self.count_unresolved_write();
-            return None;
+    fn keyed(&mut self, write: ValueWrite) -> KeyedWrite {
+        let key = match (&write.key_name, write.key_object) {
+            (Some(key_name), _) => KeyName::Absolute(key_name.clone()),
+            (None, Some(key_object)) => self.names.get(&key_object).map_or_else(
+                || KeyName::BelowUnknownKey(String::new()),
+                |entry| entry.name.clone(),
+            ),
+            (None, None) => KeyName::BelowUnknownKey(String::new()),
         };
-        Some(KeyedWrite { key_path, write })
+        let key = self.bounded(key);
+        if matches!(key, KeyName::BelowUnknownKey(_)) {
+            self.shedding.unresolved_writes.add();
+        }
+        KeyedWrite { key, write }
     }
 
-    fn count_unresolved_write(&mut self) {
-        self.unresolved_writes += 1;
-        // Powers of two only: a burst must not flood the log.
-        if self.unresolved_writes.is_power_of_two() {
-            tracing::warn!(
-                unresolved_total = self.unresolved_writes,
-                tracked_keys = self.paths.len(),
-                "registry value write through a key object with no known path; not emitted"
-            );
+    /// `name` cut to [`MAX_KEY_NAME_BYTES`] on a character boundary, the cut counted.
+    fn bounded(&self, mut name: KeyName) -> KeyName {
+        let text = name.text_mut();
+        if text.len() > MAX_KEY_NAME_BYTES {
+            text.truncate(text.floor_char_boundary(MAX_KEY_NAME_BYTES));
+            self.shedding.names_truncated.add();
         }
+        name
     }
 }
 
@@ -158,6 +251,9 @@ fn is_absolute(name: &str) -> bool {
 fn join(base: &str, relative: &str) -> String {
     if relative.is_empty() {
         return base.to_owned();
+    }
+    if base.is_empty() {
+        return relative.to_owned();
     }
     format!("{}\\{relative}", base.trim_end_matches('\\'))
 }

@@ -594,6 +594,14 @@ mod tests {
             ioc_cooled_down: 31,
             ioc_own_skipped: 6,
             ioc_sibling_skipped: 2,
+            alerts_dropped: 8,
+            etw_pid_cache_evicted: 21,
+            etw_silo_evicted: 22,
+            etw_marks_dropped: 23,
+            etw_quarantine_unremembered: 24,
+            etw_registry_unresolved_writes: 25,
+            etw_registry_keys_evicted: 26,
+            etw_registry_names_truncated: 27,
         };
         let body = serde_json::to_value(HeartbeatPayload {
             agent_id: None,
@@ -624,7 +632,15 @@ mod tests {
                     "ioc_findings": 4,
                     "ioc_cooled_down": 31,
                     "ioc_own_skipped": 6,
-                    "ioc_sibling_skipped": 2
+                    "ioc_sibling_skipped": 2,
+                    "alerts_dropped": 8,
+                    "etw_pid_cache_evicted": 21,
+                    "etw_silo_evicted": 22,
+                    "etw_marks_dropped": 23,
+                    "etw_quarantine_unremembered": 24,
+                    "etw_registry_unresolved_writes": 25,
+                    "etw_registry_keys_evicted": 26,
+                    "etw_registry_names_truncated": 27
                 }
             })
         );

@@ -115,6 +115,13 @@ telemetry with no counterpart elsewhere (`Ptrace`, `Namespace`, `Prctl`...) is
 deliberately Linux-only rather than forced into a shared shape. Each struct's
 doc comment states which sensor fills it and when a field is `None`.
 
+`RegistrySet`'s `key` is a [`RegistryKey`](../crates/schema/src/lib.rs):
+`resolved` with the full `HKLM\...`/`HKU\...` path, or `unresolved` with the
+`relative_name` the process opened the key by, below a key the sensor never saw
+opened (a root handle that predates its session). Most writes on a live Windows
+host are unresolved, so a rule on a key path matches the relative name's suffix
+too ([ETW registry key paths](sensors/windows/etw.md#registry-key-paths)).
+
 ### The exec event and its command line
 
 [`ExecEvent`](../crates/schema/src/lib.rs) is the most heavily used event. It
@@ -160,16 +167,20 @@ carries several fields with specific rules:
 ### `FileOpenEvent::flags` and synthetic flags
 
 `FileOpenEvent::flags` holds the platform's native open flags. On Linux those are
-`open(2)` flags. The crate defines the four POSIX constants it needs
-(`O_ACCMODE`, `O_WRONLY`, `O_RDWR`, `O_CREAT`) instead of depending on `libc`,
+`open(2)` flags. The crate defines the five POSIX constants it needs
+(`O_ACCMODE`, `O_WRONLY`, `O_RDWR`, `O_CREAT`, `O_TRUNC`) instead of depending on `libc`,
 which would drag platform differences into a crate that must compile everywhere.
 
 [`has_write_intent`](../crates/schema/src/lib.rs) is the only write-intent
-predicate in the workspace. It treats the access mode as a 2-bit field, as the
-kernel does: `O_WRONLY` or `O_RDWR`, or `O_CREAT` with any mode. `0o3` is not
+predicate in the workspace outside the `no_std` eBPF filter, which keeps its own copy
+(`sensors/linux/wire/src/path_filter.rs`, it cannot depend on this crate). It treats the access mode as a 2-bit field, as the
+kernel does: `O_WRONLY` or `O_RDWR`, or `O_CREAT` or `O_TRUNC` with any mode
+(`O_RDONLY | O_TRUNC` empties the file on Linux,
+[#233](https://github.com/synthaea-lab/agent/issues/233)). `0o3` is not
 write intent, because `open(2)` refuses it with `EINVAL`. Counting it would let
 deliberately failing opens inflate write counters. The Python feature code
-mirrors this predicate and is tested against the same fixtures.
+mirrors this predicate; [ml#52](https://github.com/synthaea-lab/ml/pull/52)
+adds the `O_TRUNC` case to it and the shared fixtures both sides test against.
 
 The high bits of `flags` carry **synthetic flags**. Some userspace sensors report
 an OS record as a `FileOpenEvent` instead of adding a new variant. The Windows
@@ -227,7 +238,7 @@ rules.
 
 ### The rule
 
-[`SCHEMA_VERSION`](../crates/schema/src/lib.rs) (currently 68) is bumped on
+[`SCHEMA_VERSION`](../crates/schema/src/lib.rs) (currently 69) is bumped on
 **every serialization-visible change**, including additive ones. A change is
 visible in three ways:
 
@@ -261,9 +272,9 @@ why the history skips some values.
 ```text
 crates/schema/tests/fixtures/
   v1/   frozen forever: 7 files, read by tests/v1_compat.rs
-  v2/ … v67/   frozen snapshots of past versions, never edited
+  v2/ … v68/   frozen snapshots of past versions, never edited
                 (numbers that were skipped have no directory)
-  v68/  current snapshot: every golden fixture as it serializes today
+  v69/  current snapshot: every golden fixture as it serializes today
 ```
 
 | Test | What it proves |

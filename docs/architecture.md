@@ -90,7 +90,7 @@ All `cfg(target_os)` dispatch in the agent sits in [`apps/agent/src/commands/`](
 | Module | Contents |
 | --- | --- |
 | [`commands/mod.rs`](../apps/agent/src/commands/mod.rs) | `RunOptions` (all `run` flags and config sections, bundled), and the re-export of the current platform's `cmd_status` / `cmd_run` / `cmd_capture_events` / `cmd_capture_baseline`. On an unsupported OS these compile but fail at runtime. |
-| [`commands/common.rs`](../apps/agent/src/commands/common.rs) | The platform-independent part of `run`: [`wire_run_pipeline`](../apps/agent/src/commands/common.rs) (transport, detection sink, correlator ticker, banner, heartbeat, IPC), [`apply_detection`](../apps/agent/src/commands/common.rs) (local time zone and odd-hour calibration), [`plant_canaries`](../apps/agent/src/commands/common.rs), and [`health_collector`](../apps/agent/src/commands/common.rs). |
+| [`commands/common.rs`](../apps/agent/src/commands/common.rs) | The platform-independent part of `run`: [`start_pipeline`](../apps/agent/src/commands/common.rs) (the prelude of every `cmd_run`: [`wire_run_pipeline`](../apps/agent/src/commands/common.rs) (transport, detection sink, correlator ticker, banner, heartbeat, IPC), then `--alert-details`, [`apply_detection`](../apps/agent/src/commands/common.rs) (local time zone and odd-hour calibration) and [`plant_canaries`](../apps/agent/src/commands/common.rs)), and [`health_collector`](../apps/agent/src/commands/common.rs). |
 | [`commands/linux.rs`](../apps/agent/src/commands/linux.rs) | eBPF preflight, sensor selection (eBPF or the audit fallback), and every Linux worker thread. |
 | [`commands/windows.rs`](../apps/agent/src/commands/windows.rs) | ETW plus the Event Log, socket-table and minifilter sources. |
 | [`commands/macos.rs`](../apps/agent/src/commands/macos.rs) | EndpointSecurity plus the unified log, socket-table and NetworkExtension sources. |
@@ -109,6 +109,7 @@ The detection sink ([`sink/mod.rs`](../apps/agent/src/sink/mod.rs)) has no platf
 | [`health`](../apps/agent/src/health.rs) | Health-beacon collector, sent every 30 s by default. |
 | [`heartbeat`](../apps/agent/src/heartbeat.rs) | Progress-counter file for the watchdog. |
 | [`ipc_handler`](../apps/agent/src/ipc_handler.rs) | IPC server thread answering `cli` requests and content reloads. |
+| [`spawn`](../apps/agent/src/spawn.rs) | `spawn_named`, which starts a named background thread and returns the OS error, with the thread's name, instead of panicking. |
 | [`shutdown`](../apps/agent/src/shutdown.rs) | `ShutdownPlan`, a bounded join of the registered workers. |
 | [`kill_loudness`](../apps/agent/src/kill_loudness.rs) | Attributes SIGTERM/SIGHUP/SIGQUIT to their sender before exiting (Linux). |
 | [`redact`](../apps/agent/src/redact.rs) | `RedactingSink` and `redact_event`, which redact data at the point where events leave the process. |

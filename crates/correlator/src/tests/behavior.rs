@@ -1,7 +1,7 @@
 //! `BehaviorVector` feature extraction and the naive-Bayes belief tests.
 
 use super::*;
-use crate::KillShield;
+use crate::{KillShield, MlUpdateError};
 
 // ── BehaviorVector ─────────────────────────────────────────────────────────
 
@@ -329,6 +329,30 @@ fn bayes_survives_respawn() {
     );
 }
 
+#[test]
+fn exec_without_ppid_keeps_the_belief_on_the_pid_fallback_key() {
+    // An exec with ppid 0 (the Windows ETW case) records no pid → entity entry: the
+    // belief stays keyed by (pid, comm), and a second pid does not inherit it.
+    let mut engine = CorrelationEngine::new();
+
+    engine.on_event(exec_with_meta(meta_full(500, 0, "tool", 0), ""));
+    engine.on_event(Event::Connect(ConnectEvent {
+        meta: meta_full(500, 0, "tool", 100_000_000),
+        daddr: std::net::IpAddr::V4([1, 2, 3, 4].into()),
+        dport: 4444,
+    }));
+    assert!(engine.belief_for_entity(500, "tool").is_some());
+    assert!(engine.belief_for_entity(0, "tool").is_none());
+
+    engine.on_event(exec_with_meta(meta_full(501, 0, "tool", 200_000_000), ""));
+    engine.on_event(Event::Connect(ConnectEvent {
+        meta: meta_full(501, 0, "tool", 300_000_000),
+        daddr: std::net::IpAddr::V4([1, 2, 3, 4].into()),
+        dport: 4444,
+    }));
+    assert!(engine.belief_for_entity(501, "tool").is_some());
+}
+
 // ── update_belief_with_ml (PR #345 review) ──────────────────────────────────
 
 #[test]
@@ -380,10 +404,40 @@ fn update_belief_with_ml_none_leaves_the_belief_untouched() {
 }
 
 #[test]
-fn update_belief_with_ml_before_any_belief_state_is_silent_err() {
-    // No prior `on_event` for this pid → no belief state to add an ML term to.
+fn update_belief_with_ml_for_a_pid_the_bus_never_saw_is_unknown_pid() {
     let mut engine = CorrelationEngine::new();
-    assert!(engine.update_belief_with_ml(9999, None, Some(1.0)).is_err());
+    assert_eq!(
+        engine.update_belief_with_ml(42, None, Some(0.5)),
+        Err(MlUpdateError::UnknownPid { pid: 42 })
+    );
+}
+
+#[test]
+fn update_belief_with_ml_after_another_incarnation_of_the_parent_took_the_belief_is_no_belief() {
+    // Two children named `x` of two lives of pid 77: the second replaces the belief kept
+    // under (77, "x") (#592), so the first child's ML term has nothing to land on.
+    let child = |pid: u32, parent_generation: u64, ts_ns: u64| {
+        exec_with_meta(
+            EventMeta {
+                process_generation: Some(u64::from(pid)),
+                parent_process_generation: Some(parent_generation),
+                ..meta_full(pid, 77, "x", ts_ns)
+            },
+            "",
+        )
+    };
+    let mut engine = CorrelationEngine::new();
+    engine.on_event(child(10, 1, 1_000_000_000));
+    engine.on_event(child(11, 2, 2_000_000_000));
+
+    assert_eq!(
+        engine.update_belief_with_ml(10, Some(10), Some(0.5)),
+        Err(MlUpdateError::NoBelief { pid: 10 })
+    );
+    assert_eq!(
+        engine.update_belief_with_ml(11, Some(11), Some(0.5)),
+        Ok(())
+    );
 }
 
 // ── Service main process provenance (issue #652) ───────────────────────────
@@ -701,7 +755,7 @@ fn a_daemon_that_shares_an_interpreter_family_prefix_still_qualifies() {
 #[test]
 fn interpreters_the_blocklist_used_to_miss_are_now_excluded() {
     // Review of #755 (old-dov and SherlockOmss, 2026-10-19): a handful of real
-    // script runners had no version-suffix convention `FAMILIES` could already
+    // script runners had no version-suffix convention `INTERPRETER_FAMILIES` could already
     // tolerate (`nodejs`, the only Node.js binary name some Debian/Ubuntu
     // packages ship) or weren't in either list at all (`php-cgi`, which runs
     // scripts, unlike the `php-fpm` daemon the previous test pins as protected).

@@ -83,15 +83,15 @@ mod registry {
     }
 
     #[test]
-    fn a_string_value_is_decoded_under_its_win32_key() {
+    fn a_string_value_is_decoded_under_the_key_it_is_given() {
         let fields = set_value(REG_SZ, utf16("C:\\evil.exe\0"));
+        let run = schema::RegistryKey::Resolved {
+            path: r"HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Run".to_owned(),
+        };
 
-        let event = value_write(&fields).into_event(RUN_KEY, meta());
+        let event = value_write(&fields).into_event(run.clone(), meta());
 
-        assert_eq!(
-            event.key,
-            r"HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Run"
-        );
+        assert_eq!(event.key, run);
         assert_eq!(event.value_name, "updater");
         assert_eq!(event.data_type, REG_SZ);
         assert_eq!(event.data.as_deref(), Some("C:\\evil.exe"));

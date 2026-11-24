@@ -13,7 +13,7 @@ use schema::{
 };
 use tamper::heartbeat::{SensorHeartbeat, SilenceMonitor};
 
-use crate::silence::PulsingSink;
+use crate::{shutdown::ShutdownPlan, silence::PulsingSink, sync::LockExt};
 
 /// Silence deadline (#71/#388) for the ETW sensor, pulsed on every event it
 /// forwards. ETW is the high-volume sensor (process, file, registry, DNS...),
@@ -247,15 +247,19 @@ fn run_windows_sensors(
     sink: Box<dyn EventSink>,
     silence: Option<&Mutex<SilenceMonitor>>,
     redact_commands: bool,
+    shedding: sensor_windows::EtwShedding,
 ) -> anyhow::Result<()> {
     // Run and both capture commands funnel through here, so this is the one
     // place credential redaction has to sit in front of (#440).
     let sink = crate::redact::redacting(sink, redact_commands);
 
-    let mut etw_sensor = sensor_windows::WindowsSensor::new(sensor_windows::EtwNames {
-        session_prefix: config::identity::ETW_SESSION_PREFIX.to_string(),
-        canary_prefix: config::identity::ETW_CANARY_PREFIX.to_string(),
-    });
+    let mut etw_sensor = sensor_windows::WindowsSensor::with_shedding(
+        sensor_windows::EtwNames {
+            session_prefix: config::identity::ETW_SESSION_PREFIX.to_string(),
+            canary_prefix: config::identity::ETW_CANARY_PREFIX.to_string(),
+        },
+        shedding,
+    );
     let etw_stop = etw_sensor.stop_handle();
 
     // No policy-loading/distribution mechanism exists in this workspace yet
@@ -388,14 +392,11 @@ fn spawn_minifilter(
     }
     let heartbeat = SensorHeartbeat::new("windows-minifilter");
     if let Some(monitor) = silence {
-        monitor
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .register(
-                heartbeat.clone(),
-                MINIFILTER_SILENCE_DEADLINE_NS,
-                schema::time::now_ns(),
-            );
+        monitor.lock_recovering().register(
+            heartbeat.clone(),
+            MINIFILTER_SILENCE_DEADLINE_NS,
+            schema::time::now_ns(),
+        );
     }
     let stats = Arc::new(Mutex::new(ChannelStats::default()));
     std::thread::Builder::new()
@@ -431,9 +432,7 @@ fn register_heartbeats(
         sockets: SensorHeartbeat::new("windows-sockets"),
     };
     let now_ns = schema::time::now_ns();
-    let mut monitor = monitor
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut monitor = monitor.lock_recovering();
     monitor.register(heartbeats.etw.clone(), ETW_SILENCE_DEADLINE_NS, now_ns);
     monitor.register(
         heartbeats.sockets.clone(),
@@ -469,89 +468,78 @@ pub(crate) fn cmd_status() -> anyhow::Result<()> {
 /// fully inactive on Windows regardless of these flags. `enable_tls_capture`/
 /// `enable_readline_capture` (issue #90) are Linux-uprobe-specific — ETW would need
 /// its own, unrelated mechanism — so they're accepted for parity only, same as the
-/// response flags. `enable_dns_capture` (issue #267) is the same story.
+/// response flags. `enable_dns_capture` (issue #267) is the same story. The rest of `opts`
+/// is read by `start_pipeline`.
 pub(crate) fn cmd_run(opts: super::RunOptions) -> anyhow::Result<()> {
-    let super::RunOptions {
-        alerts,
-        events,
-        storage,
-        alert_details,
-        enable_kill: _,
-        enable_quarantine: _,
-        // uprobes are a Linux mechanism — the capture flags are accepted for CLI
-        // parity and inert here, same as the response flags above.
-        enable_tls_capture: _,
-        enable_readline_capture: _,
-        enable_dns_capture: _,
-        server,
-        ipc_endpoint,
-        content_dir,
-        log_sources: _,
-        deception,
-        detection,
-        config_path: _,
-    } = opts;
-    let pipeline = super::common::wire_run_pipeline(
-        seeded_rule_state(),
-        alerts,
-        events,
-        server,
-        ipc_endpoint,
-        content_dir,
-        storage,
-    )?;
-    // #319. Set before any sensor starts; the one alert `wire_run_pipeline` can raise
-    // itself (UPLOAD-DISABLED) is the agent's own text, not an event's.
-    pipeline.sink.alert_log().set_stderr_details(alert_details);
-    super::common::apply_detection(&pipeline.sink, detection);
-    super::common::plant_canaries(
-        &pipeline.sink,
-        deception,
-        storage,
-        pipeline.transport.as_ref(),
-    );
+    let pipeline = super::common::start_pipeline(&opts, seeded_rule_state())?;
 
     // Sensor-silence detection (#71/#388): the same monitor feeds T1562
     // alerts, `cli health` and the health beacon. Heartbeats are registered
     // once the sensors are built (`run_windows_sensors`); the monitor thread
     // polls an empty list until then, which is harmless.
     let silence_monitor = Arc::new(Mutex::new(SilenceMonitor::new()));
-    crate::silence::spawn_monitor(Arc::clone(&silence_monitor), Arc::clone(&pipeline.sink));
+    crate::silence::spawn_monitor(Arc::clone(&silence_monitor), Arc::clone(&pipeline.sink))?;
+
+    // What the ETW sensor's caches shed (#178): the sensor counts into it, the beacon reads it.
+    let shedding = sensor_windows::EtwShedding::default();
 
     // Health beacon (#134/#317): without it the control plane never hears from
     // a Windows agent, and its silent-agent detection flags every one of them.
-    // No shutdown hook yet: the thread ends with the process.
+    // Wound down by `finish_run` once the sensors return (#147).
     let health = super::common::health_collector(
         &pipeline,
         Arc::clone(&silence_monitor),
         Vec::new(),
-        Arc::new(crate::host_counters::AgentHostCounters::new(
-            Arc::clone(&pipeline.sink),
-            crate::host_counters::WatchdogReport::from_env(),
-            None,
-        )),
+        Arc::new(
+            crate::host_counters::AgentHostCounters::new(
+                Arc::clone(&pipeline.sink),
+                crate::host_counters::WatchdogReport::from_env(),
+                None,
+            )
+            .with_etw_shedding(shedding.clone()),
+        ),
     );
-    let (_health_handle, _health_stop) = health.spawn();
+    let (health_handle, health_stop) = health.spawn()?;
+    let mut shutdown = ShutdownPlan::default();
+    shutdown.register("health-beacon", move || health_stop.stop(), health_handle);
+    if let Some(transport) = pipeline.transport {
+        transport.register_shutdown(&mut shutdown);
+    }
 
-    run_windows_sensors(
+    let sink = Arc::clone(&pipeline.sink);
+    let result = run_windows_sensors(
         Box::new(SharedSink(pipeline.sink)),
         Some(&silence_monitor),
         false,
-    )
+        shedding,
+    );
+    // The enrichment flush and the upload loops' last drain, as on Linux (#147).
+    super::common::finish_run(&sink, shutdown);
+    result
 }
 
 pub(crate) fn cmd_capture_events(output: &std::path::Path) -> anyhow::Result<()> {
     let sink = sinks::JsonlEventSink::open(output)?;
     eprintln!("Synthaea — raw event capture (Ctrl-C to stop)");
     eprintln!("Output: {}", output.display());
-    run_windows_sensors(Box::new(sink), None, true)
+    run_windows_sensors(
+        Box::new(sink),
+        None,
+        true,
+        sensor_windows::EtwShedding::default(),
+    )
 }
 
 pub(crate) fn cmd_capture_baseline(output: &std::path::Path) -> anyhow::Result<()> {
     let sink = crate::sink::BaselineSink::new(seeded_rule_state(), output)?;
     eprintln!("Synthaea — baseline capture (Ctrl-C to stop)");
     eprintln!("Output: {}", output.display());
-    run_windows_sensors(Box::new(sink), None, true)
+    run_windows_sensors(
+        Box::new(sink),
+        None,
+        true,
+        sensor_windows::EtwShedding::default(),
+    )
 }
 
 #[cfg(test)]

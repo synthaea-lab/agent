@@ -16,6 +16,13 @@ them. The agent only runs that sensor on its own thread
 | `NETLINK_NETFILTER` (ctnetlink) | [`conntrack_socket.rs`](../../../crates/sensors/linux/netlink/src/conntrack_socket.rs), [`conntrack_attrs.rs`](../../../crates/sensors/linux/netlink/src/conntrack_attrs.rs) | `NetworkFlow` via [`conntrack_flow_events`](../../../crates/sensors/linux/netlink/src/lib.rs) | not characterized unprivileged |
 | `NETLINK_CONNECTOR` (`CN_IDX_PROC`) | [`proc_socket.rs`](../../../crates/sensors/linux/netlink/src/proc_socket.rs), [`proc_events.rs`](../../../crates/sensors/linux/netlink/src/proc_events.rs) | `ProcEvent` (fork/exec/exit), not mapped to schema | root or `CAP_NET_ADMIN`; `EPERM` otherwise |
 
+The three clients share one socket wrapper,
+[`nl_socket.rs`](../../../crates/sensors/linux/netlink/src/nl_socket.rs) (open and bind, send a
+message, read a dump to its `NLMSG_DONE`), and one pure framing walk,
+[`frame.rs`](../../../crates/sensors/linux/netlink/src/frame.rs), that splits a received buffer
+into messages. A header with an impossible length ends the walk; nothing past the end of the buffer
+is read, including when the last message's padding is missing.
+
 ## The poller
 
 Every 10 s ([`POLL_INTERVAL`](../../../crates/sensors/linux/netlink/src/poll.rs)) `NetlinkPollSensor`

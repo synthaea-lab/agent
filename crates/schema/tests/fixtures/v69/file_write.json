@@ -1,0 +1,12 @@
+{
+  "type": "file_write",
+  "meta": {
+    "pid": 7001,
+    "ppid": 7000,
+    "user": { "os": "unix", "uid": 1000, "gid": 1000 },
+    "timestamp_ns": 1756900010000000000,
+    "comm": "encryptor"
+  },
+  "fd": 4,
+  "bytes_requested": 4096
+}

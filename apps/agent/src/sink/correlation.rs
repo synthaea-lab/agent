@@ -38,7 +38,7 @@ pub(super) enum ScorerLoadError {
 /// The `case_id` of a correlator finding: `{ppid}:{comm}`, with `@{generation}` of the
 /// parent appended when it is known, so two incarnations of a recycled parent pid do not
 /// share one case. The server treats it as an opaque string.
-pub(super) fn correlator_case_id(entity: &verdict::EntityKey) -> String {
+pub(crate) fn correlator_case_id(entity: &verdict::EntityKey) -> String {
     match entity.parent_generation {
         Some(generation) => format!("{}:{}@{generation}", entity.ppid, entity.comm),
         None => format!("{}:{}", entity.ppid, entity.comm),
@@ -157,7 +157,7 @@ impl DetectionSink {
         Ok(())
     }
 
-    pub(super) fn advance_correlation_time(&self, now_ns: u64) {
+    pub(crate) fn advance_correlation_time(&self, now_ns: u64) {
         let alerts = {
             let mut correlator = self.correlator.lock_recovering();
             correlator.advance_time(now_ns)
@@ -178,8 +178,14 @@ impl DetectionSink {
         let generation = event.meta().process_generation;
         if let Some(ref mut scorer) = *self.ml_scorer.lock_recovering() {
             let ml_llr = ml_evidence(scorer, &engine, pid, generation);
-            // `Err` only means the pid has no behavior vector yet: normal for its first events.
-            let _ = engine.update_belief_with_ml(pid, generation, ml_llr);
+            // Either `MlUpdateError` means the score has no belief to land on, not a failure:
+            // `UnknownPid` when the pid has no event on the bus (`on_event` skips event types
+            // the engine does not correlate), `NoBelief` for an evicted or replaced entity
+            // (#592). Debug, not warn: both are expected, and the event is still scored,
+            // only without the ML term.
+            if let Err(error) = engine.update_belief_with_ml(pid, generation, ml_llr) {
+                tracing::debug!(pid, %error, "ML score not folded into the belief");
+            }
         }
 
         let shield = engine.kill_shield(pid, generation);

@@ -14,7 +14,7 @@ container resolved is the sender's), the target is `target_pid`.
 
 ## Signals to the agent
 
-Userspace writes its own pid into [`SIGNAL_WATCH_PID`](../../../crates/sensors/linux/ebpf/src/main.rs)
+Userspace writes its own pid into [`SIGNAL_WATCH_PID`](../../../crates/sensors/linux/ebpf/src/mount_signal/signal.rs)
 before attaching ([`write_signal_watch_pid`](../../../crates/sensors/linux/userspace/src/ebpf.rs)).
 A zero slot means "watch nothing", so attaching first would silently drop early signals. The same
 value drives the kernel-side drop of the agent's own file activity.
@@ -27,7 +27,7 @@ not hooked: it takes a thread id, which cannot be compared with a process id. gl
 
 A `SIGKILL` cannot be attributed through the ring buffer: the agent dies before it drains. So the
 kill handlers also write the event synchronously into
-[`SIGNAL_TAMPER_LAST`](../../../crates/sensors/linux/ebpf/src/main.rs), a one-entry array, at
+[`SIGNAL_TAMPER_LAST`](../../../crates/sensors/linux/ebpf/src/mount_signal/signal.rs), a one-entry array, at
 syscall entry, before the kernel delivers the signal. The map is pinned under
 `/sys/fs/bpf/synthaea/signal_tamper_last_v<WIRE_VERSION>`
 ([`load_ebpf_for_run`](../../../crates/sensors/linux/userspace/src/ebpf.rs)), so it survives the
@@ -128,7 +128,10 @@ gets the agent's exe; any other target gets neither, so it cannot read as a sign
 - A restarted tool's new pid is unwatched until the next scan (up to 5 s).
 - Tools not run by a systemd unit, and template instances (`clamd@scan.service`), are not watched.
 - The kernel can end or freeze a tool without a signal this path reports: a CPU rlimit or a
-  `memory.max` OOM kill (`SEND_SIG_PRIV`), or `cgroup.freeze` (no signal). Tracked in
-  [#49](https://github.com/synthaea-lab/agent/issues/49).
+  `memory.max` OOM kill (`SEND_SIG_PRIV`), or `cgroup.freeze` (no signal). The rules read how
+  such a limit is set (exec of `systemctl` or `prlimit`, a write to a cgroup limit file, which
+  the open probe now passes); the kill itself stays unreported. A documented limit, see
+  [security-model.md](../../security-model.md#what-is-not-defended) (was tracked in
+  [#49](https://github.com/synthaea-lab/agent/issues/49)).
 - Only the agent's own pid is watched on the `kill`/`tgkill` path; the watchdog process is not. That
   path compares the pid argument as the sender wrote it, in the sender's pid namespace.

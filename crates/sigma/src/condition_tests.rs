@@ -439,7 +439,9 @@ fn a_hostile_nesting_is_refused_without_overflowing_the_stack() {
 
 fn compile_text(condition: &str) -> Result<(), String> {
     let rule = parse_rule_yaml(&rule_text(&["b0"], "b0")).unwrap();
-    compile(condition, &rule.detection.selections).map(|_| ())
+    compile(condition, &rule.detection.selections)
+        .map(|_| ())
+        .map_err(|e| e.to_string())
 }
 
 #[test]
@@ -631,4 +633,96 @@ fn the_engine_loads_multi_block_rules_from_a_directory_and_alerts_on_them() {
             .is_empty()
     );
     assert!(engine.eval_exec(&event(&[])).is_empty());
+}
+
+// --- every refusal's exact text (#154) --------------------------------------------------------
+
+/// The text of `condition`'s refusal against blocks `b0`, `sel_a`, `sel_b`.
+fn refusal(condition: &str) -> String {
+    let rule = parse_rule_yaml(&rule_text(&["b0", "sel_a", "sel_b"], "b0")).unwrap();
+    compile(condition, &rule.detection.selections)
+        .map(|_| ())
+        .expect_err(condition)
+        .to_string()
+}
+
+#[test]
+fn every_refusal_keeps_its_exact_text() {
+    // The text reaches operators through `SigmaError::Unsupported` when a rule is refused at
+    // load: pinned here so that typing the errors (#154) cannot reword one.
+    let cases = [
+        ("", "the condition is empty"),
+        ("b0 b0", "unexpected `b0` after a complete expression"),
+        (
+            "b0 | count()",
+            "`|`: a pipe (aggregation such as `| count()`) is not supported",
+        ),
+        (
+            "count",
+            "`count`: aggregations (`count()`, `near`, ...) are not supported",
+        ),
+        (
+            "b0 or b$",
+            "`b$`: only block names, `*`, `and`, `or`, `not`, `1 of`, `all of`, `them` and \
+             parentheses are supported",
+        ),
+        ("b0 and", "the condition ends where an operand is expected"),
+        ("(b0 b0", "expected `)` and found `b0`"),
+        ("(b0", "a `(` is never closed"),
+        (")", "a `)` closes nothing"),
+        (
+            "min(b0)",
+            "`min(`: aggregations (`count()`, `min()`, `near`, ...) are not supported",
+        ),
+        ("or", "`or` where a block name is expected"),
+        (
+            "sel_*",
+            "`sel_*`: a `*` pattern is only valid after `1 of` or `all of`",
+        ),
+        ("any of them", "`any of` is not supported (write `1 of`)"),
+        (
+            "2 of them",
+            "`2 of` is not supported (only `1 of` and `all of`)",
+        ),
+        ("1 of", "`1 of` has nothing after it"),
+        (
+            "1 of s*l*",
+            "`s*l*`: a pattern may only have one `*`, at its end",
+        ),
+        (
+            "1 of s*l",
+            "`s*l`: a pattern may only have one `*`, at its end",
+        ),
+        ("1 of not", "`1 of not`: not a block name or pattern"),
+        (
+            "1 of zz*",
+            "`1 of zz*` matches no block of this rule (an empty set would make the rule match \
+             vacuously or never)",
+        ),
+        ("nope", "unknown block `nope` (no such key in `detection`)"),
+        (
+            &format!(
+                "{}b0{}",
+                "(".repeat(MAX_DEPTH + 1),
+                ")".repeat(MAX_DEPTH + 1)
+            ),
+            "parentheses and `not` nest more than 8 deep",
+        ),
+        (
+            &format!("b0 or {}b0", " ".repeat(MAX_CONDITION_BYTES - 7)),
+            "the condition is longer than 1024 bytes",
+        ),
+        (
+            &vec!["b0"; MAX_TOKENS / 2 + 1].join(" or "),
+            "the condition has more than 128 tokens",
+        ),
+    ];
+    for (condition, text) in cases {
+        assert_eq!(refusal(condition), text, "`{condition}`");
+    }
+    let many = with_blocks(MAX_BLOCKS + 1, "1 of them").err().unwrap();
+    assert!(
+        many.contains("the condition refers to 65 blocks (at most 64)"),
+        "{many}"
+    );
 }

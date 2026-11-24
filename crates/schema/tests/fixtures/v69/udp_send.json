@@ -1,0 +1,13 @@
+{
+  "type": "udp_send",
+  "meta": {
+    "pid": 4242,
+    "ppid": 1337,
+    "user": { "os": "windows", "sid": "S-1-5-21-1004336348-1177238915-682003330-512", "integrity_level": 8192 },
+    "timestamp_ns": 1756900080000000000,
+    "comm": "dnscat.exe"
+  },
+  "daddr": "8.8.8.8",
+  "dport": 53,
+  "size": 120
+}

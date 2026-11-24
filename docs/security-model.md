@@ -424,8 +424,32 @@ They must fail closed when the target is wrong.
 - **Admin or root uninstall.** A legitimate uninstall and a malicious one look the same.
   What tells them apart is the recorded actor and the timing, not the act.
 - **A kernel stop through resource limits** (prlimit CPU limit, `memory.max` OOM kill,
-  `cgroup.freeze`) aimed at a security tool raises no alert on Linux
-  ([#49](https://github.com/synthaea-lab/agent/issues/49)).
+  `cgroup.freeze`) aimed at a security tool is only partly covered on Linux
+  ([#49](https://github.com/synthaea-lab/agent/issues/49)). The rules read the command that sets
+  the limit: `systemctl set-property` (a memory or task limit, or a `CPUQuota` below 10 %),
+  `systemctl freeze`, and `prlimit --pid` on a listed tool, and a write to a limit file
+  (`memory.max`, `memory.high`, `pids.max`, `cpu.max`, `cgroup.freeze`, and the cgroup v1
+  equivalents) in the cgroup of a listed unit. **The OOM kill that follows raises no alert on its
+  own**: the kernel sends `SIGKILL` as `SEND_SIG_PRIV`, so there is no sending process to
+  attribute, and the signal probes drop it by design. Reporting it would take a new probe on the
+  OOM victim, which is not built. Not verified: whether such a probe is usable on every supported
+  kernel. A command line the rules cannot read (an option cluster such as `prlimit -tp`, an empty
+  argv) and a limit set by a means no rule reads (a process that writes the file through a path
+  the rule cannot map to a unit, or a binary that calls `prlimit64(2)` / `setrlimit` directly: there is no
+  `prlimit64` tracepoint) are not seen either. The path case includes a
+  bare file name after a `cd` into the unit's cgroup (`cd <cgroup> && echo 1 > cgroup.freeze`): the
+  open reaches the event stream but carries no unit, and the event has no working directory
+  (lab-run on kernels 5.14 and 7.2). These limits stay documented rather than built away: closing
+  the path case means capturing the working directory or the resolved path in the probe, a
+  wire-format and verifier change (a field in `sensor-linux-wire`'s `FileOpenEvent`, so a
+  `WIRE_VERSION` bump) for a tripwire that reads how a limit is set, not a barrier. A userspace
+  fallback that reads `/proc/<pid>/cwd` on the drain task, as `resolve_dirfd_path` does for
+  relative rename paths, was rejected: the open event has no `dfd`, so an `openat` relative to a
+  directory fd would resolve against the cwd into a wrong absolute path, which is worse than a
+  relative one by that function's own rule, and a short-lived `sh` exits before the readlink. The
+  kernel's own kill (OOM or CPU rlimit) has no sender to attribute, and a probe on its victim is unverified across the
+  supported kernels. A lab capture that shows either is usable on all supported kernels is the
+  reason to reopen them.
 - **Local-only deployments** have no server-side silence detection, and their evidence
   never leaves the host.
 - **Unsigned updates on Windows and macOS.** Self-update is Linux-only today
