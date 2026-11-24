@@ -53,7 +53,7 @@ Newline-delimited JSON ([`wire.rs`](../../../crates/sensors/macos/network-extens
 
 - [`listen`](../../../crates/sensors/macos/network-extension/src/receiver.rs) removes a stale socket file from a previous run (the agent is the only legitimate owner of the path) and binds.
 - [`accept_loop`](../../../crates/sensors/macos/network-extension/src/receiver.rs) accepts connections forever and returns only on a listener error.
-- [`NormalizedNeStream`](../../../crates/sensors/macos/network-extension/src/receiver.rs) turns one connection into events. A line that does not parse (an unknown kind or field shape from a newer extension), a record with another `v`, or a record whose remote address is not a literal IP is skipped and counted, by cause, in `SkewCounters` (`unparseable`, `unknown_version`, `unmapped`; one handle shared by every connection); the stream continues, and the agent logs the counts when a connection ends. An I/O error ends that connection and the agent goes back to accepting.
+- [`NormalizedNeStream`](../../../crates/sensors/macos/network-extension/src/receiver.rs) turns one connection into events. A line that does not parse (an unknown kind or field shape from a newer extension), a record with another `v`, or a record whose remote address is not a literal IP is skipped and counted, by cause, in `SkewCounters` (`unparseable`, `unknown_version`, `unmapped`; one handle shared by every connection); the stream continues, and the agent logs what that connection skipped when it ends (the difference across the connection, not the cumulative totals). An I/O error ends that connection and the agent goes back to accepting.
 
 ## Normalization
 
@@ -73,7 +73,7 @@ Newline-delimited JSON ([`wire.rs`](../../../crates/sensors/macos/network-extens
 - **Connections are served one at a time.** `accept_loop` hands each accepted connection to a callback that reads it until it ends, and both providers open their own `EventPipe` to the same socket. While one provider's connection is open, the other's connect succeeds (it sits in the listen backlog) but is never read: its socket buffer fills, its blocking `write` stalls the pipe's serial queue, and every later record piles up on that queue in the extension's memory. Serving connections concurrently (a thread per connection) is needed before both providers run together, and a non-blocking or timed write would bound the extension side.
 - No user attribution, flow direction field, or macOS 15 endpoint APIs: [#35](https://github.com/synthaea-lab/agent/issues/35).
 - The extension is not built, signed or activated; the socket path is a placeholder; DNS-proxy upstream configuration and byte-count reporting are not wired: [#21](https://github.com/synthaea-lab/agent/issues/21).
-- No silence heartbeat, and macOS has no health beacon, so the skip counters (`SkewCounters`) are only logged when a connection ends, not reported to the control plane: [#34](https://github.com/synthaea-lab/agent/issues/34).
+- No silence heartbeat, and macOS has no health beacon, so the skip counters (`SkewCounters`) are only logged (per connection, when it ends), not reported to the control plane: [#34](https://github.com/synthaea-lab/agent/issues/34).
 
 ## Testing
 

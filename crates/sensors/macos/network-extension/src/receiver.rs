@@ -50,6 +50,18 @@ impl SkewTotals {
     }
 }
 
+impl SkewTotals {
+    /// What was skipped since `earlier`, an older reading of the same counters.
+    #[must_use]
+    pub fn since(&self, earlier: &Self) -> Self {
+        Self {
+            unparseable: self.unparseable.saturating_sub(earlier.unparseable),
+            unknown_version: self.unknown_version.saturating_sub(earlier.unknown_version),
+            unmapped: self.unmapped.saturating_sub(earlier.unmapped),
+        }
+    }
+}
+
 impl SkewCounters {
     /// The totals now.
     #[must_use]
@@ -84,6 +96,7 @@ impl<R: BufRead> NormalizedNeStream<R> {
     }
 
     /// A handle on the skip counters.
+    #[cfg(test)]
     #[must_use]
     pub fn counters(&self) -> Arc<SkewCounters> {
         Arc::clone(&self.counters)
@@ -203,7 +216,23 @@ mod tests {
     }
 
     #[test]
-    fn a_record_with_no_schema_event_counts_as_unmapped_and_connections_share_counters() {
+    fn a_record_with_no_schema_event_counts_as_unmapped() {
+        // A literal-IP remote is required: a hostname parses but maps to no event.
+        let unmapped = r#"{"kind":"flow","v":1,"ts_ns":1,"pid":4242,"direction":"outbound","remote_addr":"not-an-ip.example","remote_port":443,"protocol":6}"#;
+        let mut stream = NormalizedNeStream::new(Cursor::new(unmapped));
+        assert!(stream.next().is_none());
+        assert_eq!(
+            stream.counters().totals(),
+            SkewTotals {
+                unparseable: 0,
+                unknown_version: 0,
+                unmapped: 1,
+            }
+        );
+    }
+
+    #[test]
+    fn connections_share_counters_and_totals_since_isolates_one() {
         // A literal-IP remote is required: a hostname parses but maps to no event.
         let unmapped = r#"{"kind":"flow","v":1,"ts_ns":1,"pid":4242,"direction":"outbound","remote_addr":"not-an-ip.example","remote_port":443,"protocol":6}"#;
         let shared = Arc::new(SkewCounters::default());
@@ -218,6 +247,14 @@ mod tests {
             "one per connection, same handle"
         );
         assert_eq!(shared.totals().unparseable, 0);
+
+        let before = shared.totals();
+        let mut stream =
+            NormalizedNeStream::with_counters(Cursor::new(unmapped), Arc::clone(&shared));
+        assert!(stream.next().is_none());
+        let delta = shared.totals().since(&before);
+        assert_eq!(delta.unmapped, 1, "only the third connection's record");
+        assert!(SkewTotals::default().since(&before).is_clean());
     }
 
     #[cfg(unix)]

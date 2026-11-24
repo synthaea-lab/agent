@@ -106,14 +106,35 @@ impl<R: BufRead> NormalizedLogStream<R> {
         Arc::clone(&self.counters)
     }
 
-    /// Copies the TCC joiner's counts into the shared counters.
+    /// Copies the TCC joiner's counts into the shared counters, warning when a count grows to a
+    /// power of two (no health beacon on macOS yet, #34: this is how a loss shows while running).
     fn publish_tcc(&self) {
-        self.counters
+        let shed = self.joiner.shed_contexts;
+        if self
+            .counters
             .tcc_shed_contexts
-            .store(self.joiner.shed_contexts, Ordering::Relaxed);
-        self.counters
+            .swap(shed, Ordering::Relaxed)
+            != shed
+            && shed.is_power_of_two()
+        {
+            tracing::warn!(
+                tcc_shed_contexts = shed,
+                "unified-log tail: TCC context shed before its result arrived"
+            );
+        }
+        let unmatched = self.joiner.unmatched_results;
+        if self
+            .counters
             .tcc_unmatched_results
-            .store(self.joiner.unmatched_results, Ordering::Relaxed);
+            .swap(unmatched, Ordering::Relaxed)
+            != unmatched
+            && unmatched.is_power_of_two()
+        {
+            tracing::warn!(
+                tcc_unmatched_results = unmatched,
+                "unified-log tail: TCC result with no pending context"
+            );
+        }
     }
 
     /// Sliding-window admission: true when the event at `now_ns` fits.
@@ -126,7 +147,14 @@ impl<R: BufRead> NormalizedLogStream<R> {
             }
         }
         if self.window.len() >= MAX_EVENTS_PER_WINDOW {
-            self.counters.shed_events.fetch_add(1, Ordering::Relaxed);
+            let shed = self.counters.shed_events.fetch_add(1, Ordering::Relaxed) + 1;
+            // Powers of two only: a log storm must not flood the log.
+            if shed.is_power_of_two() {
+                tracing::warn!(
+                    shed_total = shed,
+                    "unified-log tail: event shed by the rate bound"
+                );
+            }
             return false;
         }
         self.window.push_back(now_ns);

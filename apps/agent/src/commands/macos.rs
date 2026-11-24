@@ -145,9 +145,9 @@ fn spawn_unifiedlog_tail(sink: Arc<dyn EventSink>) -> std::io::Result<Option<std
     Ok(Some(child))
 }
 
-/// Says what the unified-log tail shed or could not join when its stream ended (#178). macOS has
-/// no health beacon yet (#34), so this line is where the counts are read: silent shedding would
-/// break the "counted and observable" rule.
+/// Says what the unified-log tail shed or could not join, as a closing summary when its stream
+/// ends (#178). While the agent runs, the stream itself warns at power-of-two totals. macOS has no
+/// health beacon yet (#34), so these lines are where the counts are read.
 fn report_unified_log_losses(totals: &sensor_macos_unifiedlog::StreamTotals) {
     if !totals.is_clean() {
         tracing::warn!(
@@ -160,14 +160,15 @@ fn report_unified_log_losses(totals: &sensor_macos_unifiedlog::StreamTotals) {
 }
 
 /// The same for the `NetworkExtension` receiver, once per ended connection: what the agent skipped
-/// because the extension speaks another version, by cause (#178).
-fn report_network_extension_skew(totals: &sensor_macos_network_extension::SkewTotals) {
-    if !totals.is_clean() {
+/// on that connection because the extension speaks another version, by cause (#178). `skipped` is
+/// the difference across the connection, not the cumulative totals.
+fn report_network_extension_skew(skipped: &sensor_macos_network_extension::SkewTotals) {
+    if !skipped.is_clean() {
         tracing::warn!(
-            unparseable = totals.unparseable,
-            unknown_version = totals.unknown_version,
-            unmapped = totals.unmapped,
-            "network-extension connection: records were skipped (extension version skew?)"
+            unparseable = skipped.unparseable,
+            unknown_version = skipped.unknown_version,
+            unmapped = skipped.unmapped,
+            "network-extension connection: records were skipped on this connection (extension version skew?)"
         );
     }
 }
@@ -203,6 +204,7 @@ fn spawn_network_extension_receiver(sink: Arc<dyn EventSink>) -> std::io::Result
     let skew = Arc::new(sensor_macos_network_extension::SkewCounters::default());
     crate::spawn::spawn_named("ne-receiver", move || {
         let result = sensor_macos_network_extension::accept_loop(&listener, |conn| {
+            let before = skew.totals();
             let stream = sensor_macos_network_extension::NormalizedNeStream::with_counters(
                 std::io::BufReader::new(conn),
                 Arc::clone(&skew),
@@ -218,7 +220,7 @@ fn spawn_network_extension_receiver(sink: Arc<dyn EventSink>) -> std::io::Result
                     }
                 }
             }
-            report_network_extension_skew(&skew.totals());
+            report_network_extension_skew(&skew.totals().since(&before));
         });
         if let Err(e) = result {
             tracing::warn!(error = %e, "network-extension receiver stopped");
