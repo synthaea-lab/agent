@@ -500,7 +500,7 @@ impl DetectionSink {
 
     /// Runs one auth event through the rules and returns their alerts, without recording them:
     /// lets a test observe what the zone and offset handed to the rules decide.
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     pub(crate) fn auth_alerts_for_test(&self, event: &schema::AuthEvent) -> Vec<rules::Alert> {
         self.rule_state.lock_recovering().on_auth(event)
     }
