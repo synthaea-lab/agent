@@ -13,15 +13,23 @@ The UDP/53 query capture is part of the primary eBPF sensor but is described her
 ## How it runs
 
 [`UprobesSensor`](../../../crates/sensors/linux/uprobes/src/sensor.rs) is a separate `Sensor` on its
-own thread, started by the agent's uprobes supervisor
-([`spawn_uprobes_supervisor`](../../../apps/agent/src/commands/linux.rs)) only when at least one capture is
+own thread, started by the agent
+([`spawn_uprobes_sensor`](../../../apps/agent/src/commands/linux.rs)) only when at least one capture is
 on. It loads its own copy of the eBPF object (its [`build.rs`](../../../crates/sensors/linux/uprobes/build.rs)
 compiles the same `sensor-linux-ebpf` crate), attaches only the uprobe programs, and drains three
 rings: `TLS_CAPTURE_EVENTS`, `READLINE_EVENTS`, `DNS_QUERY_EVENTS` (256 KiB each).
 
-The capture set can be widened at run time by the agent
-([`CaptureSet`](../../../apps/agent/src/captures.rs)); the sensor reads its configuration once, so a change
-restarts the thread, with a capture gap while the object is reloaded.
+**Captures are fixed at start.** `--enable-tls-capture`, `--enable-readline-capture` and
+`--enable-dns-capture` are read once and the sensor reads its configuration once, so the set of
+captures cannot change while the agent runs. This is a decision (agent#157): a `CaptureSet` that
+could be widened at run time, and a supervisor thread that restarted the sensor when it changed,
+were written for the posture overlay (#62, ADR-0035, third slice) and had no caller, so they were
+deleted under the "no dead code" rule. The overlay slice brings them back with its caller. What
+that slice has to solve is a restart of the sensor, which unloads and loads the eBPF object and
+leaves a capture gap, in both directions; a live attach and detach on the running sensor would
+avoid the gap. The deleted design is in the history: commit `8f1b8e2e` (`apps/agent/src/captures.rs`,
+`spawn_uprobes_supervisor`, `UprobesStopHandle`, `SilenceMonitor::unregister`) and the notes of
+agent#308, which already deleted the beacon-interval setters.
 
 ```mermaid
 flowchart LR

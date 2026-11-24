@@ -99,7 +99,7 @@ use a read-only token and pinned action SHAs.
 | Job | Checks |
 | --- | --- |
 | `lint` (ubuntu) | nightly `rustfmt --check`; dependency direction ([`check-deps.py`](../tools/check-deps.py)); PowerShell scripts ASCII-only; shell scripts with a shebang are executable in git; [`check-no-test-key.sh`](../tools/check-no-test-key.sh); `cargo test -p updater --no-default-features`; unit tests of the PE/Mach-O import checkers; `cargo doc` with `-D warnings`. |
-| `deny` | `cargo-deny check` with [`deny.toml`](../deny.toml): licenses, RUSTSEC advisories, and stale advisory ignores as errors. |
+| `deny` | `cargo-deny check` with [`deny.toml`](../deny.toml): licenses, RUSTSEC advisories, and stale advisory ignores as errors. `advisories.unmaintained = "all"` keeps unmaintained *transitive* crates in scope: cargo-deny 0.22 defaults to the workspace only, which would hide `bincode` (via `yara-x`) and turn its ignore into an `advisory-not-detected` failure. |
 | `test` (ubuntu, windows, macos) | Siblings checked out, `SYNTHAEA_REQUIRE_SIBLINGS=1`; `cargo clippy --workspace --all-targets -D warnings`; `cargo test --workspace`; on Linux the SoftHSM test; the privileged/elevated IPC e2e. |
 | `content` | The `rules` sibling through the real engines (sigma, yara, IOC content suites) and `attack-coverage.py --check`, which fails when [`docs/attack-coverage.md`](attack-coverage.md) is stale. |
 | `linux-ebpf` | The pinned nightly and a SHA-256-pinned `bpf-linker`; clippy with the probes embedded; fails if either probe object was not embedded. No tests (loading probes needs a privileged kernel). Its cache is never shared with `test`, where a restored build output would skip the probes. |
