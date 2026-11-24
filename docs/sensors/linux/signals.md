@@ -14,8 +14,8 @@ container resolved is the sender's), the target is `target_pid`.
 
 ### A signal from the agent's watchdog
 
-The watchdog kills the agent on a stalled heartbeat or a rollback, so its `SIGKILL` is not
-tampering ([#322](https://github.com/synthaea-lab/agent/issues/322)). The watchdog spawns the agent
+The watchdog kills the agent on a stalled heartbeat, so that `SIGKILL` is not tampering
+([#322](https://github.com/synthaea-lab/agent/issues/322)). The watchdog spawns the agent
 and sets `SYNTHAEA_WATCHDOG_RESTARTS` in its environment; an agent started that way checks, once at
 start, that its parent runs the installed watchdog (`/proc/<ppid>/exe` is the `watchdog` binary
 next to the agent's), and reads the watchdog's `starttime`
@@ -28,6 +28,16 @@ held the pid at that moment. The last check does not rely on the `PR_SET_PDEATHS
 sets on the agent, which a credential change in the agent would clear.
 The T1562.001 rule then reports a reliable signal to the agent at Low and says so, instead of High.
 A signal from the watchdog to a security tool stays as it was.
+
+Only the heartbeat kill reads Low. The same watchdog restarts the agent after it, so the replay
+finds its sender as its parent. Two of the watchdog's kills still read High (#322 stays open for
+them):
+
+- **A probation rollback.** The watchdog kills the agent, then exits so the service manager restarts
+  it from the rolled-back release. The next agent's parent is a new watchdog with another pid, so the
+  replayed kill matches nothing.
+- **The audit fallback.** Its replay from auditd's log
+  ([audit-fallback.md](audit-fallback.md#sigkill-of-the-agent)) does not identify the watchdog.
 
 The sender's name and cgroup are not used: a root sender chooses both (one write to the agent
 unit's `cgroup.procs` moves it there, and that move is not detected). The check works the same

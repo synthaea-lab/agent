@@ -73,7 +73,7 @@ old pid, the log files it read, the ones it could not read and the ones longer t
 (a record in the head of such a file, possible with `max_log_file` above 16 MiB, is not looked at), instead of
 staying silent.
 
-**Limits.** No rule, no attribution. The agent's own watchdog also sends SIGKILL (a heartbeat stall, a probation rollback): the restarted agent reports it like any other kill (High, T1562.001, `exe=…/watchdog`), so read the `exe` before taking a watchdog restart for tampering (the eBPF path has the same gap, #1103). Ways to SIGKILL the agent that these rules do not record, so are not
+**Limits.** No rule, no attribution. The agent's own watchdog also sends SIGKILL (a heartbeat stall, a probation rollback): the restarted agent reports it like any other kill (High, T1562.001, `exe=…/watchdog`), so read the `exe` before taking a watchdog restart for tampering. The eBPF path reads the heartbeat kill as Low, but this replay does not identify the watchdog ([signals.md](signals.md#a-signal-from-the-agents-watchdog), #322). Ways to SIGKILL the agent that these rules do not record, so are not
 attributed: `systemctl kill` (no record, as captured), `rt_sigqueueinfo`, `rt_tgsigqueueinfo` and
 `pidfd_send_signal`. A kill of a thread started less than 5 s earlier, not yet in the marker, is not
 attributed. A default Fedora ships `-a never,task`, which removes syscall auditing from every task:

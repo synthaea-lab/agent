@@ -2,7 +2,8 @@
 //! `SignalEvent::sender_is_watchdog`.
 //!
 //! The watchdog spawns the agent, so it is the agent's parent. A sender is the watchdog when all
-//! of these hold:
+//! of these hold (so the kill on a stalled heartbeat, after which the same watchdog restarts the
+//! agent, passes; the kill before a rollback, after which a new watchdog starts, does not):
 //!
 //! - **its executable is the installed watchdog**, the `watchdog` binary next to the agent's own
 //!   (`resolve_agent_bin` puts the agent there). The environment variable the watchdog sets on its

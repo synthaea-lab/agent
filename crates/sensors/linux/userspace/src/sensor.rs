@@ -594,6 +594,16 @@ mod watchdog_sender_tests {
         assert!(!agent.replayed_kill_parties(&kill).sender_is_watchdog);
     }
 
+    /// A probation rollback: the old watchdog kills the agent and exits, and the service manager
+    /// starts a new watchdog (another pid) that starts this agent. That kill stays High (#322).
+    #[test]
+    fn a_kill_by_a_watchdog_that_exited_before_the_replay_is_not_the_current_watchdogs() {
+        let agent = agent_supervised_by("/opt/synthaea/current/watchdog", watchdog_is_parent);
+        let previous_watchdog = WATCHDOG_PID - 7;
+        let kill = sigkill_from(previous_watchdog, WATCHDOG_STARTED_BY_NS - 1);
+        assert!(!agent.replayed_kill_parties(&kill).sender_is_watchdog);
+    }
+
     #[test]
     fn a_replayed_kill_sent_before_the_watchdog_started_is_not_the_watchdogs() {
         let agent = agent_supervised_by("/opt/synthaea/current/watchdog", watchdog_is_parent);

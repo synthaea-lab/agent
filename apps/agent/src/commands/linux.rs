@@ -178,15 +178,8 @@ fn has_bpf_capabilities() -> bool {
 /// The variable only says which process to check: the sensor trusts that pid as the watchdog
 /// only if it runs the installed watchdog binary (`sensor-linux`'s `watchdog.rs`).
 fn supervising_watchdog_pid() -> Option<u32> {
-    watchdog_parent(
-        std::env::var_os(config::identity::WATCHDOG_RESTARTS_ENV).is_some(),
-        std::os::unix::process::parent_id(),
-    )
-}
-
-/// The parent's pid when the agent was started by its watchdog, `None` otherwise.
-fn watchdog_parent(started_by_watchdog: bool, parent_pid: u32) -> Option<u32> {
-    started_by_watchdog.then_some(parent_pid)
+    std::env::var_os(config::identity::WATCHDOG_RESTARTS_ENV)?;
+    Some(std::os::unix::process::parent_id())
 }
 
 /// Selects sensor: eBPF if available, audit fallback otherwise.
@@ -1512,20 +1505,5 @@ mod tests {
         // Sensor::run loop — a second reader here would double up PolicyDenial
         // events, not add coverage.
         assert!(!starts_avc_reader("linux-audit"));
-    }
-}
-
-#[cfg(test)]
-mod watchdog_parent_tests {
-    use super::watchdog_parent;
-
-    #[test]
-    fn an_agent_its_watchdog_started_names_its_parent_as_the_watchdog() {
-        assert_eq!(watchdog_parent(true, 4242), Some(4242));
-    }
-
-    #[test]
-    fn an_agent_started_without_the_watchdogs_variable_has_no_watchdog() {
-        assert_eq!(watchdog_parent(false, 4242), None);
     }
 }
