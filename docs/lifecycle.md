@@ -163,20 +163,20 @@ Common to every OS ([`try_main`](../apps/agent/src/main.rs)):
    - The CA bundle (`--ca-cert`, then `server.ca_cert`) applies in all cases.
 4. Resolve the content directory. The default is `<storage.state_dir>/content`.
 
-Then [`wire_run_pipeline`](../apps/agent/src/commands/common.rs), in this order:
+Then [`start_pipeline`](../apps/agent/src/commands/common.rs) takes the options by reference and does the same four steps on every platform. The first is `wire_run_pipeline`, in this order:
 
 1. Transport first, because the sink needs the spool handles. If setting up upload fails and `server.offline_fallback` is on (the default), the agent runs without upload and raises an `UPLOAD-DISABLED` alert ([`start_or_disable`](../apps/agent/src/upload.rs)). Without this fallback, an agent missing its certificates would detect nothing, and the watchdog would roll back an otherwise healthy release.
 2. `DetectionSink::new`: alert log, enrichment worker, correlator, ML scorer, Sigma, YARA, IOC, common set. Absent content is not an error.
 3. Correlator ticker. Then the control-plane URL is registered so the agent's own traffic does not raise IOC findings. Then snapshot fetch, the banner, the heartbeat writer and the IPC server.
 
-After that, each platform calls `set_stderr_details`, `apply_detection` and `plant_canaries` before any sensor starts, so the first canary touch is already matched.
+After that, `start_pipeline` itself calls `set_stderr_details`, `apply_detection` and `plant_canaries` before any sensor starts, so the first canary touch is already matched. Each platform's `cmd_run` passes only its own seeded `RuleState`.
 
 ### Linux
 
 [`linux::cmd_run`](../apps/agent/src/commands/linux.rs) runs these steps in order:
 
 1. `kill_loudness::block_termination_signals()`. This **must** come before any other thread exists, because threads inherit the signal mask when they are created.
-2. `wire_run_pipeline` with a `RuleState` seeded from `/proc`, the `ld.so.conf` library directories and a `sock_diag` listener snapshot. A failed snapshot leaves the listener baseline empty.
+2. `start_pipeline` with a `RuleState` seeded from `/proc`, the `ld.so.conf` library directories and a `sock_diag` listener snapshot. A failed snapshot leaves the listener baseline empty.
 3. Start the kill-loudness watcher.
 4. Select the sensor ([`select_sensor`](../apps/agent/src/commands/linux.rs)). eBPF is used if [`can_use_ebpf`](../apps/agent/src/commands/linux.rs) passes: privileges (root, or `CAP_BPF`+`CAP_PERFMON` / `CAP_SYS_ADMIN`), BTF present, object loads, first program accepted by the verifier. Otherwise the audit fallback is used, at lower fidelity.
 5. `enable_response`.

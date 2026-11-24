@@ -36,6 +36,103 @@ fn system_binary_in_its_legitimate_home_stays_silent() {
 }
 
 #[test]
+fn a_shell_found_through_usr_sbin_stays_silent() {
+    // On a merged-`/usr` system (Fedora 43) `/usr/sbin` is a symlink to `/usr/bin`, and a PATH
+    // that lists `/usr/sbin` first, as root's usually does, execs `/usr/sbin/sh`: the same file
+    // as `/usr/bin/sh`, under the name it was called by (#305).
+    for name in ["sh", "bash", "zsh"] {
+        for dir in ["/usr/sbin/", "/sbin/"] {
+            let path = format!("{dir}{name}");
+            assert!(
+                check_masquerading(&exec_with_path(&path, name)).is_none(),
+                "{path} must stay silent"
+            );
+        }
+    }
+}
+
+#[test]
+fn a_shell_name_outside_the_system_directories_still_alerts_beside_the_sbin_allowance() {
+    // The allowance is the directory prefix, not the word `sbin` anywhere in the path.
+    for path in [
+        "/tmp/sh",
+        "/var/tmp/bash",
+        "/home/u/sbin/zsh",
+        "/tmp/usr/sbin/sh",
+        "/opt/sbin/bash",
+    ] {
+        let name = path.rsplit('/').next().unwrap();
+        let alert = check_masquerading(&exec_with_path(path, name))
+            .unwrap_or_else(|| panic!("{path} must alert"));
+        assert_eq!(alert.technique, "T1036.005");
+    }
+}
+
+#[test]
+fn the_sbin_allowance_is_for_shells_only() {
+    // `sudo` and `login` keep their own directories: nothing was reported for them.
+    assert!(check_masquerading(&exec_with_path("/usr/sbin/sudo", "sudo")).is_some());
+    assert!(check_masquerading(&exec_with_path("/sbin/login", "login")).is_some());
+}
+
+/// `image_path` is the unresolved `bprm->filename`: a path that merely *starts*
+/// inside a system directory can still land anywhere through `..`.
+#[test]
+fn dot_dot_cannot_walk_out_of_a_system_directory() {
+    for path in [
+        "/bin/../tmp/x/sh",
+        "/usr/bin/../../tmp/x/bash",
+        "/usr/local/bin/../../../tmp/x/bash",
+        "/usr/sbin/../../tmp/x/sh",
+        "/sbin/../tmp/x/zsh",
+        "/usr/sbin/../sbin/../../tmp/x/sh",
+        "/usr/bin/./../../tmp/x/sh",
+        "/usr/sbin/sshd/../../../tmp/x/sshd",
+        "/usr/bin/../../tmp/x/sudo",
+    ] {
+        let name = path.rsplit('/').next().unwrap();
+        assert!(
+            check_masquerading(&exec_with_path(path, name)).is_some(),
+            "{path} must alert"
+        );
+    }
+}
+
+#[test]
+fn a_dot_component_is_not_proof_of_location_either() {
+    assert!(check_masquerading(&exec_with_path("/usr/bin/./bash", "bash")).is_some());
+}
+
+#[test]
+fn dot_dot_cannot_walk_out_of_a_windows_system_directory() {
+    for path in [
+        "C:\\Windows\\System32\\..\\..\\Users\\Public\\svchost.exe",
+        "c:\\windows\\system32\\..\\temp\\lsass.exe",
+        "C:\\Windows\\System32\\.\\svchost.exe",
+        "C:\\Windows/System32/../../Users/Public/svchost.exe",
+    ] {
+        let name = path.rsplit(['/', '\\']).next().unwrap();
+        assert!(
+            check_masquerading(&exec_with_path(path, name)).is_some(),
+            "{path} must alert"
+        );
+    }
+}
+
+#[test]
+fn names_that_merely_contain_dots_stay_silent_in_their_home() {
+    assert!(check_masquerading(&exec_with_path("/usr/bin/bash", "bash")).is_none());
+    assert!(check_masquerading(&exec_with_path("/usr/sbin/sshd", "sshd")).is_none());
+    assert!(
+        check_masquerading(&exec_with_path(
+            "C:\\Windows\\System32\\svchost.exe",
+            "svchost.exe"
+        ))
+        .is_none()
+    );
+}
+
+#[test]
 fn windows_masquerade_is_case_insensitive() {
     let event = exec_with_path("C:\\Users\\Public\\SvcHost.exe", "SvcHost.exe");
     let alert = check_masquerading(&event).expect("svchost outside System32 must alert");
