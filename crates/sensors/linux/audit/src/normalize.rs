@@ -174,6 +174,8 @@ pub fn sigkill_event(
         target_image_path,
         target_unit: None,
         sender_unreliable: false,
+        // The audit fallback does not identify the watchdog (#322), so this kill stays High.
+        sender_is_watchdog: false,
         signals_lost: 0,
     })
 }
