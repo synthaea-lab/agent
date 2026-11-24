@@ -19,6 +19,8 @@ pub(crate) trait PayloadFields {
     fn u16(&self, name: &str) -> Option<u16>;
     fn u32(&self, name: &str) -> Option<u32>;
     fn bytes(&self, name: &str) -> Option<Vec<u8>>;
+    /// A `win:Pointer` field, widened to 64 bits.
+    fn pointer(&self, name: &str) -> Option<u64>;
 
     /// The text of `name`, empty when the field is absent.
     fn text_or_empty(&self, name: &str) -> String {
@@ -42,6 +44,11 @@ impl PayloadFields for ferrisetw::parser::Parser<'_, '_> {
 
     fn bytes(&self, name: &str) -> Option<Vec<u8>> {
         self.try_parse(name).ok()
+    }
+
+    fn pointer(&self, name: &str) -> Option<u64> {
+        let pointer: ferrisetw::parser::Pointer = self.try_parse(name).ok()?;
+        u64::try_from(*pointer).ok()
     }
 }
 
@@ -68,49 +75,87 @@ pub(crate) fn dns_query(fields: &impl PayloadFields, meta: EventMeta) -> Option<
     })
 }
 
-/// Kernel-Registry EID 5 (`SetValueKey`); `None` when the kernel did not resolve the key
-/// name (the record then names the key only by its `KeyObject` handle). Only string data is
-/// decoded: raw DWORD or binary bytes have no text form for rules.
-pub(crate) fn registry_set(
-    fields: &impl PayloadFields,
-    meta: EventMeta,
-) -> Option<RegistrySetEvent> {
-    let raw_key = non_empty(fields.text_or_empty("KeyName"))?;
-    let data_type = fields.u32("Type").unwrap_or(0);
-    let data = match data_type {
-        REG_SZ | REG_EXPAND_SZ => decode_reg_string(&captured_text_bytes(fields)),
-        _ => None,
-    };
-    Some(RegistrySetEvent {
-        meta,
-        key: normalize::normalize_registry_key(&raw_key),
-        value_name: fields.text_or_empty("ValueName"),
-        data_type,
-        data,
+/// Kernel-Registry EID 1 (`CreateKey`) or 2 (`OpenKey`) that succeeded: the key object it
+/// returned, and the name it was opened by, relative to `base_object` unless absolute.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct KeyOpen {
+    pub(crate) key_object: u64,
+    /// The key object `relative_name` starts from; 0 when the name is absolute.
+    pub(crate) base_object: u64,
+    /// The base key's path, when the kernel wrote it.
+    pub(crate) base_name: String,
+    pub(crate) relative_name: String,
+}
+
+/// A create or open of a key; `None` when it failed (`Status` not 0) or names no key object.
+pub(crate) fn key_open(fields: &impl PayloadFields) -> Option<KeyOpen> {
+    if fields.u32("Status") != Some(0) {
+        return None;
+    }
+    Some(KeyOpen {
+        key_object: key_object(fields)?,
+        base_object: fields.pointer("BaseObject").unwrap_or(0),
+        base_name: fields.text_or_empty("BaseName"),
+        relative_name: fields.text_or_empty("RelativeName"),
     })
 }
 
-/// The value bytes to decode as text. `CapturedData` is the part of the value the kernel
-/// captured: when it is shorter than `DataSize` the data is a prefix, cut wherever the
-/// capture limit fell, so a half UTF-16 unit at its end is dropped rather than the value.
-fn captured_text_bytes(fields: &impl PayloadFields) -> Vec<u8> {
-    let mut captured = fields.bytes("CapturedData").unwrap_or_default();
-    let is_prefix = fields
-        .u32("DataSize")
-        .is_some_and(|size| captured.len() < usize::try_from(size).unwrap_or(usize::MAX));
-    if is_prefix {
-        captured.truncate(captured.len() & !1);
-    }
-    captured
+/// The `KeyObject` a Kernel-Registry record acts on; `None` when absent or null.
+pub(crate) fn key_object(fields: &impl PayloadFields) -> Option<u64> {
+    fields.pointer("KeyObject").filter(|&object| object != 0)
 }
 
-/// A `REG_SZ` / `REG_EXPAND_SZ` value: UTF-16 LE, trailing NULs dropped. `None` for an
-/// empty or odd-length buffer.
-fn decode_reg_string(bytes: &[u8]) -> Option<String> {
-    let (units, rest) = bytes.as_chunks::<2>();
-    if !rest.is_empty() {
-        return None;
+/// Kernel-Registry EID 5 (`SetValueKey`), before its key is resolved. Only string data is
+/// decoded: raw DWORD or binary bytes have no text form for rules.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ValueWrite {
+    /// `KeyName`, the key's NT path, when the kernel wrote it (never on Windows 11 26300).
+    pub(crate) key_name: Option<String>,
+    /// The key object the write went through.
+    pub(crate) key_object: Option<u64>,
+    pub(crate) value_name: String,
+    pub(crate) data_type: u32,
+    pub(crate) data: Option<String>,
+}
+
+impl ValueWrite {
+    /// The write as an event under `key_path`, the key's NT path.
+    pub(crate) fn into_event(self, key_path: &str, meta: EventMeta) -> RegistrySetEvent {
+        RegistrySetEvent {
+            meta,
+            key: normalize::normalize_registry_key(key_path),
+            value_name: self.value_name,
+            data_type: self.data_type,
+            data: self.data,
+        }
     }
+}
+
+/// The write an EID 5 record carries. `data` is `None` whenever `CapturedData` is empty,
+/// which it was on every record of a live Windows 11 26300 capture (#252).
+pub(crate) fn value_write(fields: &impl PayloadFields) -> ValueWrite {
+    let data_type = fields.u32("Type").unwrap_or(0);
+    let data = match data_type {
+        REG_SZ | REG_EXPAND_SZ => {
+            decode_reg_string(&fields.bytes("CapturedData").unwrap_or_default())
+        }
+        _ => None,
+    };
+    ValueWrite {
+        key_name: non_empty(fields.text_or_empty("KeyName")),
+        key_object: key_object(fields),
+        value_name: fields.text_or_empty("ValueName"),
+        data_type,
+        data,
+    }
+}
+
+/// A `REG_SZ` / `REG_EXPAND_SZ` value: UTF-16 LE, trailing NULs dropped; `None` when that
+/// leaves nothing. A trailing odd byte is dropped, not the value: `CapturedData` is cut
+/// wherever the kernel's capture limit fell, and a complete value of odd length still has
+/// the same whole units a consumer reading it as a string acts on.
+fn decode_reg_string(bytes: &[u8]) -> Option<String> {
+    let (units, _odd_byte) = bytes.as_chunks::<2>();
     let units: Vec<u16> = units.iter().map(|unit| u16::from_le_bytes(*unit)).collect();
     non_empty(
         String::from_utf16_lossy(&units)
@@ -343,5 +388,7 @@ fn non_empty(text: String) -> Option<String> {
     (!text.is_empty()).then_some(text)
 }
 
+#[cfg(test)]
+pub(crate) mod test_fields;
 #[cfg(test)]
 mod tests;

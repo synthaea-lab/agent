@@ -20,6 +20,7 @@ use crate::{
     cross_process::{self, ThreadOrigin},
     kernel_process::{self, ExecContext, KernelProcessEvent, ProcessStart, UNKNOWN_IMAGE},
     normalize, payload,
+    registry_keys::RegistryOperation,
     sensor::{SharedState, find_lsass},
     silo,
     sync::LockExt,
@@ -90,11 +91,40 @@ const SMB_CONNECTED: u16 = 30704;
 const BITS_EVENTS: [u16; 4] = [4, 5, 61, 16403];
 /// Microsoft-Windows-Kernel-Registry
 const KERNEL_REGISTRY_GUID: &str = "70EB4F03-C1DE-4F73-A051-33D13D5413BD";
-/// Kernel-Registry EID 5, `SetValueKey`, and its keyword, both taken from the manifest.
-/// `tests/kernel_registry_set_value.rs` (`#[ignore]`, elevated) checks them against a real
-/// session; its run is reported on the PR that introduced them (#252).
-const REGISTRY_SET_VALUE_KEY_EVENT: u16 = 5;
-const REGISTRY_KEYWORD_SET_VALUE_KEY: u64 = 0x100;
+/// Kernel-Registry manifest keywords (Windows 11 26300), one per operation read: `CloseKey`
+/// 0x1, `SetValueKey` 0x100, `CreateKey` 0x1000, `OpenKey` 0x2000. Creates, opens and
+/// closes are read only to name the key a write goes to
+/// ([`RegistryKeys`](crate::registry_keys::RegistryKeys)).
+const REGISTRY_KEYWORDS: u64 = 0x1 | 0x100 | 0x1000 | 0x2000;
+
+/// What the sensor asks of one provider: its GUID, the keyword mask (`None`: every keyword)
+/// and the event ids its callback reads, which ETW filters on before delivery
+/// (`EVENT_FILTER_TYPE_EVENT_ID`: Windows 8.1 / Server 2012 R2 and later; older systems
+/// reject it and the session does not start). The real-session tests enable providers from
+/// it, so they check the shipped values.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ProviderConfig {
+    pub(crate) guid: &'static str,
+    pub(crate) keywords: Option<u64>,
+    pub(crate) event_ids: &'static [u16],
+}
+
+impl ProviderConfig {
+    pub(crate) fn builder(&self) -> ProviderBuilder {
+        let provider = Provider::by_guid(self.guid)
+            .add_filter(EventFilter::ByEventIds(self.event_ids.to_vec()));
+        match self.keywords {
+            Some(keywords) => provider.any(keywords),
+            None => provider,
+        }
+    }
+}
+
+pub(crate) const KERNEL_REGISTRY: ProviderConfig = ProviderConfig {
+    guid: KERNEL_REGISTRY_GUID,
+    keywords: Some(REGISTRY_KEYWORDS),
+    event_ids: &RegistryOperation::EVENT_IDS,
+};
 /// Microsoft-Windows-PowerShell (script-block logging)
 const POWERSHELL_GUID: &str = "A0C1853B-5C40-4B15-8766-3CF1C58F985A";
 /// Microsoft-Windows-WMI-Activity
@@ -716,17 +746,27 @@ pub(crate) fn dns_provider(sink: Arc<dyn EventSink>, state: Arc<SharedState>) ->
         .build()
 }
 
-/// Registry value writes (EID 5 `SetValueKey`, keyword `SetValueKey`).
+/// Registry value writes (EID 5 `SetValueKey`), with the creates, opens and closes (EIDs 1,
+/// 2, 13) that name the key each write goes to.
 ///
 /// Covers persistence writes to Run keys, IFEO, Services, and Winlogon (T1547,
-/// T1546, T1543). Only value writes are enabled: reads (EID 2 `OpenKey`, 4
-/// `QueryKey`, 7 `QueryValueKey`) are high-volume noise at userland tier.
+/// T1546, T1543). Opens and closes are high-volume and only update
+/// [`RegistryKeys`](crate::registry_keys::RegistryKeys); no
+/// event is emitted for them.
 ///
-/// # Field notes (manifest-derived, not lab-captured: Windows 11 26300, 2026-11-12)
+/// # Field notes (manifest-derived: Windows 11 26300, 2026-11-12)
 ///
-/// EID 5: `KeyName` (the key's NT path, `\REGISTRY\MACHINE\...`, rewritten to
-/// `HKLM\...`/`HKU\...`), `ValueName`, `Type` (u32), `DataSize` (u32),
-/// `CapturedDataSize` (u16), `CapturedData` (Binary, `CapturedDataSize` bytes).
+/// - EID 1 `CreateKey` / 2 `OpenKey`: `BaseObject` (Pointer), `KeyObject` (Pointer),
+///   `Status` (u32, NTSTATUS), `Disposition` (u32), `BaseName`, `RelativeName`.
+/// - EID 5 `SetValueKey`: `KeyObject`, `Status`, `Type` (u32), `DataSize` (u32), `KeyName`,
+///   `ValueName`, `CapturedDataSize` (u16), `CapturedData` (Binary), then the previous value's
+///   type, size and data.
+/// - EID 13 `CloseKey`: `KeyObject`, `Status`, `KeyName`.
+///
+/// Lab-captured (Windows 11 26300, elevated, 5,955 records, #252 review): `KeyName` is empty
+/// on every record and `CapturedData` on every write, so a write is named only by its
+/// `KeyObject` and carries no value data. No documented enable property asks the provider
+/// for the data; `data` is `None` on that build.
 ///
 /// The previous notes (Windows Server 2022, 2026-09-07) named EID 4 the write, with
 /// `DataType`/`Data`. The manifest has no such fields: EID 4 is `QueryKey` (`InfoClass`,
@@ -736,26 +776,25 @@ pub(crate) fn dns_provider(sink: Arc<dyn EventSink>, state: Arc<SharedState>) ->
 /// event to catch it.
 pub(crate) fn registry_provider(sink: Arc<dyn EventSink>, state: Arc<SharedState>) -> Provider {
     let callback = move |record: &EventRecord, locator: &SchemaLocator| {
-        if record.event_id() != REGISTRY_SET_VALUE_KEY_EVENT {
+        let Some(operation) = RegistryOperation::from_id(record.event_id()) else {
             return;
-        }
+        };
         state.events_seen.fetch_add(1, Ordering::Relaxed);
         let Ok(schema_def) = locator.event_schema(record) else {
             return;
         };
         let parser = Parser::create(record, &schema_def);
-        if let Some(event) = payload::registry_set(&parser, header_meta(record, &state)) {
-            sink.on_event(Event::RegistrySet(event));
+        let keyed = state
+            .registry_keys
+            .lock_or_recover()
+            .on_record(operation, &parser);
+        if let Some(keyed) = keyed {
+            let meta = header_meta(record, &state);
+            sink.on_event(Event::RegistrySet(keyed.into_event(meta)));
         }
     };
 
-    enabled_for(
-        KERNEL_REGISTRY_GUID,
-        Some(REGISTRY_KEYWORD_SET_VALUE_KEY),
-        &[REGISTRY_SET_VALUE_KEY_EVENT],
-    )
-    .add_callback(callback)
-    .build()
+    KERNEL_REGISTRY.builder().add_callback(callback).build()
 }
 
 /// `PowerShell` script-block events (EID 4104 — `ScriptBlockLogging`).
@@ -1259,3 +1298,6 @@ mod file_keyword_tests {
         assert_eq!(file_event_keyword(10), None, "NameCreate is not handled");
     }
 }
+
+#[cfg(test)]
+mod real_session;
