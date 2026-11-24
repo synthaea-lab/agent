@@ -98,7 +98,7 @@ use a read-only token and pinned action SHAs.
 
 | Job | Checks |
 | --- | --- |
-| `lint` (ubuntu) | nightly `rustfmt --check`; dependency direction ([`check-deps.py`](../tools/check-deps.py)); PowerShell scripts ASCII-only; shell scripts with a shebang are executable in git; [`check-no-test-key.sh`](../tools/check-no-test-key.sh); `cargo test -p updater --no-default-features`; unit tests of the PE/Mach-O import checkers; `cargo doc` with `-D warnings`. |
+| `lint` (ubuntu) | nightly `rustfmt --check`; dependency direction ([`check-deps.py`](../tools/check-deps.py)); platform branches only where CLAUDE.md allows them ([`check-platform-cfg.py`](../tools/check-platform-cfg.py)); PowerShell scripts ASCII-only; shell scripts with a shebang are executable in git; [`check-no-test-key.sh`](../tools/check-no-test-key.sh); `cargo test -p updater --no-default-features`; unit tests of the PE/Mach-O import checkers and of the platform cfg check; `cargo doc` with `-D warnings`. |
 | `deny` | `cargo-deny check` with [`deny.toml`](../deny.toml): licenses, RUSTSEC advisories, and stale advisory ignores as errors. |
 | `test` (ubuntu, windows, macos) | Siblings checked out, `SYNTHAEA_REQUIRE_SIBLINGS=1`; `cargo clippy --workspace --all-targets -D warnings`; `cargo test --workspace`; on Linux the SoftHSM test; the privileged/elevated IPC e2e. |
 | `content` | The `rules` sibling through the real engines (sigma, yara, IOC content suites) and `attack-coverage.py --check`, which fails when [`docs/attack-coverage.md`](attack-coverage.md) is stale. |
