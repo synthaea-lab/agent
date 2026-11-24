@@ -120,9 +120,11 @@ fn spawn_unifiedlog_tail(sink: Arc<dyn EventSink>) -> std::io::Result<Option<std
         return Ok(None);
     };
     let spawned = crate::spawn::spawn_named("unifiedlog-tail", move || {
-        let stream =
-            sensor_macos_unifiedlog::NormalizedLogStream::new(std::io::BufReader::new(stdout));
-        let counters = stream.counters();
+        let counters = Arc::new(sensor_macos_unifiedlog::StreamCounters::default());
+        let stream = sensor_macos_unifiedlog::NormalizedLogStream::with_counters(
+            std::io::BufReader::new(stdout),
+            Arc::clone(&counters),
+        );
         for item in stream {
             match item {
                 Ok((_, event)) => sink.on_event(event),

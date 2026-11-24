@@ -37,8 +37,8 @@ const MAX_EVENTS_PER_WINDOW: usize = 512;
 const WINDOW_NS: u64 = 1_000_000_000;
 
 /// Cumulative loss counters of one [`NormalizedLogStream`], shared with whoever reports them:
-/// the stream moves into its reader thread, so the agent keeps a handle from
-/// [`NormalizedLogStream::counters`] (#178).
+/// the stream moves into its reader thread, so the agent creates the counters, keeps a handle and
+/// injects it with [`NormalizedLogStream::with_counters`] (#178).
 #[derive(Debug, Default)]
 pub struct StreamCounters {
     shed_events: AtomicU64,
@@ -90,17 +90,25 @@ pub struct NormalizedLogStream<R> {
 }
 
 impl<R: BufRead> NormalizedLogStream<R> {
+    /// A stream with counters of its own.
     pub fn new(reader: R) -> Self {
+        Self::with_counters(reader, Arc::new(StreamCounters::default()))
+    }
+
+    /// A stream that adds to `counters`, created by the agent and injected, like
+    /// [`sensor_macos_network_extension`]'s `NormalizedNeStream::with_counters` and the Windows
+    /// `EtwShedding`: the macOS health beacon (#34) reads the handle the agent already holds.
+    pub fn with_counters(reader: R, counters: Arc<StreamCounters>) -> Self {
         Self {
             lines: reader.lines(),
             joiner: TccJoiner::new(),
             window: VecDeque::new(),
-            counters: Arc::new(StreamCounters::default()),
+            counters,
         }
     }
 
-    /// A handle on the loss counters (rate-bound sheds and the TCC join's sheds and unmatched
-    /// results) that outlives the stream, for health reporting.
+    /// A handle on the stream's own counters, for tests that built it with [`Self::new`].
+    #[cfg(test)]
     #[must_use]
     pub fn counters(&self) -> Arc<StreamCounters> {
         Arc::clone(&self.counters)
