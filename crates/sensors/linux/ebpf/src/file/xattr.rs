@@ -9,7 +9,10 @@ use aya_ebpf::{
 use aya_log_ebpf::warn;
 use sensor_linux_wire::{FileRemovexattrEvent, FileSetxattrEvent, is_filtered_path};
 
-use crate::{fill_event_meta, into_ret};
+use crate::{
+    arch::{SyscallRecord, arg_offset},
+    fill_event_meta, into_ret,
+};
 
 /// Ring buffer shared with userspace for `setxattr` events.
 #[map]
@@ -31,38 +34,24 @@ static REMOVEXATTR_SCRATCH: PerCpuArray<FileRemovexattrEvent> = PerCpuArray::wit
 /// `pathname`(16), `name`(24), `value`(32, unused), `size`(40, unused), `flags`(48,
 /// unused). Verified on 2026-09-22 on Alpine (kernel 6.18.50-0-virt, `x86_64`) via
 /// `/sys/kernel/tracing/events/syscalls/sys_enter_setxattr/format`.
-#[cfg(any(bpf_target_arch = "x86_64", bpf_target_arch = "aarch64"))]
-const SETXATTR_PATHNAME_PTR_OFFSET: usize = 16;
-#[cfg(any(bpf_target_arch = "x86_64", bpf_target_arch = "aarch64"))]
-const SETXATTR_NAME_PTR_OFFSET: usize = 24;
+///
 /// i686: inferred, not independently verified (see `sys_enter_open`'s i686 note).
-#[cfg(bpf_target_arch = "x86")]
-const SETXATTR_PATHNAME_PTR_OFFSET: usize = 12;
-#[cfg(bpf_target_arch = "x86")]
-const SETXATTR_NAME_PTR_OFFSET: usize = 16;
+const SETXATTR_PATHNAME_PTR_OFFSET: usize = arg_offset(0);
+const SETXATTR_NAME_PTR_OFFSET: usize = arg_offset(1);
 
 pub fn sys_enter_setxattr(ctx: TracePointContext) -> u32 {
     into_ret(try_sys_enter_setxattr(ctx))
 }
 
 fn try_sys_enter_setxattr(ctx: TracePointContext) -> Result<u32, u32> {
-    #[cfg(any(bpf_target_arch = "x86_64", bpf_target_arch = "aarch64"))]
     let pathname_ptr: u64 = unsafe {
-        ctx.read_at(SETXATTR_PATHNAME_PTR_OFFSET)
+        ctx.read_ulong_arg(SETXATTR_PATHNAME_PTR_OFFSET)
             .map_err(|_| 1u32)?
     };
-    #[cfg(bpf_target_arch = "x86")]
-    let pathname_ptr: u64 = unsafe {
-        ctx.read_at::<u32>(SETXATTR_PATHNAME_PTR_OFFSET)
-            .map_err(|_| 1u32)? as u64
-    };
 
-    #[cfg(any(bpf_target_arch = "x86_64", bpf_target_arch = "aarch64"))]
-    let name_ptr: u64 = unsafe { ctx.read_at(SETXATTR_NAME_PTR_OFFSET).map_err(|_| 1u32)? };
-    #[cfg(bpf_target_arch = "x86")]
     let name_ptr: u64 = unsafe {
-        ctx.read_at::<u32>(SETXATTR_NAME_PTR_OFFSET)
-            .map_err(|_| 1u32)? as u64
+        ctx.read_ulong_arg(SETXATTR_NAME_PTR_OFFSET)
+            .map_err(|_| 1u32)?
     };
 
     let comm = bpf_get_current_comm().map_err(|_| 1u32)?;
@@ -111,38 +100,24 @@ fn try_sys_enter_setxattr(ctx: TracePointContext) -> Result<u32, u32> {
 /// `pathname`(16), `name`(24). Verified on 2026-09-22 on Alpine (kernel
 /// 6.18.50-0-virt, `x86_64`) via
 /// `/sys/kernel/tracing/events/syscalls/sys_enter_removexattr/format`.
-#[cfg(any(bpf_target_arch = "x86_64", bpf_target_arch = "aarch64"))]
-const REMOVEXATTR_PATHNAME_PTR_OFFSET: usize = 16;
-#[cfg(any(bpf_target_arch = "x86_64", bpf_target_arch = "aarch64"))]
-const REMOVEXATTR_NAME_PTR_OFFSET: usize = 24;
+///
 /// i686: inferred, not independently verified (see `sys_enter_open`'s i686 note).
-#[cfg(bpf_target_arch = "x86")]
-const REMOVEXATTR_PATHNAME_PTR_OFFSET: usize = 12;
-#[cfg(bpf_target_arch = "x86")]
-const REMOVEXATTR_NAME_PTR_OFFSET: usize = 16;
+const REMOVEXATTR_PATHNAME_PTR_OFFSET: usize = arg_offset(0);
+const REMOVEXATTR_NAME_PTR_OFFSET: usize = arg_offset(1);
 
 pub fn sys_enter_removexattr(ctx: TracePointContext) -> u32 {
     into_ret(try_sys_enter_removexattr(ctx))
 }
 
 fn try_sys_enter_removexattr(ctx: TracePointContext) -> Result<u32, u32> {
-    #[cfg(any(bpf_target_arch = "x86_64", bpf_target_arch = "aarch64"))]
     let pathname_ptr: u64 = unsafe {
-        ctx.read_at(REMOVEXATTR_PATHNAME_PTR_OFFSET)
+        ctx.read_ulong_arg(REMOVEXATTR_PATHNAME_PTR_OFFSET)
             .map_err(|_| 1u32)?
     };
-    #[cfg(bpf_target_arch = "x86")]
-    let pathname_ptr: u64 = unsafe {
-        ctx.read_at::<u32>(REMOVEXATTR_PATHNAME_PTR_OFFSET)
-            .map_err(|_| 1u32)? as u64
-    };
 
-    #[cfg(any(bpf_target_arch = "x86_64", bpf_target_arch = "aarch64"))]
-    let name_ptr: u64 = unsafe { ctx.read_at(REMOVEXATTR_NAME_PTR_OFFSET).map_err(|_| 1u32)? };
-    #[cfg(bpf_target_arch = "x86")]
     let name_ptr: u64 = unsafe {
-        ctx.read_at::<u32>(REMOVEXATTR_NAME_PTR_OFFSET)
-            .map_err(|_| 1u32)? as u64
+        ctx.read_ulong_arg(REMOVEXATTR_NAME_PTR_OFFSET)
+            .map_err(|_| 1u32)?
     };
 
     let comm = bpf_get_current_comm().map_err(|_| 1u32)?;
