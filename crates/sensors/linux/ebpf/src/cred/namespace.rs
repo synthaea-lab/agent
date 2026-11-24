@@ -6,7 +6,6 @@ use aya_ebpf::{
     maps::{PerCpuArray, RingBuf},
     programs::TracePointContext,
 };
-use aya_log_ebpf::warn;
 use sensor_linux_wire::NamespaceEvent;
 
 use crate::{
@@ -36,7 +35,7 @@ const SETNS_NSTYPE_OFFSET: usize = arg_offset(1);
 /// argument — assumed standard layout, see `SINGLE_ID_OFFSET`'s note in `identity.rs`.
 const UNSHARE_FLAGS_OFFSET: usize = arg_offset(0);
 
-fn emit_namespace_event(ctx: &TracePointContext, syscall: u8, fd: i32, flags: u32) -> u32 {
+fn emit_namespace_event(syscall: u8, fd: i32, flags: u32) -> u32 {
     let comm = match bpf_get_current_comm() {
         Ok(c) => c,
         Err(_) => return 1,
@@ -60,10 +59,7 @@ fn emit_namespace_event(ctx: &TracePointContext, syscall: u8, fd: i32, flags: u3
         (*e).flags = flags;
 
         if NAMESPACE_EVENTS.output::<NamespaceEvent>(&*e, 0).is_err() {
-            warn!(
-                ctx,
-                "sensor-linux-ebpf: ring buffer full, dropping namespace event"
-            );
+            crate::count_ring_drop(sensor_linux_wire::ring::NAMESPACE);
         }
     }
 
@@ -81,7 +77,7 @@ pub fn sys_enter_setns(ctx: TracePointContext) -> u32 {
         Err(_) => return 1,
     };
 
-    emit_namespace_event(&ctx, NAMESPACE_SYSCALL_SETNS, fd as i32, nstype as u32)
+    emit_namespace_event(NAMESPACE_SYSCALL_SETNS, fd as i32, nstype as u32)
 }
 
 pub fn sys_enter_unshare(ctx: TracePointContext) -> u32 {
@@ -90,5 +86,5 @@ pub fn sys_enter_unshare(ctx: TracePointContext) -> u32 {
         Err(_) => return 1,
     };
 
-    emit_namespace_event(&ctx, NAMESPACE_SYSCALL_UNSHARE, -1, flags as u32)
+    emit_namespace_event(NAMESPACE_SYSCALL_UNSHARE, -1, flags as u32)
 }

@@ -6,7 +6,6 @@ use aya_ebpf::{
     maps::{HashMap, PerCpuArray, RingBuf},
     programs::TracePointContext,
 };
-use aya_log_ebpf::warn;
 use sensor_linux_wire::MemfdCreateEvent;
 
 use crate::{
@@ -109,10 +108,7 @@ fn try_sys_exit_memfd_create(ctx: TracePointContext) -> Result<u32, u32> {
                 .output::<MemfdCreateEvent>(&*e, 0)
                 .is_err()
             {
-                warn!(
-                    &ctx,
-                    "sensor-linux-ebpf: ring buffer full, dropping memfd_create event"
-                );
+                crate::count_ring_drop(sensor_linux_wire::ring::MEMFD_CREATE);
             }
         }
     }

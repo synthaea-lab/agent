@@ -6,7 +6,6 @@ use aya_ebpf::{
     maps::{PerCpuArray, RingBuf},
     programs::TracePointContext,
 };
-use aya_log_ebpf::warn;
 use sensor_linux_wire::CapSetEvent;
 
 use crate::{
@@ -123,10 +122,7 @@ fn try_sys_enter_capset(ctx: TracePointContext) -> Result<u32, u32> {
         (*e).inheritable = inheritable;
 
         if CAPSET_EVENTS.output::<CapSetEvent>(&*e, 0).is_err() {
-            warn!(
-                &ctx,
-                "sensor-linux-ebpf: ring buffer full, dropping capset event"
-            );
+            crate::count_ring_drop(sensor_linux_wire::ring::CAPSET);
         }
     }
 

@@ -6,7 +6,7 @@ use aya_ebpf::{
     maps::{PerCpuArray, RingBuf},
     programs::TracePointContext,
 };
-use aya_log_ebpf::{info, warn};
+use aya_log_ebpf::info;
 use sensor_linux_wire::ConnectEvent;
 
 use crate::{
@@ -101,10 +101,7 @@ fn try_sys_enter_connect(ctx: TracePointContext) -> Result<u32, u32> {
         (*e).daddr_v6 = v6;
 
         if CONNECT_EVENTS.output::<ConnectEvent>(&*e, 0).is_err() {
-            warn!(
-                &ctx,
-                "sensor-linux-ebpf: ring buffer full, dropping connect event"
-            );
+            crate::count_ring_drop(sensor_linux_wire::ring::CONNECT);
         }
         (*e).meta.pid
     };

@@ -169,6 +169,7 @@ another type (execs). The userspace drain polls all of them fairly
 | `SIGNAL_WATCH_PID` | array, 1 | userspace | the agent's own pid ([signals](signals.md)) |
 | `SIGNAL_WATCH_TOOLS` | hash, 8192 | userspace | tgids of listed security tools → their `SigCgt` |
 | `SIGNAL_TAMPER_LAST` | array, 1, pinned | kill/tgkill handlers | last `SIGKILL` aimed at the agent |
+| `RING_DROPS` | per-CPU array, one slot per ring (`sensor_linux_wire::ring`) | every probe that outputs to a ring | events lost to a full ring; read every 10 s ([userspace loader](userspace-loader.md#back-pressure-and-loss)) |
 | `LSM_FILE_OPEN_HITS`, `SIGNAL_TOOL_DROPS`, `PENDING_*_DROPPED` | per-CPU array | probes | counters |
 
 ## In-kernel filters

@@ -6,7 +6,6 @@ use aya_ebpf::{
     maps::{PerCpuArray, RingBuf},
     programs::TracePointContext,
 };
-use aya_log_ebpf::warn;
 use sensor_linux_wire::PrctlEvent;
 
 use crate::{
@@ -71,10 +70,7 @@ fn try_sys_enter_prctl(ctx: TracePointContext) -> Result<u32, u32> {
         (*e).arg = arg;
 
         if PRCTL_EVENTS.output::<PrctlEvent>(&*e, 0).is_err() {
-            warn!(
-                &ctx,
-                "sensor-linux-ebpf: ring buffer full, dropping prctl event"
-            );
+            crate::count_ring_drop(sensor_linux_wire::ring::PRCTL);
         }
     }
 

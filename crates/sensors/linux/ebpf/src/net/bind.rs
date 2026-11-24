@@ -7,7 +7,6 @@ use aya_ebpf::{
     maps::{HashMap, PerCpuArray, RingBuf},
     programs::TracePointContext,
 };
-use aya_log_ebpf::warn;
 use sensor_linux_wire::SocketBindEvent;
 
 use crate::{
@@ -130,10 +129,7 @@ fn try_sys_enter_bind(ctx: TracePointContext) -> Result<u32, u32> {
             .output::<SocketBindEvent>(&*e, 0)
             .is_err()
         {
-            warn!(
-                &ctx,
-                "sensor-linux-ebpf: ring buffer full, dropping bind event"
-            );
+            crate::count_ring_drop(sensor_linux_wire::ring::SOCKET_BIND);
         }
     }
 

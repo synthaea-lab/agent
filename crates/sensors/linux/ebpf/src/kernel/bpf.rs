@@ -6,7 +6,6 @@ use aya_ebpf::{
     maps::{PerCpuArray, RingBuf},
     programs::TracePointContext,
 };
-use aya_log_ebpf::warn;
 use sensor_linux_wire::BpfEvent;
 
 use crate::{
@@ -65,10 +64,7 @@ fn try_sys_enter_bpf(ctx: TracePointContext) -> Result<u32, u32> {
         (*e).cmd = cmd;
 
         if BPF_EVENTS.output::<BpfEvent>(&*e, 0).is_err() {
-            warn!(
-                &ctx,
-                "sensor-linux-ebpf: ring buffer full, dropping bpf event"
-            );
+            crate::count_ring_drop(sensor_linux_wire::ring::BPF);
         }
     }
 

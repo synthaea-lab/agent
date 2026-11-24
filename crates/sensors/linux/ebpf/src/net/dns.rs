@@ -17,7 +17,6 @@ use aya_ebpf::{
     maps::{LruHashMap, PerCpuArray, RingBuf},
     programs::TracePointContext,
 };
-use aya_log_ebpf::warn;
 use sensor_linux_wire::{DnsUdpQueryEvent, MAX_DNS_UDP_PAYLOAD};
 
 use super::{
@@ -133,10 +132,7 @@ fn emit_dns_udp_query(
         (*e).is_ipv6 = dest.is_ipv6;
 
         if DNS_UDP_EVENTS.output::<DnsUdpQueryEvent>(&*e, 0).is_err() {
-            warn!(
-                ctx,
-                "sensor-linux-ebpf: ring buffer full, dropping dns query event"
-            );
+            crate::count_ring_drop(sensor_linux_wire::ring::DNS_UDP);
         }
     }
     Ok(0)

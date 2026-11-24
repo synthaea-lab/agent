@@ -6,7 +6,6 @@ use aya_ebpf::{
     maps::{PerCpuArray, RingBuf},
     programs::TracePointContext,
 };
-use aya_log_ebpf::warn;
 use sensor_linux_wire::{FileRemovexattrEvent, FileSetxattrEvent, is_filtered_path};
 
 use crate::{
@@ -86,10 +85,7 @@ fn try_sys_enter_setxattr(ctx: TracePointContext) -> Result<u32, u32> {
             .output::<FileSetxattrEvent>(&*e, 0)
             .is_err()
         {
-            warn!(
-                ctx,
-                "sensor-linux-ebpf: ring buffer full, dropping setxattr event"
-            );
+            crate::count_ring_drop(sensor_linux_wire::ring::FILE_SETXATTR);
         }
     }
 
@@ -152,10 +148,7 @@ fn try_sys_enter_removexattr(ctx: TracePointContext) -> Result<u32, u32> {
             .output::<FileRemovexattrEvent>(&*e, 0)
             .is_err()
         {
-            warn!(
-                ctx,
-                "sensor-linux-ebpf: ring buffer full, dropping removexattr event"
-            );
+            crate::count_ring_drop(sensor_linux_wire::ring::FILE_REMOVEXATTR);
         }
     }
 

@@ -6,7 +6,6 @@ use aya_ebpf::{
     maps::{PerCpuArray, RingBuf},
     programs::TracePointContext,
 };
-use aya_log_ebpf::warn;
 use sensor_linux_wire::KernelModuleEvent;
 
 use crate::{
@@ -62,7 +61,6 @@ const DELETE_MODULE_FLAGS_OFFSET: usize = arg_offset(1);
 /// that choice and the program stopped loading on 7.2.
 #[inline(always)]
 fn emit_kernel_module_event(
-    ctx: &TracePointContext,
     action: u8,
     name_ptr: u64,
     fd: i32,
@@ -97,10 +95,7 @@ fn emit_kernel_module_event(
             .output::<KernelModuleEvent>(&*e, 0)
             .is_err()
         {
-            warn!(
-                ctx,
-                "sensor-linux-ebpf: ring buffer full, dropping kernel module event"
-            );
+            crate::count_ring_drop(sensor_linux_wire::ring::KERNEL_MODULE);
         }
     }
 
@@ -120,7 +115,7 @@ fn try_sys_enter_init_module(ctx: TracePointContext) -> Result<u32, u32> {
     // `init_module(2)`'s module image lives inside `umod` — the raw memory blob
     // this probe deliberately does not read (see this crate's WIRE_VERSION v12
     // changelog). Only `len` is captured.
-    emit_kernel_module_event(&ctx, KERNEL_MODULE_ACTION_LOAD, 0, -1, len, 0)
+    emit_kernel_module_event(KERNEL_MODULE_ACTION_LOAD, 0, -1, len, 0)
 }
 
 pub fn sys_enter_finit_module(ctx: TracePointContext) -> u32 {
@@ -138,14 +133,7 @@ fn try_sys_enter_finit_module(ctx: TracePointContext) -> Result<u32, u32> {
             .map_err(|_| 1u32)?
     };
 
-    emit_kernel_module_event(
-        &ctx,
-        KERNEL_MODULE_ACTION_LOAD_FD,
-        0,
-        fd as i32,
-        0,
-        flags as u32,
-    )
+    emit_kernel_module_event(KERNEL_MODULE_ACTION_LOAD_FD, 0, fd as i32, 0, flags as u32)
 }
 
 pub fn sys_enter_delete_module(ctx: TracePointContext) -> u32 {
@@ -163,12 +151,5 @@ fn try_sys_enter_delete_module(ctx: TracePointContext) -> Result<u32, u32> {
             .map_err(|_| 1u32)?
     };
 
-    emit_kernel_module_event(
-        &ctx,
-        KERNEL_MODULE_ACTION_UNLOAD,
-        name_ptr,
-        -1,
-        0,
-        flags as u32,
-    )
+    emit_kernel_module_event(KERNEL_MODULE_ACTION_UNLOAD, name_ptr, -1, 0, flags as u32)
 }

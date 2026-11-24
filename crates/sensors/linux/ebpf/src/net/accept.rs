@@ -18,7 +18,6 @@ use aya_ebpf::{
     maps::{LruHashMap, PerCpuArray, RingBuf},
     programs::TracePointContext,
 };
-use aya_log_ebpf::warn;
 use sensor_linux_wire::SocketAcceptEvent;
 
 use crate::{
@@ -162,10 +161,7 @@ fn try_sys_exit_accept(ctx: TracePointContext) -> Result<u32, u32> {
             .output::<SocketAcceptEvent>(&*e, 0)
             .is_err()
         {
-            warn!(
-                &ctx,
-                "sensor-linux-ebpf: ring buffer full, dropping accept event"
-            );
+            crate::count_ring_drop(sensor_linux_wire::ring::SOCKET_ACCEPT);
         }
     }
 

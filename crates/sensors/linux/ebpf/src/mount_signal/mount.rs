@@ -10,7 +10,6 @@ use aya_ebpf::{
     maps::{PerCpuArray, RingBuf},
     programs::TracePointContext,
 };
-use aya_log_ebpf::warn;
 use sensor_linux_wire::MountEvent;
 
 use crate::{
@@ -72,7 +71,7 @@ fn try_sys_enter_mount(ctx: TracePointContext) -> Result<u32, u32> {
     };
     let flags: u64 = unsafe { ctx.read_ulong_arg(MOUNT_FLAGS_OFFSET).map_err(|_| 1u32)? };
 
-    emit_mount_event(&ctx, target_ptr, source_ptr, fstype_ptr, flags, true)
+    emit_mount_event(target_ptr, source_ptr, fstype_ptr, flags, true)
 }
 
 pub fn sys_enter_umount(ctx: TracePointContext) -> u32 {
@@ -85,7 +84,7 @@ fn try_sys_enter_umount(ctx: TracePointContext) -> Result<u32, u32> {
             .map_err(|_| 1u32)?
     };
 
-    emit_mount_event(&ctx, target_ptr, 0, 0, 0, false)
+    emit_mount_event(target_ptr, 0, 0, 0, false)
 }
 
 /// Shared by `sys_enter_mount` and `sys_enter_umount` above. `source_ptr`/
@@ -98,7 +97,6 @@ fn try_sys_enter_umount(ctx: TracePointContext) -> Result<u32, u32> {
 /// `raw_sys_enter` fails to load and the agent exits seconds after it starts.
 #[inline(always)]
 fn emit_mount_event(
-    ctx: &TracePointContext,
     mount_point_ptr: u64,
     source_ptr: u64,
     fstype_ptr: u64,
@@ -139,10 +137,7 @@ fn emit_mount_event(
         (*e).mounted = mounted;
 
         if MOUNT_EVENTS.output::<MountEvent>(&*e, 0).is_err() {
-            warn!(
-                ctx,
-                "sensor-linux-ebpf: ring buffer full, dropping mount event"
-            );
+            crate::count_ring_drop(sensor_linux_wire::ring::MOUNT);
         }
     }
 
