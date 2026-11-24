@@ -694,6 +694,7 @@ dependencies = [
  "serde_json",
  "siblings",
  "store",
+ "thiserror 2.0.21",
  "tracing",
 ]
 
@@ -2640,6 +2641,7 @@ version = "0.0.1"
 dependencies = [
  "libc",
  "schema",
+ "tempfile",
  "thiserror 2.0.21",
  "tokio",
  "tracing",

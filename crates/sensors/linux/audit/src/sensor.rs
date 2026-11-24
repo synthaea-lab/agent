@@ -19,6 +19,36 @@ const DRAIN_BUDGET: usize = 256;
 
 pub struct AuditSensor {
     stop: Arc<Notify>,
+    /// The agent's state directory, where a marker with this instance's pid lets the next one
+    /// attribute a `SIGKILL` from auditd's log (#275). `None`: no replay.
+    state_dir: Option<std::path::PathBuf>,
+    /// The audit log files read for that replay; [`crate::killrec::default_log_paths`] unless a
+    /// test says otherwise.
+    log_paths: Vec<std::path::PathBuf>,
+    /// The marker as written, kept to refresh its thread list.
+    marker: std::sync::Mutex<Option<crate::killrec::Marker>>,
+}
+
+/// How the start-up replay ended.
+#[derive(Debug, PartialEq, Eq)]
+enum ReplayOutcome {
+    /// No state directory, no marker, this instance's own pid, or another boot: nothing to look for.
+    NothingToLookFor,
+    /// A record of the kill was found and emitted.
+    Reported,
+    /// The marker survived and no record accounts for the previous instance (warned).
+    NoRecord,
+}
+
+/// How often the marker's thread list is compared with `/proc/self/task` and its anchor with the log: the runtime starts
+/// workers on demand, and a `kill(<tid>, 9)` of one that the marker lacks is not attributed.
+const THREAD_REFRESH: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// This process's group id: `kill -9 -<pgid>` aims at it.
+fn process_group() -> u32 {
+    // SAFETY: `getpgrp(2)` takes no argument, cannot fail and touches no memory.
+    let pgid = unsafe { libc::getpgrp() };
+    u32::try_from(pgid).unwrap_or(0)
 }
 
 impl AuditSensor {
@@ -26,6 +56,130 @@ impl AuditSensor {
     pub fn new() -> Self {
         Self {
             stop: Arc::new(Notify::new()),
+            state_dir: None,
+            log_paths: crate::killrec::default_log_paths(),
+            marker: std::sync::Mutex::new(None),
+        }
+    }
+
+    /// Keeps a marker in `state_dir` and, at start, replays a `SIGKILL` of the previous instance
+    /// found in auditd's log as an `Event::Signal` (#275). It finds one only when the operator
+    /// loaded `packaging/linux/audit/synthaea-kill.rules`; without the rule it reports nothing.
+    #[must_use]
+    pub fn with_state_dir(mut self, state_dir: std::path::PathBuf) -> Self {
+        self.state_dir = Some(state_dir);
+        self
+    }
+
+    /// Reads the previous instance's marker, writes this one's, and emits the replayed kill, if any.
+    ///
+    /// Synchronous, on the runtime thread, once at start-up and before the listening loop: it
+    /// reads the tail of each audit log file (2 x 16 MiB at most per file). The walk ends at the file
+    /// holding the marker's anchor, refreshed every few seconds so that it is the newest file or one
+    /// behind it, or, without an anchor, at the first file older than the previous instance; either is
+    /// brief next to the start. It is not moved to `spawn_blocking`: the sink is borrowed, and the
+    /// replay must have been emitted before the first live record.
+    fn replay_previous_sigkill(&self, sink: &dyn EventSink) -> ReplayOutcome {
+        self.replay_previous_sigkill_with(sink, &crate::killrec::STOPPING)
+    }
+
+    /// [`Self::replay_previous_sigkill`] with the "this process is stopping" flag given, so that a
+    /// test can set it without stopping every other test of the binary.
+    fn replay_previous_sigkill_with(
+        &self,
+        sink: &dyn EventSink,
+        stopping: &std::sync::atomic::AtomicBool,
+    ) -> ReplayOutcome {
+        let Some(dir) = &self.state_dir else {
+            return ReplayOutcome::NothingToLookFor;
+        };
+        let own_pid = std::process::id();
+        let boot_id = crate::killrec::current_boot_id();
+        let previous = crate::killrec::read_marker(dir);
+        let this = crate::killrec::Marker {
+            pid: own_pid,
+            pgid: process_group(),
+            started_ns: schema::time::now_ns(),
+            boot_id: boot_id.clone(),
+            tids: crate::killrec::current_thread_ids(),
+            // SAFETY: `getuid(2)` takes no argument, cannot fail and touches no memory.
+            uid: Some(unsafe { libc::getuid() }),
+            anchor: crate::killrec::newest_anchor(&self.log_paths),
+        };
+        *self.marker.lock().unwrap_or_else(|e| e.into_inner()) = Some(this.clone());
+        if let Err(e) = crate::killrec::write_marker_unless(dir, &this, stopping) {
+            tracing::warn!(error = %e, "sensor-linux-audit: could not write the instance marker, a SIGKILL of this agent will not be attributed");
+        }
+        let Some(replay) = crate::killrec::previous_instance_kill(
+            previous.as_ref(),
+            own_pid,
+            boot_id.as_deref(),
+            &self.log_paths,
+        ) else {
+            return ReplayOutcome::NothingToLookFor;
+        };
+        let previous_pid = previous.as_ref().map_or(0, |m| m.pid);
+        let Some(record) = replay.record else {
+            // The marker survived, so the previous instance did not stop on its own, and no
+            // record accounts for it: a kill the rule does not see (`systemctl kill`, a signal
+            // sent another way, no rule loaded, a record rotated out of reach) or a crash.
+            tracing::warn!(
+                previous_pid,
+                read = ?replay.read,
+                unreadable = ?replay.unreadable,
+                truncated = ?replay.truncated,
+                "sensor-linux-audit: the previous agent instance did not stop cleanly and auditd's log holds no SIGKILL record for it"
+            );
+            return ReplayOutcome::NoRecord;
+        };
+        tracing::warn!(
+            sender_pid = record.sender_pid,
+            target_pid = previous_pid,
+            "sensor-linux-audit: the previous agent instance was sent SIGKILL, reporting it"
+        );
+        sink.on_event(normalize::sigkill_event(
+            &record,
+            previous_pid,
+            std::env::current_exe()
+                .ok()
+                .map(|exe| exe.to_string_lossy().into_owned()),
+        ));
+        // A stop signal that came before this instance wrote its marker left the predecessor's
+        // marker on disk (the write is skipped once the process is stopping). The kill is reported
+        // now, so the marker goes with it: otherwise the next start would report it again.
+        if stopping.load(std::sync::atomic::Ordering::Acquire) {
+            crate::killrec::remove_marker(dir);
+        }
+        ReplayOutcome::Reported
+    }
+
+    /// Rewrites the marker when the process's thread ids changed since it was written, or when the
+    /// log has a newer kernel record than its anchor. A kill always comes after the last refresh,
+    /// so a fresh anchor keeps the replay's walk to the newest file or two instead of the whole
+    /// chain once the start-up anchor has been rotated out.
+    fn refresh_marker(&self) {
+        let Some(dir) = &self.state_dir else {
+            return;
+        };
+        let mut guard = self.marker.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(marker) = guard.as_mut() else {
+            return;
+        };
+        let tids = crate::killrec::current_thread_ids();
+        let anchor = crate::killrec::newest_anchor(&self.log_paths);
+        let threads_changed = !tids.is_empty() && tids != marker.tids;
+        let anchor_moved = anchor.is_some() && anchor != marker.anchor;
+        if !threads_changed && !anchor_moved {
+            return;
+        }
+        if threads_changed {
+            marker.tids = tids;
+        }
+        if anchor_moved {
+            marker.anchor = anchor;
+        }
+        if let Err(e) = crate::killrec::write_marker(dir, marker) {
+            tracing::warn!(error = %e, "sensor-linux-audit: could not refresh the instance marker");
         }
     }
 
@@ -44,6 +198,7 @@ impl AuditSensor {
         .map_err(|e| format!("AsyncFd: {e}"))?;
 
         tracing::info!("sensor-linux-audit: listening for exec/connect");
+        let _ = self.replay_previous_sigkill(sink.as_ref());
 
         let ctrl_c = tokio::signal::ctrl_c();
         tokio::pin!(ctrl_c);
@@ -56,9 +211,11 @@ impl AuditSensor {
         let mut overruns: u64 = 0;
         let mut execve = ExecveAssembler::default();
         let mut truncated: u64 = 0;
+        let mut threads = tokio::time::interval(THREAD_REFRESH);
         loop {
             tokio::select! {
                 _ = &mut ctrl_c => break,
+                _ = threads.tick() => self.refresh_marker(),
                 _ = self.stop.notified() => break,
                 guard = async_socket.readable_mut() => {
                     let mut guard = guard.map_err(|e| format!("poll: {e}"))?;
@@ -124,6 +281,10 @@ impl AuditSensor {
         for exec in execve.finish() {
             emit_exec(exec, sink.as_ref());
         }
+        // A clean stop: nothing killed this instance, so the next one has nothing to attribute.
+        if let Some(dir) = &self.state_dir {
+            crate::killrec::remove_marker(dir);
+        }
         tracing::info!("sensor-linux-audit: exiting");
         Ok(())
     }
@@ -133,6 +294,17 @@ impl Default for AuditSensor {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// The runtime the sensor loop runs on. It needs the time driver as well as the I/O driver:
+/// the loop ticks a `tokio::time::interval` to refresh the marker, and without
+/// `enable_time` the first call panics ("timers are disabled") at start-up.
+fn sensor_runtime() -> Result<tokio::runtime::Runtime, SensorError> {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_io()
+        .enable_time()
+        .build()
+        .map_err(|e| format!("tokio runtime: {e}").into())
 }
 
 impl Sensor for AuditSensor {
@@ -152,10 +324,7 @@ impl Sensor for AuditSensor {
     }
 
     fn run(&mut self, sink: Box<dyn EventSink>) -> Result<(), SensorError> {
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_io()
-            .build()
-            .map_err(|e| format!("tokio runtime: {e}"))?;
+        let rt = sensor_runtime()?;
         rt.block_on(self.run_async(sink))
     }
 
@@ -199,6 +368,17 @@ pub(crate) fn audit_ts_to_epoch_ns(sec: u64, ms: u32) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sensor_runtime_has_the_time_driver() {
+        // `run_async` ticks `tokio::time::interval`; on a runtime without the time driver the
+        // first `interval` call panics at start-up (found on a lab VM, agent#275).
+        let rt = sensor_runtime().expect("runtime");
+        rt.block_on(async {
+            let mut tick = tokio::time::interval(std::time::Duration::from_millis(1));
+            tick.tick().await;
+        });
+    }
 
     #[test]
     fn timestamp_conversion() {
@@ -278,5 +458,209 @@ mod tests {
         assert!(!caps.parent_lineage); // Honest: audit doesn't provide ppid
         assert!(!caps.file_events); // Phase 2
         assert!(!caps.auth_events); // journal owns this
+    }
+
+    /// A `SIGKILL` record of pid 0xff by pid 20 at `1000.500`, as auditd logs it.
+    fn kill_line(target_hex: &str) -> String {
+        format!(
+            "type=SYSCALL msg=audit(1000.500:7): arch=c000003e syscall=62 success=yes exit=0 a0={target_hex} a1=9 a2=0 a3=0 items=0 ppid=10 pid=20 auid=1000 uid=0 gid=0 euid=0 suid=0 fsuid=0 egid=0 sgid=0 fsgid=0 tty=(none) ses=4 comm=\"sh\" exe=\"/bin/sh\" key=\"{}\"",
+            crate::killrec::KILL_KEY
+        )
+    }
+
+    fn sensor_in(dir: &std::path::Path, log: std::path::PathBuf) -> AuditSensor {
+        let mut sensor = AuditSensor::new().with_state_dir(dir.to_path_buf());
+        sensor.log_paths = vec![log];
+        sensor
+    }
+
+    /// A marker for the previous instance (pid 255) that started at `started_s`, in this boot.
+    fn previous_marker(dir: &std::path::Path, pid: u32, started_s: u64) {
+        crate::killrec::write_marker(
+            dir,
+            &crate::killrec::Marker {
+                pid,
+                pgid: pid,
+                started_ns: started_s * 1_000_000_000,
+                boot_id: crate::killrec::current_boot_id(),
+                // SAFETY: `getuid(2)` takes no argument, cannot fail and touches no memory.
+                uid: Some(unsafe { libc::getuid() }),
+                ..crate::killrec::Marker::default()
+            },
+        )
+        .unwrap();
+    }
+
+    fn replayed(sensor: &AuditSensor) -> Vec<schema::Event> {
+        replayed_with_outcome(sensor).0
+    }
+
+    fn replayed_with_outcome(sensor: &AuditSensor) -> (Vec<schema::Event>, ReplayOutcome) {
+        let sink = Collect::default();
+        let outcome = sensor.replay_previous_sigkill(&sink);
+        (sink.0.lock().unwrap().clone(), outcome)
+    }
+
+    #[test]
+    fn a_restart_after_a_sigkill_reports_the_kill_as_a_signal_event_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("audit.log");
+        // The previous instance (pid 255) started at t=900 s; the kill is logged at t=1000.5 s,
+        // after that start.
+        std::fs::write(&log, format!("{}\n", kill_line("ff"))).unwrap();
+        let own = std::process::id();
+        assert_ne!(own, 0xff);
+        previous_marker(dir.path(), 0xff, 900);
+
+        let sensor = sensor_in(dir.path(), log);
+        let events = replayed(&sensor);
+        assert_eq!(events.len(), 1, "{events:?}");
+        let schema::Event::Signal(signal) = &events[0] else {
+            panic!("not a Signal event: {events:?}");
+        };
+        assert_eq!(signal.signal, 9);
+        assert_eq!(signal.target_pid, 0xff);
+        assert_eq!(signal.meta.pid, 20, "the sender is the meta");
+        assert_eq!(signal.meta.comm, "sh");
+
+        // The marker now names this instance: a second start with no new kill reports nothing.
+        assert_eq!(
+            crate::killrec::read_marker(dir.path()).map(|m| m.pid),
+            Some(own)
+        );
+        assert!(replayed(&sensor).is_empty());
+    }
+
+    #[test]
+    fn a_group_kill_of_the_previous_instance_is_reported_against_its_pid() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("audit.log");
+        // `kill -9 -255`: a0 is the 32-bit -255.
+        std::fs::write(&log, format!("{}\n", kill_line("ffffff01"))).unwrap();
+        previous_marker(dir.path(), 0xff, 900);
+        let events = replayed(&sensor_in(dir.path(), log));
+        let [schema::Event::Signal(signal)] = events.as_slice() else {
+            panic!("expected one Signal event: {events:?}");
+        };
+        assert_eq!(
+            signal.target_pid, 0xff,
+            "the old instance's pid, not the group id"
+        );
+    }
+
+    #[test]
+    fn a_marker_with_no_record_reports_no_event() {
+        // The outcome is the one that triggers the "did not stop cleanly" warning.
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("audit.log");
+        std::fs::write(&log, format!("{}\n", kill_line("aa"))).unwrap();
+        previous_marker(dir.path(), 0xff, 900);
+        let (events, outcome) = replayed_with_outcome(&sensor_in(dir.path(), log));
+        assert!(events.is_empty());
+        assert_eq!(outcome, ReplayOutcome::NoRecord);
+    }
+
+    #[test]
+    fn no_marker_or_no_state_dir_reports_nothing_and_a_stop_removes_the_marker() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("audit.log");
+        std::fs::write(&log, format!("{}\n", kill_line("ff"))).unwrap();
+        // First start ever: nothing to attribute, but the marker is written.
+        let sensor = sensor_in(dir.path(), log);
+        let sink = Collect::default();
+        assert_eq!(
+            sensor.replay_previous_sigkill(&sink),
+            ReplayOutcome::NothingToLookFor
+        );
+        assert!(sink.0.lock().unwrap().is_empty());
+        let written = crate::killrec::read_marker(dir.path()).unwrap();
+        assert!(written.tids.contains(&std::process::id()));
+        assert!(written.uid.is_some());
+        // Without a state directory the sensor does nothing at all.
+        let none = AuditSensor::new();
+        let sink = Collect::default();
+        assert_eq!(
+            none.replay_previous_sigkill(&sink),
+            ReplayOutcome::NothingToLookFor
+        );
+        assert!(sink.0.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_thread_started_later_is_added_to_the_marker_and_a_kill_of_it_is_attributed() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("audit.log");
+        let sensor = sensor_in(dir.path(), log.clone());
+        let _ = replayed(&sensor);
+        let before = crate::killrec::read_marker(dir.path()).unwrap();
+        // A new thread, alive while the marker is refreshed; its tid is then what is killed.
+        let (tid_tx, tid_rx) = std::sync::mpsc::channel();
+        let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+        let worker = std::thread::spawn(move || {
+            // SAFETY: `gettid` takes no argument and cannot fail.
+            let tid = unsafe { libc::syscall(libc::SYS_gettid) };
+            tid_tx.send(u32::try_from(tid).unwrap()).unwrap();
+            let _ = done_rx.recv();
+        });
+        let tid = tid_rx.recv().unwrap();
+        assert!(!before.tids.contains(&tid));
+        sensor.refresh_marker();
+        let after = crate::killrec::read_marker(dir.path()).unwrap();
+        assert!(after.tids.contains(&tid));
+        // `kill -9 <worker tid>` of that process, replayed by its successor (another pid).
+        std::fs::write(&log, format!("{}\n", kill_line(&format!("{tid:x}")))).unwrap();
+        let mut previous = after;
+        previous.pid = 0xff;
+        previous.started_ns = 0;
+        previous.anchor = None;
+        crate::killrec::write_marker(dir.path(), &previous).unwrap();
+        let events = replayed(&sensor_in(dir.path(), log));
+        assert_eq!(events.len(), 1, "{events:?}");
+        done_tx.send(()).unwrap();
+        worker.join().unwrap();
+    }
+
+    #[test]
+    fn a_refresh_moves_the_anchor_to_the_newest_kernel_record() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("audit.log");
+        std::fs::write(&log, format!("{}\n", kill_line("ff"))).unwrap();
+        let sensor = sensor_in(dir.path(), log.clone());
+        let _ = replayed(&sensor);
+        let before = crate::killrec::read_marker(dir.path()).unwrap();
+        assert_eq!(before.anchor.map(|a| a.serial), Some(7));
+        // The log grows while the agent runs; the next refresh follows it.
+        let newer = kill_line("ee").replace("audit(1000.500:7)", "audit(2000.500:9)");
+        std::fs::write(&log, format!("{}\n{newer}\n", kill_line("ff"))).unwrap();
+        sensor.refresh_marker();
+        let after = crate::killrec::read_marker(dir.path()).unwrap();
+        assert_eq!(after.anchor.map(|a| a.serial), Some(9));
+        // Nothing new in the log: the anchor stays. (Not the whole marker: its thread list follows
+        // the other tests' threads, which start and end while this one runs.)
+        sensor.refresh_marker();
+        assert_eq!(
+            crate::killrec::read_marker(dir.path()).unwrap().anchor,
+            after.anchor
+        );
+    }
+
+    #[test]
+    fn a_stop_before_the_marker_is_written_does_not_leave_the_kill_to_be_reported_twice() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("audit.log");
+        std::fs::write(&log, format!("{}\n", kill_line("ff"))).unwrap();
+        previous_marker(dir.path(), 0xff, 900);
+        let sensor = sensor_in(dir.path(), log.clone());
+        // SIGTERM arrived after the previous marker was read, before this instance wrote its own.
+        let stopping = std::sync::atomic::AtomicBool::new(true);
+        let sink = Collect::default();
+        let outcome = sensor.replay_previous_sigkill_with(&sink, &stopping);
+        assert_eq!(outcome, ReplayOutcome::Reported);
+        assert_eq!(sink.0.lock().unwrap().len(), 1);
+        // The predecessor's marker is gone and this instance wrote none: the next start has
+        // nothing to report again.
+        assert!(crate::killrec::read_marker(dir.path()).is_none());
+        let next = replayed_with_outcome(&sensor_in(dir.path(), log));
+        assert!(next.0.is_empty(), "{:?}", next.0);
     }
 }

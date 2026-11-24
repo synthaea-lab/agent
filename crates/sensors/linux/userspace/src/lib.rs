@@ -12,8 +12,10 @@
 
 mod dns_udp;
 pub mod normalize;
-// Read by nothing yet: the capture that feeds it is the next part of https://github.com/synthaea-lab/agent/issues/22.
-#[cfg_attr(not(test), allow(dead_code))]
+// Built for its tests only: no capture feeds this parser yet, so nothing outside them reads it. The
+// capture is the next part of https://github.com/synthaea-lab/agent/issues/22; that change turns
+// this line into a plain `mod`.
+#[cfg(test)]
 mod tls_client_hello;
 
 #[cfg(all(target_os = "linux", any(ebpf_embedded, test)))]

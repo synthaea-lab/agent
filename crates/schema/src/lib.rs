@@ -2140,6 +2140,23 @@ pub struct HealthBeacon {
     /// older beacon.
     #[serde(default)]
     pub exec_ring_dropped: u64,
+    /// Cumulative entries the Windows ETW sensor's pid cache dropped at its cap: a later event of
+    /// such a process misses its image path (issue #178). Zero on other platforms and in a
+    /// beacon from an older agent.
+    #[serde(default)]
+    pub etw_pid_cache_evicted: u64,
+    /// Cumulative entries the Windows ETW sensor's silo directory dropped at its cap: a container
+    /// event is named again by a lookup. Zero on other platforms and in an older beacon.
+    #[serde(default)]
+    pub etw_silo_evicted: u64,
+    /// Cumulative `Zone.Identifier` marks the Windows ETW read-back queue dropped: each one is a
+    /// lost `FileQuarantine`. Zero on other platforms and in an older beacon.
+    #[serde(default)]
+    pub etw_marks_dropped: u64,
+    /// Cumulative quarantine paths reported without dedup because the dedup map was full: a
+    /// possible duplicate, never a lost mark. Zero on other platforms and in an older beacon.
+    #[serde(default)]
+    pub etw_quarantine_unremembered: u64,
 }
 
 /// A logon/authentication outcome, or a privileged-session assignment — shared

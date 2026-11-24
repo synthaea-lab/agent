@@ -66,7 +66,7 @@ Every record begins with [`EventMeta`](../../../crates/sensors/linux/wire/src/li
 | `uid`, `gid` | `bpf_get_current_uid_gid()` | root |
 | `timestamp_ns` | `bpf_ktime_get_ns()`, monotonic since boot | userspace adds the boot-to-epoch offset |
 | `comm` | `bpf_get_current_comm()` | |
-| `cgroup_id` | `bpf_get_current_cgroup_id()` at probe time | helper failed; also always 0 on uprobe records |
+| `cgroup_id` | `bpf_get_current_cgroup_id()` at probe time | helper failed |
 | `process_generation` | `PROC_LINEAGE[tgid].generation` | no stamp (never a real generation) |
 | `parent_generation` | `PROC_LINEAGE[tgid].parent_generation` | unknown |
 
