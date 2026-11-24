@@ -182,42 +182,54 @@ pub(crate) fn is_one_shot_wrapper(event: &ExecEvent) -> bool {
     }
 }
 
+/// Programs that are discovery whatever their arguments, with what they ask about. Each is
+/// named after itself; no name appears twice, so the lookup never depends on order. The
+/// programs that count only with certain arguments are matched in [`discovery`].
+pub(crate) const DISCOVERY_PROGRAMS: &[(&str, Category)] = &[
+    ("ps", Category::Process),
+    ("pgrep", Category::Process),
+    ("pstree", Category::Process),
+    ("tasklist", Category::Process),
+    ("whoami", Category::Account),
+    ("id", Category::Account),
+    ("who", Category::Account),
+    ("w", Category::Account),
+    ("last", Category::Account),
+    ("lastlog", Category::Account),
+    ("quser", Category::Account),
+    ("qwinsta", Category::Account),
+    ("uname", Category::System),
+    ("hostname", Category::System),
+    ("hostnamectl", Category::System),
+    ("systeminfo", Category::System),
+    ("uptime", Category::System),
+    ("lscpu", Category::System),
+    ("lsb_release", Category::System),
+    ("sw_vers", Category::System),
+    ("system_profiler", Category::System),
+    ("ifconfig", Category::Network),
+    ("ipconfig", Category::Network),
+    ("netstat", Category::Network),
+    ("ss", Category::Network),
+    ("arp", Category::Network),
+    ("nbtstat", Category::Network),
+    ("route", Category::Network),
+];
+
 /// The discovery command this exec is, with its category; `None` for anything else.
 /// Commands that also do other things (`ip`, `net`, `dscl`, `wmic`, `getent`, `cat`) count
 /// only with the arguments that ask a question.
 pub(crate) fn discovery(event: &ExecEvent) -> Option<(&'static str, Category)> {
     let program = program(event);
     let args = args(event);
+    if let Some(&(name, category)) = DISCOVERY_PROGRAMS
+        .iter()
+        .find(|(name, _)| *name == program.as_str())
+    {
+        return Some((name, category));
+    }
     let first = args.first().map(String::as_str);
     let found = match program.as_str() {
-        "ps" => ("ps", Category::Process),
-        "pgrep" => ("pgrep", Category::Process),
-        "pstree" => ("pstree", Category::Process),
-        "tasklist" => ("tasklist", Category::Process),
-        "whoami" => ("whoami", Category::Account),
-        "id" => ("id", Category::Account),
-        "who" => ("who", Category::Account),
-        "w" => ("w", Category::Account),
-        "last" => ("last", Category::Account),
-        "lastlog" => ("lastlog", Category::Account),
-        "quser" => ("quser", Category::Account),
-        "qwinsta" => ("qwinsta", Category::Account),
-        "uname" => ("uname", Category::System),
-        "hostname" => ("hostname", Category::System),
-        "hostnamectl" => ("hostnamectl", Category::System),
-        "systeminfo" => ("systeminfo", Category::System),
-        "uptime" => ("uptime", Category::System),
-        "lscpu" => ("lscpu", Category::System),
-        "lsb_release" => ("lsb_release", Category::System),
-        "sw_vers" => ("sw_vers", Category::System),
-        "system_profiler" => ("system_profiler", Category::System),
-        "ifconfig" => ("ifconfig", Category::Network),
-        "ipconfig" => ("ipconfig", Category::Network),
-        "netstat" => ("netstat", Category::Network),
-        "ss" => ("ss", Category::Network),
-        "arp" => ("arp", Category::Network),
-        "nbtstat" => ("nbtstat", Category::Network),
-        "route" => ("route", Category::Network),
         "ip" => match first? {
             "a" | "addr" | "address" | "r" | "route" | "l" | "link" | "n" | "neigh"
             | "neighbour" => ("ip", Category::Network),
