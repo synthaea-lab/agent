@@ -336,7 +336,9 @@ pub fn ntlm_account(user: &str, domain: &str) -> String {
 /// The dedup key of an NTLM event (#364): two events with the same key within the
 /// window are one fact. The event id and the status are part of it, so an incoming
 /// failure and the success that follows it (same account, target, address and version)
-/// stay two events: the success is the one the success-after-failure rules need.
+/// stay two events: the success is the one the success-after-failure rules need. Text
+/// fields are written quoted and escaped, so a `|` in an account or target name cannot
+/// make two different authentications one key.
 #[must_use]
 pub fn ntlm_dedup_key(
     direction: schema::NtlmDirection,
@@ -348,8 +350,7 @@ pub fn ntlm_dedup_key(
     status: Option<&str>,
 ) -> String {
     format!(
-        "{direction:?}|{event_id}|{user}|{target}|{remote_address:?}|{ntlm_version}|{}",
-        status.unwrap_or("")
+        "{direction:?}|{event_id}|{user:?}|{target:?}|{remote_address:?}|{ntlm_version:?}|{status:?}"
     )
 }
 
@@ -951,6 +952,24 @@ mod tests {
             text.contains("a (") && text.contains("c (") && !text.contains("d ("),
             "{text}"
         );
+    }
+
+    #[test]
+    fn a_separator_inside_an_ntlm_account_or_target_does_not_merge_two_keys() {
+        let key = |user, target| {
+            ntlm_dedup_key(
+                schema::NtlmDirection::Outgoing,
+                4020,
+                user,
+                target,
+                None,
+                "NTLMv2",
+                None,
+            )
+        };
+
+        assert_ne!(key("a|b", "c"), key("a", "b|c"));
+        assert_ne!(key(r#"a"|"b"#, "c"), key("a", r#""b|c"#));
     }
 
     #[test]

@@ -1828,9 +1828,8 @@ pub struct UnitStopEvent {
 
 /// UDP datagram sent — the primary signal for DNS-tunneling and C2-over-UDP detection.
 ///
-/// Emitted on EID 14 (`UDPSend` IPv4) of the Microsoft-Windows-Kernel-Network
-/// provider, which is already subscribed for TCP connect/send events. IPv6 UDP
-/// is not captured at this tier (field layout differs; add EID 18 separately if needed).
+/// Emitted on EIDs 42 (UDP v4 send) and 58 (UDP v6 send) of the
+/// Microsoft-Windows-Kernel-Network provider on Windows.
 ///
 /// Note: UDP is stateless — unlike TCP connects there is no dedup filter, so
 /// high-volume UDP flows (QUIC, media) may produce many events. Rules matching
@@ -1838,7 +1837,7 @@ pub struct UnitStopEvent {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct UdpSendEvent {
     pub meta: EventMeta,
-    /// Destination address (IPv4 only at this tier).
+    /// Destination address.
     pub daddr: core::net::IpAddr,
     pub dport: u16,
     /// UDP payload size in bytes. Useful for detecting large DNS queries (tunneling)
