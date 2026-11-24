@@ -1706,9 +1706,9 @@ pub struct ProcessAccessEvent {
 /// Registry value write — the primary signal for persistence and configuration
 /// manipulation detections.
 ///
-/// Emitted on EID 4 (`RegSetValueKey`) of the Microsoft-Windows-Kernel-Registry
-/// provider. Only write operations are captured; reads (EID 2 `RegOpenKey`) are
-/// high-volume noise with almost no detection value at this tier.
+/// Emitted on EID 5 (`SetValueKey`) of the Microsoft-Windows-Kernel-Registry
+/// provider. Only writes are emitted; the sensor reads key opens and closes only to
+/// name the key a write went to.
 ///
 /// Key path is normalized from NT registry format (`\REGISTRY\MACHINE\...`) to
 /// the familiar Win32 hive prefix (`HKLM\...`) by the sensor.

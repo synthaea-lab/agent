@@ -1,22 +1,15 @@
 //! The bounded pid -> (image path, incarnation, server silo) cache behind
-//! `SharedState::pids`.
-//!
-//! A local copy of the `store::BoundedMap` shape (sensor crates may depend only
-//! on `schema`, `tools/check-deps.py`), plus the explicit `remove` a pid cache
-//! needs for PID recycling.
+//! `SharedState::pids`, with the explicit `remove` a pid cache needs for PID recycling.
 
-use std::collections::HashMap;
+use crate::bounded_lru::BoundedLru;
 
 /// pid → full image path, process sequence number and server silo, never
 /// larger than its cap. Explicit [`Self::remove`] on
 /// `ProcessEnd` is the correctness path (PID recycling); LRU eviction is only the
-/// backstop for when that removal never arrives, and is counted so the loss is
-/// observable rather than silent.
+/// backstop for when that removal never arrives (`ProcessEnd` records lost, or a cap
+/// too small for this host), and is counted so the loss is observable rather than silent.
 pub(crate) struct PidCache {
-    entries: HashMap<u32, Entry>,
-    cap: usize,
-    tick: u64,
-    evicted: u64,
+    entries: BoundedLru<u32, Entry>,
 }
 
 struct Entry {
@@ -30,7 +23,6 @@ struct Entry {
     generation: Option<u64>,
     /// The server silo: 0 the host, `None` when it could not be read.
     silo: Option<u32>,
-    last_used: u64,
 }
 
 impl PidCache {
@@ -38,18 +30,9 @@ impl PidCache {
     ///
     /// Panics when `cap` is 0 — a configuration bug, not a runtime condition.
     pub(crate) fn new(cap: usize) -> Self {
-        assert!(cap >= 1, "PidCache cap must be >= 1");
         Self {
-            entries: HashMap::new(),
-            cap,
-            tick: 0,
-            evicted: 0,
+            entries: BoundedLru::new("pid cache", cap),
         }
-    }
-
-    fn next_tick(&mut self) -> u64 {
-        self.tick += 1;
-        self.tick
     }
 
     pub(crate) fn insert(
@@ -81,46 +64,35 @@ impl PidCache {
         generation: Option<u64>,
         silo: Option<u32>,
     ) {
-        let last_used = self.next_tick();
         self.entries.insert(
             pid,
             Entry {
                 image_path,
                 generation,
                 silo,
-                last_used,
             },
         );
-        if self.entries.len() > self.cap {
-            self.evict_batch();
-        }
     }
 
     /// Refreshes recency: a pid still producing events is still alive.
     pub(crate) fn get(&mut self, pid: u32) -> Option<&str> {
-        let tick = self.next_tick();
-        let entry = self.entries.get_mut(&pid)?;
-        entry.last_used = tick;
-        entry.image_path.as_deref()
+        self.entries.get(&pid)?.image_path.as_deref()
     }
 
     /// Whether `pid` is cached, without refreshing recency.
     pub(crate) fn contains(&self, pid: u32) -> bool {
-        self.entries.contains_key(&pid)
+        self.entries.peek(&pid).is_some()
     }
 
     /// The process sequence number cached for `pid`, without refreshing recency.
     pub(crate) fn generation(&self, pid: u32) -> Option<u64> {
-        self.entries.get(&pid)?.generation
+        self.entries.peek(&pid)?.generation
     }
 
     /// The pid's server silo, when it was read (0 = the host). Refreshes
     /// recency like [`Self::get`].
     pub(crate) fn silo(&mut self, pid: u32) -> Option<u32> {
-        let tick = self.next_tick();
-        let entry = self.entries.get_mut(&pid)?;
-        entry.last_used = tick;
-        entry.silo
+        self.entries.get(&pid)?.silo
     }
 
     /// Deliberate retirement (`ProcessEnd`) — not counted as an eviction, since
@@ -137,26 +109,7 @@ impl PidCache {
     /// events were lost (or the cap is too small for this host).
     #[cfg_attr(not(test), allow(dead_code))] // read by a future health surface
     pub(crate) fn evicted(&self) -> u64 {
-        self.evicted
-    }
-
-    fn evict_batch(&mut self) {
-        let batch = (self.cap / 8).max(1);
-        let mut by_age: Vec<(u64, u32)> = self
-            .entries
-            .iter()
-            .map(|(pid, entry)| (entry.last_used, *pid))
-            .collect();
-        by_age.sort_unstable();
-        for (_, pid) in by_age.into_iter().take(batch) {
-            self.entries.remove(&pid);
-            self.evicted += 1;
-        }
-        tracing::warn!(
-            size = self.entries.len(),
-            evicted_total = self.evicted,
-            "pid cache hit its cap — ProcessEnd events were likely lost"
-        );
+        self.entries.evicted()
     }
 }
 

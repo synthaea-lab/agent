@@ -1,69 +1,13 @@
-use std::collections::HashMap;
-
 use proptest::prelude::*;
 use schema::{EventMeta, NtlmDirection, fixtures};
 
-use super::*;
-
-/// A field value with its ETW type: reading it as another type gives `None`, as `Parser`'s
-/// size check does.
-#[derive(Debug, Clone)]
-enum Value {
-    Text(String),
-    U16(u16),
-    U32(u32),
-    Bytes(Vec<u8>),
-}
-
-#[derive(Debug, Default)]
-struct Fields(HashMap<&'static str, Value>);
-
-impl Fields {
-    fn of(fields: &[(&'static str, Value)]) -> Self {
-        Self(fields.iter().cloned().collect())
-    }
-}
-
-impl PayloadFields for Fields {
-    fn text(&self, name: &str) -> Option<String> {
-        match self.0.get(name)? {
-            Value::Text(text) => Some(text.clone()),
-            _ => None,
-        }
-    }
-
-    fn u16(&self, name: &str) -> Option<u16> {
-        match self.0.get(name)? {
-            Value::U16(value) => Some(*value),
-            _ => None,
-        }
-    }
-
-    fn u32(&self, name: &str) -> Option<u32> {
-        match self.0.get(name)? {
-            Value::U32(value) => Some(*value),
-            _ => None,
-        }
-    }
-
-    fn bytes(&self, name: &str) -> Option<Vec<u8>> {
-        match self.0.get(name)? {
-            Value::Bytes(bytes) => Some(bytes.clone()),
-            _ => None,
-        }
-    }
-}
-
-fn text_value(text: &str) -> Value {
-    Value::Text(text.to_string())
-}
+use super::{
+    test_fields::{Fields, Value, text_value, utf16},
+    *,
+};
 
 fn meta() -> EventMeta {
     fixtures::meta()
-}
-
-fn utf16(text: &str) -> Vec<u8> {
-    text.encode_utf16().flat_map(u16::to_le_bytes).collect()
 }
 
 mod dns {
@@ -121,22 +65,28 @@ mod registry {
     use super::*;
 
     const RUN_KEY: &str = r"\REGISTRY\MACHINE\SOFTWARE\Microsoft\Windows\CurrentVersion\Run";
+    const KEY_OBJECT: u64 = 0xffff_c08a_1234_5670;
 
     /// The EID 5 `SetValueKey` template of the manifest.
     fn set_value(data_type: u32, data: Vec<u8>) -> Fields {
         Fields::of(&[
-            ("KeyName", text_value(RUN_KEY)),
+            ("KeyObject", Value::Pointer(KEY_OBJECT)),
+            ("KeyName", text_value("")),
             ("ValueName", text_value("updater")),
             ("Type", Value::U32(data_type)),
             ("CapturedData", Value::Bytes(data)),
         ])
     }
 
+    fn data_of(fields: &Fields) -> Option<String> {
+        value_write(fields).data
+    }
+
     #[test]
     fn a_string_value_is_decoded_under_its_win32_key() {
         let fields = set_value(REG_SZ, utf16("C:\\evil.exe\0"));
 
-        let event = registry_set(&fields, meta()).expect("named key");
+        let event = value_write(&fields).into_event(RUN_KEY, meta());
 
         assert_eq!(
             event.key,
@@ -148,51 +98,50 @@ mod registry {
     }
 
     #[test]
+    fn a_write_names_its_key_object_and_no_key_name_when_the_kernel_left_it_empty() {
+        let write = value_write(&set_value(REG_SZ, Vec::new()));
+
+        assert_eq!(write.key_object, Some(KEY_OBJECT));
+        assert_eq!(write.key_name, None);
+    }
+
+    #[test]
+    fn a_write_keeps_the_key_name_the_kernel_wrote() {
+        let mut fields = set_value(REG_SZ, Vec::new());
+        fields.0.insert("KeyName", text_value(RUN_KEY));
+
+        assert_eq!(value_write(&fields).key_name.as_deref(), Some(RUN_KEY));
+    }
+
+    #[test]
+    fn a_write_with_no_captured_data_has_no_text() {
+        let mut fields = set_value(REG_SZ, Vec::new());
+        fields.0.remove("CapturedData");
+
+        assert_eq!(data_of(&set_value(REG_SZ, Vec::new())), None);
+        assert_eq!(data_of(&fields), None);
+    }
+
+    #[test]
     fn an_expandable_string_value_is_decoded() {
-        let fields = set_value(REG_EXPAND_SZ, utf16("%TEMP%\\a.exe"));
-
-        let event = registry_set(&fields, meta()).expect("named key");
-
-        assert_eq!(event.data.as_deref(), Some("%TEMP%\\a.exe"));
+        assert_eq!(
+            data_of(&set_value(REG_EXPAND_SZ, utf16("%TEMP%\\a.exe"))).as_deref(),
+            Some("%TEMP%\\a.exe")
+        );
     }
 
     #[test]
     fn a_binary_or_dword_value_has_no_text() {
         const REG_DWORD: u32 = 4;
-        let event =
-            registry_set(&set_value(REG_DWORD, vec![1, 0, 0, 0]), meta()).expect("named key");
+        let write = value_write(&set_value(REG_DWORD, vec![1, 0, 0, 0]));
 
-        assert_eq!(event.data_type, REG_DWORD);
-        assert_eq!(event.data, None);
+        assert_eq!(write.data_type, REG_DWORD);
+        assert_eq!(write.data, None);
     }
 
     #[test]
-    fn odd_length_or_all_nul_string_data_has_no_text() {
-        let odd = registry_set(&set_value(REG_SZ, vec![b'a', 0, b'b']), meta());
-        let nul = registry_set(&set_value(REG_SZ, vec![0, 0, 0, 0]), meta());
-
-        assert_eq!(odd.expect("named key").data, None);
-        assert_eq!(nul.expect("named key").data, None);
-    }
-
-    #[test]
-    fn a_record_whose_key_was_not_resolved_is_dropped() {
-        assert!(registry_set(&Fields::default(), meta()).is_none());
-    }
-
-    #[test]
-    fn a_write_naming_its_key_only_by_handle_is_dropped() {
-        let by_handle = Fields::of(&[
-            (
-                "KeyObject",
-                Value::Bytes(vec![0x10, 0x20, 0, 0, 0, 0xff, 0xff, 0xff]),
-            ),
-            ("KeyName", text_value("")),
-            ("ValueName", text_value("updater")),
-            ("Type", Value::U32(REG_SZ)),
-        ]);
-
-        assert!(registry_set(&by_handle, meta()).is_none());
+    fn all_nul_string_data_has_no_text() {
+        assert_eq!(data_of(&set_value(REG_SZ, vec![0, 0, 0, 0])), None);
     }
 
     #[test]
@@ -202,17 +151,58 @@ mod registry {
         let mut fields = set_value(REG_SZ, captured);
         fields.0.insert("DataSize", Value::U32(200));
 
-        let event = registry_set(&fields, meta()).expect("named key");
-
-        assert_eq!(event.data.as_deref(), Some("C:\\long\\path"));
+        assert_eq!(data_of(&fields).as_deref(), Some("C:\\long\\path"));
     }
 
     #[test]
-    fn a_complete_value_of_odd_length_is_not_text() {
+    fn a_complete_value_of_odd_length_keeps_its_whole_units() {
         let mut fields = set_value(REG_SZ, vec![b'a', 0, b'b']);
         fields.0.insert("DataSize", Value::U32(3));
 
-        assert_eq!(registry_set(&fields, meta()).expect("named key").data, None);
+        assert_eq!(data_of(&fields).as_deref(), Some("a"));
+    }
+
+    /// The EID 1/2 `CreateKey`/`OpenKey` template of the manifest.
+    fn key_opened(status: u32, relative_name: &str) -> Fields {
+        Fields::of(&[
+            ("BaseObject", Value::Pointer(0)),
+            ("KeyObject", Value::Pointer(KEY_OBJECT)),
+            ("Status", Value::U32(status)),
+            ("Disposition", Value::U32(1)),
+            ("BaseName", text_value("")),
+            ("RelativeName", text_value(relative_name)),
+        ])
+    }
+
+    #[test]
+    fn a_successful_open_names_its_key_object_and_relative_name() {
+        let open = key_open(&key_opened(0, RUN_KEY)).expect("successful open");
+
+        assert_eq!(open.key_object, KEY_OBJECT);
+        assert_eq!(open.base_object, 0);
+        assert_eq!(open.relative_name, RUN_KEY);
+    }
+
+    #[test]
+    fn a_failed_open_or_one_without_a_status_opened_nothing() {
+        const STATUS_OBJECT_NAME_NOT_FOUND: u32 = 0xc000_0034;
+        let mut without_status = key_opened(0, RUN_KEY);
+        without_status.0.remove("Status");
+
+        assert_eq!(
+            key_open(&key_opened(STATUS_OBJECT_NAME_NOT_FOUND, RUN_KEY)),
+            None
+        );
+        assert_eq!(key_open(&without_status), None);
+    }
+
+    #[test]
+    fn a_null_key_object_is_no_key_object() {
+        let mut open_of_null = key_opened(0, RUN_KEY);
+        open_of_null.0.insert("KeyObject", Value::Pointer(0));
+
+        assert_eq!(key_object(&open_of_null), None);
+        assert_eq!(key_open(&open_of_null), None);
     }
 }
 
@@ -601,7 +591,7 @@ mod ntlm {
 mod never_panics {
     use super::*;
 
-    const NAMES: [&str; 36] = [
+    const NAMES: [&str; 40] = [
         "DataSize",
         "Username",
         "DomainName",
@@ -638,6 +628,10 @@ mod never_panics {
         "AttributeList",
         "ProcessPID",
         "Status",
+        "KeyObject",
+        "BaseObject",
+        "BaseName",
+        "RelativeName",
     ];
 
     fn any_value() -> impl Strategy<Value = Value> {
@@ -646,6 +640,7 @@ mod never_panics {
             any::<u16>().prop_map(Value::U16),
             any::<u32>().prop_map(Value::U32),
             prop::collection::vec(any::<u8>(), 0..64).prop_map(Value::Bytes),
+            any::<u64>().prop_map(Value::Pointer),
         ]
     }
 
@@ -658,7 +653,8 @@ mod never_panics {
         #[test]
         fn decoding_arbitrary_fields_never_panics(fields in any_fields(), data in prop::collection::vec(any::<u8>(), 0..64)) {
             let _ = dns_query(&fields, meta());
-            let _ = registry_set(&fields, meta());
+            let _ = value_write(&fields);
+            let _ = key_open(&fields);
             let _ = decode_reg_string(&data);
             let _ = script_block(&fields, meta());
             let _ = wmi_activity(WmiOperation::ExecQuery, &fields, meta());

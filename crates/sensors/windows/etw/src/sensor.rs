@@ -24,6 +24,7 @@ use crate::{
         dotnet_provider, file_provider, ldap_provider, network_provider, ntlm_provider,
         powershell_provider, process_provider, registry_provider, smb_provider, wmi_provider,
     },
+    registry_keys::RegistryKeys,
     silo::{self, SiloDirectory},
     sync::LockExt,
     winapi,
@@ -35,6 +36,10 @@ use crate::{
 /// helpers) while bounding memory if `ProcessEnd` events are lost — a documented
 /// ETW behavior under buffer pressure, not a theoretical one.
 const PID_CACHE_CAP: usize = 16_384;
+
+/// Registry key objects tracked at once (#91). Opens and closes pair up, so the table holds
+/// the keys open on the host; the cap is the backstop for closes the session lost.
+pub(crate) const REGISTRY_KEY_OBJECTS_CAP: usize = 32_768;
 
 /// Short-named directories are a small, stable set per host (#489); this is a
 /// backstop, not a working-set size.
@@ -285,6 +290,8 @@ pub(crate) struct SharedState {
     pub(crate) bits: Mutex<BitsJobs>,
     /// F-2: events observed — the silence watchdog reads this.
     pub(crate) events_seen: AtomicU64,
+    /// #91: registry key object → key path, so a value write names its key.
+    pub(crate) registry_keys: Mutex<RegistryKeys>,
     /// AMSI volume gate (#282): dedup + per-process budget.
     pub(crate) amsi: Mutex<amsi::AmsiGate>,
     /// LDAP search budget (#364): per process, no dedup (the burst rule
@@ -610,6 +617,7 @@ impl Sensor for WindowsSensor {
             marks,
             bits: Mutex::new(BitsJobs::default()),
             events_seen: AtomicU64::new(0),
+            registry_keys: Mutex::new(RegistryKeys::new(REGISTRY_KEY_OBJECTS_CAP)),
             amsi: Mutex::new(amsi::AmsiGate::default()),
             ldap: Mutex::new(budget::PidBudget::new(
                 "ldap",
