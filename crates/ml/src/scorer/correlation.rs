@@ -75,20 +75,7 @@ impl CorrelationScorer {
             });
         }
 
-        let (bounds, threshold) = if let Some(meta_bytes) = metadata {
-            let parsed: ModelMetadata = serde_json::from_slice(meta_bytes)
-                .map_err(|_| crate::forest::ParseError::Malformed("invalid metadata JSON"))?;
-
-            // Validate feature bounds internal consistency (issue #46: prevent panic on
-            // malformed metadata where array lengths don't match)
-            if let Some(ref b) = parsed.feature_bounds {
-                b.check_invariant()?;
-            }
-
-            (parsed.feature_bounds, parsed.threshold)
-        } else {
-            (None, None)
-        };
+        let (bounds, threshold) = ModelMetadata::parse_optional(metadata)?;
 
         Ok(Self {
             session,

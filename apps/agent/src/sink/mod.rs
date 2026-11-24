@@ -591,10 +591,13 @@ impl DetectionSink {
         if let Some(sigma) = sigma_guard.as_ref() {
             let entity = entity_key(&event.meta);
             for hit in sigma.eval_exec(event) {
-                let technique = if hit.tags.is_empty() {
+                // The ATT&CK ids, not the raw `tags`: those keep the `attack.` prefix and the
+                // tactic tags (`attack.execution`), which the server's grouping folds to one
+                // base id, `attack`, so every Sigma detection related to every other.
+                let technique = if hit.techniques.is_empty() {
                     "Sigma".to_string()
                 } else {
-                    hit.tags.join("/")
+                    hit.techniques.join("/")
                 };
                 let source = schema::detection::DetectionSource::Sigma {
                     rule_id: hit.title.clone(),

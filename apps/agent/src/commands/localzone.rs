@@ -53,7 +53,12 @@ mod imp {
     }
 
     pub(super) fn utc_offset_seconds_at(utc_secs: i64) -> Option<i64> {
-        let time = libc::time_t::try_from(utc_secs).ok()?;
+        // `time_t` is inferred from `localtime_r`'s signature rather than named: on musl the
+        // `libc` crate deprecates the alias (it will widen to 64 bits on 32-bit musl targets),
+        // and naming it fails clippy's `-D warnings` there. `i64` on 64-bit targets, `i32` on
+        // some 32-bit ones, so the conversion is not always useless.
+        #[allow(clippy::useless_conversion)]
+        let time = utc_secs.try_into().ok()?;
         // SAFETY: `tm` is plain data the call fills in; `localtime_r` writes only into it and
         // reads `time` by pointer for the duration of the call. `tzset` takes no arguments.
         unsafe {

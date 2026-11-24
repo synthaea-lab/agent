@@ -52,8 +52,8 @@ pub struct TransportConfig {
     pub request_timeout: Duration,
 
     /// Interval between heartbeats. **Not wired**: nothing in the agent reads this field. The
-    /// beacon's cadence is `agent::health::BeaconInterval` (30 s by default, shortened at run time
-    /// by a posture overlay, ADR-0035); changing this value changes nothing. Left in place rather
+    /// beacon's cadence is `HealthCollectorConfig::interval` in `agent::health` (30 s by default);
+    /// changing this value changes nothing. Left in place rather
     /// than removed so that no existing configuration that sets it is refused (#62).
     pub heartbeat_interval: Duration,
 
