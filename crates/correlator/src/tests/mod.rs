@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use schema::{
     AssemblyLoadEvent, ConnectEvent, DnsQueryEvent, Event, EventMeta, ExecEvent, FileOpenEvent,
-    SmbConnectEvent,
+    SmbConnectEvent, UdpSendEvent,
 };
 
 use crate::{CorrelationEngine, bayes::PRIOR_LOG_ODDS};
@@ -56,6 +56,15 @@ fn connect_to(meta: EventMeta, daddr: [u8; 4], dport: u16) -> Event {
         meta,
         daddr: std::net::IpAddr::V4(daddr.into()),
         dport,
+    })
+}
+
+fn udp_send_to(pid: u32, ts_ns: u64, dport: u16) -> Event {
+    Event::UdpSend(UdpSendEvent {
+        meta: meta(pid, ts_ns),
+        daddr: std::net::IpAddr::V4([198, 51, 100, 7].into()),
+        dport,
+        size: 64,
     })
 }
 
@@ -108,4 +117,5 @@ mod behavior;
 mod parent_generation;
 mod rarity;
 mod rules;
+mod udp_flows;
 mod web;

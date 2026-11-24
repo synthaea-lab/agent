@@ -1,7 +1,8 @@
 //! Sliding queue of recent events — the correlator's short-term memory.
 //!
 //! Deliberately unbounded beyond time-based eviction for now; the bounded entity
-//! store (`crates/store`, issue #15) takes over long-lived state.
+//! store (`crates/store`, issue #15) takes over long-lived state. Per-datagram UDP
+//! volume is kept off it by `udp_flows`.
 
 use std::{collections::VecDeque, time::Duration};
 

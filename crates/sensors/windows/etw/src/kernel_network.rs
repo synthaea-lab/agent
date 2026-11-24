@@ -55,8 +55,8 @@ pub(crate) struct Flow {
     pub(crate) size: u32,
 }
 
-/// The record's flow; `None` without a usable destination (a v4 `daddr` of 0, a v6 one
-/// that is not 16 bytes). Ports arrive in network byte order.
+/// The record's flow; `None` without a usable destination (an unspecified address, `0`
+/// or `::`, or a v6 one that is not 16 bytes). Ports arrive in network byte order.
 pub(crate) fn flow(family: IpFamily, fields: &impl PayloadFields) -> Option<Flow> {
     Some(Flow {
         pid: fields.u32("PID").unwrap_or(0),
@@ -76,7 +76,7 @@ fn destination(family: IpFamily, fields: &impl PayloadFields) -> Option<IpAddr> 
             .map(|raw| IpAddr::from(raw.to_ne_bytes())),
         IpFamily::V6 => {
             let bytes = <[u8; 16]>::try_from(fields.bytes("daddr")?).ok()?;
-            Some(IpAddr::from(bytes))
+            Some(IpAddr::from(bytes)).filter(|daddr| !daddr.is_unspecified())
         }
     }
 }
@@ -182,6 +182,13 @@ mod tests {
     #[test]
     fn a_record_without_a_usable_destination_names_no_flow() {
         assert_eq!(flow(IpFamily::V4, &record(Value::U32(0))), None);
+        assert_eq!(
+            flow(
+                IpFamily::V6,
+                &record(Value::Bytes(Ipv6Addr::UNSPECIFIED.octets().to_vec()))
+            ),
+            None
+        );
         assert_eq!(flow(IpFamily::V6, &record(Value::Bytes(vec![0; 4]))), None);
         assert_eq!(flow(IpFamily::V6, &record(Value::U32(1))), None);
     }
