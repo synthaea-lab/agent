@@ -1,0 +1,14 @@
+{
+  "type": "process_vm_read",
+  "meta": {
+    "pid": 9002,
+    "ppid": 1,
+    "user": { "os": "unix", "uid": 0, "gid": 0 },
+    "timestamp_ns": 1756900020000000000,
+    "comm": "scraper"
+  },
+  "target_pid": 4242,
+  "local_iov_count": 1,
+  "remote_iov_count": 1,
+  "remote_iov_len": 4096
+}

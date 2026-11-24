@@ -59,6 +59,9 @@ pub(crate) struct EtwShedCounts {
     pub(crate) silo_evicted: u64,
     pub(crate) marks_dropped: u64,
     pub(crate) quarantine_unremembered: u64,
+    pub(crate) registry_unresolved_writes: u64,
+    pub(crate) registry_keys_evicted: u64,
+    pub(crate) registry_names_truncated: u64,
 }
 
 /// Reads the [`EtwShedCounts`]. Windows only: other platforms pass none.
@@ -102,6 +105,9 @@ impl AgentHostCounters {
             silo_evicted: shedding.silo_evicted(),
             marks_dropped: shedding.marks_dropped(),
             quarantine_unremembered: shedding.quarantine_unremembered(),
+            registry_unresolved_writes: shedding.registry_unresolved_writes(),
+            registry_keys_evicted: shedding.registry_keys_evicted(),
+            registry_names_truncated: shedding.registry_names_truncated(),
         }))
     }
 }
@@ -134,6 +140,9 @@ impl HostCountersSource for AgentHostCounters {
             etw_silo_evicted: etw_shed.silo_evicted,
             etw_marks_dropped: etw_shed.marks_dropped,
             etw_quarantine_unremembered: etw_shed.quarantine_unremembered,
+            etw_registry_unresolved_writes: etw_shed.registry_unresolved_writes,
+            etw_registry_keys_evicted: etw_shed.registry_keys_evicted,
+            etw_registry_names_truncated: etw_shed.registry_names_truncated,
         }
     }
 }
@@ -308,14 +317,17 @@ mod tests {
         assert_eq!(counters.alerts_dropped, 0);
     }
 
-    /// The four ETW shedding counts, in beacon order.
-    fn etw_shed(counters: &HostCounters) -> (u64, u64, u64, u64) {
-        (
+    /// The ETW shedding counts, in beacon order.
+    fn etw_shed(counters: &HostCounters) -> [u64; 7] {
+        [
             counters.etw_pid_cache_evicted,
             counters.etw_silo_evicted,
             counters.etw_marks_dropped,
             counters.etw_quarantine_unremembered,
-        )
+            counters.etw_registry_unresolved_writes,
+            counters.etw_registry_keys_evicted,
+            counters.etw_registry_names_truncated,
+        ]
     }
 
     #[test]
@@ -323,7 +335,7 @@ mod tests {
         let counters =
             AgentHostCounters::new(sink("etw-shed-none"), WatchdogReport::default(), None)
                 .host_counters();
-        assert_eq!(etw_shed(&counters), (0, 0, 0, 0));
+        assert_eq!(etw_shed(&counters), [0; 7]);
     }
 
     #[test]
@@ -334,9 +346,12 @@ mod tests {
                 silo_evicted: 2,
                 marks_dropped: 3,
                 quarantine_unremembered: 4,
+                registry_unresolved_writes: 5,
+                registry_keys_evicted: 6,
+                registry_names_truncated: 7,
             }))
             .host_counters();
-        assert_eq!(etw_shed(&counters), (1, 2, 3, 4));
+        assert_eq!(etw_shed(&counters), [1, 2, 3, 4, 5, 6, 7]);
     }
 
     #[test]

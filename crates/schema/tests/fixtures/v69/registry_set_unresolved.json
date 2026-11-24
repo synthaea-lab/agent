@@ -1,0 +1,13 @@
+{
+  "type": "registry_set",
+  "meta": {
+    "pid": 4243,
+    "ppid": 1337,
+    "user": { "os": "windows", "sid": "S-1-5-21-1-2-3-1001", "integrity_level": 8192 },
+    "timestamp_ns": 1756900021000000000,
+    "comm": "explorer.exe"
+  },
+  "key": { "state": "unresolved", "relative_name": "Software\\Microsoft\\Windows\\CurrentVersion\\Run" },
+  "value_name": "Updater",
+  "data_type": 1
+}

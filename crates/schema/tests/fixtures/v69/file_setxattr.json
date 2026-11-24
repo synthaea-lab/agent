@@ -1,0 +1,12 @@
+{
+  "type": "file_setxattr",
+  "meta": {
+    "pid": 9003,
+    "ppid": 9000,
+    "user": { "os": "unix", "uid": 0, "gid": 0 },
+    "timestamp_ns": 1756900016000000000,
+    "comm": "setcap"
+  },
+  "path": "/tmp/backdoor",
+  "name": "security.capability"
+}

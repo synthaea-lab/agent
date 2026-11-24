@@ -291,7 +291,7 @@ pub(crate) struct SharedState {
     pub(crate) bits: Mutex<BitsJobs>,
     /// F-2: events observed — the silence watchdog reads this.
     pub(crate) events_seen: AtomicU64,
-    /// #91: registry key object → key path, so a value write names its key.
+    /// #91: registry key object → key name, so a value write names its key.
     pub(crate) registry_keys: Mutex<RegistryKeys>,
     /// AMSI volume gate (#282): dedup + per-process budget.
     pub(crate) amsi: Mutex<amsi::AmsiGate>,
@@ -642,7 +642,10 @@ impl Sensor for WindowsSensor {
             marks,
             bits: Mutex::new(BitsJobs::default()),
             events_seen: AtomicU64::new(0),
-            registry_keys: Mutex::new(RegistryKeys::new(REGISTRY_KEY_OBJECTS_CAP)),
+            registry_keys: Mutex::new(RegistryKeys::counting(
+                REGISTRY_KEY_OBJECTS_CAP,
+                self.shedding.registry_keys.clone(),
+            )),
             amsi: Mutex::new(amsi::AmsiGate::default()),
             ldap: Mutex::new(budget::PidBudget::new(
                 "ldap",

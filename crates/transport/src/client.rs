@@ -599,6 +599,9 @@ mod tests {
             etw_silo_evicted: 22,
             etw_marks_dropped: 23,
             etw_quarantine_unremembered: 24,
+            etw_registry_unresolved_writes: 25,
+            etw_registry_keys_evicted: 26,
+            etw_registry_names_truncated: 27,
         };
         let body = serde_json::to_value(HeartbeatPayload {
             agent_id: None,
@@ -634,7 +637,10 @@ mod tests {
                     "etw_pid_cache_evicted": 21,
                     "etw_silo_evicted": 22,
                     "etw_marks_dropped": 23,
-                    "etw_quarantine_unremembered": 24
+                    "etw_quarantine_unremembered": 24,
+                    "etw_registry_unresolved_writes": 25,
+                    "etw_registry_keys_evicted": 26,
+                    "etw_registry_names_truncated": 27
                 }
             })
         );

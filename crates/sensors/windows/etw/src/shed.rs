@@ -2,7 +2,7 @@
 //!
 //! Each cache already counted its own losses and logged them; nothing read the count, so an
 //! operator saw a warning in a log and the control plane saw nothing (#178). The caches now
-//! count through a [`ShedCounter`], a shared atomic, and [`EtwShedding`] hands the four that
+//! count through a [`ShedCounter`], a shared atomic, and [`EtwShedding`] hands the ones that
 //! lose information to the agent before the sensor runs (like `WindowsSensor::stop_handle`).
 
 use std::sync::{
@@ -33,6 +33,16 @@ pub struct EtwShedding {
     pub(crate) silo_evicted: ShedCounter,
     pub(crate) marks_dropped: ShedCounter,
     pub(crate) quarantine_unremembered: ShedCounter,
+    pub(crate) registry_keys: RegistryKeyShedding,
+}
+
+/// What the registry key table loses: each count is a value write reported with less of its
+/// key's name than the process used.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct RegistryKeyShedding {
+    pub(crate) unresolved_writes: ShedCounter,
+    pub(crate) evicted: ShedCounter,
+    pub(crate) names_truncated: ShedCounter,
 }
 
 impl EtwShedding {
@@ -59,6 +69,26 @@ impl EtwShedding {
     pub fn quarantine_unremembered(&self) -> u64 {
         self.quarantine_unremembered.get()
     }
+
+    /// Registry value writes reported with their key unresolved: the key was opened relative
+    /// to one the sensor never saw opened (before its session, or evicted).
+    #[must_use]
+    pub fn registry_unresolved_writes(&self) -> u64 {
+        self.registry_keys.unresolved_writes.get()
+    }
+
+    /// Registry key objects the key table dropped at its cap or at a process's share of it:
+    /// a later write through one is reported unresolved.
+    #[must_use]
+    pub fn registry_keys_evicted(&self) -> u64 {
+        self.registry_keys.evicted.get()
+    }
+
+    /// Registry key names the key table cut to its length bound.
+    #[must_use]
+    pub fn registry_names_truncated(&self) -> u64 {
+        self.registry_keys.names_truncated.get()
+    }
 }
 
 #[cfg(test)]
@@ -83,8 +113,11 @@ mod tests {
                 shedding.silo_evicted(),
                 shedding.marks_dropped(),
                 shedding.quarantine_unremembered(),
+                shedding.registry_unresolved_writes(),
+                shedding.registry_keys_evicted(),
+                shedding.registry_names_truncated(),
             ],
-            [0; 4]
+            [0; 7]
         );
     }
 }

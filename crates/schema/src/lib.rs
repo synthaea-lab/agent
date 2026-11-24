@@ -360,7 +360,14 @@ pub mod time;
 /// Linux exec probe reads a head and a tail window of the argument block and says
 /// how much of it lies between them. First claimed 67;
 /// <https://github.com/synthaea-lab/agent/issues/41> merged first and took it, so this takes 68.
-pub const SCHEMA_VERSION: u32 = 68;
+///
+/// Bumped 68 → 69 for [`RegistrySetEvent::key`] becoming a [`RegistryKey`]
+/// (<https://github.com/synthaea-lab/agent/issues/91>): a write through a key the Windows
+/// sensor cannot name in full (opened relative to a root handle that predates its session,
+/// about 80% of a live host's writes) is emitted with the part of the name it knows instead
+/// of being dropped. Whichever of this and agent#323 (also claiming 69) merges second
+/// renumbers, same coordination note as above.
+pub const SCHEMA_VERSION: u32 = 69;
 
 /// Bytes of argv, one separator per token included, a sensor keeps for one exec
 /// ([`bound_argv`], #1112).
@@ -1718,13 +1725,13 @@ pub struct ProcessAccessEvent {
 /// provider. Only writes are emitted; the sensor reads key opens and closes only to
 /// name the key a write went to.
 ///
-/// Key path is normalized from NT registry format (`\REGISTRY\MACHINE\...`) to
+/// A resolved key path is normalized from NT registry format (`\REGISTRY\MACHINE\...`) to
 /// the familiar Win32 hive prefix (`HKLM\...`) by the sensor.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RegistrySetEvent {
     pub meta: EventMeta,
-    /// Normalized registry key path (e.g. `HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Run`).
-    pub key: String,
+    /// The key the value was written under, in full or only in the part the sensor saw.
+    pub key: RegistryKey,
     /// Name of the value being written. Empty string means the default value `(Default)`.
     pub value_name: String,
     /// Registry data type (`1=REG_SZ`, `2=REG_EXPAND_SZ`, `3=REG_BINARY`, `4=REG_DWORD`, ...).
@@ -1733,6 +1740,25 @@ pub struct RegistrySetEvent {
     /// `None` for binary or DWORD types where string decoding is not meaningful.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub data: Option<String>,
+}
+
+/// The key a [`RegistrySetEvent`] wrote under.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum RegistryKey {
+    /// The full key path, hive-prefixed (e.g.
+    /// `HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Run`).
+    Resolved { path: String },
+    /// The sensor did not see where the key's name starts: the key was opened relative to
+    /// a key opened before the sensor started (a process's cached `HKEY_CURRENT_USER` or
+    /// `HKEY_LOCAL_MACHINE` root), or the sensor's key table had dropped it. The write is
+    /// still reported, so rules on the value, the data and the process keep firing.
+    Unresolved {
+        /// The name the process opened the key by, below that unknown key (e.g.
+        /// `Software\Microsoft\Windows\CurrentVersion\Run`): a rule on a key path can match
+        /// its suffix. Empty when the sensor knows no part of the name.
+        relative_name: String,
+    },
 }
 
 /// In-memory .NET assembly load — the primary signal for execute-assembly /
@@ -2147,6 +2173,21 @@ pub struct HealthBeacon {
     /// possible duplicate, never a lost mark. Zero on other platforms and in an older beacon.
     #[serde(default)]
     pub etw_quarantine_unremembered: u64,
+    /// Cumulative registry value writes the Windows ETW sensor reported with their key
+    /// unresolved ([`RegistryKey::Unresolved`]): the key was opened relative to one opened
+    /// before the session, or the key table had dropped it (#91). Zero on other platforms and
+    /// in an older beacon.
+    #[serde(default)]
+    pub etw_registry_unresolved_writes: u64,
+    /// Cumulative key objects the Windows ETW sensor's registry key table dropped at its cap or
+    /// at one process's share of it: a later write through one is reported unresolved. Zero on
+    /// other platforms and in an older beacon.
+    #[serde(default)]
+    pub etw_registry_keys_evicted: u64,
+    /// Cumulative registry key names the Windows ETW sensor cut to its length bound. Zero on
+    /// other platforms and in an older beacon.
+    #[serde(default)]
+    pub etw_registry_names_truncated: u64,
 }
 
 /// A logon/authentication outcome, or a privileged-session assignment — shared

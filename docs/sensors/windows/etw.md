@@ -9,7 +9,7 @@
 | [`sensor.rs`](../../../crates/sensors/windows/etw/src/sensor.rs) | `WindowsSensor`: builds `SharedState`, cleans up orphaned sessions, starts the trace, runs the liveness loop |
 | [`providers.rs`](../../../crates/sensors/windows/etw/src/providers.rs) | One builder per provider (GUID, keyword mask, callback). The callbacks filter, spend budgets and emit. |
 | [`payload.rs`](../../../crates/sensors/windows/etw/src/payload.rs) | How the DNS, registry, PowerShell, WMI, .NET, SMB, LDAP and NTLM records become events, decided on their named fields alone (`PayloadFields`) |
-| [`registry_keys.rs`](../../../crates/sensors/windows/etw/src/registry_keys.rs) | `RegistryKeys`: the key object → key path table that names the key of a registry value write ([below](#registry-key-paths)) |
+| [`registry_keys.rs`](../../../crates/sensors/windows/etw/src/registry_keys.rs) | `RegistryKeys`: the key object → key name table that names the key of a registry value write ([below](#registry-key-paths)) |
 | [`normalize.rs`](../../../crates/sensors/windows/etw/src/normalize.rs) | Pure helpers: FILETIME conversion, NT and registry path rewriting, session-name generation, orphan selection, diagnosis text |
 | [`etw_sessions.rs`](../../../crates/sensors/windows/etw/src/etw_sessions.rs) | Native session enumeration (`QueryAllTracesW`) and provider-enablement lookup (`EnumerateTraceGuidsEx`) |
 | [`budget.rs`](../../../crates/sensors/windows/etw/src/budget.rs) | `PidBudget` (N events per process per window) and `KeyDedup` (one event per key per window) |
@@ -82,11 +82,19 @@ Provider-specific behavior worth knowing:
 
 A live Windows 11 26300 session delivers `SetValueKey` with an empty `KeyName` on every record: the write names its key only by `KeyObject`, the kernel object it went through. The sensor therefore also reads the creates and opens that return key objects, and the closes that end them, in [`RegistryKeys`](../../../crates/sensors/windows/etw/src/registry_keys.rs):
 
-- a successful create or open (`Status` 0) records its `KeyObject` under the NT path it named: `RelativeName` when absolute (`\REGISTRY\...`), else joined to its base key's path, which is `BaseName` when the kernel wrote one and the table's entry for `BaseObject` otherwise. An open whose base is unknown removes whatever path the key object had, so a stale one is never used;
+- a successful create or open (`Status` 0) records its `KeyObject` under the name it gave the key: `RelativeName` when absolute (`\REGISTRY\...`), else joined to its base key's name, which is `BaseName` when the kernel wrote one and the table's entry for `BaseObject` otherwise. When neither knows the base, the key is recorded as `RelativeName` below an unknown key, and keys opened below it keep extending that name;
 - a close forgets the key object;
-- a write uses its `KeyName` when the kernel wrote one, else the table's path for its `KeyObject`. A write whose key object is not in the table is not emitted: it is counted in `unresolved_writes` and logged at powers of two. It is not emitted with an empty key because every registry detection keys on the path, and an `Option` key would be a schema change.
+- a write uses its `KeyName` when the kernel wrote one, else the table's name for its `KeyObject`. Every write is emitted. Its [`RegistryKey`](../../../crates/schema/src/lib.rs) is `resolved` with the full `HKLM\...`/`HKU\...` path when the table knows where the name starts, and `unresolved` with the known `relative_name` otherwise (empty when the key object itself is unknown). Each unresolved write is counted in the health beacon's `etw_registry_unresolved_writes`.
 
-Keys opened before the session started, by long-running processes, are not in the table, so their writes are counted rather than emitted until the process opens the key again. That `KeyObject` is the same pointer on the open and on the write is read from the manifest's field names; [the real-session test](#testing) is what checks it.
+The predefined roots are where most names start unresolved. advapi32/kernelbase open `HKEY_CURRENT_USER` and `HKEY_LOCAL_MACHINE` once per process and keep the handle, so every process that opened its root before the session opens every later key relative to a key object the table never saw, for the rest of its life, keys it creates later included. On a live Windows 11 26300 host that was about 80% of all writes in the first minute (explorer, services, svchost, anything already running, and everything after each agent restart). Those writes reach rules as `unresolved` with a relative name such as `Software\Microsoft\Windows\CurrentVersion\Run`, without the hive: a rule on a key path has to match the relative name's suffix too, and cannot tell `HKCU` from `HKLM` there. That `KeyObject` is the same pointer on the open and on the write is read from the manifest's field names; [the real-session test](#testing) is what checks it.
+
+The table is bounded three ways, each counted in the health beacon:
+
+- 32,768 key objects in all (`etw_registry_keys_evicted`), least recently used evicted first;
+- each process may hold an eighth of that. A process past its share evicts its own oldest entries, so one process opening keys without closing them cannot push another's key out before that process writes to it. Eight or more such processes together still can;
+- a key name is cut at 1,024 bytes ([`MAX_KEY_NAME_BYTES`](../../../crates/sensors/windows/etw/src/registry_keys.rs), `etw_registry_names_truncated`), never refused: names are caller-chosen, and refusing a long one would hide its write.
+
+A write through an evicted key object is still emitted, `unresolved` with an empty name.
 
 ## Threading
 
@@ -114,7 +122,7 @@ The sensor never blocks the consumer thread waiting for a consumer. Every queue 
 | Structure | Bound | At the bound | Constant |
 | --- | --- | --- | --- |
 | Pid store | 16,384 pids | LRU batch eviction of 1/8, counted | [`PID_CACHE_CAP`](../../../crates/sensors/windows/etw/src/sensor.rs) |
-| Registry key objects | 32,768 keys | LRU batch eviction of 1/8, counted; a write through an evicted key is counted, not emitted | [`REGISTRY_KEY_OBJECTS_CAP`](../../../crates/sensors/windows/etw/src/sensor.rs) |
+| Registry key objects | 32,768 keys, an eighth per process, names cut at 1,024 bytes | LRU batch eviction of 1/8 (of the process's share when it is the one past it), counted; a write through an evicted key is emitted unresolved | [`REGISTRY_KEY_OBJECTS_CAP`](../../../crates/sensors/windows/etw/src/sensor.rs) |
 | 8.3 directory cache | 4,096 dirs | cleared, counted | [`LONG_PATH_CACHE_CAP`](../../../crates/sensors/windows/etw/src/sensor.rs) |
 | Mark read-back queue | 256 marks | mark dropped, counted | [`MARK_QUEUE_CAPACITY`](../../../crates/sensors/windows/etw/src/sensor.rs) |
 | Quarantine dedup | 5 s window, 1,024 paths | reported without dedup | [`QUARANTINE_DEDUP_WINDOW_NS`](../../../crates/sensors/windows/etw/src/sensor.rs) |
@@ -183,7 +191,8 @@ Everything else (provider set, keyword masks, budgets, windows) is a constant in
 
 ## Known gaps
 
-- Kernel-Registry: the key of a value write is resolved through `KeyObject` ([registry key paths](#registry-key-paths)); writes through keys opened before the session started are counted, not emitted, and value data is not captured on Windows 11 26300. Opens and closes are among the most frequent registry operations, and each costs a schema lookup and a parse on the consumer thread ([#91](https://github.com/synthaea-lab/agent/issues/91)).
+- Kernel-Registry: the key of a value write is resolved through `KeyObject` ([registry key paths](#registry-key-paths)); a write through a key opened relative to a root handle that predates the session is emitted `unresolved`, without its hive, and value data is not captured on Windows 11 26300.
+- Kernel-Registry names a key by the name the caller used, not by the key: `ControlSet001\Services\X` and `CurrentControlSet\Services\X` are the same key under two names, and a registry symbolic link (`REG_LINK`) can point a harmless name at a Run key. The sensor does not canonicalize either, since no rule yet keys on a registry path; a rule that does has to match both forms ([#91](https://github.com/synthaea-lab/agent/issues/91)). Opens and closes are among the most frequent registry operations, and each costs a schema lookup and a parse on the consumer thread ([#91](https://github.com/synthaea-lab/agent/issues/91)).
 - Kernel-Network, DNS-Client, PowerShell, WMI, DotNETRuntime and the other user-mode providers are enabled with every keyword. Filtering happens on the event id in the callback, after the record has been delivered.
 - Injection without a new thread (APC, thread hijack), handle duplication into LSASS and kernel-mode activity are not visible to ETW from a non-PPL session. They need the driver work tracked in [#32](https://github.com/synthaea-lab/agent/issues/32) and [#27](https://github.com/synthaea-lab/agent/issues/27).
 - The image file identity is taken in the `ProcessStart` callback, so a rename-and-replace faster than ETW delivery still wins: [#46](https://github.com/synthaea-lab/agent/issues/46).

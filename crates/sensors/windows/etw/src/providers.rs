@@ -730,10 +730,11 @@ pub(crate) fn registry_provider(sink: Arc<dyn EventSink>, state: Arc<SharedState
             return;
         };
         let parser = Parser::create(record, &schema_def);
-        let keyed = state
-            .registry_keys
-            .lock_or_recover()
-            .on_record(operation, &parser);
+        let keyed = state.registry_keys.lock_or_recover().on_record(
+            operation,
+            record.process_id(),
+            &parser,
+        );
         if let Some(keyed) = keyed {
             let meta = header_meta(record, &state);
             sink.on_event(Event::RegistrySet(keyed.into_event(meta)));

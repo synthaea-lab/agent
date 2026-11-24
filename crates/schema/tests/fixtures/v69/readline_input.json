@@ -1,0 +1,16 @@
+{
+  "type": "readline_input",
+  "meta": {
+    "pid": 6001,
+    "ppid": 6000,
+    "user": {
+      "os": "unix",
+      "uid": 1000,
+      "gid": 1000
+    },
+    "timestamp_ns": 1756900009000000000,
+    "comm": "bash"
+  },
+  "shell_type": "bash",
+  "input": "export PATH=/tmp/.hidden:$PATH"
+}

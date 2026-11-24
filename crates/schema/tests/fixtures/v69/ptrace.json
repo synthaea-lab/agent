@@ -1,0 +1,14 @@
+{
+  "type": "ptrace",
+  "meta": {
+    "pid": 9001,
+    "ppid": 1,
+    "user": { "os": "unix", "uid": 0, "gid": 0 },
+    "timestamp_ns": 1756900019000000000,
+    "comm": "gdb"
+  },
+  "request": 16,
+  "target_pid": 4242,
+  "addr": 0,
+  "data": 0
+}

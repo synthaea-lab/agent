@@ -1,0 +1,12 @@
+{
+  "type": "socket_bind",
+  "meta": {
+    "pid": 8001,
+    "ppid": 8000,
+    "user": { "os": "unix", "uid": 0, "gid": 0 },
+    "timestamp_ns": 1756900013000000000,
+    "comm": "nc"
+  },
+  "local_addr": "0.0.0.0",
+  "local_port": 4444
+}

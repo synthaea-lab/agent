@@ -15,7 +15,7 @@ use std::{
 use ferrisetw::{EventRecord, parser::Parser, schema_locator::SchemaLocator, trace::UserTrace};
 
 use super::{KERNEL_REGISTRY, ProviderConfig};
-use crate::registry_keys::{KeyedWrite, RegistryKeys, RegistryOperation};
+use crate::registry_keys::{KeyName, KeyedWrite, RegistryKeys, RegistryOperation};
 
 /// A name no other process on the host will use.
 fn unique_marker(prefix: &str) -> String {
@@ -87,7 +87,7 @@ mod kernel_registry {
             let Ok(mut keys) = keys.lock() else {
                 return;
             };
-            if let Some(write) = keys.on_record(operation, &parser) {
+            if let Some(write) = keys.on_record(operation, record.process_id(), &parser) {
                 observed.writes.push(write);
             }
         };
@@ -111,12 +111,15 @@ mod kernel_registry {
             .find(|keyed| keyed.write.value_name == "probe")
             .unwrap_or_else(|| {
                 panic!(
-                    "no resolved write of the probe value; {} resolved writes, ids seen {:?}",
+                    "no write of the probe value; {} writes, ids seen {:?}",
                     observed.writes.len(),
                     observed.event_ids
                 )
             });
-        let key_path = probe.key_path.to_ascii_lowercase();
+        let KeyName::Absolute(key_path) = &probe.key else {
+            panic!("the probe write's key is unresolved: {probe:?}");
+        };
+        let key_path = key_path.to_ascii_lowercase();
         assert!(
             key_path.starts_with(r"\registry\user\") && key_path.ends_with(&key_suffix),
             "the probe write is not under its key's NT path: {probe:?}"

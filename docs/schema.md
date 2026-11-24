@@ -115,6 +115,13 @@ telemetry with no counterpart elsewhere (`Ptrace`, `Namespace`, `Prctl`...) is
 deliberately Linux-only rather than forced into a shared shape. Each struct's
 doc comment states which sensor fills it and when a field is `None`.
 
+`RegistrySet`'s `key` is a [`RegistryKey`](../crates/schema/src/lib.rs):
+`resolved` with the full `HKLM\...`/`HKU\...` path, or `unresolved` with the
+`relative_name` the process opened the key by, below a key the sensor never saw
+opened (a root handle that predates its session). Most writes on a live Windows
+host are unresolved, so a rule on a key path matches the relative name's suffix
+too ([ETW registry key paths](sensors/windows/etw.md#registry-key-paths)).
+
 ### The exec event and its command line
 
 [`ExecEvent`](../crates/schema/src/lib.rs) is the most heavily used event. It
@@ -231,7 +238,7 @@ rules.
 
 ### The rule
 
-[`SCHEMA_VERSION`](../crates/schema/src/lib.rs) (currently 68) is bumped on
+[`SCHEMA_VERSION`](../crates/schema/src/lib.rs) (currently 69) is bumped on
 **every serialization-visible change**, including additive ones. A change is
 visible in three ways:
 
@@ -265,9 +272,9 @@ why the history skips some values.
 ```text
 crates/schema/tests/fixtures/
   v1/   frozen forever: 7 files, read by tests/v1_compat.rs
-  v2/ … v67/   frozen snapshots of past versions, never edited
+  v2/ … v68/   frozen snapshots of past versions, never edited
                 (numbers that were skipped have no directory)
-  v68/  current snapshot: every golden fixture as it serializes today
+  v69/  current snapshot: every golden fixture as it serializes today
 ```
 
 | Test | What it proves |

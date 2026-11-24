@@ -7,7 +7,7 @@ use std::net::IpAddr;
 
 use schema::{
     AssemblyLoadEvent, DnsQueryEvent, EventMeta, LdapSearchEvent, NtlmAuthEvent, NtlmDirection,
-    RegistrySetEvent, ScriptBlockEvent, SmbConnectEvent, WmiActivityEvent,
+    RegistryKey, RegistrySetEvent, ScriptBlockEvent, SmbConnectEvent, WmiActivityEvent,
 };
 
 use crate::normalize;
@@ -119,11 +119,11 @@ pub(crate) struct ValueWrite {
 }
 
 impl ValueWrite {
-    /// The write as an event under `key_path`, the key's NT path.
-    pub(crate) fn into_event(self, key_path: &str, meta: EventMeta) -> RegistrySetEvent {
+    /// The write as an event under `key`.
+    pub(crate) fn into_event(self, key: RegistryKey, meta: EventMeta) -> RegistrySetEvent {
         RegistrySetEvent {
             meta,
-            key: normalize::normalize_registry_key(key_path),
+            key,
             value_name: self.value_name,
             data_type: self.data_type,
             data: self.data,

@@ -1,0 +1,11 @@
+{
+  "type": "file_delete",
+  "meta": {
+    "pid": 7002,
+    "ppid": 7000,
+    "user": { "os": "unix", "uid": 0, "gid": 0 },
+    "timestamp_ns": 1756900011000000000,
+    "comm": "rm"
+  },
+  "path": "/var/log/auth.log"
+}

@@ -1,0 +1,18 @@
+{
+  "type": "file_quarantine",
+  "meta": {
+    "pid": 812,
+    "ppid": 1,
+    "user": {
+      "os": "unix",
+      "uid": 501,
+      "gid": 20
+    },
+    "timestamp_ns": 1756900000123456789,
+    "comm": "Safari"
+  },
+  "path": "/Users/mal/Downloads/invoice.app.zip",
+  "agent": "Safari",
+  "origin_url": "https://example.test/invoice.app.zip",
+  "referrer_url": "https://example.test/downloads"
+}

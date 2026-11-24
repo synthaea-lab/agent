@@ -83,6 +83,12 @@ pub struct HostCounters {
     pub etw_marks_dropped: u64,
     /// Quarantine paths reported without dedup (the map was full).
     pub etw_quarantine_unremembered: u64,
+    /// Windows ETW registry writes reported with their key unresolved (#91).
+    pub etw_registry_unresolved_writes: u64,
+    /// Windows ETW registry key objects the key table dropped.
+    pub etw_registry_keys_evicted: u64,
+    /// Windows ETW registry key names cut to the length bound.
+    pub etw_registry_names_truncated: u64,
 }
 
 /// Reads the [`HostCounters`].
@@ -279,6 +285,9 @@ impl HealthCollector {
             etw_silo_evicted: host.etw_silo_evicted,
             etw_marks_dropped: host.etw_marks_dropped,
             etw_quarantine_unremembered: host.etw_quarantine_unremembered,
+            etw_registry_unresolved_writes: host.etw_registry_unresolved_writes,
+            etw_registry_keys_evicted: host.etw_registry_keys_evicted,
+            etw_registry_names_truncated: host.etw_registry_names_truncated,
         }
     }
 }
@@ -380,6 +389,9 @@ mod tests {
             etw_silo_evicted: 22,
             etw_marks_dropped: 23,
             etw_quarantine_unremembered: 24,
+            etw_registry_unresolved_writes: 25,
+            etw_registry_keys_evicted: 26,
+            etw_registry_names_truncated: 27,
         }));
 
         let (tx, rx) = mpsc::channel();
@@ -460,9 +472,12 @@ mod tests {
                 beacon.etw_pid_cache_evicted,
                 beacon.etw_silo_evicted,
                 beacon.etw_marks_dropped,
-                beacon.etw_quarantine_unremembered
+                beacon.etw_quarantine_unremembered,
+                beacon.etw_registry_unresolved_writes,
+                beacon.etw_registry_keys_evicted,
+                beacon.etw_registry_names_truncated
             ),
-            (21, 22, 23, 24),
+            (21, 22, 23, 24, 25, 26, 27),
             "what the Windows ETW sensor sheds rides the beacon (#178)"
         );
     }
