@@ -1451,6 +1451,33 @@ mod tests {
         assert!(!supervised(1000).is_hit_by(&kill_of(3001)));
     }
 
+    /// The line captured on Debian 13.7 (kernel 6.12.107, auditd 4.0.2, ENRICHED, 2026-11-24) when
+    /// `/usr/bin/kill -KILL 1034` hit the watchdog (`a0=40a`) of the packaged unit (#342). The
+    /// agent it started (pid 1318, parent 1034) died with it; no record names the agent.
+    const WATCHDOG_KILL: &str = "type=SYSCALL msg=audit(1795519432.428:293): arch=c000003e syscall=62 success=yes exit=0 a0=40a a1=9 a2=0 a3=7fbb962effe0 items=0 ppid=1109 pid=1420 auid=1000 uid=0 gid=0 euid=0 suid=0 fsuid=0 egid=0 sgid=0 fsgid=0 tty=(none) ses=9 comm=\"kill\" exe=\"/usr/bin/kill\" subj=unconfined key=\"synthaea-kill\"\u{1d}ARCH=x86_64 SYSCALL=kill AUID=\"edr-lab\" UID=\"root\" GID=\"root\" EUID=\"root\" SUID=\"root\" FSUID=\"root\" EGID=\"root\" SGID=\"root\" FSGID=\"root\"";
+
+    #[test]
+    fn the_real_watchdog_kill_line_hits_the_agent_it_started() {
+        let record = parse_kill_log_line(WATCHDOG_KILL).expect("a SIGKILL record");
+        assert_eq!(record.target, KillTarget::Process(0x40a));
+        assert_eq!((record.sender_pid, record.comm.as_str()), (1420, "kill"));
+        // The agent of the captured run: pid 1318, started by the watchdog 1034 (0x40a).
+        let agent = Marker {
+            pid: 1318,
+            pgid: 1034,
+            watchdog_pid: Some(1034),
+            ..marker(1318, 1000)
+        };
+        assert!(agent.is_hit_by(&record));
+        assert_eq!(agent.signalled_pid(&record), 1034);
+        // Without the watchdog in the marker (the state before #342) the same line hits no one.
+        let before = Marker {
+            watchdog_pid: None,
+            ..agent
+        };
+        assert!(!before.is_hit_by(&record));
+    }
+
     #[test]
     fn the_watchdog_kill_is_found_in_the_log_and_replayed_with_its_sender() {
         let dir = tempfile::tempdir().unwrap();
