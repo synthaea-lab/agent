@@ -196,6 +196,7 @@ fn watchdog_parent(started_by_watchdog: bool, parent_pid: u32) -> Option<u32> {
 /// beacon (#863); the audit fallback has no such cache.
 fn select_sensor(
     enable_dns_capture: bool,
+    state_dir: &std::path::Path,
 ) -> (
     Box<dyn schema::sensor::Sensor>,
     &'static str,
@@ -217,7 +218,7 @@ fn select_sensor(
 
     tracing::warn!("eBPF unavailable — using audit fallback (reduced fidelity)");
     (
-        Box::new(sensor_linux_audit::AuditSensor::new()),
+        Box::new(sensor_linux_audit::AuditSensor::new().with_state_dir(state_dir.to_path_buf())),
         "linux-audit",
         None,
     )
@@ -268,22 +269,23 @@ fn can_use_ebpf() -> bool {
 /// blanket `EventSink for Arc<T>`) since `LinuxSensor::run` needs to own its sink
 /// for `Sensor`'s lifetime but the poller thread outlives no particular caller.
 pub(crate) fn cmd_run(opts: super::RunOptions) -> anyhow::Result<()> {
+    // The fields bound as `_` are not ignored: `start_pipeline` reads them from `opts` below.
     let super::RunOptions {
         alerts,
         events,
         storage,
-        alert_details,
+        alert_details: _,
         enable_kill,
         enable_quarantine,
         enable_tls_capture,
         enable_readline_capture,
         enable_dns_capture,
-        server,
-        ipc_endpoint,
-        content_dir,
+        server: _,
+        ipc_endpoint: _,
+        content_dir: _,
         log_sources,
-        deception,
-        detection,
+        deception: _,
+        detection: _,
         config_path,
     } = opts;
     // Kill-loudness (#71): must run before any other thread exists — the signal mask
@@ -291,36 +293,28 @@ pub(crate) fn cmd_run(opts: super::RunOptions) -> anyhow::Result<()> {
     // own worker threads.
     crate::kill_loudness::block_termination_signals();
 
-    let pipeline = super::common::wire_run_pipeline(
-        seeded_rule_state(),
-        alerts,
-        events,
-        server,
-        ipc_endpoint,
-        content_dir,
-        storage,
-    )?;
-    // #319. Set before any sensor starts; the one alert `wire_run_pipeline` can raise
-    // itself (UPLOAD-DISABLED) is the agent's own text, not an event's.
-    pipeline.sink.alert_log().set_stderr_details(alert_details);
-    super::common::apply_detection(&pipeline.sink, detection);
-    super::common::plant_canaries(
-        &pipeline.sink,
-        deception,
-        storage,
-        pipeline.transport.as_ref(),
-    );
+    let pipeline = super::common::start_pipeline(&opts, seeded_rule_state())?;
     let sink = Arc::clone(&pipeline.sink);
 
     // The watcher thread itself can start any time after the mask above — only the
     // masking has to precede every other thread. Started here (not right after the
     // masking call) so it can hold a clone of the sink's enrich queue for #341's
     // bounded shutdown drain.
-    crate::kill_loudness::spawn_watcher(alerts.to_path_buf(), sink.enrich_queue().clone())?;
+    // A stop by SIGTERM, SIGHUP or SIGQUIT ends in the watcher's `exit`, which never returns to the
+    // audit sensor's own clean-stop code: the watcher removes the audit fallback's instance marker,
+    // or every restart would leave one and the next start would report an unclean stop. Only this
+    // instance's own marker: until the sensor has replayed it, the file is the predecessor's.
+    let marker_dir = storage.state_dir.clone();
+    crate::kill_loudness::spawn_watcher(
+        alerts.to_path_buf(),
+        sink.enrich_queue().clone(),
+        move || sensor_linux_audit::killrec::remove_own_marker(&marker_dir),
+    )?;
 
     // Select the primary sensor (eBPF or audit fallback) before creating heartbeats
     // so telemetry reports the correct sensor type.
-    let (mut sensor, sensor_name, evictions) = select_sensor(enable_dns_capture);
+    let (mut sensor, sensor_name, evictions) =
+        select_sensor(enable_dns_capture, &storage.state_dir);
 
     // Automated response (#25): policy off by default (observe-only), opted into
     // per flag. Quarantine lands next to alerts.ndjson, the same "derived, no

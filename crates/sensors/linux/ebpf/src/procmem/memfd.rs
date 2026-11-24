@@ -7,9 +7,9 @@ use aya_ebpf::{
     programs::TracePointContext,
 };
 use aya_log_ebpf::warn;
-use sensor_linux_wire::{MemfdCreateEvent, TASK_COMM_LEN};
+use sensor_linux_wire::MemfdCreateEvent;
 
-use crate::{SYS_EXIT_RET_OFFSET, fill_lineage, into_ret};
+use crate::{SYS_EXIT_RET_OFFSET, fill_event_meta, into_ret};
 
 /// Ring buffer shared with userspace for `memfd_create` events (issue #265).
 #[map]
@@ -30,9 +30,9 @@ static MEMFD_CREATE_SCRATCH: PerCpuArray<MemfdCreateEvent> = PerCpuArray::with_m
 #[map]
 static MEMFD_ARGS: HashMap<u64, MemfdCreateEvent> = HashMap::with_max_entries(1024, 0);
 
-/// Offsets of the `syscalls:sys_enter_memfd_create` tracepoint (x86_64/aarch64):
+/// Offsets of the `syscalls:sys_enter_memfd_create` tracepoint (`x86_64`/`aarch64`):
 /// `uname`(16), `flags`(24). Verified on 2026-09-22 on Arch (kernel
-/// 6.6.9-arch1-1, x86_64) via
+/// 6.6.9-arch1-1, `x86_64`) via
 /// `/sys/kernel/tracing/events/syscalls/sys_enter_memfd_create/format`.
 #[cfg(any(bpf_target_arch = "x86_64", bpf_target_arch = "aarch64"))]
 const MEMFD_CREATE_NAME_PTR_OFFSET: usize = 16;
@@ -73,22 +73,17 @@ fn try_sys_enter_memfd_create(ctx: TracePointContext) -> Result<u32, u32> {
     let e = MEMFD_CREATE_SCRATCH.get_ptr_mut(0).ok_or(1u32)?;
     unsafe {
         core::ptr::write_bytes(e, 0, 1);
-        (*e).meta.pid = (bpf_get_current_pid_tgid() >> 32) as u32;
-        fill_lineage(&mut (*e).meta);
-        (*e).meta.uid = uid_gid as u32;
-        (*e).meta.gid = (uid_gid >> 32) as u32;
-        (*e).meta.timestamp_ns = aya_ebpf::helpers::bpf_ktime_get_ns();
-        (*e).meta.cgroup_id = aya_ebpf::helpers::bpf_get_current_cgroup_id();
-        let mut i = 0usize;
-        while i < TASK_COMM_LEN {
-            (*e).meta.comm[i] = comm[i];
-            i += 1;
-        }
+        fill_event_meta(
+            &mut (*e).meta,
+            (bpf_get_current_pid_tgid() >> 32) as u32,
+            uid_gid,
+            &comm,
+        );
 
-        if name_ptr != 0 {
-            if let Ok(name) = bpf_probe_read_user_str_bytes(name_ptr as *const u8, &mut (*e).name) {
-                (*e).name_len = name.len() as u16;
-            }
+        if name_ptr != 0
+            && let Ok(name) = bpf_probe_read_user_str_bytes(name_ptr as *const u8, &mut (*e).name)
+        {
+            (*e).name_len = name.len() as u16;
         }
         (*e).flags = flags as u32;
         (*e).fd = -1;

@@ -7,9 +7,9 @@ use aya_ebpf::{
     programs::TracePointContext,
 };
 use aya_log_ebpf::warn;
-use sensor_linux_wire::{BpfEvent, TASK_COMM_LEN};
+use sensor_linux_wire::BpfEvent;
 
-use crate::{fill_lineage, into_ret};
+use crate::{fill_event_meta, into_ret};
 
 /// Ring buffer shared with userspace for filtered `bpf(2)` events.
 #[map]
@@ -23,7 +23,7 @@ static BPF_SCRATCH: PerCpuArray<BpfEvent> = PerCpuArray::with_max_entries(1, 0);
 /// command — `BPF_MAP_LOOKUP_ELEM`/`BPF_MAP_UPDATE_ELEM`/etc., the overwhelming
 /// majority of real `bpf(2)` traffic, including this agent's own sensor's
 /// map reads/writes at runtime — is filtered in-kernel before touching the ring
-/// buffer (see this crate's WIRE_VERSION v12 changelog).
+/// buffer (see this crate's `WIRE_VERSION` v12 changelog).
 const BPF_CMD_MAP_CREATE: u32 = 0;
 const BPF_CMD_PROG_LOAD: u32 = 5;
 const BPF_CMD_PROG_ATTACH: u32 = 8;
@@ -58,17 +58,12 @@ fn try_sys_enter_bpf(ctx: TracePointContext) -> Result<u32, u32> {
     unsafe {
         core::ptr::write_bytes(e, 0, 1);
 
-        (*e).meta.pid = (bpf_get_current_pid_tgid() >> 32) as u32;
-        fill_lineage(&mut (*e).meta);
-        (*e).meta.uid = uid_gid as u32;
-        (*e).meta.gid = (uid_gid >> 32) as u32;
-        (*e).meta.timestamp_ns = aya_ebpf::helpers::bpf_ktime_get_ns();
-        (*e).meta.cgroup_id = aya_ebpf::helpers::bpf_get_current_cgroup_id();
-        let mut i = 0usize;
-        while i < TASK_COMM_LEN {
-            (*e).meta.comm[i] = comm[i];
-            i += 1;
-        }
+        fill_event_meta(
+            &mut (*e).meta,
+            (bpf_get_current_pid_tgid() >> 32) as u32,
+            uid_gid,
+            &comm,
+        );
         (*e).cmd = cmd;
 
         if BPF_EVENTS.output::<BpfEvent>(&*e, 0).is_err() {

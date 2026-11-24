@@ -14,9 +14,9 @@ use aya_ebpf::{
     programs::TracePointContext,
 };
 use aya_log_ebpf::warn;
-use sensor_linux_wire::{SocketCreateEvent, TASK_COMM_LEN};
+use sensor_linux_wire::SocketCreateEvent;
 
-use crate::{SYS_EXIT_RET_OFFSET, fill_lineage, into_ret};
+use crate::{SYS_EXIT_RET_OFFSET, fill_event_meta, into_ret};
 
 /// Ring buffer shared with userspace for `socket` events.
 #[map]
@@ -60,10 +60,10 @@ const SOCK_NONBLOCK_FLAG: i32 = 0o4000;
 /// review).
 const AF_UNIX: i32 = 1;
 
-/// Offsets of the `syscalls:sys_enter_socket` tracepoint (x86_64/aarch64):
+/// Offsets of the `syscalls:sys_enter_socket` tracepoint (`x86_64`/`aarch64`):
 /// `domain`(16), `type`(24), `protocol`(32) — the standard three-plain-argument
 /// layout also verified for `tgkill`'s `(tgid, tid, sig)`. Verified on 2026-10-07
-/// on Alpine (kernel 6.18.50-0-virt, x86_64) via
+/// on Alpine (kernel 6.18.50-0-virt, `x86_64`) via
 /// `/sys/kernel/tracing/events/syscalls/sys_enter_socket/format`.
 #[cfg(any(bpf_target_arch = "x86_64", bpf_target_arch = "aarch64"))]
 const SOCKET_DOMAIN_OFFSET: usize = 16;
@@ -141,17 +141,7 @@ fn try_sys_exit_socket(ctx: TracePointContext) -> Result<u32, u32> {
     unsafe {
         core::ptr::write_bytes(e, 0, 1);
 
-        (*e).meta.pid = (pid_tgid >> 32) as u32;
-        fill_lineage(&mut (*e).meta);
-        (*e).meta.uid = uid_gid as u32;
-        (*e).meta.gid = (uid_gid >> 32) as u32;
-        (*e).meta.timestamp_ns = aya_ebpf::helpers::bpf_ktime_get_ns();
-        (*e).meta.cgroup_id = aya_ebpf::helpers::bpf_get_current_cgroup_id();
-        let mut i = 0usize;
-        while i < TASK_COMM_LEN {
-            (*e).meta.comm[i] = comm[i];
-            i += 1;
-        }
+        fill_event_meta(&mut (*e).meta, (pid_tgid >> 32) as u32, uid_gid, &comm);
         (*e).domain = args.domain;
         (*e).socket_type = args.socket_type;
         (*e).protocol = args.protocol;

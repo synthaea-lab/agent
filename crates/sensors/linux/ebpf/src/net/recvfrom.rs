@@ -12,9 +12,9 @@ use aya_ebpf::{
     programs::TracePointContext,
 };
 use aya_log_ebpf::warn;
-use sensor_linux_wire::{TASK_COMM_LEN, UdpRecvEvent};
+use sensor_linux_wire::UdpRecvEvent;
 
-use crate::{AF_INET, AF_INET6, SYS_EXIT_RET_OFFSET, fill_lineage, into_ret};
+use crate::{AF_INET, AF_INET6, SYS_EXIT_RET_OFFSET, fill_event_meta, into_ret};
 
 /// Ring buffer shared with userspace for `recvfrom` events.
 #[map]
@@ -43,9 +43,9 @@ struct RecvfromArgs {
 static RECVFROM_ARGS: LruHashMap<u64, RecvfromArgs> = LruHashMap::with_max_entries(1024, 0);
 
 /// Offsets of `addr`(48) and `addr_len`(56) in `syscalls:sys_enter_recvfrom`
-/// (x86_64/aarch64): `fd`(16), `ubuf`(24), `size`(32), `flags`(40), the same layout
+/// (`x86_64`/`aarch64`): `fd`(16), `ubuf`(24), `size`(32), `flags`(40), the same layout
 /// `sys_enter_sendto` reports. Verified on 2026-10-05 on Alpine (kernel 6.18.50-0-virt,
-/// x86_64) via `/sys/kernel/tracing/events/syscalls/sys_enter_recvfrom/format`.
+/// `x86_64`) via `/sys/kernel/tracing/events/syscalls/sys_enter_recvfrom/format`.
 #[cfg(any(bpf_target_arch = "x86_64", bpf_target_arch = "aarch64"))]
 const RECVFROM_ADDR_PTR_OFFSET: usize = 48;
 #[cfg(any(bpf_target_arch = "x86_64", bpf_target_arch = "aarch64"))]
@@ -155,17 +155,7 @@ fn try_sys_exit_recvfrom(ctx: TracePointContext) -> Result<u32, u32> {
     unsafe {
         core::ptr::write_bytes(e, 0, 1);
 
-        (*e).meta.pid = (pid_tgid >> 32) as u32;
-        fill_lineage(&mut (*e).meta);
-        (*e).meta.uid = uid_gid as u32;
-        (*e).meta.gid = (uid_gid >> 32) as u32;
-        (*e).meta.timestamp_ns = aya_ebpf::helpers::bpf_ktime_get_ns();
-        (*e).meta.cgroup_id = aya_ebpf::helpers::bpf_get_current_cgroup_id();
-        let mut i = 0usize;
-        while i < TASK_COMM_LEN {
-            (*e).meta.comm[i] = comm[i];
-            i += 1;
-        }
+        fill_event_meta(&mut (*e).meta, (pid_tgid >> 32) as u32, uid_gid, &comm);
         (*e).peer_addr_v4 = v4;
         (*e).peer_addr_v6 = v6;
         (*e).peer_port = u16::from_be(port_be);

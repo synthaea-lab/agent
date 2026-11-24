@@ -7,9 +7,9 @@ use aya_ebpf::{
     programs::TracePointContext,
 };
 use aya_log_ebpf::warn;
-use sensor_linux_wire::{PrctlEvent, TASK_COMM_LEN};
+use sensor_linux_wire::PrctlEvent;
 
-use crate::{fill_lineage, into_ret};
+use crate::{fill_event_meta, into_ret};
 
 /// Ring buffer shared with userspace for filtered `prctl(2)` events.
 #[map]
@@ -22,7 +22,7 @@ static PRCTL_SCRATCH: PerCpuArray<PrctlEvent> = PerCpuArray::with_max_entries(1,
 /// `prctl(2)` options (`<linux/prctl.h>`) this probe cares about. `prctl` has
 /// dozens of options and some run constantly (`PR_SET_NAME` on every thread
 /// rename), so every other option returns before touching a ring buffer — the
-/// same in-kernel filter as `sys_enter_bpf`'s `cmd` (see this crate's WIRE_VERSION
+/// same in-kernel filter as `sys_enter_bpf`'s `cmd` (see this crate's `WIRE_VERSION`
 /// v19 changelog).
 const PR_CAPBSET_DROP: u64 = 24;
 const PR_SET_SECUREBITS: u64 = 28;
@@ -69,17 +69,12 @@ fn try_sys_enter_prctl(ctx: TracePointContext) -> Result<u32, u32> {
     unsafe {
         core::ptr::write_bytes(e, 0, 1);
 
-        (*e).meta.pid = (bpf_get_current_pid_tgid() >> 32) as u32;
-        fill_lineage(&mut (*e).meta);
-        (*e).meta.uid = uid_gid as u32;
-        (*e).meta.gid = (uid_gid >> 32) as u32;
-        (*e).meta.timestamp_ns = aya_ebpf::helpers::bpf_ktime_get_ns();
-        (*e).meta.cgroup_id = aya_ebpf::helpers::bpf_get_current_cgroup_id();
-        let mut i = 0usize;
-        while i < TASK_COMM_LEN {
-            (*e).meta.comm[i] = comm[i];
-            i += 1;
-        }
+        fill_event_meta(
+            &mut (*e).meta,
+            (bpf_get_current_pid_tgid() >> 32) as u32,
+            uid_gid,
+            &comm,
+        );
         (*e).option = option as u32;
         (*e).arg = arg;
 

@@ -7,9 +7,9 @@ use aya_ebpf::{
     programs::TracePointContext,
 };
 use aya_log_ebpf::warn;
-use sensor_linux_wire::{TASK_COMM_LEN, UdpSendEvent};
+use sensor_linux_wire::UdpSendEvent;
 
-use crate::{AF_INET, AF_INET6, fill_lineage, into_ret};
+use crate::{AF_INET, AF_INET6, fill_event_meta, into_ret};
 
 /// Ring buffer shared with userspace for `sendto` events.
 #[map]
@@ -19,9 +19,9 @@ static UDP_SEND_EVENTS: RingBuf = RingBuf::with_byte_size(256 * 1024, 0);
 #[map]
 static UDP_SEND_SCRATCH: PerCpuArray<UdpSendEvent> = PerCpuArray::with_max_entries(1, 0);
 
-/// Offsets of the `syscalls:sys_enter_sendto` tracepoint (x86_64/aarch64): `fd`(16),
+/// Offsets of the `syscalls:sys_enter_sendto` tracepoint (`x86_64`/`aarch64`): `fd`(16),
 /// `buff`(24), `len`(32), `flags`(40), `addr`(48), `addr_len`(56). Verified on
-/// 2026-09-22 on Alpine (kernel 6.18.50-0-virt, x86_64) via
+/// 2026-09-22 on Alpine (kernel 6.18.50-0-virt, `x86_64`) via
 /// `/sys/kernel/tracing/events/syscalls/sys_enter_sendto/format`.
 #[cfg(any(bpf_target_arch = "x86_64", bpf_target_arch = "aarch64"))]
 pub(crate) const SENDTO_FD_OFFSET: usize = 16;
@@ -96,17 +96,12 @@ fn try_sys_enter_sendto(ctx: TracePointContext) -> Result<u32, u32> {
     unsafe {
         core::ptr::write_bytes(e, 0, 1);
 
-        (*e).meta.pid = (bpf_get_current_pid_tgid() >> 32) as u32;
-        fill_lineage(&mut (*e).meta);
-        (*e).meta.uid = uid_gid as u32;
-        (*e).meta.gid = (uid_gid >> 32) as u32;
-        (*e).meta.timestamp_ns = aya_ebpf::helpers::bpf_ktime_get_ns();
-        (*e).meta.cgroup_id = aya_ebpf::helpers::bpf_get_current_cgroup_id();
-        let mut i = 0usize;
-        while i < TASK_COMM_LEN {
-            (*e).meta.comm[i] = comm[i];
-            i += 1;
-        }
+        fill_event_meta(
+            &mut (*e).meta,
+            (bpf_get_current_pid_tgid() >> 32) as u32,
+            uid_gid,
+            &comm,
+        );
         (*e).is_ipv6 = family == AF_INET6;
         (*e).dport = u16::from_be(port_be);
         (*e).daddr_v4 = v4;

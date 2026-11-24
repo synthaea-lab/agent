@@ -186,10 +186,26 @@ pub fn evaluate_raw_volume_open(event: &RawVolumeOpenEvent) -> Vec<Alert> {
 /// the real binary lives under. Unix side (Linux + macOS — both checked, a
 /// path matching either platform's legitimate home is fine; the *mismatch*
 /// is the signal, not the platform).
+///
+/// The shells also list `/usr/sbin/` and `/sbin/`: on a merged-`/usr` system (Fedora 43) `/usr/sbin`
+/// is a symlink to `/usr/bin`, and a `PATH` that lists it first, as root's usually does, execs
+/// `/usr/sbin/sh`, the same file as `/usr/bin/sh` under the name it was called by (#305). The
+/// image path the sensor reports is not resolved, so the prefix is all there is to compare. A
+/// real, separate `/usr/sbin/sh` is accepted too; no distribution ships one, and writing there
+/// takes root.
 const MASQUERADE_UNIX: &[(&str, &[&str])] = &[
-    ("bash", &["/bin/", "/usr/bin/", "/usr/local/bin/"]),
-    ("sh", &["/bin/", "/usr/bin/"]),
-    ("zsh", &["/bin/", "/usr/bin/"]),
+    (
+        "bash",
+        &[
+            "/bin/",
+            "/usr/bin/",
+            "/usr/local/bin/",
+            "/usr/sbin/",
+            "/sbin/",
+        ],
+    ),
+    ("sh", &["/bin/", "/usr/bin/", "/usr/sbin/", "/sbin/"]),
+    ("zsh", &["/bin/", "/usr/bin/", "/usr/sbin/", "/sbin/"]),
     (
         "sshd",
         &[
@@ -271,7 +287,15 @@ pub(crate) fn check_masquerading(event: &ExecEvent) -> Option<Alert> {
     };
 
     let lower_path = path.to_ascii_lowercase();
-    let legitimate = allowed.iter().any(|prefix| lower_path.starts_with(prefix));
+    // `image_path` is the unresolved `bprm->filename`, so a prefix proves nothing
+    // when the path can still climb out of it: `/usr/bin/../../tmp/x/sh` starts
+    // with `/usr/bin/` and runs from `/tmp/x`. A `.` or `..` component means the
+    // location is unproven, so the path is never treated as legitimate.
+    let has_dot_component = lower_path
+        .split(['/', '\\'])
+        .any(|component| component == "." || component == "..");
+    let legitimate =
+        !has_dot_component && allowed.iter().any(|prefix| lower_path.starts_with(prefix));
     if legitimate {
         return None;
     }

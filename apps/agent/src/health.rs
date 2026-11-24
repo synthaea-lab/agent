@@ -75,6 +75,14 @@ pub struct HostCounters {
     pub ioc_sibling_skipped: u64,
     /// Alerts that could not be written to `alerts.ndjson`.
     pub alerts_dropped: u64,
+    /// Windows ETW pid-cache entries the cap dropped (#178).
+    pub etw_pid_cache_evicted: u64,
+    /// Windows ETW silo-directory entries the cap dropped.
+    pub etw_silo_evicted: u64,
+    /// `Zone.Identifier` marks the read-back queue dropped.
+    pub etw_marks_dropped: u64,
+    /// Quarantine paths reported without dedup (the map was full).
+    pub etw_quarantine_unremembered: u64,
 }
 
 /// Reads the [`HostCounters`].
@@ -267,6 +275,10 @@ impl HealthCollector {
             ioc_own_skipped: host.ioc_own_skipped,
             ioc_sibling_skipped: host.ioc_sibling_skipped,
             alerts_dropped: host.alerts_dropped,
+            etw_pid_cache_evicted: host.etw_pid_cache_evicted,
+            etw_silo_evicted: host.etw_silo_evicted,
+            etw_marks_dropped: host.etw_marks_dropped,
+            etw_quarantine_unremembered: host.etw_quarantine_unremembered,
         }
     }
 }
@@ -364,6 +376,10 @@ mod tests {
             ioc_own_skipped: 6,
             ioc_sibling_skipped: 2,
             alerts_dropped: 8,
+            etw_pid_cache_evicted: 21,
+            etw_silo_evicted: 22,
+            etw_marks_dropped: 23,
+            etw_quarantine_unremembered: 24,
         }));
 
         let (tx, rx) = mpsc::channel();
@@ -438,6 +454,16 @@ mod tests {
         assert_eq!(
             beacon.alerts_dropped, 8,
             "the alerts the log file refused ride the beacon (#167)"
+        );
+        assert_eq!(
+            (
+                beacon.etw_pid_cache_evicted,
+                beacon.etw_silo_evicted,
+                beacon.etw_marks_dropped,
+                beacon.etw_quarantine_unremembered
+            ),
+            (21, 22, 23, 24),
+            "what the Windows ETW sensor sheds rides the beacon (#178)"
         );
     }
 

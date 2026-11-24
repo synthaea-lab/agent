@@ -18,7 +18,7 @@ use aya_ebpf::{
     programs::TracePointContext,
 };
 use aya_log_ebpf::warn;
-use sensor_linux_wire::{DnsUdpQueryEvent, MAX_DNS_UDP_PAYLOAD, TASK_COMM_LEN};
+use sensor_linux_wire::{DnsUdpQueryEvent, MAX_DNS_UDP_PAYLOAD};
 
 use super::{
     connect::{CONNECT_FD_OFFSET, CONNECT_USERVADDR_PTR_OFFSET},
@@ -27,7 +27,7 @@ use super::{
 use crate::{
     AF_INET, AF_INET6,
     file::write_delete_rename::{WRITE_BUF_OFFSET, WRITE_COUNT_OFFSET, WRITE_FD_OFFSET},
-    fill_lineage,
+    fill_event_meta,
     mount_signal::signal::is_agent_own_pid,
 };
 
@@ -128,17 +128,7 @@ fn emit_dns_udp_query(
         }
         (*e).payload_len = to_read as u16;
 
-        (*e).meta.pid = pid;
-        fill_lineage(&mut (*e).meta);
-        (*e).meta.uid = uid_gid as u32;
-        (*e).meta.gid = (uid_gid >> 32) as u32;
-        (*e).meta.timestamp_ns = aya_ebpf::helpers::bpf_ktime_get_ns();
-        (*e).meta.cgroup_id = aya_ebpf::helpers::bpf_get_current_cgroup_id();
-        let mut i = 0usize;
-        while i < TASK_COMM_LEN {
-            (*e).meta.comm[i] = comm[i];
-            i += 1;
-        }
+        fill_event_meta(&mut (*e).meta, pid, uid_gid, &comm);
         (*e).daddr_v4 = dest.daddr_v4;
         (*e).daddr_v6 = dest.daddr_v6;
         (*e).dport = DNS_PORT;
@@ -217,13 +207,12 @@ pub fn dns_udp_connect(ctx: TracePointContext) -> u32 {
         return 1;
     };
     let key = dns_fd_key(bpf_get_current_pid_tgid(), fd);
-    if addr_ptr != 0 {
-        if let Some((entry, port)) = read_inet_dest(addr_ptr) {
-            if port == DNS_PORT {
-                let _ = DNS_UDP_FDS.insert(&key, &entry, 0);
-                return 0;
-            }
-        }
+    if addr_ptr != 0
+        && let Some((entry, port)) = read_inet_dest(addr_ptr)
+        && port == DNS_PORT
+    {
+        let _ = DNS_UDP_FDS.insert(&key, &entry, 0);
+        return 0;
     }
     let _ = DNS_UDP_FDS.remove(&key);
     0
@@ -284,10 +273,10 @@ pub fn dns_udp_sendto(ctx: TracePointContext) -> u32 {
         let _ = emit_dns_on_connected_socket(&ctx, fd, SENDTO_BUF_OFFSET, len);
         return 0;
     }
-    if let Some((dest, port)) = read_inet_dest(addr_ptr) {
-        if port == DNS_PORT {
-            let _ = emit_dns_udp_query(&ctx, SENDTO_BUF_OFFSET, len, &dest);
-        }
+    if let Some((dest, port)) = read_inet_dest(addr_ptr)
+        && port == DNS_PORT
+    {
+        let _ = emit_dns_udp_query(&ctx, SENDTO_BUF_OFFSET, len, &dest);
     }
     0
 }

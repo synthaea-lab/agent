@@ -26,6 +26,15 @@ pub(crate) struct Change {
     pub(crate) unchanged: usize,
 }
 
+/// The content manifest in `json`, as read from the file of the earlier release.
+///
+/// # Errors
+///
+/// The text is not a content manifest.
+pub(crate) fn parse_earlier(json: &str) -> anyhow::Result<ContentManifest> {
+    serde_json::from_str(json).context("not a content manifest")
+}
+
 /// Compares the earlier release being restored with the release the ring is on now.
 pub(crate) fn compare(earlier: &ContentManifest, current: &ContentManifest) -> Change {
     fn had<'a>(manifest: &'a ContentManifest, path: &str) -> Option<&'a updater::ContentEntry> {
@@ -52,7 +61,7 @@ pub(crate) fn compare(earlier: &ContentManifest, current: &ContentManifest) -> C
     change
 }
 
-/// Rebuilds `earlier_json` (a content manifest as it was published, signed) as the unsigned
+/// Rebuilds `earlier` (a content manifest as it was published, signed) as the unsigned
 /// release `release_version`, with the same ring and entries and the given `released_at`.
 ///
 /// The earlier manifest's signature is **verified first** against the key this build embeds:
@@ -62,17 +71,16 @@ pub(crate) fn compare(earlier: &ContentManifest, current: &ContentManifest) -> C
 ///
 /// # Errors
 ///
-/// The text is not a content manifest, its signature does not verify (unsigned, edited after
+/// Its signature does not verify (unsigned, edited after
 /// signing, signed by another key, or this build embeds no key), it lists nothing,
 /// `release_version` is not above the earlier one, or `released_at` is not a real UTC
 /// timestamp of the form `YYYY-MM-DDTHH:MM:SSZ`.
 pub(crate) fn roll_forward(
-    earlier_json: &str,
+    earlier: &ContentManifest,
     release_version: u64,
     released_at: &str,
 ) -> anyhow::Result<ContentManifest> {
-    let mut manifest: ContentManifest =
-        serde_json::from_str(earlier_json).context("not a content manifest")?;
+    let mut manifest = earlier.clone();
     manifest.verify_signature().map_err(|error| {
         anyhow::anyhow!(
             "the earlier manifest's signature does not verify ({error}): only a manifest that \
@@ -128,6 +136,15 @@ mod tests {
     use super::*;
     use crate::sign::{Kind, sign};
 
+    /// `roll_forward` over the text of an earlier manifest, as the command reads it.
+    fn rolled(
+        earlier_json: &str,
+        release_version: u64,
+        released_at: &str,
+    ) -> anyhow::Result<ContentManifest> {
+        roll_forward(&parse_earlier(earlier_json)?, release_version, released_at)
+    }
+
     fn entry(path: &str, sha256: &str) -> ContentEntry {
         ContentEntry {
             metadata: None,
@@ -158,7 +175,7 @@ mod tests {
 
     #[test]
     fn the_corrective_release_carries_the_earlier_content_under_a_higher_number() {
-        let corrective = roll_forward(&signed_v2(), 5, "2026-10-12T09:30:00Z").unwrap();
+        let corrective = rolled(&signed_v2(), 5, "2026-10-12T09:30:00Z").unwrap();
         assert_eq!(corrective.release_version, 5);
         assert_eq!(corrective.released_at, "2026-10-12T09:30:00Z");
         assert_eq!(corrective.ring, "canary_0");
@@ -172,7 +189,7 @@ mod tests {
 
     #[test]
     fn it_signs_and_the_agent_would_accept_it() {
-        let corrective = roll_forward(&signed_v2(), 5, "2026-10-12T09:30:00Z").unwrap();
+        let corrective = rolled(&signed_v2(), 5, "2026-10-12T09:30:00Z").unwrap();
         let signed = sign(
             Kind::Content,
             &serde_json::to_string(&corrective).unwrap(),
@@ -187,7 +204,7 @@ mod tests {
     fn an_earlier_manifest_that_was_never_signed_is_refused() {
         let unsigned =
             serde_json::to_string(&manifest(2, vec![entry("a.yml", &"a".repeat(64))])).unwrap();
-        let error = roll_forward(&unsigned, 5, "2026-10-12T09:30:00Z").unwrap_err();
+        let error = rolled(&unsigned, 5, "2026-10-12T09:30:00Z").unwrap_err();
         assert!(error.to_string().contains("signature"), "{error}");
     }
 
@@ -197,7 +214,7 @@ mod tests {
         // edited entry list into a validly signed release (review of #782).
         let mut tampered: ContentManifest = serde_json::from_str(&signed_v2()).unwrap();
         tampered.entries[0].sha256 = "b".repeat(64);
-        let error = roll_forward(
+        let error = rolled(
             &serde_json::to_string(&tampered).unwrap(),
             5,
             "2026-10-12T09:30:00Z",
@@ -208,7 +225,7 @@ mod tests {
         let mut foreign = manifest(2, vec![entry("a.yml", &"a".repeat(64))]);
         foreign.sign(&ring::signature::Ed25519KeyPair::from_seed_unchecked(&[7u8; 32]).unwrap());
         assert!(
-            roll_forward(
+            rolled(
                 &serde_json::to_string(&foreign).unwrap(),
                 5,
                 "2026-10-12T09:30:00Z"
@@ -221,7 +238,7 @@ mod tests {
     fn an_earlier_manifest_that_lists_nothing_is_refused() {
         let mut empty = manifest(2, vec![]);
         empty.sign(&test_key_pair());
-        let error = roll_forward(
+        let error = rolled(
             &serde_json::to_string(&empty).unwrap(),
             5,
             "2026-10-12T09:30:00Z",
@@ -236,7 +253,7 @@ mod tests {
     #[test]
     fn a_number_that_is_not_above_the_restored_release_is_refused() {
         for version in [1, 2] {
-            let error = roll_forward(&signed_v2(), version, "2026-10-12T09:30:00Z").unwrap_err();
+            let error = rolled(&signed_v2(), version, "2026-10-12T09:30:00Z").unwrap_err();
             assert!(error.to_string().contains("numbered above"), "{error}");
         }
     }
@@ -256,10 +273,10 @@ mod tests {
             "2026-10-12T09:60:00Z",
             "2026-10-12T09:30:61Z",
         ] {
-            assert!(roll_forward(&signed_v2(), 5, stamp).is_err(), "{stamp:?}");
+            assert!(rolled(&signed_v2(), 5, stamp).is_err(), "{stamp:?}");
         }
-        assert!(roll_forward("{}", 5, "2026-10-12T09:30:00Z").is_err());
-        assert!(roll_forward(&signed_v2(), 5, "2026-12-31T23:59:59Z").is_ok());
+        assert!(rolled("{}", 5, "2026-10-12T09:30:00Z").is_err());
+        assert!(rolled(&signed_v2(), 5, "2026-12-31T23:59:59Z").is_ok());
     }
 
     #[test]

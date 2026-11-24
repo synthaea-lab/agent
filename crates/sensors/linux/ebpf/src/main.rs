@@ -1,7 +1,39 @@
 // SPDX-License-Identifier: GPL-2.0-only OR MIT
+//! The Linux kernel probes: eBPF programs, their maps and the helpers they share. Each domain
+//! module (`exec`, `file`, `net`, `cred`, ...) owns its programs; this root holds what every
+//! domain uses.
+//!
+//! # Safety
+//!
+//! Nearly every `unsafe` block here is one of four patterns, so they are documented once here
+//! instead of on each block (AS-029). A block that does anything else, and every read through
+//! a raw kernel pointer (`task_struct`, `pt_regs`, an LSM hook argument), carries its own
+//! `// SAFETY:` comment (#184).
+//!
+//! - **Syscall arguments.** `ctx.read_at::<T>(OFFSET)` reads a field of the syscall record.
+//!   No program here attaches to a real tracepoint: every `TracePointContext` wraps the
+//!   synthetic `SysEnterRecord`/`SysExitRecord` that `raw.rs` builds in a per-CPU map from
+//!   `pt_regs`, laid out like the tracepoint's `format` file (the `*_OFFSET` constants).
+//!   `read_at` goes through `bpf_probe_read_kernel`, so a wrong offset gives an error or a
+//!   wrong value, never a fault.
+//! - **Probe reads.** `bpf_probe_read_user`, `bpf_probe_read_kernel` and their `_str`/`_buf`
+//!   forms copy from an address the kernel may not map. The helper handles the fault and
+//!   returns an error, which each call site turns into an early return or an explicit
+//!   fallback value (`unwrap_or(0)`, `.ok()?`, `if let Ok`).
+//! - **Per-CPU scratch.** `SCRATCH.get_ptr_mut(0)` gives this CPU's only slot of a
+//!   `PerCpuArray`. A program does not nest on its own CPU, so nothing else writes it between
+//!   the `write_bytes` that zeroes it and the `output` that copies it out. The field writes
+//!   through `(*e)` stay inside that one value.
+//! - **Map lookups.** `map.get(&key)` returns a reference into the map, which is copied or
+//!   read before the program returns, and never kept.
 #![no_std]
 #![no_main]
+#![allow(
+    clippy::undocumented_unsafe_blocks,
+    reason = "the recurring unsafe patterns are documented once in the crate-level Safety section (AS-029)"
+)]
 
+mod arch;
 mod cred;
 mod exec;
 mod file;
@@ -13,8 +45,9 @@ mod procmem;
 mod raw;
 mod uprobe;
 
+pub(crate) use arch::SYS_EXIT_RET_OFFSET;
 use aya_ebpf::{helpers::bpf_get_current_pid_tgid, macros::map, maps::HashMap};
-use sensor_linux_wire::LineageEntry;
+use sensor_linux_wire::{LineageEntry, TASK_COMM_LEN};
 
 // Raw scheduler tracepoints expose task pointers instead of formatted event records.
 // Their field offsets come from the running kernel's BTF in `userspace/src/btf.rs`;
@@ -41,17 +74,32 @@ fn fill_lineage(meta: &mut sensor_linux_wire::EventMeta) {
     }
 }
 
-/// Offset of `ret` in every `sys_exit_*` tracepoint (x86_64/aarch64): 8-byte common
-/// header + `__syscall_nr`(4, +4 padding) + `ret`(8, signed). Verified on
-/// 2026-09-22 on Alpine (kernel 6.18.50-0-virt, x86_64) via
-/// `/sys/kernel/tracing/events/syscalls/sys_exit_accept{,4}/format` — identical for
-/// both.
-#[cfg(any(bpf_target_arch = "x86_64", bpf_target_arch = "aarch64"))]
-const SYS_EXIT_RET_OFFSET: usize = 16;
-/// i686: `ret` is a packed 4-byte `long`, not independently verified (see
-/// `sys_enter_open`'s i686 note for the same packed-layout reasoning).
-#[cfg(bpf_target_arch = "x86")]
-const SYS_EXIT_RET_OFFSET: usize = 12;
+/// Fills the `EventMeta` every event carries, in the order each probe used to write it by
+/// hand (AS-008): `pid`, the lineage from `PROC_LINEAGE`, `uid`/`gid` from a
+/// `bpf_get_current_uid_gid()` value, the timestamp, the cgroup and `comm`. `comm` is copied
+/// with the same byte loop as before, so the generated code does not change shape.
+#[inline(always)]
+pub(crate) fn fill_event_meta(
+    meta: &mut sensor_linux_wire::EventMeta,
+    pid: u32,
+    uid_gid: u64,
+    comm: &[u8; TASK_COMM_LEN],
+) {
+    meta.pid = pid;
+    fill_lineage(meta);
+    meta.uid = uid_gid as u32;
+    meta.gid = (uid_gid >> 32) as u32;
+    // SAFETY: neither helper takes an argument; both only read the clock or the current task.
+    unsafe {
+        meta.timestamp_ns = aya_ebpf::helpers::bpf_ktime_get_ns();
+        meta.cgroup_id = aya_ebpf::helpers::bpf_get_current_cgroup_id();
+    }
+    let mut i = 0usize;
+    while i < TASK_COMM_LEN {
+        meta.comm[i] = comm[i];
+        i += 1;
+    }
+}
 
 /// `sa_family_t` values (linux/socket.h) for the two tracked families. Any other family
 /// (notably `AF_UNIX` = 1, very frequent — D-Bus, local sockets) is ignored: out of scope of

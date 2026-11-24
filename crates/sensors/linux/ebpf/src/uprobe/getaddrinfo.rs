@@ -1,7 +1,7 @@
 //! Uprobes: DNS resolution capture (issue #267 Phase 1)
 //!
 //! getaddrinfo(3) uprobe/uretprobe pair, attached from userspace (sensor-linux-uprobes)
-//! after resolving the symbol in libc with goblin — same shape as the SSL_read
+//! after resolving the symbol in libc with goblin — same shape as the `SSL_read`
 //! entry/exit pair in `tls.rs`: the resolved address is only in `*res` once the call
 //! returns, so entry stashes what's needed to read it back at exit.
 
@@ -15,9 +15,9 @@ use aya_ebpf::{
     programs::{ProbeContext, RetProbeContext},
 };
 use aya_log_ebpf::warn;
-use sensor_linux_wire::{GetAddrInfoEvent, MAX_DNS_ANSWERS, TASK_COMM_LEN};
+use sensor_linux_wire::{GetAddrInfoEvent, MAX_DNS_ANSWERS};
 
-use crate::{AF_INET, AF_INET6, fill_lineage, into_ret};
+use crate::{AF_INET, AF_INET6, fill_event_meta, into_ret};
 
 /// Ring buffer for DNS query events, shared with the `gethostbyname*_r` pair.
 #[map]
@@ -28,7 +28,7 @@ pub(super) static DNS_QUERY_EVENTS: RingBuf = RingBuf::with_byte_size(256 * 1024
 static DNS_SCRATCH: PerCpuArray<GetAddrInfoEvent> = PerCpuArray::with_max_entries(1, 0);
 
 /// Tracks `getaddrinfo(3)` arguments between entry and return:
-/// pid_tgid → (node_ptr, res_ptr_ptr). `getaddrinfo(const char *node, const char
+/// `pid_tgid` → (`node_ptr`, `res_ptr_ptr`). `getaddrinfo(const char *node, const char
 /// *service, const struct addrinfo *hints, struct addrinfo **res)` only populates
 /// `*res` on success, so the entry probe stashes the query-name pointer and the
 /// address OF the caller's `res` output variable (not what it points to yet) — the
@@ -156,16 +156,7 @@ fn try_getaddrinfo_exit(ctx: RetProbeContext) -> Result<u32, u32> {
     let uid_gid = aya_ebpf::helpers::bpf_get_current_uid_gid();
 
     unsafe {
-        (*e).meta.pid = (pid_tgid >> 32) as u32;
-        fill_lineage(&mut (*e).meta);
-        (*e).meta.uid = uid_gid as u32;
-        (*e).meta.gid = (uid_gid >> 32) as u32;
-        (*e).meta.timestamp_ns = aya_ebpf::helpers::bpf_ktime_get_ns();
-        let mut i = 0usize;
-        while i < TASK_COMM_LEN {
-            (*e).meta.comm[i] = comm[i];
-            i += 1;
-        }
+        fill_event_meta(&mut (*e).meta, (pid_tgid >> 32) as u32, uid_gid, &comm);
 
         if let Ok(query) = bpf_probe_read_user_str_bytes(node_ptr as *const u8, &mut (*e).query) {
             (*e).query_len = query.len() as u16;

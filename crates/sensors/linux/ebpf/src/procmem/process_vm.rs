@@ -7,9 +7,9 @@ use aya_ebpf::{
     programs::TracePointContext,
 };
 use aya_log_ebpf::warn;
-use sensor_linux_wire::{ProcessVmReadEvent, ProcessVmWriteEvent, TASK_COMM_LEN};
+use sensor_linux_wire::{ProcessVmReadEvent, ProcessVmWriteEvent};
 
-use crate::{fill_lineage, into_ret};
+use crate::{fill_event_meta, into_ret};
 
 /// Ring buffer shared with userspace for `process_vm_readv` events (issue #265).
 #[map]
@@ -28,9 +28,9 @@ static PROCESS_VM_WRITE_SCRATCH: PerCpuArray<ProcessVmWriteEvent> =
     PerCpuArray::with_max_entries(1, 0);
 
 /// Offsets of the `syscalls:sys_enter_process_vm_readv`/`sys_enter_process_vm_writev`
-/// tracepoints (x86_64/aarch64, identical shape on both): `pid`(16), `lvec`(24),
+/// tracepoints (`x86_64/aarch64`, identical shape on both): `pid`(16), `lvec`(24),
 /// `liovcnt`(32), `rvec`(40), `riovcnt`(48). Verified on 2026-09-22 on Arch
-/// (kernel 6.6.9-arch1-1, x86_64) via
+/// (kernel 6.6.9-arch1-1, `x86_64`) via
 /// `/sys/kernel/tracing/events/syscalls/sys_enter_process_vm_readv/format` (and
 /// `..._writev/format`, identical layout).
 #[cfg(any(bpf_target_arch = "x86_64", bpf_target_arch = "aarch64"))]
@@ -54,7 +54,7 @@ const PROCESS_VM_REMOTE_IOV_OFFSET: usize = 24;
 #[cfg(bpf_target_arch = "x86")]
 const PROCESS_VM_RIOVCNT_OFFSET: usize = 28;
 
-/// Reads `iovec[0].iov_len` from a user-space `struct iovec *`. On x86_64/aarch64
+/// Reads `iovec[0].iov_len` from a user-space `struct iovec *`. On `x86_64/aarch64`
 /// `iov_base` (a pointer, unread here) occupies the first 8 bytes and `iov_len`
 /// (`size_t`) the next 8. On i686 the whole struct is 4+4 — a 32-bit userspace
 /// process's `struct iovec` has no 8-byte fields — so `iov_len` sits at offset 4,
@@ -121,17 +121,12 @@ fn try_sys_enter_process_vm_readv(ctx: TracePointContext) -> Result<u32, u32> {
     let e = PROCESS_VM_READ_SCRATCH.get_ptr_mut(0).ok_or(1u32)?;
     unsafe {
         core::ptr::write_bytes(e, 0, 1);
-        (*e).meta.pid = (bpf_get_current_pid_tgid() >> 32) as u32;
-        fill_lineage(&mut (*e).meta);
-        (*e).meta.uid = uid_gid as u32;
-        (*e).meta.gid = (uid_gid >> 32) as u32;
-        (*e).meta.timestamp_ns = aya_ebpf::helpers::bpf_ktime_get_ns();
-        (*e).meta.cgroup_id = aya_ebpf::helpers::bpf_get_current_cgroup_id();
-        let mut i = 0usize;
-        while i < TASK_COMM_LEN {
-            (*e).meta.comm[i] = comm[i];
-            i += 1;
-        }
+        fill_event_meta(
+            &mut (*e).meta,
+            (bpf_get_current_pid_tgid() >> 32) as u32,
+            uid_gid,
+            &comm,
+        );
         (*e).target_pid = target_pid as u32;
         (*e).local_iov_count = local_iov_count;
         (*e).remote_iov_count = remote_iov_count;
@@ -196,17 +191,12 @@ fn try_sys_enter_process_vm_writev(ctx: TracePointContext) -> Result<u32, u32> {
     let e = PROCESS_VM_WRITE_SCRATCH.get_ptr_mut(0).ok_or(1u32)?;
     unsafe {
         core::ptr::write_bytes(e, 0, 1);
-        (*e).meta.pid = (bpf_get_current_pid_tgid() >> 32) as u32;
-        fill_lineage(&mut (*e).meta);
-        (*e).meta.uid = uid_gid as u32;
-        (*e).meta.gid = (uid_gid >> 32) as u32;
-        (*e).meta.timestamp_ns = aya_ebpf::helpers::bpf_ktime_get_ns();
-        (*e).meta.cgroup_id = aya_ebpf::helpers::bpf_get_current_cgroup_id();
-        let mut i = 0usize;
-        while i < TASK_COMM_LEN {
-            (*e).meta.comm[i] = comm[i];
-            i += 1;
-        }
+        fill_event_meta(
+            &mut (*e).meta,
+            (bpf_get_current_pid_tgid() >> 32) as u32,
+            uid_gid,
+            &comm,
+        );
         (*e).target_pid = target_pid as u32;
         (*e).local_iov_count = local_iov_count;
         (*e).remote_iov_count = remote_iov_count;
