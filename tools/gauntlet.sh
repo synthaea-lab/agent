@@ -32,9 +32,6 @@ fi
 step "PowerShell scripts ASCII-only (Windows PowerShell 5.1 misreads anything else)"
 python3 tools/check-ps1-ascii.py
 
-step "eBPF tracepoint offsets follow the syscall record layout (i686 is not built anywhere)"
-python3 tools/check-ebpf-offsets.py
-
 step "clippy, host, all targets, -D warnings"
 cargo clippy --workspace --exclude sensor-linux-ebpf --all-targets -- -D warnings
 
@@ -66,6 +63,13 @@ if [[ $FAST -eq 0 ]]; then
     step "clippy, x86_64-unknown-linux-gnu (the platform-gated Linux sensor code)"
     cargo clippy --workspace --exclude sensor-linux-ebpf --all-targets \
         --target x86_64-unknown-linux-gnu -- -D warnings
+
+    step "clippy, the eBPF probes (bpfel, pinned nightly)"
+    if rustup run "$(tr -d '[:space:]' < packaging/toolchain/ebpf-toolchain.txt)" cargo clippy --version >/dev/null 2>&1; then
+        bash tools/clippy-ebpf.sh
+    else
+        echo "skipped: the pinned eBPF nightly (packaging/toolchain/ebpf-toolchain.txt) with clippy is not installed"
+    fi
 
     step "clippy, Windows sensor crates, x86_64-pc-windows-msvc"
     # Only the Windows-gated crates: a full workspace pass needs a cross C

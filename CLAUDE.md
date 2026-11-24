@@ -92,7 +92,10 @@ New crate? Add it to the rules in `tools/check-deps.py` in the same change.
 
 - Curated lint bar in root `[workspace.lints]`; clippy runs `-D warnings`, so every
   listed lint is enforced: `dbg_macro`/`todo`/`unimplemented` and
-  `undocumented_unsafe_blocks` (write `// SAFETY:` on every unsafe block) are deny;
+  `undocumented_unsafe_blocks` (write `// SAFETY:` on every unsafe block) are deny
+  (exception: `sensor-linux-ebpf` documents its four recurring unsafe patterns once in
+  its crate-level `# Safety` section, and keeps `// SAFETY:` on everything else, raw
+  kernel-pointer reads included);
   `doc_markdown`, `must_use_candidate`, `missing_errors_doc`, `missing_panics_doc`,
   `semicolon_if_nothing_returned` are enforced warns. `similar_names` is deliberately
   off (pid/ppid is kernel nomenclature).
@@ -136,6 +139,8 @@ New crate? Add it to the rules in `tools/check-deps.py` in the same change.
   that catches the same failures on one machine before CI does.
 - `cargo check` / `cargo test` (default members) — works on any OS; with `--workspace`, add `--exclude sensor-linux-ebpf` (bpfel target).
 - `cargo clippy --workspace --exclude sensor-linux-ebpf --all-targets -- -D warnings` — must stay clean.
+- `tools/clippy-ebpf.sh` — clippy for the excluded eBPF crate (pinned nightly, once per
+  `bpf_target_arch`: x86_64, aarch64); CI and the gauntlet run it.
 - `python3 tools/check-deps.py` — dependency direction check.
 - `python3 tools/check-docs.py` — docs links, anchors, and tracking issues on capability rows; `python3 tools/gen-roadmap.py` regenerates `docs/roadmap.md` (needs `gh`).
 - `python3 tools/attack-coverage.py [--check]` — regenerate / verify `docs/attack-coverage.md` (needs the `rules/` sibling).

@@ -14,9 +14,12 @@ use aya_ebpf::{
     programs::TracePointContext,
 };
 use aya_log_ebpf::warn;
-use sensor_linux_wire::{SocketCreateEvent, TASK_COMM_LEN};
+use sensor_linux_wire::SocketCreateEvent;
 
-use crate::{SYS_EXIT_RET_OFFSET, fill_lineage, into_ret};
+use crate::{
+    arch::{SYS_EXIT_RET_OFFSET, SyscallRecord, arg_offset},
+    fill_event_meta, into_ret,
+};
 
 /// Ring buffer shared with userspace for `socket` events.
 #[map]
@@ -60,46 +63,29 @@ const SOCK_NONBLOCK_FLAG: i32 = 0o4000;
 /// review).
 const AF_UNIX: i32 = 1;
 
-/// Offsets of the `syscalls:sys_enter_socket` tracepoint (x86_64/aarch64):
+/// Offsets of the `syscalls:sys_enter_socket` tracepoint (`x86_64`/`aarch64`):
 /// `domain`(16), `type`(24), `protocol`(32) — the standard three-plain-argument
 /// layout also verified for `tgkill`'s `(tgid, tid, sig)`. Verified on 2026-10-07
-/// on Alpine (kernel 6.18.50-0-virt, x86_64) via
+/// on Alpine (kernel 6.18.50-0-virt, `x86_64`) via
 /// `/sys/kernel/tracing/events/syscalls/sys_enter_socket/format`.
-#[cfg(any(bpf_target_arch = "x86_64", bpf_target_arch = "aarch64"))]
-const SOCKET_DOMAIN_OFFSET: usize = 16;
-#[cfg(any(bpf_target_arch = "x86_64", bpf_target_arch = "aarch64"))]
-const SOCKET_TYPE_OFFSET: usize = 24;
-#[cfg(any(bpf_target_arch = "x86_64", bpf_target_arch = "aarch64"))]
-const SOCKET_PROTOCOL_OFFSET: usize = 32;
+///
 /// i686: inferred, not independently verified (see `sys_enter_open`'s i686 note).
-#[cfg(bpf_target_arch = "x86")]
-const SOCKET_DOMAIN_OFFSET: usize = 12;
-#[cfg(bpf_target_arch = "x86")]
-const SOCKET_TYPE_OFFSET: usize = 16;
-#[cfg(bpf_target_arch = "x86")]
-const SOCKET_PROTOCOL_OFFSET: usize = 20;
+const SOCKET_DOMAIN_OFFSET: usize = arg_offset(0);
+const SOCKET_TYPE_OFFSET: usize = arg_offset(1);
+const SOCKET_PROTOCOL_OFFSET: usize = arg_offset(2);
 
 pub fn sys_enter_socket(ctx: TracePointContext) -> u32 {
     into_ret(try_sys_enter_socket(&ctx))
 }
 
 fn try_sys_enter_socket(ctx: &TracePointContext) -> Result<u32, u32> {
-    #[cfg(any(bpf_target_arch = "x86_64", bpf_target_arch = "aarch64"))]
-    let domain: i64 = unsafe { ctx.read_at(SOCKET_DOMAIN_OFFSET).map_err(|_| 1u32)? };
-    #[cfg(bpf_target_arch = "x86")]
-    let domain: i64 = unsafe { ctx.read_at::<i32>(SOCKET_DOMAIN_OFFSET).map_err(|_| 1u32)? as i64 };
+    let domain: i64 = unsafe { ctx.read_long_arg(SOCKET_DOMAIN_OFFSET).map_err(|_| 1u32)? };
 
-    #[cfg(any(bpf_target_arch = "x86_64", bpf_target_arch = "aarch64"))]
-    let raw_type: i64 = unsafe { ctx.read_at(SOCKET_TYPE_OFFSET).map_err(|_| 1u32)? };
-    #[cfg(bpf_target_arch = "x86")]
-    let raw_type: i64 = unsafe { ctx.read_at::<i32>(SOCKET_TYPE_OFFSET).map_err(|_| 1u32)? as i64 };
+    let raw_type: i64 = unsafe { ctx.read_long_arg(SOCKET_TYPE_OFFSET).map_err(|_| 1u32)? };
 
-    #[cfg(any(bpf_target_arch = "x86_64", bpf_target_arch = "aarch64"))]
-    let protocol: i64 = unsafe { ctx.read_at(SOCKET_PROTOCOL_OFFSET).map_err(|_| 1u32)? };
-    #[cfg(bpf_target_arch = "x86")]
     let protocol: i64 = unsafe {
-        ctx.read_at::<i32>(SOCKET_PROTOCOL_OFFSET)
-            .map_err(|_| 1u32)? as i64
+        ctx.read_long_arg(SOCKET_PROTOCOL_OFFSET)
+            .map_err(|_| 1u32)?
     };
 
     let pid_tgid = bpf_get_current_pid_tgid();
@@ -118,10 +104,7 @@ pub fn sys_exit_socket(ctx: TracePointContext) -> u32 {
 }
 
 fn try_sys_exit_socket(ctx: TracePointContext) -> Result<u32, u32> {
-    #[cfg(any(bpf_target_arch = "x86_64", bpf_target_arch = "aarch64"))]
-    let ret: i64 = unsafe { ctx.read_at(SYS_EXIT_RET_OFFSET).map_err(|_| 1u32)? };
-    #[cfg(bpf_target_arch = "x86")]
-    let ret: i64 = unsafe { ctx.read_at::<i32>(SYS_EXIT_RET_OFFSET).map_err(|_| 1u32)? as i64 };
+    let ret: i64 = unsafe { ctx.read_long_arg(SYS_EXIT_RET_OFFSET).map_err(|_| 1u32)? };
 
     let pid_tgid = bpf_get_current_pid_tgid();
     let args = match unsafe { SOCKET_CREATE_ARGS.get(&pid_tgid) } {
@@ -141,17 +124,7 @@ fn try_sys_exit_socket(ctx: TracePointContext) -> Result<u32, u32> {
     unsafe {
         core::ptr::write_bytes(e, 0, 1);
 
-        (*e).meta.pid = (pid_tgid >> 32) as u32;
-        fill_lineage(&mut (*e).meta);
-        (*e).meta.uid = uid_gid as u32;
-        (*e).meta.gid = (uid_gid >> 32) as u32;
-        (*e).meta.timestamp_ns = aya_ebpf::helpers::bpf_ktime_get_ns();
-        (*e).meta.cgroup_id = aya_ebpf::helpers::bpf_get_current_cgroup_id();
-        let mut i = 0usize;
-        while i < TASK_COMM_LEN {
-            (*e).meta.comm[i] = comm[i];
-            i += 1;
-        }
+        fill_event_meta(&mut (*e).meta, (pid_tgid >> 32) as u32, uid_gid, &comm);
         (*e).domain = args.domain;
         (*e).socket_type = args.socket_type;
         (*e).protocol = args.protocol;

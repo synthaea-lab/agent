@@ -280,6 +280,6 @@ Live status and ordering are on the [project board](https://github.com/orgs/synt
 
 - ODD-HOUR-LOGON with operator-configured offset, work hours and exempt accounts (partial, Rule engine). See [detection/rules.md#configuration](detection/rules.md#configuration).
 
-### [#342](https://github.com/synthaea-lab/agent/issues/342) Linux audit fallback: a SIGKILL of the watchdog is not attributed (split from #275)
+### [#275](https://github.com/synthaea-lab/agent/issues/275) Linux kill loudness: flow only validated by hand, no SIGKILL attribution under the audit fallback
 
 - Kill loudness: record the sender of a termination signal before exit (partial, Self-protection). See [self-protection.md#kill-loudness](self-protection.md#kill-loudness).
