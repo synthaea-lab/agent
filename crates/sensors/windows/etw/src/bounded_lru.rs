@@ -5,6 +5,8 @@
 
 use std::{collections::HashMap, hash::Hash};
 
+use crate::shed::ShedCounter;
+
 /// A map that never holds more than `cap` entries. Reads through [`Self::get`] refresh
 /// recency; [`Self::peek`] does not.
 pub(crate) struct BoundedLru<K, V> {
@@ -13,21 +15,31 @@ pub(crate) struct BoundedLru<K, V> {
     entries: HashMap<K, (V, u64)>,
     cap: usize,
     tick: u64,
-    evicted: u64,
+    evicted: ShedCounter,
 }
 
 impl<K: Eq + Hash + Copy, V> BoundedLru<K, V> {
     /// # Panics
     ///
     /// Panics when `cap` is 0 — a configuration bug, not a runtime condition.
+    #[cfg(test)]
     pub(crate) fn new(name: &'static str, cap: usize) -> Self {
+        Self::counting(name, cap, ShedCounter::default())
+    }
+
+    /// A table whose evictions are counted into `evicted`, which the health beacon reads.
+    ///
+    /// # Panics
+    ///
+    /// Panics when `cap` is 0.
+    pub(crate) fn counting(name: &'static str, cap: usize, evicted: ShedCounter) -> Self {
         assert!(cap >= 1, "{name} cap must be >= 1");
         Self {
             name,
             entries: HashMap::new(),
             cap,
             tick: 0,
-            evicted: 0,
+            evicted,
         }
     }
 
@@ -67,9 +79,9 @@ impl<K: Eq + Hash + Copy, V> BoundedLru<K, V> {
     }
 
     /// Entries dropped by the cap since creation.
-    #[cfg_attr(not(test), allow(dead_code))] // read by a future health surface
+    #[cfg(test)]
     pub(crate) fn evicted(&self) -> u64 {
-        self.evicted
+        self.evicted.get()
     }
 
     fn evict_batch(&mut self) {
@@ -82,12 +94,12 @@ impl<K: Eq + Hash + Copy, V> BoundedLru<K, V> {
         by_age.sort_unstable_by_key(|(last_used, _)| *last_used);
         for (_, key) in by_age.into_iter().take(batch) {
             self.entries.remove(&key);
-            self.evicted += 1;
+            self.evicted.add();
         }
         tracing::warn!(
             table = self.name,
             size = self.entries.len(),
-            evicted_total = self.evicted,
+            evicted_total = self.evicted.get(),
             "bounded table hit its cap; least recently used entries evicted"
         );
     }

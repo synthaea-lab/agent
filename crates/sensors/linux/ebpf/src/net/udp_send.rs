@@ -6,10 +6,13 @@ use aya_ebpf::{
     maps::{PerCpuArray, RingBuf},
     programs::TracePointContext,
 };
-use aya_log_ebpf::warn;
-use sensor_linux_wire::{TASK_COMM_LEN, UdpSendEvent};
+use sensor_linux_wire::UdpSendEvent;
 
-use crate::{AF_INET, AF_INET6, fill_lineage};
+use crate::{
+    AF_INET, AF_INET6,
+    arch::{SyscallRecord, arg_offset},
+    fill_event_meta, into_ret,
+};
 
 /// Ring buffer shared with userspace for `sendto` events.
 #[map]
@@ -19,50 +22,30 @@ static UDP_SEND_EVENTS: RingBuf = RingBuf::with_byte_size(256 * 1024, 0);
 #[map]
 static UDP_SEND_SCRATCH: PerCpuArray<UdpSendEvent> = PerCpuArray::with_max_entries(1, 0);
 
-/// Offsets of the `syscalls:sys_enter_sendto` tracepoint (x86_64/aarch64): `fd`(16),
+/// Offsets of the `syscalls:sys_enter_sendto` tracepoint (`x86_64`/`aarch64`): `fd`(16),
 /// `buff`(24), `len`(32), `flags`(40), `addr`(48), `addr_len`(56). Verified on
-/// 2026-09-22 on Alpine (kernel 6.18.50-0-virt, x86_64) via
+/// 2026-09-22 on Alpine (kernel 6.18.50-0-virt, `x86_64`) via
 /// `/sys/kernel/tracing/events/syscalls/sys_enter_sendto/format`.
-#[cfg(any(bpf_target_arch = "x86_64", bpf_target_arch = "aarch64"))]
-pub(crate) const SENDTO_FD_OFFSET: usize = 16;
-#[cfg(any(bpf_target_arch = "x86_64", bpf_target_arch = "aarch64"))]
-pub(crate) const SENDTO_BUF_OFFSET: usize = 24;
-#[cfg(any(bpf_target_arch = "x86_64", bpf_target_arch = "aarch64"))]
-pub(crate) const SENDTO_LEN_OFFSET: usize = 32;
-#[cfg(any(bpf_target_arch = "x86_64", bpf_target_arch = "aarch64"))]
-pub(crate) const SENDTO_ADDR_PTR_OFFSET: usize = 48;
+///
 /// i686: inferred, not independently verified (see `sys_enter_open`'s i686 note).
-#[cfg(bpf_target_arch = "x86")]
-pub(crate) const SENDTO_FD_OFFSET: usize = 12;
-#[cfg(bpf_target_arch = "x86")]
-pub(crate) const SENDTO_BUF_OFFSET: usize = 16;
-#[cfg(bpf_target_arch = "x86")]
-pub(crate) const SENDTO_LEN_OFFSET: usize = 20;
-#[cfg(bpf_target_arch = "x86")]
-pub(crate) const SENDTO_ADDR_PTR_OFFSET: usize = 28;
+pub(crate) const SENDTO_FD_OFFSET: usize = arg_offset(0);
+pub(crate) const SENDTO_BUF_OFFSET: usize = arg_offset(1);
+pub(crate) const SENDTO_LEN_OFFSET: usize = arg_offset(2);
+pub(crate) const SENDTO_ADDR_PTR_OFFSET: usize = arg_offset(4);
 
 pub fn sys_enter_sendto(ctx: TracePointContext) -> u32 {
-    match try_sys_enter_sendto(ctx) {
-        Ok(ret) => ret,
-        Err(ret) => ret,
-    }
+    into_ret(try_sys_enter_sendto(ctx))
 }
 
-/// Mirrors `try_sys_enter_connect`/`try_sys_enter_bind` above for the address read —
-/// same family filter, same raw-byte address read (avoids the endianness bug
+/// Mirrors `try_sys_enter_connect`/`try_sys_enter_bind` (`connect.rs`, `bind.rs`) for the
+/// address read — same family filter, same raw-byte address read (avoids the endianness bug
 /// documented on `ConnectEvent`) — plus the requested payload size from `len`.
 fn try_sys_enter_sendto(ctx: TracePointContext) -> Result<u32, u32> {
-    #[cfg(any(bpf_target_arch = "x86_64", bpf_target_arch = "aarch64"))]
-    let len: u64 = unsafe { ctx.read_at(SENDTO_LEN_OFFSET).map_err(|_| 1u32)? };
-    #[cfg(bpf_target_arch = "x86")]
-    let len: u64 = unsafe { ctx.read_at::<u32>(SENDTO_LEN_OFFSET).map_err(|_| 1u32)? as u64 };
+    let len: u64 = unsafe { ctx.read_ulong_arg(SENDTO_LEN_OFFSET).map_err(|_| 1u32)? };
 
-    #[cfg(any(bpf_target_arch = "x86_64", bpf_target_arch = "aarch64"))]
-    let addr_ptr: u64 = unsafe { ctx.read_at(SENDTO_ADDR_PTR_OFFSET).map_err(|_| 1u32)? };
-    #[cfg(bpf_target_arch = "x86")]
     let addr_ptr: u64 = unsafe {
-        ctx.read_at::<u32>(SENDTO_ADDR_PTR_OFFSET)
-            .map_err(|_| 1u32)? as u64
+        ctx.read_ulong_arg(SENDTO_ADDR_PTR_OFFSET)
+            .map_err(|_| 1u32)?
     };
     // NULL addr: a connected-socket send (or plain `send(2)`, which glibc issues as
     // `sendto(fd, buf, len, flags, NULL, 0)`) — no destination to report, same
@@ -99,17 +82,12 @@ fn try_sys_enter_sendto(ctx: TracePointContext) -> Result<u32, u32> {
     unsafe {
         core::ptr::write_bytes(e, 0, 1);
 
-        (*e).meta.pid = (bpf_get_current_pid_tgid() >> 32) as u32;
-        fill_lineage(&mut (*e).meta);
-        (*e).meta.uid = uid_gid as u32;
-        (*e).meta.gid = (uid_gid >> 32) as u32;
-        (*e).meta.timestamp_ns = aya_ebpf::helpers::bpf_ktime_get_ns();
-        (*e).meta.cgroup_id = aya_ebpf::helpers::bpf_get_current_cgroup_id();
-        let mut i = 0usize;
-        while i < TASK_COMM_LEN {
-            (*e).meta.comm[i] = comm[i];
-            i += 1;
-        }
+        fill_event_meta(
+            &mut (*e).meta,
+            (bpf_get_current_pid_tgid() >> 32) as u32,
+            uid_gid,
+            &comm,
+        );
         (*e).is_ipv6 = family == AF_INET6;
         (*e).dport = u16::from_be(port_be);
         (*e).daddr_v4 = v4;
@@ -117,10 +95,7 @@ fn try_sys_enter_sendto(ctx: TracePointContext) -> Result<u32, u32> {
         (*e).size = len as u32;
 
         if UDP_SEND_EVENTS.output::<UdpSendEvent>(&*e, 0).is_err() {
-            warn!(
-                &ctx,
-                "sensor-linux-ebpf: ring buffer full, dropping udp send event"
-            );
+            crate::count_ring_drop(sensor_linux_wire::ring::UDP_SEND);
         }
     }
 

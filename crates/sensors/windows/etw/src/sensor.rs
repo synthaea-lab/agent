@@ -25,6 +25,7 @@ use crate::{
         powershell_provider, process_provider, registry_provider, smb_provider, wmi_provider,
     },
     registry_keys::RegistryKeys,
+    shed::{EtwShedding, ShedCounter},
     silo::{self, SiloDirectory},
     sync::LockExt,
     winapi,
@@ -396,6 +397,7 @@ impl SharedState {
 fn spawn_mark_reader(
     marks: std::sync::mpsc::Receiver<zone_identifier::MarkWrite>,
     sink: Arc<dyn EventSink>,
+    unremembered: ShedCounter,
 ) -> Result<(), SensorError> {
     std::thread::Builder::new()
         .name("zone-identifier-reader".into())
@@ -403,7 +405,11 @@ fn spawn_mark_reader(
             zone_identifier::run_mark_reader(
                 &marks,
                 zone_identifier::read_stream,
-                QuarantineDedup::new(QUARANTINE_DEDUP_WINDOW_NS, QUARANTINE_DEDUP_CAP),
+                QuarantineDedup::counting(
+                    QUARANTINE_DEDUP_WINDOW_NS,
+                    QUARANTINE_DEDUP_CAP,
+                    unremembered,
+                ),
                 |event| sink.on_event(event),
             );
         })
@@ -557,14 +563,23 @@ pub struct EtwNames {
 pub struct WindowsSensor {
     stop: Arc<AtomicBool>,
     names: EtwNames,
+    shedding: EtwShedding,
 }
 
 impl WindowsSensor {
     #[must_use]
     pub fn new(names: EtwNames) -> Self {
+        Self::with_shedding(names, EtwShedding::default())
+    }
+
+    /// A sensor whose caches and queues count what they shed into `shedding`. The agent keeps a
+    /// clone for its health beacon, which is built before the sensor.
+    #[must_use]
+    pub fn with_shedding(names: EtwNames, shedding: EtwShedding) -> Self {
         Self {
             stop: Arc::new(AtomicBool::new(false)),
             names,
+            shedding,
         }
     }
 
@@ -601,13 +616,23 @@ impl Sensor for WindowsSensor {
             self.names.canary_prefix,
             std::process::id()
         ));
-        let (marks, mark_rx) = MarkQueue::bounded(MARK_QUEUE_CAPACITY);
-        spawn_mark_reader(mark_rx, Arc::clone(&sink))?;
-        let silos = Arc::new(Mutex::new(SiloDirectory::new()));
+        let (marks, mark_rx) =
+            MarkQueue::counting(MARK_QUEUE_CAPACITY, self.shedding.marks_dropped.clone());
+        spawn_mark_reader(
+            mark_rx,
+            Arc::clone(&sink),
+            self.shedding.quarantine_unremembered.clone(),
+        )?;
+        let silos = Arc::new(Mutex::new(SiloDirectory::counting(
+            self.shedding.silo_evicted.clone(),
+        )));
         let (silo_requests, silo_rx) = std::sync::mpsc::sync_channel(SILO_REQUEST_CAPACITY);
         spawn_silo_resolver(silo_rx, Arc::clone(&silos))?;
         let state = Arc::new(SharedState {
-            pids: Mutex::new(PidCache::new(PID_CACHE_CAP)),
+            pids: Mutex::new(PidCache::counting(
+                PID_CACHE_CAP,
+                self.shedding.pid_cache_evicted.clone(),
+            )),
             paths: PathNormalizer::new(
                 winapi::build_volume_map,
                 winapi::long_path_name,

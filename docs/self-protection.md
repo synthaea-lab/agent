@@ -124,8 +124,9 @@ the same observable, telemetry stops, and
   [`SilenceMonitor::poll`](../crates/tamper/src/heartbeat.rs) reports a
   [`SilenceVerdict`](../crates/tamper/src/heartbeat.rs) once per silence episode for a
   counter static past its deadline, and re-arms when it advances. A sensor that never
-  pulses is caught one deadline after registration. A sensor switched off on purpose
-  is unregistered first, so it is not reported.
+  pulses is caught one deadline after registration. A sensor that is switched off on
+  purpose (an optional capture whose flag is not set) is never registered, so it is not
+  reported.
 - [`silence::spawn_monitor`](../apps/agent/src/silence.rs) polls every 10 s
   (`POLL_INTERVAL`) on its own thread and emits each verdict as a `T1562` alert through
   `DetectionSink::emit_tamper`, which also counts it for the health beacon. The same
@@ -241,12 +242,32 @@ from a catchable termination signal, it records who sent it.
    (`SHUTDOWN_FLUSH_BUDGET`) to drain. The bound keeps this from becoming a shutdown
    path a wedged process could use to outlast the signal.
 
+The flow is tested end to end by `termination_signal_flow_records_sender_and_exits`:
+the test re-executes its own binary, the child forks a process that runs steps 1 to 3,
+and the parent sends each of the three signals and checks the exit code
+(`128 + signo`) and an alert line naming the parent as the sender. The fork matters:
+libtest's main thread does not block the signals, which the real agent never has.
+
 `SIGKILL` and `SIGSTOP` cannot be caught or attributed by the dying process. The eBPF
 sensor covers that from the kernel side: its signal probes record a `SIGKILL` aimed
 at the agent, and the restarted agent reports the sender through a rule. Under the
-audit fallback sensor that gap remains. Kernel-mediated stops that involve no signal
-from a process (a CPU rlimit, a cgroup memory limit, `cgroup.freeze`) raise nothing
-today ([#49](https://github.com/synthaea-lab/agent/issues/49)). The full
+audit fallback sensor the same replay reads auditd's log instead
+([audit-fallback.md](sensors/linux/audit-fallback.md#sigkill-of-the-agent)): the restarted agent
+finds the `SIGKILL` record aimed at its predecessor's pid and reports the sender, **only when the
+operator loaded** [`synthaea-kill.rules`](../packaging/linux/audit/synthaea-kill.rules), which the
+packages neither install nor load. A `systemctl kill` leaves no such record and is not attributed
+([#275](https://github.com/synthaea-lab/agent/issues/275)).
+Kernel-mediated stops that involve no signal
+from a process (a CPU rlimit, a cgroup memory limit, `cgroup.freeze`) are read from how
+they are set: the command (`systemctl freeze|set-property`, a memory or task limit, or a
+`CPUQuota` below 10 %, in `%`, `‰` or `‱`, on a listed tool is Medium, also after any `systemctl` option that takes a separate value
+(`-M`, `-H`, `-t`, `-p`, `--job-mode`, `--what` and the others, alone or last in a cluster such as
+`-qM`, and by any unambiguous long prefix) and that value: the value is not the verb. A command
+that names a machine or host is read, not skipped, because `-M .host` and `-H localhost` reach
+this host; `prlimit --pid <pid> --cpu|--as`, with `--pid` abbreviated
+to `--p` or `--pi`, is Medium when the pid is a listed tool, from its comm or image name, and Low
+otherwise), or a write to a cgroup limit file of a listed unit. The kill that a memory limit then
+causes is not reported ([#49](https://github.com/synthaea-lab/agent/issues/49)). The full
 mask-wait-exit flow is not unit-tested because it terminates the test runner; only the
 pure helpers are.
 
@@ -329,7 +350,7 @@ are compile-time constants.
   [`probation.rs`](../apps/watchdog/src/probation.rs).
 - Pin, world-writable refusal, permission hardening: [`apps/watchdog/src/tamper.rs`](../apps/watchdog/src/tamper.rs).
 - Service SDDL: [`service/windows.rs`](../apps/watchdog/src/service/windows.rs).
-- Silence monitor episodes, re-arming, unregister: [`tamper/src/heartbeat.rs`](../crates/tamper/src/heartbeat.rs);
+- Silence monitor episodes, re-arming: [`tamper/src/heartbeat.rs`](../crates/tamper/src/heartbeat.rs);
   silence to alert: [`apps/agent/src/silence.rs`](../apps/agent/src/silence.rs).
 - Manifest verification: [`tamper/src/integrity.rs`](../crates/tamper/src/integrity.rs) and
   [`apps/agent/src/integrity.rs`](../apps/agent/src/integrity.rs).

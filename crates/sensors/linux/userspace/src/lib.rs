@@ -12,8 +12,10 @@
 
 mod dns_udp;
 pub mod normalize;
-// Read by nothing yet: the capture that feeds it is the next part of https://github.com/synthaea-lab/agent/issues/22.
-#[cfg_attr(not(test), allow(dead_code))]
+// Built for its tests only: no capture feeds this parser yet, so nothing outside them reads it. The
+// capture is the next part of https://github.com/synthaea-lab/agent/issues/22; that change turns
+// this line into a plain `mod`.
+#[cfg(test)]
 mod tls_client_hello;
 
 #[cfg(all(target_os = "linux", any(ebpf_embedded, test)))]
@@ -28,6 +30,9 @@ mod parent_image;
 mod proc;
 #[cfg(target_os = "linux")]
 mod rings;
+// Events the probes lost to a full ring, counted kernel-side and logged per ring (#304).
+#[cfg(target_os = "linux")]
+mod ring_drops;
 #[cfg(target_os = "linux")]
 mod sensor;
 #[cfg(all(target_os = "linux", any(ebpf_embedded, test)))]
@@ -35,9 +40,13 @@ mod syscall;
 // Which processes belong to a listed security unit, for the `signal_generate` probe (#1103).
 #[cfg(target_os = "linux")]
 mod unit_procs;
+#[cfg(all(target_os = "linux", ebpf_embedded))]
+pub use ebpf::verifier_loader;
 #[cfg(target_os = "linux")]
 pub use ebpf::{RAW_TRACEPOINTS, load_ebpf, load_program};
 #[cfg(target_os = "linux")]
 pub use parent_image::ParentImageEvictions;
+#[cfg(target_os = "linux")]
+pub use proc::{SeedProcess, read_seed_processes};
 #[cfg(target_os = "linux")]
 pub use sensor::LinuxSensor;

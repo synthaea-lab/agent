@@ -67,8 +67,7 @@ impl BehaviorScorer {
 
         let (bounds, threshold) = match metadata {
             Some(bytes) => {
-                let parsed: ModelMetadata = serde_json::from_slice(bytes)
-                    .map_err(|_| ParseError::Malformed("invalid metadata JSON"))?;
+                let parsed = ModelMetadata::from_json(bytes)?;
                 // A metadata file means a calibrated model, and `train_behavior.py` always
                 // writes both halves. Either one missing would switch its guard off without
                 // a word (no bounds: any vector is scored; no threshold: every score is

@@ -56,7 +56,7 @@ or the rules lives in the agent.
    is primary; otherwise [`AuditSensor`](../../../crates/sensors/linux/audit/src/sensor.rs).
 2. Supplementary workers start: the netlink poller, the journal tail, the AVC reader (only when
    eBPF is primary, because the audit sensor already classifies AVC records), the service-log
-   tailer, and the uprobes supervisor (idle unless a capture flag is set).
+   tailer, and the uprobes sensor (started only when a capture flag is set).
 3. `attach_lsm_hooks` loads a second copy of the eBPF object and attaches the `file_open` LSM
    hook if the kernel supports it.
 4. The primary sensor runs on the calling thread until Ctrl-C or `stop()`.

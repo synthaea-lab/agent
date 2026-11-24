@@ -1,15 +1,15 @@
 //! Socket accept (issue #263 Phase 2)
 //!
-//! First paired sys_enter/sys_exit probe in this crate. Every other probe here is
-//! sys_enter_*: it reads syscall arguments before the call runs, which is enough
+//! First paired `sys_enter/sys_exit` probe in this crate. Every other probe here is
+//! `sys_enter`_*: it reads syscall arguments before the call runs, which is enough
 //! because the kernel hasn't touched anything yet. accept(2)/accept4(2) are
 //! different — the caller passes a sockaddr buffer that the kernel fills in DURING
-//! the call, so the peer address does not exist yet at sys_enter time. The standard
-//! sys_exit_* tracepoint format carries only __syscall_nr and the return value, not
-//! the original arguments, so sys_enter_accept{,4} stashes the caller's
-//! (fd, addr_ptr) in ACCEPT_ARGS (keyed by pid_tgid, the same entry/exit
-//! correlation pattern already used by the uprobes crate's SSL_READ_ARGS for
-//! SSL_read's output buffer), and sys_exit_accept{,4} reads it back once the kernel
+//! the call, so the peer address does not exist yet at `sys_enter` time. The standard
+//! `sys_exit`_* tracepoint format carries only __`syscall_nr` and the return value, not
+//! the original arguments, so `sys_enter_accept{,4`} stashes the caller's
+//! (fd, `addr_ptr`) in `ACCEPT_ARGS` (keyed by `pid_tgid`, the same entry/exit
+//! correlation pattern already used by the uprobes crate's `SSL_READ_ARGS` for
+//! `SSL_read`'s output buffer), and `sys_exit_accept{,4`} reads it back once the kernel
 //! has actually written the peer address.
 
 use aya_ebpf::{
@@ -18,10 +18,13 @@ use aya_ebpf::{
     maps::{LruHashMap, PerCpuArray, RingBuf},
     programs::TracePointContext,
 };
-use aya_log_ebpf::warn;
-use sensor_linux_wire::{SocketAcceptEvent, TASK_COMM_LEN};
+use sensor_linux_wire::SocketAcceptEvent;
 
-use crate::{AF_INET, AF_INET6, SYS_EXIT_RET_OFFSET, fill_lineage};
+use crate::{
+    AF_INET, AF_INET6,
+    arch::{SYS_EXIT_RET_OFFSET, SyscallRecord, arg_offset},
+    fill_event_meta, into_ret,
+};
 
 /// Ring buffer shared with userspace for `accept`/`accept4` events.
 #[map]
@@ -48,48 +51,31 @@ struct AcceptArgs {
 static ACCEPT_ARGS: LruHashMap<u64, AcceptArgs> = LruHashMap::with_max_entries(1024, 0);
 
 /// Offsets of the `syscalls:sys_enter_accept`/`sys_enter_accept4` tracepoints
-/// (x86_64/aarch64): `fd`(16), `upeer_sockaddr`(24) — identical shape for both
+/// (`x86_64`/`aarch64`): `fd`(16), `upeer_sockaddr`(24) — identical shape for both
 /// (accept4's extra `flags` argument trails at 40, not needed here). Verified on
-/// 2026-09-22 on Alpine (kernel 6.18.50-0-virt, x86_64) via
+/// 2026-09-22 on Alpine (kernel 6.18.50-0-virt, `x86_64`) via
 /// `/sys/kernel/tracing/events/syscalls/sys_enter_accept{,4}/format`.
-#[cfg(any(bpf_target_arch = "x86_64", bpf_target_arch = "aarch64"))]
-const ACCEPT_FD_OFFSET: usize = 16;
-#[cfg(any(bpf_target_arch = "x86_64", bpf_target_arch = "aarch64"))]
-const ACCEPT_ADDR_PTR_OFFSET: usize = 24;
+///
 /// i686: inferred, not independently verified (see `sys_enter_open`'s i686 note).
-#[cfg(bpf_target_arch = "x86")]
-const ACCEPT_FD_OFFSET: usize = 12;
-#[cfg(bpf_target_arch = "x86")]
-const ACCEPT_ADDR_PTR_OFFSET: usize = 16;
+const ACCEPT_FD_OFFSET: usize = arg_offset(0);
+const ACCEPT_ADDR_PTR_OFFSET: usize = arg_offset(1);
 
 pub fn sys_enter_accept(ctx: TracePointContext) -> u32 {
-    match stash_accept_args(&ctx) {
-        Ok(ret) => ret,
-        Err(ret) => ret,
-    }
+    into_ret(stash_accept_args(&ctx))
 }
 
 pub fn sys_enter_accept4(ctx: TracePointContext) -> u32 {
-    match stash_accept_args(&ctx) {
-        Ok(ret) => ret,
-        Err(ret) => ret,
-    }
+    into_ret(stash_accept_args(&ctx))
 }
 
 /// Shared by `sys_enter_accept` and `sys_enter_accept4` — both have the same
 /// `fd`/`upeer_sockaddr` layout.
 fn stash_accept_args(ctx: &TracePointContext) -> Result<u32, u32> {
-    #[cfg(any(bpf_target_arch = "x86_64", bpf_target_arch = "aarch64"))]
-    let fd: u64 = unsafe { ctx.read_at(ACCEPT_FD_OFFSET).map_err(|_| 1u32)? };
-    #[cfg(bpf_target_arch = "x86")]
-    let fd: u64 = unsafe { ctx.read_at::<u32>(ACCEPT_FD_OFFSET).map_err(|_| 1u32)? as u64 };
+    let fd: u64 = unsafe { ctx.read_ulong_arg(ACCEPT_FD_OFFSET).map_err(|_| 1u32)? };
 
-    #[cfg(any(bpf_target_arch = "x86_64", bpf_target_arch = "aarch64"))]
-    let addr_ptr: u64 = unsafe { ctx.read_at(ACCEPT_ADDR_PTR_OFFSET).map_err(|_| 1u32)? };
-    #[cfg(bpf_target_arch = "x86")]
     let addr_ptr: u64 = unsafe {
-        ctx.read_at::<u32>(ACCEPT_ADDR_PTR_OFFSET)
-            .map_err(|_| 1u32)? as u64
+        ctx.read_ulong_arg(ACCEPT_ADDR_PTR_OFFSET)
+            .map_err(|_| 1u32)?
     };
 
     let pid_tgid = bpf_get_current_pid_tgid();
@@ -107,17 +93,11 @@ fn stash_accept_args(ctx: &TracePointContext) -> Result<u32, u32> {
 }
 
 pub fn sys_exit_accept(ctx: TracePointContext) -> u32 {
-    match try_sys_exit_accept(ctx) {
-        Ok(ret) => ret,
-        Err(ret) => ret,
-    }
+    into_ret(try_sys_exit_accept(ctx))
 }
 
 pub fn sys_exit_accept4(ctx: TracePointContext) -> u32 {
-    match try_sys_exit_accept(ctx) {
-        Ok(ret) => ret,
-        Err(ret) => ret,
-    }
+    into_ret(try_sys_exit_accept(ctx))
 }
 
 /// Shared by `sys_exit_accept` and `sys_exit_accept4`. No-ops (returns `Ok(0)`
@@ -125,10 +105,7 @@ pub fn sys_exit_accept4(ctx: TracePointContext) -> u32 {
 /// or an evicted stash), the call failed (`ret < 0`), or the peer's address
 /// family isn't one this sensor tracks.
 fn try_sys_exit_accept(ctx: TracePointContext) -> Result<u32, u32> {
-    #[cfg(any(bpf_target_arch = "x86_64", bpf_target_arch = "aarch64"))]
-    let ret: i64 = unsafe { ctx.read_at(SYS_EXIT_RET_OFFSET).map_err(|_| 1u32)? };
-    #[cfg(bpf_target_arch = "x86")]
-    let ret: i64 = unsafe { ctx.read_at::<i32>(SYS_EXIT_RET_OFFSET).map_err(|_| 1u32)? as i64 };
+    let ret: i64 = unsafe { ctx.read_long_arg(SYS_EXIT_RET_OFFSET).map_err(|_| 1u32)? };
 
     let pid_tgid = bpf_get_current_pid_tgid();
     let args = match unsafe { ACCEPT_ARGS.get(&pid_tgid) } {
@@ -172,17 +149,7 @@ fn try_sys_exit_accept(ctx: TracePointContext) -> Result<u32, u32> {
     unsafe {
         core::ptr::write_bytes(e, 0, 1);
 
-        (*e).meta.pid = (pid_tgid >> 32) as u32;
-        fill_lineage(&mut (*e).meta);
-        (*e).meta.uid = uid_gid as u32;
-        (*e).meta.gid = (uid_gid >> 32) as u32;
-        (*e).meta.timestamp_ns = aya_ebpf::helpers::bpf_ktime_get_ns();
-        (*e).meta.cgroup_id = aya_ebpf::helpers::bpf_get_current_cgroup_id();
-        let mut i = 0usize;
-        while i < TASK_COMM_LEN {
-            (*e).meta.comm[i] = comm[i];
-            i += 1;
-        }
+        fill_event_meta(&mut (*e).meta, (pid_tgid >> 32) as u32, uid_gid, &comm);
         (*e).listen_fd = args.fd;
         (*e).accepted_fd = accepted_fd;
         (*e).peer_addr_v4 = v4;
@@ -194,10 +161,7 @@ fn try_sys_exit_accept(ctx: TracePointContext) -> Result<u32, u32> {
             .output::<SocketAcceptEvent>(&*e, 0)
             .is_err()
         {
-            warn!(
-                &ctx,
-                "sensor-linux-ebpf: ring buffer full, dropping accept event"
-            );
+            crate::count_ring_drop(sensor_linux_wire::ring::SOCKET_ACCEPT);
         }
     }
 

@@ -20,11 +20,11 @@
 //! per-agent clients.
 
 use std::{
-    fs::OpenOptions,
-    io::{BufWriter, Write as _},
+    fs::{File, OpenOptions},
+    io::Write as _,
     path::Path,
     sync::{
-        Mutex,
+        Mutex, PoisonError,
         atomic::{AtomicU64, Ordering},
     },
 };
@@ -35,7 +35,8 @@ use serde::{Deserialize, Serialize};
 /// JSON-Lines writer shared between threads (the `EventSink` trait requires
 /// `Send + Sync` and only exposes `&self`).
 pub struct JsonlWriter {
-    inner: Mutex<BufWriter<std::fs::File>>,
+    inner: Mutex<File>,
+    dropped: AtomicU64,
 }
 
 impl JsonlWriter {
@@ -54,24 +55,43 @@ impl JsonlWriter {
         if needs_tail_repair(path) {
             f.write_all(b"\n")?;
         }
-        Ok(Self {
-            inner: Mutex::new(BufWriter::new(f)),
-        })
+        Ok(Self::from_file(f))
     }
 
-    /// Writes one serialized value as one line, silently ignoring a write error —
-    /// a missed line in a local log must not bring down the capture. Flushed per line:
-    /// these logs are read while the agent runs (tail, lab assertions), and losing
-    /// buffered lines on a crash would cost more than the syscall.
-    pub fn write<T: Serialize>(&self, value: &T) {
-        let Ok(line) = serde_json::to_string(value) else {
-            return;
-        };
-        if let Ok(mut w) = self.inner.lock() {
-            let _ = w.write_all(line.as_bytes());
-            let _ = w.write_all(b"\n");
-            let _ = w.flush();
+    fn from_file(file: File) -> Self {
+        Self {
+            inner: Mutex::new(file),
+            dropped: AtomicU64::new(0),
         }
+    }
+
+    /// Writes one serialized value as one line. A line that cannot be serialized or
+    /// written (a full disk) is counted in [`Self::dropped`], not raised: a missed line
+    /// in a local log must not bring down the capture, but it must not vanish unseen
+    /// either. Unbuffered, one `write_all` per line: these logs are read while the agent runs
+    /// (tail, lab assertions), and a line counted as dropped must not reach the file later
+    /// from a buffer retrying it.
+    pub fn write<T: Serialize>(&self, value: &T) {
+        if self.try_write(value).is_err() {
+            self.dropped.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// Lines [`Self::write`] could not serialize or write since this writer opened.
+    #[must_use]
+    pub fn dropped(&self) -> u64 {
+        self.dropped.load(Ordering::Relaxed)
+    }
+
+    /// A poisoned lock is recovered: a panic elsewhere while holding it leaves at worst
+    /// a torn line, which readers skip, and the log must keep going.
+    fn try_write<T: Serialize>(&self, value: &T) -> std::io::Result<()> {
+        let mut line = serde_json::to_vec(value)?;
+        line.push(b'\n');
+        self.inner
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .write_all(&line)
     }
 }
 

@@ -28,9 +28,6 @@ use crate::{
 pub struct Client {
     reader: BufReader<tokio::io::ReadHalf<Stream>>,
     writer: tokio::io::WriteHalf<Stream>,
-    /// Kept for logs/diagnostics. Value from the server's hello.
-    #[allow(dead_code)]
-    agent_version: String,
 }
 
 impl Client {
@@ -88,7 +85,6 @@ impl Client {
         Ok(Self {
             reader,
             writer: write_half,
-            agent_version: hello.agent_version,
         })
     }
 

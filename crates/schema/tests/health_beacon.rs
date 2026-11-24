@@ -126,3 +126,52 @@ fn the_ioc_counters_survive_a_round_trip() {
         serde_json::from_str(&serde_json::to_string(&beacon).unwrap()).unwrap();
     assert_eq!(back, beacon);
 }
+
+// The alert-log loss counter (#167) is additive in the same way.
+
+#[test]
+fn a_beacon_from_an_agent_without_the_alert_log_loss_counter_parses_with_zero() {
+    let beacon: HealthBeacon = serde_json::from_str(&beacon_json("")).unwrap();
+    assert_eq!(beacon.alerts_dropped, 0);
+}
+
+#[test]
+fn the_alert_log_loss_counter_round_trips() {
+    let beacon: HealthBeacon =
+        serde_json::from_str(&beacon_json(r#","alerts_dropped":8"#)).unwrap();
+    assert_eq!(beacon.alerts_dropped, 8);
+    let back: HealthBeacon =
+        serde_json::from_str(&serde_json::to_string(&beacon).unwrap()).unwrap();
+    assert_eq!(back, beacon);
+}
+
+// The Windows ETW shedding counters (issue #178) are additive in the same way.
+
+/// The four ETW shedding counts, in beacon order.
+fn etw_shed(beacon: &HealthBeacon) -> (u64, u64, u64, u64) {
+    (
+        beacon.etw_pid_cache_evicted,
+        beacon.etw_silo_evicted,
+        beacon.etw_marks_dropped,
+        beacon.etw_quarantine_unremembered,
+    )
+}
+
+#[test]
+fn a_beacon_from_an_agent_without_the_etw_shedding_counters_parses_with_zeros() {
+    let beacon: HealthBeacon = serde_json::from_str(&beacon_json("")).unwrap();
+    assert_eq!(etw_shed(&beacon), (0, 0, 0, 0));
+}
+
+#[test]
+fn the_etw_shedding_counters_round_trip() {
+    let beacon: HealthBeacon = serde_json::from_str(&beacon_json(
+        r#","etw_pid_cache_evicted":21,"etw_silo_evicted":22,
+        "etw_marks_dropped":23,"etw_quarantine_unremembered":24"#,
+    ))
+    .unwrap();
+    assert_eq!(etw_shed(&beacon), (21, 22, 23, 24));
+    let back: HealthBeacon =
+        serde_json::from_str(&serde_json::to_string(&beacon).unwrap()).unwrap();
+    assert_eq!(back, beacon);
+}

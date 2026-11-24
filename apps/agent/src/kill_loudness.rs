@@ -6,7 +6,8 @@
 //! sensor closes that gap from the kernel side (issue #362): its `kill`/`tgkill`
 //! probes record a SIGKILL aimed at the agent in a pinned map before delivery, and
 //! the restarted agent reports the sender through the T1562.001 rule. Under the
-//! audit fallback sensor the gap remains.
+//! audit fallback sensor the same replay reads auditd's log, but only when the operator loaded
+//! `packaging/linux/audit/synthaea-kill.rules` (#275); a `systemctl kill` is not attributed.
 //!
 //! Mechanism: the catchable termination signals (SIGTERM/SIGHUP/SIGQUIT — **not**
 //! SIGINT, deliberately: `sensor_linux::LinuxSensor::run` already owns Ctrl-C via
@@ -27,10 +28,15 @@
 //! real clean-shutdown path a compromised or wedged process could use to outlast the
 //! signal — see `SHUTDOWN_FLUSH_BUDGET` and `EnrichQueue::flush`'s own doc.
 //!
-//! Not unit-tested past the pure helpers below: the full mask-then-`sigwaitinfo`-then-
-//! `exit` flow deliberately terminates the process, which would kill the `cargo test`
-//! runner itself. Validated for real instead — see the issue/PR for a genuine `kill
-//! -TERM` against a running `agent run` on the lab VM.
+//! The pure helpers are unit-tested in place. The full mask-then-`sigwaitinfo`-then-
+//! `exit` flow terminates the process, so `termination_signal_flow_records_sender_and_exits`
+//! runs it in a child: the test re-executes its own binary, the child blocks the
+//! signals and spawns the watcher, and the parent sends each watched signal and checks
+//! the exit status (`128 + signo`) and the alert line (sender pid = the parent). A SIGKILL
+//! cannot be caught, so it is not read here: under the audit fallback the next start reports it
+//! from auditd's log (`sensor-linux-audit`'s `killrec`, unit-tested, and run end to end on a Rocky
+//! 9.8 VM on 2026-11-19; see `docs/sensors/linux/audit-fallback.md` for what that run did and did
+//! not cover).
 
 #![cfg_attr(not(target_os = "linux"), allow(dead_code))]
 
@@ -81,38 +87,46 @@ pub(crate) fn block_termination_signals() {
 /// who sent it, gives `enrich_queue` a bounded chance to drain (issue #341) before
 /// actually terminating the process (blocking suppressed the signal's own default
 /// disposition, so nothing else will end it).
-pub(crate) fn spawn_watcher(alerts_path: PathBuf, enrich_queue: EnrichQueue) {
-    std::thread::Builder::new()
-        .name("kill-loudness".into())
-        .spawn(move || {
-            let set = watched_signal_set();
-            // SAFETY: `set` watches only the signals blocked by
-            // `block_termination_signals`; `info` is an output-only `siginfo_t` the
-            // kernel fills in on a successful return, read only after that return.
-            let (signo, sender_pid) = unsafe {
-                let mut info: libc::siginfo_t = std::mem::zeroed();
-                let signo = libc::sigwaitinfo(&set, &mut info);
-                (signo, info.si_pid())
-            };
-            if signo < 0 {
-                // `sigwaitinfo` failed (e.g. interrupted by an unwatched signal) —
-                // nothing to attribute, and the process is not terminating.
-                return;
-            }
-            report_kill_attempt(&alerts_path, signo, sender_pid);
-            // Bounded, not unconditional (see `enrich_queue`'s module doc): the
-            // worst case here is the exact same immediate exit as before this
-            // issue was fixed, just after up to `SHUTDOWN_FLUSH_BUDGET` instead of
-            // none — #71's hard-exit guarantee against a wedged/compromised
-            // process outlasting a termination signal is unchanged.
-            if !enrich_queue.flush(SHUTDOWN_FLUSH_BUDGET) {
-                tracing::warn!(
-                    "kill-loudness: enrich queue did not fully drain within the shutdown budget"
-                );
-            }
-            std::process::exit(128 + signo);
-        })
-        .expect("spawning the kill-loudness watcher thread");
+///
+/// `on_exit` runs just before that exit, after the sender was recorded: this is a stop the agent
+/// attributed itself, so whatever a successor would otherwise read as a crash (the audit
+/// fallback's instance marker) is removed here, since the process never returns to the code that
+/// would remove it.
+pub(crate) fn spawn_watcher(
+    alerts_path: PathBuf,
+    enrich_queue: EnrichQueue,
+    on_exit: impl FnOnce() + Send + 'static,
+) -> std::io::Result<()> {
+    crate::spawn::spawn_named("kill-loudness", move || {
+        let set = watched_signal_set();
+        // SAFETY: `set` watches only the signals blocked by
+        // `block_termination_signals`; `info` is an output-only `siginfo_t` the
+        // kernel fills in on a successful return, read only after that return.
+        let (signo, sender_pid) = unsafe {
+            let mut info: libc::siginfo_t = std::mem::zeroed();
+            let signo = libc::sigwaitinfo(&set, &mut info);
+            (signo, info.si_pid())
+        };
+        if signo < 0 {
+            // `sigwaitinfo` failed (e.g. interrupted by an unwatched signal) —
+            // nothing to attribute, and the process is not terminating.
+            return;
+        }
+        report_kill_attempt(&alerts_path, signo, sender_pid);
+        // Bounded, not unconditional (see `enrich_queue`'s module doc): the
+        // worst case here is the exact same immediate exit as before this
+        // issue was fixed, just after up to `SHUTDOWN_FLUSH_BUDGET` instead of
+        // none — #71's hard-exit guarantee against a wedged/compromised
+        // process outlasting a termination signal is unchanged.
+        if !enrich_queue.flush(SHUTDOWN_FLUSH_BUDGET) {
+            tracing::warn!(
+                "kill-loudness: enrich queue did not fully drain within the shutdown budget"
+            );
+        }
+        on_exit();
+        std::process::exit(128 + signo);
+    })?;
+    Ok(())
 }
 
 fn signal_name(signo: i32) -> &'static str {
@@ -220,5 +234,126 @@ mod tests {
             escape_json_string(r#"binary at "C:\agent.exe" was swapped"#),
             r#"binary at \"C:\\agent.exe\" was swapped"#
         );
+    }
+
+    /// Env var that turns [`termination_signal_flow_records_sender_and_exits`] into
+    /// its own child: the value is the alert log path the child must write.
+    const CHILD_ALERTS_ENV: &str = "KILL_LOUDNESS_FLOW_CHILD_ALERTS";
+    const CHILD_READY_ENV: &str = "KILL_LOUDNESS_FLOW_CHILD_READY";
+
+    /// Child side: the production sequence, then wait to be killed. It runs in a
+    /// forked grandchild whose only thread is the one that blocks the signals: under
+    /// libtest the main thread is a second, unmasked thread, and a process-directed
+    /// signal can land on it and kill the process with its default disposition. The
+    /// real agent has no such thread, because `block_termination_signals` runs on its
+    /// main thread before anything else. The grandchild records its pid in `ready`
+    /// for the parent, and the re-executed child relays its exit status.
+    fn run_flow_child(alerts: PathBuf, ready: PathBuf) -> ! {
+        // SAFETY: the re-executed child has only libtest's parked main thread besides
+        // this one, so no other thread can hold the allocator lock at fork time.
+        let pid = unsafe { libc::fork() };
+        assert!(pid >= 0, "fork failed");
+        if pid == 0 {
+            block_termination_signals();
+            let queue = EnrichQueue::start(enrich::Enricher::new(), |_, _| {});
+            let hook = ready.with_extension("exit-hook");
+            spawn_watcher(alerts, queue, move || {
+                std::fs::write(hook, "ran").expect("exit hook marker");
+            })
+            .expect("spawning the kill-loudness watcher");
+            std::fs::write(ready, std::process::id().to_string()).expect("ready marker");
+            // The watcher thread ends the process; reaching the end of this sleep
+            // means the signal was not taken, which the parent reports as a timeout.
+            std::thread::sleep(Duration::from_secs(30));
+            std::process::exit(0);
+        }
+        let mut status = 0;
+        // SAFETY: `pid` is the child forked above and `status` is a valid out pointer.
+        unsafe { libc::waitpid(pid, &mut status, 0) };
+        let code = if libc::WIFEXITED(status) {
+            libc::WEXITSTATUS(status)
+        } else {
+            // Died by a signal: not a clean exit, report it distinctly.
+            255
+        };
+        // SAFETY: `_exit` skips libtest teardown, which is wanted in this child.
+        unsafe { libc::_exit(code) }
+    }
+
+    #[test]
+    fn termination_signal_flow_records_sender_and_exits() {
+        if let Some(alerts) = std::env::var_os(CHILD_ALERTS_ENV) {
+            let ready = std::env::var_os(CHILD_READY_ENV).expect("ready path");
+            run_flow_child(alerts.into(), ready.into());
+        }
+
+        let exe = std::env::current_exe().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        for &signo in &WATCHED_SIGNALS {
+            let alerts = dir.path().join(format!("alerts-{signo}.ndjson"));
+            let ready = dir.path().join(format!("ready-{signo}"));
+            let mut child = std::process::Command::new(&exe)
+                .args([
+                    "kill_loudness::tests::termination_signal_flow_records_sender_and_exits",
+                    "--exact",
+                    "--test-threads=1",
+                    "--nocapture",
+                ])
+                .env(CHILD_ALERTS_ENV, &alerts)
+                .env(CHILD_READY_ENV, &ready)
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .unwrap();
+
+            let deadline = std::time::Instant::now() + Duration::from_secs(20);
+            while !ready.exists() {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "child never became ready"
+                );
+                std::thread::sleep(Duration::from_millis(20));
+            }
+
+            let target: i32 = std::fs::read_to_string(&ready)
+                .unwrap()
+                .trim()
+                .parse()
+                .unwrap();
+            // SAFETY: plain kill(2), process-directed like `systemctl stop`.
+            assert_eq!(unsafe { libc::kill(target, signo) }, 0);
+
+            let status = loop {
+                if let Some(status) = child.try_wait().unwrap() {
+                    break status;
+                }
+                if std::time::Instant::now() >= deadline {
+                    // SAFETY: cleanup of the stuck grandchild, then its relay.
+                    unsafe { libc::kill(target, libc::SIGKILL) };
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    panic!("child did not exit after {}", signal_name(signo));
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            };
+            assert_eq!(status.code(), Some(128 + signo), "exit code for {signo}");
+            assert_ne!(
+                status.code(),
+                Some(255),
+                "died by a signal instead of exiting"
+            );
+
+            assert!(
+                ready.with_extension("exit-hook").exists(),
+                "the exit hook must run before the process exits"
+            );
+            let line = std::fs::read_to_string(&alerts).expect("alert line written");
+            assert!(line.contains("\"technique\":\"T1562\""), "{line}");
+            assert!(line.contains(signal_name(signo)), "{line}");
+            assert!(
+                line.contains(&format!("from pid {}", std::process::id())),
+                "sender must be this process: {line}"
+            );
+        }
     }
 }

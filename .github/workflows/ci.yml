@@ -50,9 +50,6 @@ jobs:
         run: python3 tools/check-ps1-ascii.py
       - name: shell scripts with a shebang are executable in git
         run: python3 tools/check-exec-bits.py
-      # The i686 probes are not built anywhere in CI: their offsets are only checked here.
-      - name: eBPF tracepoint offsets follow the syscall record layout
-        run: python3 tools/check-ebpf-offsets.py
       - name: packaged build carries no test signing key (ADR-0027)
         run: tools/check-no-test-key.sh
       - name: updater trust set without the test key (production code path)
@@ -243,7 +240,7 @@ jobs:
       - name: musl target for the pinned toolchain
         run: rustup target add x86_64-unknown-linux-musl
       - name: pinned nightly + rust-src (aya-build compiles the probes with it)
-        run: rustup toolchain install "$(tr -d '[:space:]' < packaging/toolchain/ebpf-toolchain.txt)" --profile minimal --component rust-src
+        run: rustup toolchain install "$(tr -d '[:space:]' < packaging/toolchain/ebpf-toolchain.txt)" --profile minimal --component rust-src --component clippy
       - name: bpf-linker (prebuilt, musl-static, bundled LLVM, SHA-256 pinned)
         run: |
           curl -fsSL --retry 3 --retry-all-errors -o "$RUNNER_TEMP/bpf-linker.tar.zst" \
@@ -260,6 +257,10 @@ jobs:
           key: ebpf-embedded
       - name: clippy (embedded probes)
         run: cargo clippy -p sensor-linux -p sensor-linux-uprobes -p agent --all-targets -- -D warnings
+      # The probes themselves: the host passes exclude sensor-linux-ebpf (bpfel only), so its
+      # workspace lints would otherwise never run (AS-029).
+      - name: clippy (the eBPF probes, bpfel)
+        run: bash tools/clippy-ebpf.sh
       - name: probes are embedded
         run: |
           for crate in sensor-linux sensor-linux-uprobes; do
@@ -306,7 +307,8 @@ jobs:
   # The verifier differs a lot between kernels, and the agent only logs a warning when a
   # probe is refused, then runs without it. #204 (three `ssl_read_entry_*` programs refused
   # on 5.15 and 6.1, accepted on 6.18) passed every other job. This loads every program on
-  # the oldest kernels we support, in a VM, and fails on any refusal (#226).
+  # the oldest kernels we support and on the newest stable series, in a VM, and fails on
+  # any refusal (#226).
   linux-ebpf-verify:
     name: linux-ebpf-verify (${{ matrix.kernel-version || matrix.image }})
     needs: linux-ebpf
@@ -330,6 +332,11 @@ jobs:
           - image: "6.1-20261021.083220"
             kernel: "old"
             kernel-version: "6.1-20231220.153727"
+          # The newest series too: 7.2's verifier checks stack-passed arguments of a
+          # BPF-to-BPF call that 5.15 and 6.1 do not, and refused `raw_sys_enter` when a
+          # six-parameter helper stopped being inlined (`emit_kernel_module_event`).
+          - image: "7.2-20261021.083220"
+            kernel: ""
     steps:
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:

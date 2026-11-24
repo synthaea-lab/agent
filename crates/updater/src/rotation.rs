@@ -12,13 +12,10 @@
 //! binary's job (`updater` is a LEAF crate, see [`crate`]). What is here is pure: the checks run
 //! against the key state and the clock the caller passes, so every rule is tested without either.
 
-use ring::signature::{self, UnparsedPublicKey};
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    error::UpdaterError,
-    hash::{hex_decode, hex_encode},
-    key::RECOVERY_PUBLIC_KEY,
+    error::UpdaterError, hash::hex_decode, key::RECOVERY_PUBLIC_KEY, signed::SignedDocument,
 };
 
 /// The only `schema_version` this build accepts, versioned independently of the other manifests.
@@ -91,18 +88,20 @@ pub struct KeyRotationManifest {
     pub signature: String,
 }
 
-impl KeyRotationManifest {
-    /// The bytes signed and verified: 2-space-indented JSON, `signature` forced to `""`, fields
-    /// in the alphabetical order of the struct.
-    fn canonical_bytes(&self) -> Vec<u8> {
-        let unsigned = Self {
-            signature: String::new(),
-            ..self.clone()
-        };
-        serde_json::to_vec_pretty(&unsigned)
-            .expect("KeyRotationManifest has no non-serializable content")
+impl SignedDocument for KeyRotationManifest {
+    /// Looks for the key before it decodes the signature, as this document always did.
+    const KEY_BEFORE_SIGNATURE: bool = true;
+
+    fn signature(&self) -> &str {
+        &self.signature
     }
 
+    fn signature_mut(&mut self) -> &mut String {
+        &mut self.signature
+    }
+}
+
+impl KeyRotationManifest {
     /// Signs in place with `sign`, which receives the canonical bytes [`Self::verify_signature`]
     /// checks and returns the 64-byte Ed25519 signature over them: the `recovery` key never
     /// leaves its custody (a token, or the air-gapped machine of the ceremony), the caller only
@@ -115,19 +114,14 @@ impl KeyRotationManifest {
         &mut self,
         sign: impl FnOnce(&[u8]) -> Result<Vec<u8>, E>,
     ) -> Result<(), E> {
-        self.signature.clear();
-        let sig = sign(&self.canonical_bytes())?;
-        self.signature = hex_encode(&sig);
-        Ok(())
+        self.sign_via(sign)
     }
 
     /// Signs in place with a key pair. For tests and the public test `recovery` key; production
     /// signs through [`Self::sign_with`].
     #[cfg(any(test, feature = "test-key"))]
     pub fn sign(&mut self, key_pair: &ring::signature::Ed25519KeyPair) {
-        self.signature.clear();
-        let sig = key_pair.sign(&self.canonical_bytes());
-        self.signature = hex_encode(sig.as_ref());
+        self.sign_with_key_pair(key_pair);
     }
 
     pub(crate) fn release_change(&self) -> Result<RoleChange, UpdaterError> {
@@ -207,11 +201,7 @@ impl KeyRotationManifest {
         recovery: Option<&[u8; 32]>,
     ) -> Result<(), UpdaterError> {
         self.validate()?;
-        let recovery = recovery.ok_or(UpdaterError::SigningKeyUnprovisioned)?;
-        let signature = hex_decode(&self.signature).ok_or(UpdaterError::SignatureInvalid)?;
-        UnparsedPublicKey::new(&signature::ED25519, recovery)
-            .verify(&self.canonical_bytes(), &signature)
-            .map_err(|_| UpdaterError::SignatureInvalid)
+        self.verify_against(recovery)
     }
 
     /// Anti-rollback (ADR-0015 decision 2, ADR-0027 decision 5): rejects a rotation whose
@@ -366,6 +356,7 @@ mod tests {
 
     use super::*;
     use crate::{
+        hash::{hex_decode, hex_encode},
         key::{CONTENT_PUBLIC_KEY, RELEASE_PUBLIC_KEY, test_key_pair, test_recovery_key_pair},
         manifest::ReleaseManifest,
     };

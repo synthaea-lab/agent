@@ -44,17 +44,15 @@ const TAMPER_TECHNIQUE: &str = "T1601";
 /// `/var/lib/synthaea` in production), the same root `updater::layout::Layout`
 /// itself is built from — the updater and this check must agree on it, or the
 /// manifest this reads back is never the one a real update actually staged.
-pub(crate) fn spawn_monitor(state_dir: PathBuf, sink: Arc<DetectionSink>) {
-    std::thread::Builder::new()
-        .name("self-integrity".into())
-        .spawn(move || {
-            let layout = updater::layout::Layout::new(&state_dir);
-            loop {
-                std::thread::sleep(CHECK_INTERVAL);
-                check_once(&layout, &sink);
-            }
-        })
-        .expect("spawning the self-integrity monitor thread");
+pub(crate) fn spawn_monitor(state_dir: PathBuf, sink: Arc<DetectionSink>) -> std::io::Result<()> {
+    crate::spawn::spawn_named("self-integrity", move || {
+        let layout = updater::layout::Layout::new(&state_dir);
+        loop {
+            std::thread::sleep(CHECK_INTERVAL);
+            check_once(&layout, &sink);
+        }
+    })?;
+    Ok(())
 }
 
 /// The layout's base directory: where the record of key rotations lives.

@@ -99,6 +99,32 @@ pub(crate) struct ModelMetadata {
     feature_bounds: Option<FeatureBounds>,
 }
 
+impl ModelMetadata {
+    /// Parses the sidecar JSON and nothing else: what a caller requires of it differs (the
+    /// behavior scorer refuses a file missing either half, the other two accept either).
+    pub(crate) fn from_json(bytes: &[u8]) -> Result<Self, crate::forest::ParseError> {
+        serde_json::from_slice(bytes)
+            .map_err(|_| crate::forest::ParseError::Malformed("invalid metadata JSON"))
+    }
+
+    /// The bounds and threshold of an optional sidecar, for the scorers that accept a model
+    /// without one (legacy: no OOD validation, no threshold) and either half missing. The
+    /// bounds' array lengths are checked here so a truncated or tampered file is refused at
+    /// load time, not panicked on later in the hot path (issue #46).
+    pub(crate) fn parse_optional(
+        metadata: Option<&[u8]>,
+    ) -> Result<(Option<FeatureBounds>, Option<f32>), crate::forest::ParseError> {
+        let Some(bytes) = metadata else {
+            return Ok((None, None));
+        };
+        let parsed = Self::from_json(bytes)?;
+        if let Some(bounds) = &parsed.feature_bounds {
+            bounds.check_invariant()?;
+        }
+        Ok((parsed.feature_bounds, parsed.threshold))
+    }
+}
+
 /// Scores command lines against one Isolation Forest model.
 pub struct CmdlineScorer {
     session: Session,
@@ -135,20 +161,7 @@ impl CmdlineScorer {
             });
         }
 
-        let (bounds, threshold) = if let Some(meta_bytes) = metadata {
-            let parsed: ModelMetadata = serde_json::from_slice(meta_bytes)
-                .map_err(|_| ParseError::Malformed("invalid metadata JSON"))?;
-
-            // Validate feature bounds internal consistency (issue #46: prevent panic on
-            // malformed metadata where array lengths don't match)
-            if let Some(ref b) = parsed.feature_bounds {
-                b.check_invariant()?;
-            }
-
-            (parsed.feature_bounds, parsed.threshold)
-        } else {
-            (None, None)
-        };
+        let (bounds, threshold) = ModelMetadata::parse_optional(metadata)?;
 
         Ok(Self {
             session,
@@ -250,6 +263,58 @@ impl CmdlineScorer {
             value,
             attributions: crate::forest::top_attributions(&attribution, &features, &names, k),
         }))
+    }
+}
+
+#[cfg(test)]
+mod metadata_tests {
+    use super::*;
+    use crate::forest::ParseError;
+
+    #[test]
+    fn no_sidecar_means_no_bounds_and_no_threshold() {
+        let (bounds, threshold) = ModelMetadata::parse_optional(None).unwrap();
+        assert!(bounds.is_none() && threshold.is_none());
+    }
+
+    #[test]
+    fn either_half_alone_is_accepted() {
+        let only_threshold = br#"{"threshold": 0.25}"#;
+        let (bounds, threshold) = ModelMetadata::parse_optional(Some(only_threshold)).unwrap();
+        assert!(bounds.is_none());
+        assert_eq!(threshold, Some(0.25));
+
+        let only_bounds =
+            br#"{"feature_bounds": {"feature_names": ["a"], "min_values": [0.0], "max_values": [1.0]}}"#;
+        let (bounds, threshold) = ModelMetadata::parse_optional(Some(only_bounds)).unwrap();
+        assert_eq!(bounds.unwrap().feature_names, ["a"]);
+        assert!(threshold.is_none());
+    }
+
+    #[test]
+    fn malformed_json_is_refused_with_the_documented_message() {
+        let err = ModelMetadata::parse_optional(Some(b"{not json")).unwrap_err();
+        assert!(matches!(
+            err,
+            ParseError::Malformed("invalid metadata JSON")
+        ));
+    }
+
+    #[test]
+    fn bounds_with_mismatched_array_lengths_are_refused_at_load() {
+        let bad = br#"{"feature_bounds": {"feature_names": ["a", "b"], "min_values": [0.0], "max_values": [1.0, 2.0]}}"#;
+        let err = ModelMetadata::parse_optional(Some(bad)).unwrap_err();
+        assert!(matches!(
+            err,
+            ParseError::Malformed("FeatureBounds arrays have mismatched lengths")
+        ));
+    }
+
+    #[test]
+    fn from_json_does_not_validate_the_bounds() {
+        // The behavior scorer decides what it requires; from_json only parses.
+        let bad = br#"{"feature_bounds": {"feature_names": ["a", "b"], "min_values": [0.0], "max_values": [1.0, 2.0]}}"#;
+        assert!(ModelMetadata::from_json(bad).is_ok());
     }
 }
 

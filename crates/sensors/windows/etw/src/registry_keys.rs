@@ -8,6 +8,7 @@ use schema::{EventMeta, RegistrySetEvent};
 use crate::{
     bounded_lru::BoundedLru,
     payload::{self, KeyOpen, PayloadFields, ValueWrite},
+    shed::ShedCounter,
 };
 
 /// The Kernel-Registry operations the sensor reads.
@@ -65,7 +66,7 @@ impl RegistryKeys {
     /// Panics when `cap` is 0 — a configuration bug, not a runtime condition.
     pub(crate) fn new(cap: usize) -> Self {
         Self {
-            paths: BoundedLru::new("registry key objects", cap),
+            paths: BoundedLru::counting("registry key objects", cap, ShedCounter::default()),
             unresolved_writes: 0,
         }
     }

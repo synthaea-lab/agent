@@ -321,6 +321,19 @@ shield for a pid and incarnation. The rules behind it:
   script runners (by exact name or by family plus version suffix), because otherwise
   every payload run through `/usr/bin/python3` from a unit would be immune. A daemon
   whose own image is an interpreter (firewalld, tuned) therefore stays killable.
+
+  The decision, checked in this order (each step is a named predicate in
+  [`policy`](../crates/policy/src/lib.rs); a path that fails any step is not shielded):
+
+  | Step | Refuses | Example |
+  | --- | --- | --- |
+  | `is_trusted_system_path` | a path outside the system prefixes | `/tmp/payload`, `C:\Users\bob\svchost.exe` |
+  | `has_parent_component` | a `..` component, either separator | `/usr/../tmp/payload` |
+  | `is_admin_or_third_party_prefix` | `/opt/` and `/usr/local/` | `/opt/vendor/bin/agentd` |
+  | `is_shell_or_interpreter` | an exact shell or runner name, or a family name with only a version suffix | `/usr/bin/sh`, `/usr/bin/python3.11` |
+
+  A name that only shares a family prefix (`php-fpm8.4`, `nodm`, `javac`) is a real
+  daemon and keeps the shield. Pinned row by row by `service_main_path_decision_table`.
 - It is a path-and-parent heuristic, not package verification. A binary replaced
   under `/usr/sbin` by root is not caught by it, and a unit that runs a non-listed
   tool from a trusted path (`socat`, `ncat`) gets the shield.
@@ -395,9 +408,11 @@ reads only whether the alert raised by *this* event is `BAYES`; see
   enrichment worker (signature-gated findings), the YARA file worker and the memory
   scanner. A finding the worker records late keys on its own event timestamp; the
   dedup check saturates, so a late arrival can at most be absorbed as a duplicate.
-- All locks use `lock().unwrap()`. A panic while one is held poisons it and turns the
-  next event into a panic; the progress heartbeat then stops and the watchdog's hang
-  detection restarts the agent ([Self-protection](self-protection.md#liveness-and-hang-detection)).
+- The agent's locks are taken through `LockExt::lock_recovering` (see
+  [Poisoned locks](lifecycle.md#poisoned-locks)): a panic while one is held does not turn
+  every later event into a panic. The progress heartbeat and the watchdog's hang detection
+  ([Self-protection](self-protection.md#liveness-and-hang-detection)) stay the backstop for a
+  thread that is stuck rather than panicked.
 
 ## Bounds and observability
 
