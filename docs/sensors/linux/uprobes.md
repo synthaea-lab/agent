@@ -124,10 +124,11 @@ redaction applies. `sendmsg`/`sendmmsg` are not hooked.
 
 ## Limits
 
-- **No `ppid`, no container on uprobe events.** The uprobes sensor's object is a separate copy whose
-  `PROC_LINEAGE` is never primed or fed by the fork probe, so `ppid` and the generations are 0; and
-  the uprobe handlers do not set `cgroup_id`, so container attribution always resolves to `None`.
-  `UprobesSensor::capabilities` still reports `parent_lineage: true`.
+- **No `ppid` on uprobe events.** The uprobes sensor's object is a separate copy whose
+  `PROC_LINEAGE` is never primed or fed by the fork probe, so `ppid` and the generations are 0.
+  `UprobesSensor::capabilities` still reports `parent_lineage: true`. The handlers fill `cgroup_id`
+  through the same `fill_event_meta` as the main probes, so container attribution works as for
+  the main sensor's events.
 - **No self-exclusion.** The agent's own TLS or DNS calls are captured like any other process's.
 - **Dynamically linked libraries only.** Statically linked TLS (Go's `crypto/tls`, BoringSSL inside
   browsers) and non-standard library paths are not found. `LibraryType` is derived from the file
