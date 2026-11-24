@@ -14,7 +14,6 @@ use schema::sensor::{EventSink as _, Sensor as _};
 use tamper::heartbeat::{SensorHeartbeat, SilenceMonitor};
 
 use crate::{
-    captures::{CaptureSet, Captures, HeartbeatWatch, UprobesAction, heartbeat_watch, plan},
     protected::ProtectedResourceGuard,
     shutdown::{ShutdownPlan, sleep_unless_stopped},
     silence::{PulsingSink, SourceStatus},
@@ -365,14 +364,6 @@ pub(crate) fn cmd_run(opts: super::RunOptions) -> anyhow::Result<()> {
     };
     let avc_heartbeat = SensorHeartbeat::new("linux-avc");
     let silence_monitor = Arc::new(Mutex::new(SilenceMonitor::new()));
-    // The optional uprobe captures as configured. Nothing widens them yet: a posture overlay will
-    // (ADR-0035, third slice); the supervisor below already follows the set.
-    let capture_set = CaptureSet::new(Captures {
-        tls: enable_tls_capture,
-        readline: enable_readline_capture,
-        dns: enable_dns_capture,
-    });
-    let uprobes_monitor = Arc::clone(&silence_monitor);
     {
         let now_ns = schema::time::now_ns();
         let mut mon = silence_monitor.lock_recovering();
@@ -391,6 +382,13 @@ pub(crate) fn cmd_run(opts: super::RunOptions) -> anyhow::Result<()> {
             NO_CANARY_SILENCE_DEADLINE_NS,
             now_ns,
         );
+        if enable_tls_capture || enable_readline_capture || enable_dns_capture {
+            mon.register(
+                uprobes_heartbeat.clone(),
+                NO_CANARY_SILENCE_DEADLINE_NS,
+                now_ns,
+            );
+        }
         if runs_avc_worker {
             mon.register(avc_heartbeat.clone(), AVC_SILENCE_DEADLINE_NS, now_ns);
         }
@@ -444,12 +442,15 @@ pub(crate) fn cmd_run(opts: super::RunOptions) -> anyhow::Result<()> {
         )?;
     }
     crate::log_sources::spawn(sink.clone(), log_sources, alerts, &mut shutdown)?;
-    spawn_uprobes_supervisor(
-        sink.clone(),
-        uprobes_heartbeat,
-        uprobes_monitor,
-        capture_set,
-    )?;
+    if enable_tls_capture || enable_readline_capture || enable_dns_capture {
+        spawn_uprobes_sensor(
+            sink.clone(),
+            uprobes_heartbeat,
+            enable_tls_capture,
+            enable_readline_capture,
+            enable_dns_capture,
+        )?;
+    }
 
     // Observation-only BPF-LSM coverage (issue #91/#313): best-effort, never
     // fails `cmd_run`. `_lsm_ebpf` must stay bound for the rest of this function
@@ -924,133 +925,50 @@ fn spawn_journal_canary() -> std::io::Result<()> {
     Ok(())
 }
 
-/// The uprobes thread that is running, and the captures it was started with.
-struct RunningUprobes {
-    captures: Captures,
-    stop: sensor_linux_uprobes::UprobesStopHandle,
-    thread: std::thread::JoinHandle<()>,
-}
-
-impl RunningUprobes {
-    /// Stops the sensor and waits for the thread to end, which unloads its eBPF object. Safe on a
-    /// thread that has already ended (the sensor failed): the stop is kept and the join returns.
-    fn stop(self) {
-        self.stop.stop();
-        if self.thread.join().is_err() {
-            tracing::warn!("the uprobes thread panicked");
-        }
-    }
-}
-
-/// Starts the uprobes sensor with exactly `captures` (issue #90: TLS plaintext taps via
-/// `SSL_read`/`SSL_write` uprobes, shell readline capture; issue #267 Phase 1: DNS query capture
-/// via a `getaddrinfo(3)` uprobe). `captures` is never empty: `plan` starts nothing for an empty
-/// set.
-fn start_uprobes(
+/// Spawns the background thread running the uprobes sensor (issue #90: TLS
+/// plaintext taps via `SSL_read`/`SSL_write` uprobes, shell readline capture;
+/// issue #267 Phase 1: DNS query capture via a `getaddrinfo(3)` uprobe) when at
+/// least one capture is enabled by CLI flag. Only called when the caller has
+/// already checked `enable_tls_capture || enable_readline_capture ||
+/// enable_dns_capture` — `cmd_run` doesn't spawn this thread at all otherwise,
+/// so a deliberately-disabled capture costs nothing at runtime, not even a
+/// parked thread.
+///
+/// The captures are read once at start and never change while the agent runs
+/// (`docs/sensors/linux/uprobes.md`, "Captures are fixed at start").
+///
+/// Unlike [`spawn_netlink_poller`]/[`spawn_journal_tail`] above, `UprobesSensor`
+/// implements `Sensor` — the same trait the primary eBPF/audit sensor does — so
+/// its own blocking `run` owns this thread and `PulsingSink` (the primary sensor's
+/// own wrapper) pulses `heartbeat` on every event, rather than a manual per-item
+/// pulse. No `ProtectedResourceGuard` here: unlike the primary eBPF sensor, this
+/// one never produces `FileOpen` events.
+///
+/// # Errors
+///
+/// The OS refused the thread; `cmd_run` exits with it like any other start-up failure. The
+/// heartbeat is already registered by then, but the agent does not run.
+fn spawn_uprobes_sensor(
     sink: Arc<DetectionSink>,
     heartbeat: SensorHeartbeat,
-    captures: Captures,
-) -> std::io::Result<RunningUprobes> {
-    let mut config = sensor_linux_uprobes::UprobesConfig::new();
-    if captures.tls {
-        config = config.with_tls_enabled();
-    }
-    if captures.readline {
-        config = config.with_readline_enabled();
-    }
-    if captures.dns {
-        config = config.with_dns_enabled();
-    }
-    let mut sensor = sensor_linux_uprobes::UprobesSensor::with_config(config);
-    let stop = sensor.stop_handle();
-    let thread = crate::spawn::spawn_named("uprobes", move || {
+    enable_tls_capture: bool,
+    enable_readline_capture: bool,
+    enable_dns_capture: bool,
+) -> std::io::Result<()> {
+    crate::spawn::spawn_named("uprobes", move || {
+        let mut config = sensor_linux_uprobes::UprobesConfig::new();
+        if enable_tls_capture {
+            config = config.with_tls_enabled();
+        }
+        if enable_readline_capture {
+            config = config.with_readline_enabled();
+        }
+        if enable_dns_capture {
+            config = config.with_dns_enabled();
+        }
+        let mut sensor = sensor_linux_uprobes::UprobesSensor::with_config(config);
         if let Err(e) = sensor.run(Box::new(PulsingSink::new(sink, heartbeat))) {
             tracing::warn!(error = %e, "uprobes sensor failed");
-        }
-    })?;
-    Ok(RunningUprobes {
-        captures,
-        stop,
-        thread,
-    })
-}
-
-/// [`start_uprobes`] for the supervisor, which runs long after start-up and so cannot fail
-/// `cmd_run`: a thread the OS refuses is logged and the sensor stays off (the silence monitor
-/// watches its heartbeat from the moment the supervisor registered it, so the gap is reported).
-fn start_uprobes_or_log(
-    sink: &Arc<DetectionSink>,
-    heartbeat: &SensorHeartbeat,
-    captures: Captures,
-) -> Option<RunningUprobes> {
-    match start_uprobes(sink.clone(), heartbeat.clone(), captures) {
-        Ok(running) => Some(running),
-        Err(e) => {
-            tracing::error!(error = %e, "uprobes sensor not started");
-            None
-        }
-    }
-}
-
-/// Keeps the uprobes thread running exactly the captures `captures` says are wanted, and keeps
-/// its heartbeat watched by the silence monitor only while it runs: a capture that is off is
-/// deliberate, and must never accrue silence (a stalled sensor is reported as tampering). With
-/// nothing configured and nothing widened it parks on the set and costs nothing.
-///
-/// The sensor reads its config once, so a change **restarts** it: the eBPF object is unloaded
-/// and loaded again, and capture has a gap in between (on the way up, and again when a widening
-/// ends). A live attach and detach on the running sensor would avoid the gap and is a separate
-/// piece of work.
-fn spawn_uprobes_supervisor(
-    sink: Arc<DetectionSink>,
-    heartbeat: SensorHeartbeat,
-    monitor: Arc<Mutex<SilenceMonitor>>,
-    captures: CaptureSet,
-) -> std::io::Result<()> {
-    crate::spawn::spawn_named("uprobes-supervisor", move || {
-        let mut running: Option<RunningUprobes> = None;
-        // Whether the heartbeat is watched follows what is wanted, not what runs: a start the OS
-        // refuses leaves nothing running, and switching the capture off must still unregister.
-        let mut registered = false;
-        let mut wanted = captures.effective();
-        loop {
-            if heartbeat_watch(registered, wanted) == HeartbeatWatch::Watch {
-                monitor.lock_recovering().register(
-                    heartbeat.clone(),
-                    NO_CANARY_SILENCE_DEADLINE_NS,
-                    schema::time::now_ns(),
-                );
-                registered = true;
-            }
-            let current = running.as_ref().map_or(Captures::NONE, |r| r.captures);
-            match plan(current, wanted) {
-                UprobesAction::Idle => {}
-                UprobesAction::Start(set) => {
-                    tracing::info!(?set, "starting the uprobes sensor");
-                    running = start_uprobes_or_log(&sink, &heartbeat, set);
-                }
-                UprobesAction::Restart(set) => {
-                    tracing::info!(
-                        ?set,
-                        "restarting the uprobes sensor with other captures: capture has a gap while it reloads"
-                    );
-                    if let Some(old) = running.take() {
-                        old.stop();
-                    }
-                    running = start_uprobes_or_log(&sink, &heartbeat, set);
-                }
-                UprobesAction::Stop => {
-                    tracing::info!("stopping the uprobes sensor: no capture is wanted any more");
-                    if let Some(old) = running.take() {
-                        old.stop();
-                    }
-                }
-            }
-            if heartbeat_watch(registered, wanted) == HeartbeatWatch::Unwatch {
-                monitor.lock_recovering().unregister(heartbeat.name());
-                registered = false;
-            }
-            wanted = captures.wait_until_differs(wanted);
         }
     })?;
     Ok(())
