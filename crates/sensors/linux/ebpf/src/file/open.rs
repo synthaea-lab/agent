@@ -11,9 +11,14 @@ use sensor_linux_wire::{FileOpenEvent, is_filtered_path};
 
 use crate::{fill_event_meta, into_ret, mount_signal::signal::is_agent_own_pid};
 
-/// Ring buffer shared with userspace for `open` events.
+/// Ring buffer shared with userspace for `open` events. One record is 336 bytes (a 328-byte
+/// `FileOpenEvent` plus the ring's 8-byte header), so 256 KiB held about 780. systemd's device
+/// enumeration reads `uevent` and friends under `/sys` with relative `openat`, which the read
+/// filter cannot see (#334), in bursts of a few thousand opens. In the lab (2 vCPU, release
+/// agent, 2026-11-24) 256 KiB lost 6,355 of 10,000 opens sent in bursts of 2,000 and 3,000;
+/// 1 MiB lost none.
 #[map]
-static FILE_OPEN_EVENTS: RingBuf = RingBuf::with_byte_size(256 * 1024, 0);
+static FILE_OPEN_EVENTS: RingBuf = RingBuf::with_byte_size(1024 * 1024, 0);
 
 /// Per-CPU scratch for building one `FileOpenEvent` (see `EXEC_SCRATCH`).
 #[map]
