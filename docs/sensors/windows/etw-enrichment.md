@@ -22,7 +22,7 @@ The rule for all of it: **every Win32 call is best-effort.** A failure degrades 
 
 ## The pid store
 
-[`PidCache`](../../../crates/sensors/windows/etw/src/pid_cache.rs) maps pid to (image path, sequence number, server silo). It is a local copy of the `store::BoundedMap` design (sensor crates cannot depend on `store`): a `HashMap` plus a use counter, with the least-recently-used eighth evicted when the 16,384-entry cap is hit, and evictions counted.
+[`PidCache`](../../../crates/sensors/windows/etw/src/pid_cache.rs) maps pid to (image path, sequence number, server silo). It is a local copy of the `store::BoundedMap` design (sensor crates cannot depend on `store`): a `HashMap` plus a use counter, with the least-recently-used eighth evicted when the 16,384-entry cap is hit, and evictions counted. The count rides the health beacon as `etw_pid_cache_evicted`, with the silo directory's (`etw_silo_evicted`), the mark queue's (`etw_marks_dropped`) and the quarantine dedup's (`etw_quarantine_unremembered`), through [`EtwShedding`](../../../crates/sensors/windows/etw/src/shed.rs) (#178).
 
 - **Seeded** before the trace starts from a Toolhelp snapshot ([`seed_pid_store`](../../../crates/sensors/windows/etw/src/sensor.rs)), so events from already-running processes resolve and parent exclusions apply to them. The seed only knows file names, not full paths.
 - **Filled** by every `ProcessStart`. An unknown image (`<unknown>`) is never cached as a path, because a hit would suppress later live lookups; the silo is still recorded.

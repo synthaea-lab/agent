@@ -30,7 +30,7 @@ mod rules;
 pub use bayes::BeliefState;
 pub use behavior::BehaviorVector;
 pub use bus::EventBus;
-pub use engine::{CorrelationEngine, KillShield};
+pub use engine::{CorrelationEngine, KillShield, MlUpdateError};
 pub use rules::CorrelationAlert;
 
 #[cfg(test)]
