@@ -9,7 +9,11 @@ use aya_ebpf::{
 use aya_log_ebpf::{info, warn};
 use sensor_linux_wire::ConnectEvent;
 
-use crate::{AF_INET, AF_INET6, fill_event_meta, into_ret};
+use crate::{
+    AF_INET, AF_INET6,
+    arch::{SyscallRecord, arg_offset},
+    fill_event_meta, into_ret,
+};
 
 /// Ring buffer shared with userspace for `connect` events.
 #[map]
@@ -24,36 +28,24 @@ static CONNECT_SCRATCH: PerCpuArray<ConnectEvent> = PerCpuArray::with_max_entrie
 /// aligned on 8 bytes each — `fd`(16), `uservaddr`(24), `addrlen`(32). Not verified against
 /// `/sys/kernel/tracing/events/syscalls/sys_enter_connect/format` on this machine (reading
 /// requires root) — to be confirmed before trusting the data outside the lab.
-#[cfg(any(bpf_target_arch = "x86_64", bpf_target_arch = "aarch64"))]
-pub(crate) const CONNECT_USERVADDR_PTR_OFFSET: usize = 24;
-/// `fd` is the first argument, right after the 16-byte record header (same layout as `bind`'s
-/// `BIND_FD_OFFSET` below, which was read from the tracefs `format` file).
-#[cfg(any(bpf_target_arch = "x86_64", bpf_target_arch = "aarch64"))]
-pub(crate) const CONNECT_FD_OFFSET: usize = 16;
-#[cfg(bpf_target_arch = "x86")]
-pub(crate) const CONNECT_FD_OFFSET: usize = 12;
-
+///
 /// On i686, `fd`(12), `uservaddr`(16), `addrlen`(20) are packed without padding (the
 /// `uservaddr` pointer is 4 bytes, not 8) — verified on 2026-08-19 via
 /// `/sys/kernel/debug/tracing/events/syscalls/sys_enter_connect/format` on the target i686
 /// kernel (Debian 12 Bookworm, `6.1.0-52-686-pae`).
-#[cfg(bpf_target_arch = "x86")]
-pub(crate) const CONNECT_USERVADDR_PTR_OFFSET: usize = 16;
+pub(crate) const CONNECT_USERVADDR_PTR_OFFSET: usize = arg_offset(1);
+/// `fd` is the first argument, right after the record header (same layout as `bind`'s
+/// `BIND_FD_OFFSET`, which was read from the tracefs `format` file).
+pub(crate) const CONNECT_FD_OFFSET: usize = arg_offset(0);
 
 pub fn sys_enter_connect(ctx: TracePointContext) -> u32 {
     into_ret(try_sys_enter_connect(ctx))
 }
 
 fn try_sys_enter_connect(ctx: TracePointContext) -> Result<u32, u32> {
-    #[cfg(any(bpf_target_arch = "x86_64", bpf_target_arch = "aarch64"))]
     let uservaddr_ptr: u64 = unsafe {
-        ctx.read_at(CONNECT_USERVADDR_PTR_OFFSET)
+        ctx.read_ulong_arg(CONNECT_USERVADDR_PTR_OFFSET)
             .map_err(|_| 1u32)?
-    };
-    #[cfg(bpf_target_arch = "x86")]
-    let uservaddr_ptr: u64 = unsafe {
-        ctx.read_at::<u32>(CONNECT_USERVADDR_PTR_OFFSET)
-            .map_err(|_| 1u32)? as u64
     };
     if uservaddr_ptr == 0 {
         return Ok(0);
