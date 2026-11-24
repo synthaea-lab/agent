@@ -1,6 +1,37 @@
 // SPDX-License-Identifier: GPL-2.0-only OR MIT
+//! The Linux kernel probes: eBPF programs, their maps and the helpers they share. Each domain
+//! module (`exec`, `file`, `net`, `cred`, ...) owns its programs; this root holds what every
+//! domain uses.
+//!
+//! # Safety
+//!
+//! Nearly every `unsafe` block here is one of four patterns, so they are documented once here
+//! instead of on each block (AS-029). A block that does anything else, and every read through
+//! a raw kernel pointer (`task_struct`, `pt_regs`, an LSM hook argument), carries its own
+//! `// SAFETY:` comment (#184).
+//!
+//! - **Syscall arguments.** `ctx.read_at::<T>(OFFSET)` reads a field of the syscall record.
+//!   No program here attaches to a real tracepoint: every `TracePointContext` wraps the
+//!   synthetic `SysEnterRecord`/`SysExitRecord` that `raw.rs` builds in a per-CPU map from
+//!   `pt_regs`, laid out like the tracepoint's `format` file (the `*_OFFSET` constants).
+//!   `read_at` goes through `bpf_probe_read_kernel`, so a wrong offset gives an error or a
+//!   wrong value, never a fault.
+//! - **Probe reads.** `bpf_probe_read_user`, `bpf_probe_read_kernel` and their `_str`/`_buf`
+//!   forms copy from an address the kernel may not map. The helper handles the fault and
+//!   returns an error, which each call site turns into an early return or an explicit
+//!   fallback value (`unwrap_or(0)`, `.ok()?`, `if let Ok`).
+//! - **Per-CPU scratch.** `SCRATCH.get_ptr_mut(0)` gives this CPU's only slot of a
+//!   `PerCpuArray`. A program does not nest on its own CPU, so nothing else writes it between
+//!   the `write_bytes` that zeroes it and the `output` that copies it out. The field writes
+//!   through `(*e)` stay inside that one value.
+//! - **Map lookups.** `map.get(&key)` returns a reference into the map, which is copied or
+//!   read before the program returns, and never kept.
 #![no_std]
 #![no_main]
+#![allow(
+    clippy::undocumented_unsafe_blocks,
+    reason = "the recurring unsafe patterns are documented once in the crate-level Safety section (AS-029)"
+)]
 
 mod cred;
 mod exec;
@@ -67,9 +98,9 @@ pub(crate) fn fill_event_meta(
     }
 }
 
-/// Offset of `ret` in every `sys_exit_*` tracepoint (x86_64/aarch64): 8-byte common
+/// Offset of `ret` in every `sys_exit_*` tracepoint (`x86_64`/`aarch64`): 8-byte common
 /// header + `__syscall_nr`(4, +4 padding) + `ret`(8, signed). Verified on
-/// 2026-09-22 on Alpine (kernel 6.18.50-0-virt, x86_64) via
+/// 2026-09-22 on Alpine (kernel 6.18.50-0-virt, `x86_64`) via
 /// `/sys/kernel/tracing/events/syscalls/sys_exit_accept{,4}/format` — identical for
 /// both.
 #[cfg(any(bpf_target_arch = "x86_64", bpf_target_arch = "aarch64"))]

@@ -207,13 +207,12 @@ pub fn dns_udp_connect(ctx: TracePointContext) -> u32 {
         return 1;
     };
     let key = dns_fd_key(bpf_get_current_pid_tgid(), fd);
-    if addr_ptr != 0 {
-        if let Some((entry, port)) = read_inet_dest(addr_ptr) {
-            if port == DNS_PORT {
-                let _ = DNS_UDP_FDS.insert(&key, &entry, 0);
-                return 0;
-            }
-        }
+    if addr_ptr != 0
+        && let Some((entry, port)) = read_inet_dest(addr_ptr)
+        && port == DNS_PORT
+    {
+        let _ = DNS_UDP_FDS.insert(&key, &entry, 0);
+        return 0;
     }
     let _ = DNS_UDP_FDS.remove(&key);
     0
@@ -274,10 +273,10 @@ pub fn dns_udp_sendto(ctx: TracePointContext) -> u32 {
         let _ = emit_dns_on_connected_socket(&ctx, fd, SENDTO_BUF_OFFSET, len);
         return 0;
     }
-    if let Some((dest, port)) = read_inet_dest(addr_ptr) {
-        if port == DNS_PORT {
-            let _ = emit_dns_udp_query(&ctx, SENDTO_BUF_OFFSET, len, &dest);
-        }
+    if let Some((dest, port)) = read_inet_dest(addr_ptr)
+        && port == DNS_PORT
+    {
+        let _ = emit_dns_udp_query(&ctx, SENDTO_BUF_OFFSET, len, &dest);
     }
     0
 }

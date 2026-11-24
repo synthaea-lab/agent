@@ -19,7 +19,7 @@ static CONNECT_EVENTS: RingBuf = RingBuf::with_byte_size(256 * 1024, 0);
 #[map]
 static CONNECT_SCRATCH: PerCpuArray<ConnectEvent> = PerCpuArray::with_max_entries(1, 0);
 
-/// Offsets of the `syscalls:sys_enter_connect` tracepoint (x86_64). Same stable layout as
+/// Offsets of the `syscalls:sys_enter_connect` tracepoint (`x86_64`). Same stable layout as
 /// `sys_enter_openat` (see `file/open.rs`): 8-byte common header, `__syscall_nr`, then the arguments
 /// aligned on 8 bytes each — `fd`(16), `uservaddr`(24), `addrlen`(32). Not verified against
 /// `/sys/kernel/tracing/events/syscalls/sys_enter_connect/format` on this machine (reading

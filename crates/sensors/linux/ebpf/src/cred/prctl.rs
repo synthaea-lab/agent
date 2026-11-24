@@ -22,7 +22,7 @@ static PRCTL_SCRATCH: PerCpuArray<PrctlEvent> = PerCpuArray::with_max_entries(1,
 /// `prctl(2)` options (`<linux/prctl.h>`) this probe cares about. `prctl` has
 /// dozens of options and some run constantly (`PR_SET_NAME` on every thread
 /// rename), so every other option returns before touching a ring buffer — the
-/// same in-kernel filter as `sys_enter_bpf`'s `cmd` (see this crate's WIRE_VERSION
+/// same in-kernel filter as `sys_enter_bpf`'s `cmd` (see this crate's `WIRE_VERSION`
 /// v19 changelog).
 const PR_CAPBSET_DROP: u64 = 24;
 const PR_SET_SECUREBITS: u64 = 28;

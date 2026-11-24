@@ -1,6 +1,6 @@
 //! Uprobes: TLS plaintext capture (issue #90)
 //!
-//! These uprobes attach to SSL_read/SSL_write in OpenSSL/BoringSSL/GnuTLS libraries.
+//! These uprobes attach to `SSL_read/SSL_write` in OpenSSL/BoringSSL/GnuTLS libraries.
 //! Attachment is done from userspace (sensor-linux-uprobes) after resolving symbols
 //! with goblin — the eBPF programs in this module are just the handlers.
 
@@ -23,33 +23,33 @@ static TLS_CAPTURE_EVENTS: RingBuf = RingBuf::with_byte_size(256 * 1024, 0);
 #[map]
 static TLS_SCRATCH: PerCpuArray<TlsCaptureEvent> = PerCpuArray::with_max_entries(1, 0);
 
-/// Tracks SSL_read buffer pointers between entry and return: pid → (buf_ptr, num, lib_type).
-/// SSL_read(SSL *ssl, void *buf, int num) fills `buf` on success, so we need to
+/// Tracks `SSL_read` buffer pointers between entry and return: pid → (`buf_ptr`, num, `lib_type`).
+/// `SSL_read(SSL *ssl, void *buf, int num)` fills `buf` on success, so we need to
 /// stash the arguments at entry and read the buffer at return (uretprobe).
-/// The lib_type (0=OpenSSL, 1=BoringSSL, 2=GnuTLS) is passed from entry to exit.
+/// The `lib_type` (0=OpenSSL, 1=BoringSSL, 2=GnuTLS) is passed from entry to exit.
 ///
 /// Three `u64`s, not `(u64, u32, u8)`: that tuple has 3 bytes of padding that are never
 /// written, and the 5.15 and 6.1 verifiers refuse to pass uninitialized stack bytes to
-/// `bpf_map_update_elem` (`invalid indirect read from stack`), so the SSL_read entry probes
+/// `bpf_map_update_elem` (`invalid indirect read from stack`), so the `SSL_read` entry probes
 /// did not load there (#204). 6.18 accepts it.
 #[map]
 static SSL_READ_ARGS: HashMap<u64, (u64, u64, u64)> = HashMap::with_max_entries(1024, 0);
 
-/// Uprobe on SSL_write entry for OpenSSL (pre-encryption plaintext capture).
+/// Uprobe on `SSL_write` entry for OpenSSL (pre-encryption plaintext capture).
 /// Signature: `int SSL_write(SSL *ssl, const void *buf, int num)`
-/// Captures the first MAX_TLS_CAPTURE bytes of `buf` before encryption.
+/// Captures the first `MAX_TLS_CAPTURE` bytes of `buf` before encryption.
 #[uprobe]
 pub fn ssl_write_openssl(ctx: ProbeContext) -> u32 {
     into_ret(try_ssl_write(ctx, 0))
 }
 
-/// Uprobe on SSL_write entry for BoringSSL (pre-encryption plaintext capture).
+/// Uprobe on `SSL_write` entry for `BoringSSL` (pre-encryption plaintext capture).
 #[uprobe]
 pub fn ssl_write_boringssl(ctx: ProbeContext) -> u32 {
     into_ret(try_ssl_write(ctx, 1))
 }
 
-/// Uprobe on gnutls_record_send entry for GnuTLS (pre-encryption plaintext capture).
+/// Uprobe on `gnutls_record_send` entry for `GnuTLS` (pre-encryption plaintext capture).
 /// Signature: `ssize_t gnutls_record_send(gnutls_session_t session, const void *data, size_t data_size)`
 #[uprobe]
 pub fn ssl_write_gnutls(ctx: ProbeContext) -> u32 {
@@ -120,20 +120,20 @@ fn try_ssl_write(ctx: ProbeContext, lib_type: u8) -> Result<u32, u32> {
     Ok(0)
 }
 
-/// Uprobe on SSL_read entry for OpenSSL: stash arguments for the uretprobe.
+/// Uprobe on `SSL_read` entry for OpenSSL: stash arguments for the uretprobe.
 /// Signature: `int SSL_read(SSL *ssl, void *buf, int num)`
 #[uprobe]
 pub fn ssl_read_entry_openssl(ctx: ProbeContext) -> u32 {
     try_ssl_read_entry(ctx, 0)
 }
 
-/// Uprobe on SSL_read entry for BoringSSL: stash arguments for the uretprobe.
+/// Uprobe on `SSL_read` entry for `BoringSSL`: stash arguments for the uretprobe.
 #[uprobe]
 pub fn ssl_read_entry_boringssl(ctx: ProbeContext) -> u32 {
     try_ssl_read_entry(ctx, 1)
 }
 
-/// Uprobe on gnutls_record_recv entry for GnuTLS: stash arguments for the uretprobe.
+/// Uprobe on `gnutls_record_recv` entry for `GnuTLS`: stash arguments for the uretprobe.
 /// Signature: `ssize_t gnutls_record_recv(gnutls_session_t session, void *data, size_t data_size)`
 #[uprobe]
 pub fn ssl_read_entry_gnutls(ctx: ProbeContext) -> u32 {
@@ -143,30 +143,31 @@ pub fn ssl_read_entry_gnutls(ctx: ProbeContext) -> u32 {
 fn try_ssl_read_entry(ctx: ProbeContext, lib_type: u8) -> u32 {
     // SSL_read(SSL *ssl, void *buf, int num) / gnutls_record_recv(session, data, size)
     // arg(0) = ssl/session, arg(1) = buf/data, arg(2) = num/size
-    if let (Some(buf_ptr), Some(num)) = (ctx.arg::<u64>(1), ctx.arg::<i32>(2)) {
-        if buf_ptr != 0 && num > 0 {
-            let pid_tgid = bpf_get_current_pid_tgid();
-            let args = (buf_ptr, u64::from(num as u32), u64::from(lib_type));
-            let _ = SSL_READ_ARGS.insert(&pid_tgid, &args, 0);
-        }
+    if let (Some(buf_ptr), Some(num)) = (ctx.arg::<u64>(1), ctx.arg::<i32>(2))
+        && buf_ptr != 0
+        && num > 0
+    {
+        let pid_tgid = bpf_get_current_pid_tgid();
+        let args = (buf_ptr, u64::from(num as u32), u64::from(lib_type));
+        let _ = SSL_READ_ARGS.insert(&pid_tgid, &args, 0);
     }
     0
 }
 
-/// Uretprobe on SSL_read return for OpenSSL: capture decrypted plaintext.
+/// Uretprobe on `SSL_read` return for OpenSSL: capture decrypted plaintext.
 /// The return value is the number of bytes read, or <= 0 on error.
 #[uretprobe]
 pub fn ssl_read_exit_openssl(ctx: RetProbeContext) -> u32 {
     into_ret(try_ssl_read_exit(ctx))
 }
 
-/// Uretprobe on SSL_read return for BoringSSL: capture decrypted plaintext.
+/// Uretprobe on `SSL_read` return for `BoringSSL`: capture decrypted plaintext.
 #[uretprobe]
 pub fn ssl_read_exit_boringssl(ctx: RetProbeContext) -> u32 {
     into_ret(try_ssl_read_exit(ctx))
 }
 
-/// Uretprobe on gnutls_record_recv return for GnuTLS: capture decrypted plaintext.
+/// Uretprobe on `gnutls_record_recv` return for `GnuTLS`: capture decrypted plaintext.
 #[uretprobe]
 pub fn ssl_read_exit_gnutls(ctx: RetProbeContext) -> u32 {
     into_ret(try_ssl_read_exit(ctx))
