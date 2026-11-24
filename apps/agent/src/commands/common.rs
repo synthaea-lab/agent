@@ -703,6 +703,9 @@ mod tests {
 
     #[test]
     fn the_run_prelude_builds_the_sink_and_plants_the_canaries() {
+        // `start_pipeline` reads the host's zone, which on Unix is `TZ`.
+        #[cfg(unix)]
+        let _tz = super::localzone::TzGuard::new();
         let fixture = PreludeFixture::new();
         let pipeline = start_pipeline(&fixture.options(None), rules::RuleState::new())
             .expect("the standalone prelude");
@@ -724,6 +727,8 @@ mod tests {
     /// the agent's own, not an event's, so `--alert-details` does not change it.
     #[test]
     fn the_run_prelude_reports_an_upload_that_could_not_start_and_goes_on() {
+        #[cfg(unix)]
+        let _tz = super::localzone::TzGuard::new();
         let fixture = PreludeFixture::new();
         let missing_ca = fixture.dir.path().join("no-such-ca.pem");
         let server = crate::upload::ControlPlane {
@@ -773,20 +778,13 @@ mod tests {
                 .count()
         }
 
-        fn set_tz(rule: &str) {
-            // SAFETY: the caller holds `TZ_LOCK`, which every test touching `TZ` takes.
-            unsafe { std::env::set_var("TZ", rule) };
-        }
-
         #[test]
         fn the_platform_zone_turns_the_rule_on_and_the_operator_offset_wins_over_it() {
-            let _tz = super::super::localzone::TZ_LOCK
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let tz = super::super::localzone::TzGuard::new();
 
             // Zone only: UTC+9 (no daylight saving). 12:00 UTC is 21:00 on the host, after the
             // working day; 02:00 UTC is 11:00, inside it.
-            set_tz("JST-9");
+            tz.set("JST-9");
             let (zone_only, dir_a) = sink("zone-only");
             apply_detection(&zone_only, &config::DetectionConfig::default());
             assert_eq!(odd_hour_alerts(&zone_only, 12), 1, "21:00 host time");
