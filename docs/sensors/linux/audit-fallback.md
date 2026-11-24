@@ -36,8 +36,8 @@ auditd's log (#275):
    Only `kill` takes a negative pid: `tkill` and `tgkill` refuse an id that is not positive. For `tgkill` the
    process is `a0`, the tgid.
 2. At start, `AuditSensor` (given the state directory) reads the marker `audit-agent.pid` (pid, process group,
-   start time, boot id, thread ids, uid and the newest kernel record of the log, its time and serial, as the
-   anchor) and writes its own, mode 0600. A clean stop removes the marker, and so does a stop by SIGTERM, SIGHUP
+   start time, boot id, thread ids, uid, the newest kernel record of the log, its time and serial, as the
+   anchor, and the pid of its watchdog) and writes its own, mode 0600. A clean stop removes the marker, and so does a stop by SIGTERM, SIGHUP
    or SIGQUIT: the kill-loudness watcher ends the process with `exit` and removes it first, so a routine
    `systemctl restart` leaves none and only a kill or a crash does.
 3. It reads the tail of `/var/log/audit/audit.log`, then `audit.log.1`, `.2` and so on up to `.9`
@@ -72,6 +72,16 @@ When the marker survived and no record accounts for the previous instance, the r
 old pid, the log files it read, the ones it could not read and the ones longer than the 16 MiB tail it reads
 (a record in the head of such a file, possible with `max_log_file` above 16 MiB, is not looked at), instead of
 staying silent.
+
+**The watchdog (#342).** The watchdog starts the agent with `PR_SET_PDEATHSIG` = `SIGKILL`, so a `SIGKILL` of the
+watchdog ends the agent with no record naming the agent: the record names the watchdog's pid. The marker keeps that
+pid (the ninth field, `-` when there is none), and a record aimed at it counts like one aimed at the agent. The agent
+takes its parent for the watchdog only when its own death signal is `SIGKILL` (`prctl(PR_GET_PDEATHSIG)`, read on the
+main thread, where the kernel keeps it across `execve`) and the parent is not init: a shell or a service manager that
+started it is not recorded, so a kill of it is not blamed on the agent. The event's `target_pid` is the pid the signal
+went to, the watchdog's, with no `target_image_path` (the rule prints `?`); the warning says that the agent died with
+it. A `tkill` or `tgkill` of a thread of the watchdog (not its pid) is not attributed, as the watchdog's thread ids are
+not in the marker. Unit-tested on the marker, the replay, the real `prctl` read and the line captured below. Run under the packaged unit on Debian 13.7 (kernel 6.12.107, systemd 257, auditd 4.0.2, 2026-11-24): the marker's ninth field was the watchdog's pid, and `/usr/bin/kill -KILL <watchdog>` was reported by the restarted agent (`the previous agent instance's watchdog was sent SIGKILL, which ended the agent too`, T1562.001 `pid=<sender> comm=kill … security process pid=<watchdog> (?)`), with no "did not stop cleanly" warning; a `kill -KILL` of the agent was still reported as before. The agent was built from the head of the change; the watchdog and `cli` are those of `e1567838`, unchanged in `apps/watchdog`, `apps/cli` and `packaging/` up to it. Not run: another distribution or kernel, an agent with eBPF probes under the watchdog.
 
 **Limits.** No rule, no attribution. The agent's own watchdog also sends SIGKILL (a heartbeat stall, a probation rollback): the restarted agent reports it like any other kill (High, T1562.001, `exe=…/watchdog`), so read the `exe` before taking a watchdog restart for tampering (the eBPF path has the same gap, #1103). Ways to SIGKILL the agent that these rules do not record, so are not
 attributed: `systemctl kill` (no record, as captured), `rt_sigqueueinfo`, `rt_tgsigqueueinfo` and
