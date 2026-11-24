@@ -255,8 +255,10 @@ audit fallback sensor the same replay reads auditd's log instead
 ([audit-fallback.md](sensors/linux/audit-fallback.md#sigkill-of-the-agent)): the restarted agent
 finds the `SIGKILL` record aimed at its predecessor's pid and reports the sender, **only when the
 operator loaded** [`synthaea-kill.rules`](../packaging/linux/audit/synthaea-kill.rules), which the
-packages neither install nor load. A `systemctl kill` leaves no such record and is not attributed
-([#275](https://github.com/synthaea-lab/agent/issues/275)).
+packages neither install nor load. A `systemctl kill` leaves no such record and is not
+attributed (a permanent limit, decided in
+[#275](https://github.com/synthaea-lab/agent/issues/275)). A SIGKILL of the watchdog is
+attributed ([#342](https://github.com/synthaea-lab/agent/issues/342)).
 Kernel-mediated stops that involve no signal
 from a process (a CPU rlimit, a cgroup memory limit, `cgroup.freeze`) are read from how
 they are set: the command (`systemctl freeze|set-property`, a memory or task limit, or a
