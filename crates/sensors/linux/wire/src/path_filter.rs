@@ -199,15 +199,15 @@ pub fn is_filtered_path(path: &[u8], flags: i64, is_mutation: bool) -> bool {
 /// | --- | --- | --- | --- | --- |
 /// | `main`, no scan | 244,498 | 254,839 | 242,708 | loads |
 /// | an `if` per byte, early return | | `E2BIG` | | |
-/// | branchless, a byte per step (this one) | | 469,697 | 664,321 | loads |
+/// | branchless, a byte per step (this one) | 666,141 | 469,697 | 664,321 | loads |
 /// | eight bytes per step, one `u64` load | 379,054 | refused | 373,752 | refused |
 /// | eight bytes per step, from byte loads | 496,702 | 558,655 | | loads |
 /// | any of the above run before the prefix rules | `E2BIG` | `E2BIG` | | |
 ///
 /// The `u64` load is refused where the path buffer is not 8-aligned on older verifiers.
-/// Running the scan on every path multiplies its exits by the rest of each handler. RHEL
-/// 9.9 is 36k under `verify_probes`' 700k ceiling with this shape: verifying the scan once,
-/// as a global BPF function, is the way to buy that room back.
+/// Running the scan on every path multiplies its exits by the rest of each handler. With
+/// this shape, 7.2 and RHEL 9.9 are 34k and 36k under `verify_probes`' 700k ceiling.
+/// Verifying the scan once, as a global BPF function, is the way to buy that room back.
 fn may_leave_its_prefix(path: &[u8]) -> bool {
     let mut slashes = 0u64;
     let mut previous_is_slash = 0u64;
