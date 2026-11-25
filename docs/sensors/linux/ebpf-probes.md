@@ -210,8 +210,10 @@ These rules are not style; each one was a verifier rejection on a supported kern
   (`MAX_DNS_ANSWERS`, `SET_TIME_COMPONENTS`, `TASK_COMM_LEN` copies). The one loop in the filter,
   `may_leave_its_prefix` (#350), runs only on paths the prefixes would drop, and its body has no
   branch on the bytes. A first version with an `if` per byte took `raw_sys_enter` past the limit on
-  6.1 (`E2BIG`); the branchless one verifies at 469,697 instructions there, against 254,839 without
-  it.
+  6.1 (`E2BIG`). The branchless one verifies at 469,697 instructions there (254,839 without it), and
+  at 664,321 on RHEL 9.9's 5.14 (242,708 without it), 36k under `verify_probes`' 700k ceiling. The
+  other shapes tried, eight bytes per step or the scan run before the prefix rules, were refused
+  somewhere or cost more; the table is on `may_leave_its_prefix`.
 - **Clamp before a variable-length helper call.** User buffers (argv, TLS, DNS payloads) are read
   with one `bpf_probe_read_user_buf` into a slice whose length was clamped against the buffer size
   first, so the verifier sees an upper bound. A byte loop is never used.
