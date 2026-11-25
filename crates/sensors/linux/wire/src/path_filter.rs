@@ -205,6 +205,7 @@ pub fn is_filtered_path(path: &[u8], flags: i64, is_mutation: bool) -> bool {
 /// either one is the marks of the slashes moved up one byte, masked by both. The last byte's
 /// slash carries into the next word, or into the tail of under eight bytes, which goes a byte
 /// at a time.
+#[inline(always)]
 fn may_leave_its_prefix(path: &[u8]) -> bool {
     const WORD: usize = 8;
     let mut leaves = 0u64;
@@ -258,12 +259,14 @@ fn may_leave_its_prefix(path: &[u8]) -> bool {
 }
 
 /// `0x80` in each byte of `word` equal to `wanted`, 0 elsewhere.
+#[inline(always)]
 fn bytes_equal(word: u64, wanted: u8) -> u64 {
     zero_bytes(word ^ (0x0101_0101_0101_0101 * u64::from(wanted)))
 }
 
 /// `0x80` in each zero byte of `x`, 0 elsewhere. Exact: the shorter `(x - ONES) & !x & HIGH`
 /// also marks a `0x01` byte above a zero one, through the borrow.
+#[inline(always)]
 fn zero_bytes(x: u64) -> u64 {
     const LOW7: u64 = 0x7f7f_7f7f_7f7f_7f7f;
     !((x & LOW7).wrapping_add(LOW7) | x | LOW7)
@@ -271,6 +274,7 @@ fn zero_bytes(x: u64) -> u64 {
 
 /// 1 when `byte == wanted`, else 0, without a branch: `byte ^ wanted` is 0 only on a match,
 /// and only 0 wraps below zero, which sets the top bit.
+#[inline(always)]
 fn is_byte(byte: u8, wanted: u8) -> u64 {
     (u64::from(byte ^ wanted)).wrapping_sub(1) >> 63
 }
