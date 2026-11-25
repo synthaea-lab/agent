@@ -219,7 +219,7 @@ These rules are not style; each one was a verifier rejection on a supported kern
 
 | Event | Syscalls | Captured | Notes |
 | --- | --- | --- | --- |
-| `FileOpenEvent` | `openat`, `open` | raw path, raw flags | Path not resolved against `dfd`. `open` is needed for musl/busybox. Flags are masked in userspace |
+| `FileOpenEvent` | `openat`, `openat2`, `open` | raw path, raw flags | Path not resolved against `dfd`. `open` is needed for musl/busybox. `openat2` (5.6+) shares `openat`'s handler and reads its flags from `struct open_how` (#349); `resolve` is not read. Flags are masked in userspace |
 | `FileWriteEvent` | `write` | fd, requested count | No path (no fd → path resolution). `pwrite64`/`writev` are not routed |
 | `FileDeleteEvent` | `unlink`, `unlinkat` | raw path | |
 | `FileRenameEvent` | `rename`, `renameat`, `renameat2` | both raw paths, both dir fds | Userspace resolves relative paths |

@@ -14,8 +14,9 @@ use aya_log_ebpf::{info, warn};
 #[cfg(bpf_target_arch = "aarch64")]
 use sensor_linux_wire::syscall_nr_from_i32;
 use sensor_linux_wire::{
-    DISPATCH_CONNECT, DISPATCH_SENDTO, DISPATCH_WRITE, LineageEntry, SIGNAL_SENDER_UNRELIABLE,
-    TASK_COMM_LEN, encode_pending_syscall_exit, matching_pending_syscall_exit,
+    DISPATCH_CONNECT, DISPATCH_OPENAT2, DISPATCH_SENDTO, DISPATCH_WRITE, LineageEntry,
+    SIGNAL_SENDER_UNRELIABLE, TASK_COMM_LEN, encode_pending_syscall_exit,
+    matching_pending_syscall_exit,
 };
 
 use crate::{
@@ -35,7 +36,7 @@ use crate::{
             sys_enter_chmod, sys_enter_chown, sys_enter_fchmodat, sys_enter_fchownat,
             sys_enter_lchown,
         },
-        open::{sys_enter_open, sys_enter_openat},
+        open::{OpenFlags, sys_enter_open, sys_enter_openat},
         write_delete_rename::{
             sys_enter_rename, sys_enter_renameat, sys_enter_renameat2, sys_enter_unlink,
             sys_enter_unlinkat, sys_enter_write,
@@ -419,7 +420,9 @@ pub fn raw_sys_enter(ctx: RawTracePointContext) -> u32 {
 
     let trace_ctx = TracePointContext::new(record.cast());
     match *action {
-        1 => sys_enter_openat(trace_ctx),
+        // One arm, so the open handler is inlined once: `raw_sys_enter` is within ~34k
+        // instructions of the verifier ceiling on 7.2 (#352), and a second copy would not fit.
+        1 | DISPATCH_OPENAT2 => sys_enter_openat(trace_ctx, OpenFlags::from_action(*action)),
         2 => sys_enter_open(trace_ctx),
         DISPATCH_CONNECT => sys_enter_connect(trace_ctx),
         DISPATCH_WRITE => sys_enter_write(trace_ctx),

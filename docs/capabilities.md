@@ -12,7 +12,7 @@ What the agent can do today, area by area, with the code and tests that back eac
 
 Every `partial` and `planned` row links a tracking issue; `tools/check-docs.py` fails CI otherwise.
 
-Totals: 273 capabilities, 153 built, 79 partial, 41 planned.
+Totals: 272 capabilities, 152 built, 81 partial, 39 planned.
 
 ## Contents
 
@@ -118,6 +118,7 @@ Totals: 273 capabilities, 153 built, 79 partial, 41 planned.
 | Exec argv captured in the probe (head 768 B + tail 256 B, omitted-byte count, /proc fallback) | built | ebpf exec.rs read_exec_argv; wire parse_exec_record with crates/sensors/linux/wire/tests/exec_record.rs and tests/fuzz/fuzz_targets/exec_record_parse.rs; userspace proc.rs exec_argv/argv_from_windows tests |  | [sensors/linux/process-context.md#argv](sensors/linux/process-context.md#argv) |
 | Process lineage and generations (ppid, pid-reuse-safe generation stamps, /proc priming) | built | raw.rs raw_sched_process_fork/exit, main.rs fill_lineage, userspace ebpf.rs prime_proc_lineage, proc.rs primed_generation/parse_stat_* tests |  | [sensors/linux/process-context.md#lineage](sensors/linux/process-context.md#lineage) |
 | File open telemetry with in-kernel prefix/write-intent filter and masked flags | built | main.rs emit_file_open_event, wire path_filter.rs is_filtered_path (20 tests), normalize OPEN_FLAGS_MASK + apps/agent/tests/probe_open_synthetic_bits.rs; paths are not resolved against dfd |  | [sensors/linux/ebpf-probes.md#in-kernel-filters](sensors/linux/ebpf-probes.md#in-kernel-filters) |
+| File opens through `openat2(2)` (5.6+) reported like `openat` | partial | ebpf file/open.rs OpenFlags::InOpenHow (flags read from `struct open_how`), raw.rs one `1 \| DISPATCH_OPENAT2` arm so the handler is inlined once, userspace syscall.rs entry 437 (x86_64, i686, aarch64; dispatch test). Not yet run on a lab host: a direct `syscall(SYS_openat2, …)` next to an `openat` of the same file | [#349](https://github.com/synthaea-lab/agent/issues/349) | [sensors/linux/ebpf-probes.md](sensors/linux/ebpf-probes.md) |
 | Kernel module load/unload, bpf() program/map lifecycle, prctl capability options, mount/umount | built | kernel/module.rs sys_enter_init_module/finit_module/delete_module, kernel/bpf.rs sys_enter_bpf, cred/prctl.rs sys_enter_prctl, mount_signal/mount.rs sys_enter_mount/umount; normalize kernel_module/bpf_operation/prctl/mount tests |  | [sensors/linux/ebpf-probes.md#what-each-syscall-route-captures](sensors/linux/ebpf-probes.md#what-each-syscall-route-captures) |
 | Injection telemetry: ptrace, process_vm_readv/writev, memfd_create (with returned fd) | built | main.rs sys_enter_ptrace/process_vm_*/memfd_create + sys_exit_memfd_create; normalize tests |  | [sensors/linux/ebpf-probes.md#what-each-syscall-route-captures](sensors/linux/ebpf-probes.md#what-each-syscall-route-captures) |
 | Privilege telemetry: setuid family, capset (both capability words), setns/unshare | built | main.rs sys_enter_set*id/capset/setns/unshare; normalize identity_change/cap_set/namespace tests |  | [sensors/linux/ebpf-probes.md#what-each-syscall-route-captures](sensors/linux/ebpf-probes.md#what-each-syscall-route-captures) |

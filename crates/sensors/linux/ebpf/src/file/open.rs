@@ -1,12 +1,15 @@
-//! File opens: the `openat`/`open` syscall handlers.
+//! File opens: the `openat`/`openat2`/`open` syscall handlers.
 
 use aya_ebpf::{
-    helpers::{bpf_get_current_comm, bpf_get_current_pid_tgid, bpf_probe_read_user_str_bytes},
+    helpers::{
+        bpf_get_current_comm, bpf_get_current_pid_tgid, bpf_probe_read_user,
+        bpf_probe_read_user_str_bytes,
+    },
     macros::map,
     maps::{PerCpuArray, RingBuf},
     programs::TracePointContext,
 };
-use sensor_linux_wire::{FileOpenEvent, is_filtered_path};
+use sensor_linux_wire::{DISPATCH_OPENAT2, FileOpenEvent, is_filtered_path};
 
 use crate::{
     arch::{SyscallRecord, arg_offset},
@@ -62,19 +65,58 @@ const OPENAT_FLAGS_OFFSET: usize = arg_offset(2);
 const OPEN_FILENAME_PTR_OFFSET: usize = arg_offset(0);
 const OPEN_FLAGS_OFFSET: usize = arg_offset(1);
 
-pub fn sys_enter_openat(ctx: TracePointContext) -> u32 {
-    into_ret(try_sys_enter_openat(ctx))
+/// Where an `openat`-shaped call keeps its flags (#349). `openat2(2)` (5.6+) takes the same
+/// `dfd` and `filename`, but its third argument is a `struct open_how *`, whose first field is
+/// the `u64` flags; `resolve` restricts how the path is walked, not what is opened, so it is not
+/// read. Fieldless on purpose: an enum with a payload crossing a call boundary once failed the
+/// verifier's uninitialised-stack check (`path_filter.rs`).
+#[derive(Clone, Copy)]
+pub enum OpenFlags {
+    /// `openat(2)`: the flags are the third argument.
+    InArgument,
+    /// `openat2(2)`: the third argument points to a `struct open_how`.
+    InOpenHow,
 }
 
-fn try_sys_enter_openat(ctx: TracePointContext) -> Result<u32, u32> {
+impl OpenFlags {
+    /// The flag source of a `raw_sys_enter` action routed to [`sys_enter_openat`].
+    #[must_use]
+    pub fn from_action(action: u32) -> Self {
+        if action == DISPATCH_OPENAT2 {
+            Self::InOpenHow
+        } else {
+            Self::InArgument
+        }
+    }
+}
+
+pub fn sys_enter_openat(ctx: TracePointContext, flags_source: OpenFlags) -> u32 {
+    into_ret(try_sys_enter_openat(ctx, flags_source))
+}
+
+fn try_sys_enter_openat(ctx: TracePointContext, flags_source: OpenFlags) -> Result<u32, u32> {
     let filename_ptr: u64 = unsafe {
         ctx.read_ulong_arg(OPENAT_FILENAME_PTR_OFFSET)
             .map_err(|_| 1u32)?
     };
-
-    let flags: i64 = unsafe { ctx.read_long_arg(OPENAT_FLAGS_OFFSET).map_err(|_| 1u32)? };
+    let flags = read_open_flags(&ctx, flags_source)?;
 
     emit_file_open_event(filename_ptr, flags)
+}
+
+/// The open flags, read from the argument or from the caller's `struct open_how`.
+fn read_open_flags(ctx: &TracePointContext, flags_source: OpenFlags) -> Result<i64, u32> {
+    match flags_source {
+        OpenFlags::InArgument => unsafe {
+            ctx.read_long_arg(OPENAT_FLAGS_OFFSET).map_err(|_| 1u32)
+        },
+        OpenFlags::InOpenHow => {
+            let how_ptr: u64 =
+                unsafe { ctx.read_ulong_arg(OPENAT_FLAGS_OFFSET).map_err(|_| 1u32)? };
+            let flags = unsafe { bpf_probe_read_user(how_ptr as *const u64).map_err(|_| 1u32)? };
+            Ok(flags as i64)
+        }
+    }
 }
 
 pub fn sys_enter_open(ctx: TracePointContext) -> u32 {
@@ -92,7 +134,7 @@ fn try_sys_enter_open(ctx: TracePointContext) -> Result<u32, u32> {
     emit_file_open_event(filename_ptr, flags)
 }
 
-/// Shared by `sys_enter_openat` and `sys_enter_open` above: both land on the same
+/// Shared by `sys_enter_openat` (and `openat2`) and `sys_enter_open` above: all land on the same
 /// `FileOpenEvent` shape/`FILE_OPEN_EVENTS` ring buffer, and differ only in where
 /// `filename`/`flags` sit in the tracepoint record.
 fn emit_file_open_event(filename_ptr: u64, flags: i64) -> Result<u32, u32> {

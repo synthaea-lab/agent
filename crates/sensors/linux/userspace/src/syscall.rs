@@ -8,7 +8,7 @@
 use aya::maps::Array;
 #[cfg(ebpf_embedded)]
 use schema::sensor::SensorError;
-use sensor_linux_wire::{DISPATCH_CONNECT, DISPATCH_SENDTO, DISPATCH_WRITE};
+use sensor_linux_wire::{DISPATCH_CONNECT, DISPATCH_OPENAT2, DISPATCH_SENDTO, DISPATCH_WRITE};
 
 #[cfg(ebpf_embedded)]
 use crate::ebpf::err;
@@ -62,6 +62,7 @@ const DISPATCH_ENTRIES: &[(libc::c_long, u32)] = &[
     (libc::SYS_unshare, 43),
     (libc::SYS_recvfrom, 44),
     (libc::SYS_socket, 45),
+    (libc::SYS_openat2, DISPATCH_OPENAT2),
 ];
 
 /// Linux's asm-generic syscall numbers used by native AArch64. Legacy syscalls
@@ -108,6 +109,7 @@ const DISPATCH_ENTRIES: &[(libc::c_long, u32)] = &[
     (97, 43),                // unshare
     (207, 44),               // recvfrom
     (198, 45),               // socket
+    (437, DISPATCH_OPENAT2), // openat2
 ];
 
 #[cfg(ebpf_embedded)]
@@ -146,20 +148,20 @@ fn syscall_id_to_i64(syscall_id: libc::c_long) -> i64 {
 mod tests {
     use std::collections::HashSet;
 
-    use super::DISPATCH_ENTRIES;
+    use super::{DISPATCH_ENTRIES, DISPATCH_OPENAT2};
 
     #[test]
     fn dispatch_actions_are_unique_and_in_range() {
         let mut actions = HashSet::new();
         for &(syscall_id, action) in DISPATCH_ENTRIES {
             assert!((0..1024).contains(&syscall_id));
-            assert!((1..=45).contains(&action));
+            assert!((1..=DISPATCH_OPENAT2).contains(&action));
             assert!(
                 actions.insert(action),
                 "duplicate dispatcher action {action}"
             );
         }
         assert!(actions.contains(&1));
-        assert!(actions.contains(&45));
+        assert!(actions.contains(&DISPATCH_OPENAT2));
     }
 }

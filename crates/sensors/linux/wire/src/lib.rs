@@ -528,6 +528,10 @@ pub const DISPATCH_CONNECT: u32 = 3;
 pub const DISPATCH_WRITE: u32 = 4;
 /// See [`DISPATCH_CONNECT`].
 pub const DISPATCH_SENDTO: u32 = 16;
+/// The `SYSCALL_DISPATCH` handler id of `openat2(2)` (#349). It shares `sys_enter_openat`'s
+/// handler, which reads the flags from `struct open_how` for this id only; userspace maps the
+/// syscall to it and the router passes it on, so both sides name it.
+pub const DISPATCH_OPENAT2: u32 = 46;
 /// Budget for TLS plaintext capture (first N bytes). Chosen to fit comfortably
 /// in a ring-buffer event with metadata while staying under 512 bytes total.
 pub const MAX_TLS_CAPTURE: usize = 256;
