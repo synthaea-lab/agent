@@ -107,7 +107,10 @@ fn spawn_socket_poller(
 /// Event Log sensor: its failure is logged, never fatal — `EndpointSecurity`
 /// is the sensor that must work. Returns the `log stream` child so shutdown
 /// can kill it (which ends the tail thread's stream and thus the thread).
-fn spawn_unifiedlog_tail(sink: Arc<dyn EventSink>) -> std::io::Result<Option<std::process::Child>> {
+fn spawn_unifiedlog_tail(
+    sink: Arc<dyn EventSink>,
+    counters: Arc<sensor_macos_unifiedlog::StreamCounters>,
+) -> std::io::Result<Option<std::process::Child>> {
     let mut child = match sensor_macos_unifiedlog::spawn_stream() {
         Ok(child) => child,
         Err(e) => {
@@ -120,7 +123,6 @@ fn spawn_unifiedlog_tail(sink: Arc<dyn EventSink>) -> std::io::Result<Option<std
         return Ok(None);
     };
     let spawned = crate::spawn::spawn_named("unifiedlog-tail", move || {
-        let counters = Arc::new(sensor_macos_unifiedlog::StreamCounters::default());
         let stream = sensor_macos_unifiedlog::NormalizedLogStream::with_counters(
             std::io::BufReader::new(stdout),
             Arc::clone(&counters),
@@ -245,7 +247,10 @@ fn run_macos_sensors(sink: Box<dyn EventSink>, redact_commands: bool) -> anyhow:
     spawn_network_extension_receiver(Arc::clone(&sink))?;
     let poll_stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
     spawn_socket_poller(Arc::clone(&sink), Arc::clone(&poll_stop))?;
-    let log_child = spawn_unifiedlog_tail(Arc::clone(&sink))?;
+    // Created here, not in the tail thread, so the agent holds the handle the macOS health
+    // beacon (#34) will read, as `skew` is held on the network-extension side.
+    let log_counters = Arc::new(sensor_macos_unifiedlog::StreamCounters::default());
+    let log_child = spawn_unifiedlog_tail(Arc::clone(&sink), Arc::clone(&log_counters))?;
     let log_child = std::sync::Mutex::new(log_child);
 
     ctrlc::set_handler(move || {

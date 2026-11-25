@@ -48,9 +48,7 @@ impl SkewTotals {
     pub fn is_clean(&self) -> bool {
         *self == Self::default()
     }
-}
 
-impl SkewTotals {
     /// What was skipped since `earlier`, an older reading of the same counters.
     #[must_use]
     pub fn since(&self, earlier: &Self) -> Self {
@@ -82,8 +80,10 @@ pub struct NormalizedNeStream<R> {
 }
 
 impl<R: BufRead> NormalizedNeStream<R> {
-    /// A stream with counters of its own.
-    pub fn new(reader: R) -> Self {
+    /// A stream with counters of its own, for tests: a caller outside them has no way to read the
+    /// counters, so it injects a handle with [`Self::with_counters`].
+    #[cfg(test)]
+    fn new(reader: R) -> Self {
         Self::with_counters(reader, Arc::new(SkewCounters::default()))
     }
 
@@ -100,6 +100,19 @@ impl<R: BufRead> NormalizedNeStream<R> {
     #[must_use]
     pub fn counters(&self) -> Arc<SkewCounters> {
         Arc::clone(&self.counters)
+    }
+
+    /// Counts one skipped record, warning when the total for its cause reaches a power of two:
+    /// one connection can last the whole run, so a version-skewed extension must show while it
+    /// lives, not only when the connection ends (no health beacon on macOS yet, #34).
+    fn count_skip(&self, cause: &AtomicU64, what: &'static str) {
+        let total = cause.fetch_add(1, Ordering::Relaxed) + 1;
+        if total.is_power_of_two() {
+            tracing::warn!(
+                total,
+                "network-extension receiver: record skipped ({what}); extension version skew?"
+            );
+        }
     }
 }
 
@@ -120,18 +133,16 @@ impl<R: BufRead> Iterator for NormalizedNeStream<R> {
                 Err(_) => {
                     // A record kind or field shape this build doesn't know —
                     // a newer extension. Skip the line, never the stream.
-                    self.counters.unparseable.fetch_add(1, Ordering::Relaxed);
+                    self.count_skip(&self.counters.unparseable, "unparseable");
                     continue;
                 }
             };
             if record.version() != WIRE_VERSION {
-                self.counters
-                    .unknown_version
-                    .fetch_add(1, Ordering::Relaxed);
+                self.count_skip(&self.counters.unknown_version, "unknown wire version");
                 continue;
             }
             let Some(event) = normalize(&record) else {
-                self.counters.unmapped.fetch_add(1, Ordering::Relaxed);
+                self.count_skip(&self.counters.unmapped, "no schema event");
                 continue;
             };
             return Some(Ok(event));
@@ -217,9 +228,8 @@ mod tests {
 
     #[test]
     fn a_record_with_no_schema_event_counts_as_unmapped() {
-        // A literal-IP remote is required: a hostname parses but maps to no event.
-        let unmapped = r#"{"kind":"flow","v":1,"ts_ns":1,"pid":4242,"direction":"outbound","remote_addr":"not-an-ip.example","remote_port":443,"protocol":6}"#;
-        let mut stream = NormalizedNeStream::new(Cursor::new(unmapped));
+        // A hostname parses but maps to no event: a literal-IP remote is required.
+        let mut stream = NormalizedNeStream::new(Cursor::new(UNMAPPED));
         assert!(stream.next().is_none());
         assert_eq!(
             stream.counters().totals(),
@@ -231,14 +241,14 @@ mod tests {
         );
     }
 
+    const UNMAPPED: &str = r#"{"kind":"flow","v":1,"ts_ns":1,"pid":4242,"direction":"outbound","remote_addr":"not-an-ip.example","remote_port":443,"protocol":6}"#;
+
     #[test]
-    fn connections_share_counters_and_totals_since_isolates_one() {
-        // A literal-IP remote is required: a hostname parses but maps to no event.
-        let unmapped = r#"{"kind":"flow","v":1,"ts_ns":1,"pid":4242,"direction":"outbound","remote_addr":"not-an-ip.example","remote_port":443,"protocol":6}"#;
+    fn connections_share_one_set_of_counters() {
         let shared = Arc::new(SkewCounters::default());
         for _ in 0..2 {
             let mut stream =
-                NormalizedNeStream::with_counters(Cursor::new(unmapped), Arc::clone(&shared));
+                NormalizedNeStream::with_counters(Cursor::new(UNMAPPED), Arc::clone(&shared));
             assert!(stream.next().is_none());
         }
         assert_eq!(
@@ -247,14 +257,32 @@ mod tests {
             "one per connection, same handle"
         );
         assert_eq!(shared.totals().unparseable, 0);
+    }
 
+    #[test]
+    fn totals_since_an_earlier_reading_count_only_what_came_after() {
+        let shared = Arc::new(SkewCounters::default());
+        let mut first =
+            NormalizedNeStream::with_counters(Cursor::new(UNMAPPED), Arc::clone(&shared));
+        assert!(first.next().is_none());
         let before = shared.totals();
-        let mut stream =
-            NormalizedNeStream::with_counters(Cursor::new(unmapped), Arc::clone(&shared));
-        assert!(stream.next().is_none());
-        let delta = shared.totals().since(&before);
-        assert_eq!(delta.unmapped, 1, "only the third connection's record");
-        assert!(SkewTotals::default().since(&before).is_clean());
+        let mut second =
+            NormalizedNeStream::with_counters(Cursor::new(UNMAPPED), Arc::clone(&shared));
+        assert!(second.next().is_none());
+        assert_eq!(
+            shared.totals().since(&before).unmapped,
+            1,
+            "only the second connection's record"
+        );
+    }
+
+    #[test]
+    fn since_never_underflows() {
+        let later = SkewTotals {
+            unmapped: 3,
+            ..SkewTotals::default()
+        };
+        assert!(SkewTotals::default().since(&later).is_clean());
     }
 
     #[cfg(unix)]
