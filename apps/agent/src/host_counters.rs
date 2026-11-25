@@ -89,7 +89,8 @@ pub(crate) struct AgentHostCounters {
 
 impl AgentHostCounters {
     /// The counters every platform has. A platform sensor's own totals are added with
-    /// [`Self::with_ebpf_sensor_totals`] or [`Self::with_etw_shed_reader`].
+    /// `with_ebpf_sensor_totals` (Linux) or `with_etw_shed_reader` (Windows). Plain text, not
+    /// links: each builder exists only on its platform, so a link would break the other's docs.
     pub(crate) fn new(sink: Arc<DetectionSink>, watchdog: WatchdogReport) -> Self {
         Self {
             sink,
