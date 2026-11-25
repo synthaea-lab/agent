@@ -27,8 +27,10 @@ class CountPlatformCfg(unittest.TestCase):
             "if cfg!(windows) { 1 } else { 2 }",
             '#[cfg_attr(unix, allow(dead_code))]',
             '#[cfg(target_family = "unix")]',
+            '#[cfg(target_vendor = "apple")]',
+            '#[cfg(target_env = "msvc")]',
         ])
-        self.assertEqual(tool.count_platform_cfg(text), 7)
+        self.assertEqual(tool.count_platform_cfg(text), 9)
 
     def test_other_cfgs_comments_and_words_do_not_count(self) -> None:
         text = "\n".join([
@@ -158,6 +160,87 @@ class CfgTestItems(unittest.TestCase):
         self.assertEqual(tool.count_platform_cfg(text), 0)
 
 
+    def test_a_multi_line_cfg_test_use_does_not_hide_the_code_after_it(self) -> None:
+        text = "\n".join([
+            "#[cfg(test)]",
+            "pub(crate) use stateless::{",
+            "    a,",
+            "    b,",
+            "};",
+            "",
+            "#[cfg(windows)]",
+            "pub struct Alert {",
+            "}",
+        ])
+        self.assertEqual(tool.count_platform_cfg(text), 1)
+
+    def test_a_multi_line_cfg_test_const_does_not_hide_the_code_after_it(self) -> None:
+        text = "\n".join([
+            "#[cfg(test)]",
+            "const FIXTURE: Fixture = Fixture {",
+            "    a: 1,",
+            "};",
+            "#[cfg(unix)]",
+            "fn real() {",
+            "}",
+        ])
+        self.assertEqual(tool.count_platform_cfg(text), 1)
+
+    def test_a_macro_invocation_after_a_test_module_is_counted(self) -> None:
+        text = "\n".join([
+            "#[cfg(test)]",
+            "mod tests {",
+            "    #[cfg(unix)]",
+            "    fn fixture() {}",
+            "}",
+            "cfg_if::cfg_if! {",
+            "    if #[cfg(unix)] {",
+            "        fn p() {}",
+            "    }",
+            "}",
+            "foo!();",
+            "#[cfg(windows)]",
+            "fn q() {}",
+        ])
+        self.assertEqual(tool.count_platform_cfg(text), 2)
+
+    def test_a_const_fn_and_a_const_generic_impl_are_block_items(self) -> None:
+        for item in ("const fn helper() {", "impl<const N: usize> Buf<N> {", "unsafe impl Send for X {"):
+            with self.subTest(item=item):
+                text = "\n".join([
+                    "#[cfg(test)]",
+                    item,
+                    "    #[cfg(unix)]",
+                    "    fn fixture() {}",
+                    "}",
+                    "#[cfg(windows)]",
+                    "fn real() {}",
+                ])
+                self.assertEqual(tool.count_platform_cfg(text), 1)
+
+    def test_braces_in_strings_chars_and_comments_end_nothing(self) -> None:
+        text = "\n".join([
+            "#[cfg(test)]",
+            "mod tests {",
+            '    const A: &str = "}";',
+            "    const B: char = '}';",
+            "    const C: &str = \"\\\"}\";",
+            "    // }",
+            "    /* } /* } */ } */",
+            "    fn lifetime<'a>(x: &'a str) {}",
+            "    #[cfg(unix)]",
+            "    fn fixture() {}",
+            "}",
+            "#[cfg(windows)]",
+            "fn real() {}",
+        ])
+        self.assertEqual(tool.count_platform_cfg(text), 1)
+
+    def test_a_cfg_test_item_that_never_ends_is_skipped_to_the_end(self) -> None:
+        text = "\n".join(["#[cfg(test)]", "mod tests {", "    #[cfg(unix)]"])
+        self.assertEqual(tool.count_platform_cfg(text), 0)
+
+
 class MultiLineCfg(unittest.TestCase):
     def test_a_cfg_split_over_several_lines_counts_once(self) -> None:
         text = "\n".join([
@@ -185,6 +268,15 @@ class MultiLineCfg(unittest.TestCase):
             "fn linux() {}",
         ])
         self.assertEqual(tool.count_platform_cfg(text), 0)
+
+    def test_a_platform_word_on_the_same_line_after_the_cfg_does_not_count(self) -> None:
+        for line in (
+            '#[cfg(feature = "tls")] fn linux() {}',
+            '#[cfg(feature = "unix-socket")]',
+            "fn f() {} // see cfg(windows)",
+        ):
+            with self.subTest(line=line):
+                self.assertEqual(tool.count_platform_cfg(line), 0)
 
     def test_an_unbalanced_cfg_does_not_run_away(self) -> None:
         text = "\n".join(["#[cfg(any("] + ["let x = 1;"] * 100 + ["#[cfg(windows)]", "fn f() {}"])
@@ -221,8 +313,20 @@ class Violations(unittest.TestCase):
         path = "crates/yara/src/access.rs"
         ceiling = tool.EXCEPTIONS[path][0]
         self.assertEqual(tool.violations(tree({path: ceiling})), [])
-        self.assertEqual(tool.violations(tree({path: ceiling - 1})), [])
         self.assertEqual(len(tool.violations(tree({path: ceiling + 1}))), 1)
+
+    def test_a_ceiling_above_the_count_must_be_lowered(self) -> None:
+        path = "crates/yara/src/access.rs"
+        ceiling = tool.EXCEPTIONS[path][0]
+        problems = tool.violations(tree({path: ceiling - 1}))
+        self.assertEqual(len(problems), 1)
+        self.assertIn(f"lower EXCEPTIONS['{path}'] to {ceiling - 1}", problems[0])
+
+    def test_a_listed_file_with_no_branch_left_must_leave_the_list(self) -> None:
+        path = "crates/yara/src/access.rs"
+        problems = tool.violations(tree({path: 0}))
+        self.assertEqual(len(problems), 1)
+        self.assertIn("remove it from EXCEPTIONS", problems[0])
 
     def test_an_exception_for_a_file_that_is_gone_is_reported(self) -> None:
         counts = tree({})
@@ -239,6 +343,13 @@ class Violations(unittest.TestCase):
 
 
 class RealTree(unittest.TestCase):
+    def test_it_gives_the_same_answer_from_a_subdirectory(self) -> None:
+        result = subprocess.run(
+            [sys.executable, str(TOOL)], cwd=REPO / "tools", capture_output=True, text=True,
+            check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
     def test_the_repository_passes(self) -> None:
         result = subprocess.run(
             [sys.executable, str(TOOL)], cwd=REPO, capture_output=True, text=True, check=False

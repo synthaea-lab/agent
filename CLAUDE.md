@@ -71,13 +71,15 @@ New crate? Add it to the rules in `tools/check-deps.py` in the same change.
   Platform deps must be target-gated: `[target.'cfg(windows)'.dependencies]`, never
   unconditional.
 - `tools/check-platform-cfg.py` enforces this in CI (`lint` job). It counts source lines with a
-  platform `cfg` (`target_os`, `target_family`, `windows`, `unix`, `macos`, `linux`; an attribute
-  split over several lines counts once), leaving out comments and the items a column-0
-  `#[cfg(test)]` opens (a `use`, `mod tests;`, a test module). It does not look at
-  `Cargo.toml`: that platform dependencies are target-gated is not enforced by it. Not counted at all: the places above, `apps/`
-  (each binary owns its OS entry point), `tools/` and test code. Everywhere else the count is
-  zero, except the core-crate files in the script's `EXCEPTIONS` table, which hold a ceiling
-  that may go down, never up. The exceptions, each with its reason:
+  platform `cfg` (`target_os`, `target_family`, `target_vendor`, `target_env`, `windows`, `unix`,
+  `macos`, `linux`; an attribute split over several lines counts once), leaving out comments
+  and the items a column-0 `#[cfg(test)]` opens (a `use`, `const`, `mod tests;`, a test
+  module, found by bracket depth). It does not look at `Cargo.toml`: that platform
+  dependencies are target-gated is not enforced by it. Not counted at all: the places above,
+  `apps/` (each binary owns its OS entry point), `tools/` and test code. Everywhere else the
+  count is zero, except the core-crate files in the script's `EXCEPTIONS` table, which hold a ceiling
+  that may go down, never up: the check fails when a count drops below its ceiling, until the
+  number is lowered in the same change. The exceptions, each with its reason:
   - `config`: default config path per OS (`discovery.rs`), the shape of `ipc.endpoint`
     (named pipe or socket path, `load.rs`), the Linux default template (`template.rs`).
   - `ipc` (`stream.rs`): the one place that picks a Unix socket or a Windows named pipe, with
