@@ -220,10 +220,12 @@ fn may_leave_its_prefix(path: &[u8]) -> bool {
         let Some(chunk) = path.get(start..start + WORD) else {
             break;
         };
-        let Ok(bytes) = <[u8; WORD]>::try_from(chunk) else {
-            break;
-        };
-        let word = u64::from_le_bytes(bytes);
+        // Built from single-byte reads, not `u64::from_le_bytes`: LLVM turns that into one
+        // 8-byte load, and the path buffer is not 8-aligned for every handler.
+        let mut word = 0u64;
+        for (k, &byte) in chunk.iter().enumerate() {
+            word |= u64::from(byte) << (8 * k);
+        }
         let slashes = bytes_equal(word, b'/');
         let dots = bytes_equal(word, b'.');
         // Little-endian: byte k + 1 sits eight bits above byte k.
