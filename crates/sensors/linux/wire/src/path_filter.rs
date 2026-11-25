@@ -189,26 +189,37 @@ pub fn is_filtered_path(path: &[u8], flags: i64, is_mutation: bool) -> bool {
 /// path (the `&&` in [`is_filtered_path`]), at most [`crate::MAX_PATH_LEN`] steps over
 /// bytes the probe already read, with no nested loop: what `verify_probes` has to fit on
 /// 5.14 and 5.15 (see the module comment on #429).
+///
+/// The body has no branch on the bytes, only arithmetic, and the one branch per step is the
+/// bounds check. A first version compared each byte in an `if` and returned early. Every
+/// handler in `raw_sys_enter` inlines this, so the verifier tracked a known and an unknown
+/// "previous byte" per step, per call site, and `raw_sys_enter` went past the
+/// 1M-instruction limit on 6.1 (`E2BIG`; 254,839 on `main`).
 fn may_leave_its_prefix(path: &[u8]) -> bool {
-    let mut slashes = 0u32;
-    let mut previous = 0u8;
+    let mut slashes = 0u64;
+    let mut previous_is_slash = 0u64;
+    let mut leaves = 0u64;
     let mut i = 0usize;
     while i < crate::MAX_PATH_LEN {
         let Some(&byte) = path.get(i) else {
             break;
         };
-        if previous == b'/' && (byte == b'.' || byte == b'/') {
-            return true;
-        }
-        if byte == b'/' {
-            slashes += 1;
-        }
-        previous = byte;
+        let is_slash = is_byte(byte, b'/');
+        leaves |= previous_is_slash & (is_slash | is_byte(byte, b'.'));
+        slashes += is_slash;
+        previous_is_slash = is_slash;
         i += 1;
     }
     // `/dev/fd/<n>/...` has a fourth `/`; `/dev/stdin/...` (and the other two) a third.
-    (path.starts_with(b"/dev/fd/") && slashes >= 4)
+    leaves != 0
+        || (path.starts_with(b"/dev/fd/") && slashes >= 4)
         || (path.starts_with(b"/dev/std") && slashes >= 3)
+}
+
+/// 1 when `byte == wanted`, else 0, without a branch: `byte ^ wanted` is 0 only on a match,
+/// and only 0 wraps below zero, which sets the top bit.
+fn is_byte(byte: u8, wanted: u8) -> u64 {
+    (u64::from(byte ^ wanted)).wrapping_sub(1) >> 63
 }
 
 /// The prefix rules alone, on the path as the caller spelled it.
@@ -569,6 +580,15 @@ mod tests {
         // filtered.
         assert!(is_filtered_path(b"/sys/devices/cpu0.1/uevent", 0, false));
         assert!(is_filtered_path(b"/tmp/lib.so.6", 0, false));
+    }
+
+    #[test]
+    fn the_branchless_byte_test_matches_equality_for_every_byte() {
+        for byte in 0..=u8::MAX {
+            for wanted in *b"/." {
+                assert_eq!(is_byte(byte, wanted), u64::from(byte == wanted), "{byte}");
+            }
+        }
     }
 
     #[test]
