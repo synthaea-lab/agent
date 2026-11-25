@@ -54,6 +54,31 @@ impl SetTimeWindow {
 /// One Linux timestomp alert per process incarnation per this window (#1036).
 pub(crate) const SET_TIME_ALERT_WINDOW_NS: u64 = 60_000_000_000;
 
+/// The directory, below `/var/lib`, where systemd keeps the last-trigger stamp of a
+/// `Persistent=true` timer.
+const SYSTEMD_TIMER_STAMP_PARENTS: [&str; 2] = ["systemd", "timers"];
+
+/// Whether `event` is systemd stamping a persistent timer (#353): pid 1 sets the mtime of
+/// `/var/lib/systemd/timers/stamp-<unit>.timer` every time such a timer fires, so every
+/// systemd host with `logrotate.timer`, `fstrim.timer` or `dnf-makecache.timer` raised a Low
+/// T1070.006 case per run.
+///
+/// Keyed on pid 1, not on `comm`: the Linux sensor reports the tgid of the initial pid
+/// namespace (`bpf_get_current_pid_tgid`), where only init itself is 1 (a container's own init
+/// has a host pid), and no process can rename or start its way into it. Read on the last three
+/// segments, not the full path: the hook rebuilds the path from dentries, so on a host where
+/// `/var` or `/var/lib` is its own mount the mount prefix is missing (`lsm.md`). Only the stamp
+/// is skipped: pid 1 setting a time on any other file still alerts.
+fn is_systemd_timer_stamp(event: &schema::FileSetTimeEvent) -> bool {
+    let mut segments = event.path.rsplit('/');
+    let name = segments.next().unwrap_or_default();
+    let parents: Vec<&str> = segments.take(SYSTEMD_TIMER_STAMP_PARENTS.len()).collect();
+    event.meta.pid == 1
+        && name.starts_with("stamp-")
+        && name.ends_with(".timer")
+        && parents.iter().rev().eq(SYSTEMD_TIMER_STAMP_PARENTS.iter())
+}
+
 /// The sliding history of the file-impact rules. The rules that trust a process by its binary
 /// read the exec-time image table `RuleState` keeps, passed in as `images`.
 pub(crate) struct ImpactState {
@@ -481,7 +506,7 @@ impl ImpactState {
 
     /// The Linux per-process dedup of [`crate::RuleState::on_file_set_time`] over the `alerts`
     /// a Unix event raised: one alert per process incarnation per
-    /// [`SET_TIME_ALERT_WINDOW_NS`], package managers skipped.
+    /// [`SET_TIME_ALERT_WINDOW_NS`], package managers and systemd's timer stamps skipped.
     pub(crate) fn dedup_file_set_time(
         &mut self,
         event: &schema::FileSetTimeEvent,
@@ -494,9 +519,9 @@ impl ImpactState {
         // `touch` named `/tmp/rpm`, or `python3` renamed to `rpm`, would otherwise stomp silently
         // (#1045 review). Fails closed: a package manager whose exec the sensor missed (started
         // before the agent) alerts at Low until it exits.
-        if crate::stateless::is_package_manager_comm(&event.meta.comm)
-            && Self::runs_trusted_binary_named(&event.meta, images)
-        {
+        let package_manager = crate::stateless::is_package_manager_comm(&event.meta.comm)
+            && Self::runs_trusted_binary_named(&event.meta, images);
+        if package_manager || is_systemd_timer_stamp(event) {
             return Vec::new();
         }
         let key = (event.meta.pid, event.meta.process_generation.unwrap_or(0));
