@@ -190,30 +190,83 @@ pub fn is_filtered_path(path: &[u8], flags: i64, is_mutation: bool) -> bool {
 /// bytes the probe already read, with no nested loop: what `verify_probes` has to fit on
 /// 5.14 and 5.15 (see the module comment on #429).
 ///
-/// The body has no branch on the bytes, only arithmetic, and the one branch per step is the
-/// bounds check. A first version compared each byte in an `if` and returned early. Every
-/// handler in `raw_sys_enter` inlines this, so the verifier tracked a known and an unknown
-/// "previous byte" per step, per call site, and `raw_sys_enter` went past the
-/// 1M-instruction limit on 6.1 (`E2BIG`; 254,839 on `main`).
+/// The body never branches on the bytes, and it reads them eight at a time. Every handler in
+/// `raw_sys_enter` inlines this, so its cost is paid once per call site the verifier walks.
+/// Measured with `verify_probes` (`raw_sys_enter`, verified instructions):
+///
+/// | version | 6.1 (Debian 12) | 5.14 (RHEL 9.9) |
+/// | --- | --- | --- |
+/// | `main`, no scan | 254,839 | 242,708 |
+/// | an `if` per byte, early return | refused, `E2BIG` | not run |
+/// | branchless, a byte per step | 469,697 | 664,321 (36k under the 700k ceiling) |
+/// | branchless, a word per step (this one) | see the PR | see the PR |
+///
+/// Per word, `bytes_equal` marks each `/` and each `.` with `0x80`, and a `/` followed by
+/// either one is the marks of the slashes moved up one byte, masked by both. The last byte's
+/// slash carries into the next word, or into the tail of under eight bytes, which goes a byte
+/// at a time.
 fn may_leave_its_prefix(path: &[u8]) -> bool {
-    let mut slashes = 0u64;
-    let mut previous_is_slash = 0u64;
+    const WORD: usize = 8;
     let mut leaves = 0u64;
-    let mut i = 0usize;
-    while i < crate::MAX_PATH_LEN {
+    // `0x80` when the byte just before the next word or tail byte is a `/`.
+    let mut slash_before = 0u64;
+    // Slashes at byte 5 or later, and at byte 8 or later, for the aliases at the end.
+    let mut slashes_from_5 = 0u64;
+    let mut slashes_from_8 = 0u64;
+    let mut words = 0usize;
+    while words < crate::MAX_PATH_LEN / WORD {
+        let start = words * WORD;
+        let Some(chunk) = path.get(start..start + WORD) else {
+            break;
+        };
+        let Ok(bytes) = <[u8; WORD]>::try_from(chunk) else {
+            break;
+        };
+        let word = u64::from_le_bytes(bytes);
+        let slashes = bytes_equal(word, b'/');
+        let dots = bytes_equal(word, b'.');
+        // Little-endian: byte k + 1 sits eight bits above byte k.
+        leaves |= ((slashes << 8) | slash_before) & (slashes | dots);
+        slash_before = slashes >> 56;
+        if words == 0 {
+            slashes_from_5 |= slashes & 0x8080_8000_0000_0000;
+        } else {
+            slashes_from_8 |= slashes;
+        }
+        words += 1;
+    }
+    let mut i = words * WORD;
+    let tail_end = i + WORD;
+    while i < tail_end {
         let Some(&byte) = path.get(i) else {
             break;
         };
         let is_slash = is_byte(byte, b'/');
-        leaves |= previous_is_slash & (is_slash | is_byte(byte, b'.'));
-        slashes += is_slash;
-        previous_is_slash = is_slash;
+        leaves |= (slash_before >> 7) & (is_slash | is_byte(byte, b'.'));
+        slash_before = is_slash << 7;
+        if i >= 8 {
+            slashes_from_8 |= is_slash;
+        } else if i >= 5 {
+            slashes_from_5 |= is_slash;
+        }
         i += 1;
     }
-    // `/dev/fd/<n>/...` has a fourth `/`; `/dev/stdin/...` (and the other two) a third.
+    // `/dev/fd/<n>/...` has a `/` past byte 7; `/dev/stdin/...` (and the other two) past byte 4.
     leaves != 0
-        || (path.starts_with(b"/dev/fd/") && slashes >= 4)
-        || (path.starts_with(b"/dev/std") && slashes >= 3)
+        || (path.starts_with(b"/dev/fd/") && slashes_from_8 != 0)
+        || (path.starts_with(b"/dev/std") && (slashes_from_5 | slashes_from_8) != 0)
+}
+
+/// `0x80` in each byte of `word` equal to `wanted`, 0 elsewhere.
+fn bytes_equal(word: u64, wanted: u8) -> u64 {
+    zero_bytes(word ^ (0x0101_0101_0101_0101 * u64::from(wanted)))
+}
+
+/// `0x80` in each zero byte of `x`, 0 elsewhere. Exact: the shorter `(x - ONES) & !x & HIGH`
+/// also marks a `0x01` byte above a zero one, through the borrow.
+fn zero_bytes(x: u64) -> u64 {
+    const LOW7: u64 = 0x7f7f_7f7f_7f7f_7f7f;
+    !((x & LOW7).wrapping_add(LOW7) | x | LOW7)
 }
 
 /// 1 when `byte == wanted`, else 0, without a branch: `byte ^ wanted` is 0 only on a match,
@@ -588,6 +641,70 @@ mod tests {
             for wanted in *b"/." {
                 assert_eq!(is_byte(byte, wanted), u64::from(byte == wanted), "{byte}");
             }
+        }
+    }
+
+    /// The rule `may_leave_its_prefix` implements, a byte at a time with plain comparisons:
+    /// what the word-at-a-time version is checked against.
+    fn leaves_by_bytes(path: &[u8]) -> bool {
+        let slash_at = |i: usize| path.get(i) == Some(&b'/');
+        let dot_or_empty_segment =
+            (1..path.len()).any(|i| slash_at(i - 1) && matches!(path[i], b'.' | b'/'));
+        let slash_from = |start: usize| (start..path.len()).any(slash_at);
+        dot_or_empty_segment
+            || (path.starts_with(b"/dev/fd/") && slash_from(8))
+            || (path.starts_with(b"/dev/std") && slash_from(5))
+    }
+
+    #[test]
+    fn the_word_scan_agrees_with_the_byte_rule_on_every_short_path() {
+        // Every string of up to 9 bytes over `/`, `.` and `a`, after each prefix that matters:
+        // covers a `/.` or `//` at every offset, both sides of the 8-byte word boundary, and
+        // the tail.
+        let alphabet = *b"/.a";
+        for prefix in [
+            &b""[..],
+            b"/dev/",
+            b"/dev/fd/",
+            b"/dev/std",
+            b"/sys/kernel/",
+        ] {
+            for len in 0..=9u32 {
+                for n in 0..3usize.pow(len) {
+                    let mut path = prefix.to_vec();
+                    let mut rest = n;
+                    for _ in 0..len {
+                        path.push(alphabet[rest % 3]);
+                        rest /= 3;
+                    }
+                    assert_eq!(
+                        may_leave_its_prefix(&path),
+                        leaves_by_bytes(&path),
+                        "{path:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_slash_dot_across_the_word_boundary_is_found() {
+        // Byte 7 is the last `/` of the first word, byte 8 the `.` of the second.
+        assert!(!is_filtered_path(b"/dev/ab/../../etc/x", 0, true));
+        assert!(!is_filtered_path(b"/dev/ab//x", 0, true));
+        assert!(is_filtered_path(b"/dev/ab/x.y", 0, true));
+    }
+
+    #[test]
+    fn the_zero_byte_mask_marks_exactly_the_zero_bytes() {
+        // The borrow case the shorter formula gets wrong: a 0x01 byte above a zero one.
+        assert_eq!(zero_bytes(0x4141_4141_4141_0100), 0x80);
+        assert_eq!(zero_bytes(0), 0x8080_8080_8080_8080);
+        assert_eq!(zero_bytes(u64::MAX), 0);
+        for byte in 0..=u8::MAX {
+            let word = u64::from(byte) << 24 | 0x4141_4141_0041_4141;
+            let expected = if byte == 0 { 0x8000_0000 } else { 0 };
+            assert_eq!(zero_bytes(word), expected, "{byte}");
         }
     }
 
