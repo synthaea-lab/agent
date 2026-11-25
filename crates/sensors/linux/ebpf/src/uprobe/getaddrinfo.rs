@@ -14,7 +14,6 @@ use aya_ebpf::{
     maps::{HashMap, PerCpuArray, RingBuf},
     programs::{ProbeContext, RetProbeContext},
 };
-use aya_log_ebpf::warn;
 use sensor_linux_wire::{GetAddrInfoEvent, MAX_DNS_ANSWERS};
 
 use crate::{AF_INET, AF_INET6, fill_event_meta, into_ret};
@@ -166,10 +165,7 @@ fn try_getaddrinfo_exit(ctx: RetProbeContext) -> Result<u32, u32> {
         (*e).answers_truncated = answers_truncated;
 
         if DNS_QUERY_EVENTS.output::<GetAddrInfoEvent>(&*e, 0).is_err() {
-            warn!(
-                &ctx,
-                "sensor-linux-ebpf: ring buffer full, dropping DNS query event"
-            );
+            crate::count_ring_drop(sensor_linux_wire::ring::DNS_QUERY);
         }
     }
 

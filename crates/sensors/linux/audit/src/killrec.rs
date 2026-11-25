@@ -20,6 +20,12 @@
 //! these syscalls), so it is not attributed; neither are `rt_sigqueueinfo`, `rt_tgsigqueueinfo`
 //! and `pidfd_send_signal`.
 //!
+//! A `SIGKILL` of the agent's watchdog counts too (#342): the agent dies with it (the watchdog
+//! starts it with `PR_SET_PDEATHSIG`), no record names the agent, and the record names the
+//! watchdog's pid. The marker keeps that pid only when this process was started the way the
+//! watchdog starts it ([`watchdog_pid`]); any other parent (a shell, init) is not the agent's
+//! supervisor, and a kill of it must not be blamed for the agent's death.
+//!
 //! Pure functions over text and files, so they run on every platform and are tested on lines
 //! captured from a real auditd.
 
@@ -244,6 +250,9 @@ pub struct Marker {
     /// The newest kernel record in the log at start. Within one boot, what comes after it in the
     /// log was written after the start, whatever the clock says. `None` with no readable record.
     pub anchor: Option<Anchor>,
+    /// The pid of the watchdog that started this instance, `None` when something else did (see
+    /// [`watchdog_pid`]). A `SIGKILL` of it kills this instance too, through `PR_SET_PDEATHSIG`.
+    pub watchdog_pid: Option<u32>,
 }
 
 /// The header of a line of the audit log, `msg=audit(<sec>.<ms>:<serial>)`: what a marker keeps to
@@ -265,11 +274,80 @@ impl Marker {
     pub fn is_hit_by(&self, record: &SigkillRecord) -> bool {
         let may_signal = record.euid == 0 || self.uid == Some(record.euid);
         match record.target {
-            KillTarget::Process(id) => id == self.pid || self.tids.contains(&id),
+            KillTarget::Process(id) => {
+                id == self.pid || self.tids.contains(&id) || self.watchdog_pid == Some(id)
+            }
             KillTarget::Group(group) => (group == self.pgid || group == self.pid) && may_signal,
             KillTarget::AllProcesses => may_signal,
         }
     }
+}
+
+impl Marker {
+    /// The pid the signal of `record` went to, for the event that reports it: the watchdog's when
+    /// that is what the record names, this instance's pid otherwise (a thread id, a group or
+    /// every process all end this instance, which is what the event says).
+    #[must_use]
+    pub fn signalled_pid(&self, record: &SigkillRecord) -> u32 {
+        match record.target {
+            KillTarget::Process(id)
+                if self.watchdog_pid == Some(id) && id != self.pid && !self.tids.contains(&id) =>
+            {
+                id
+            }
+            _ => self.pid,
+        }
+    }
+}
+
+/// The pid of the watchdog that started this process, `None` when something else did.
+///
+/// The watchdog starts the agent with `PR_SET_PDEATHSIG` = `SIGKILL` (`die_with_parent`), and the
+/// kernel keeps it across `execve` for a binary without file capabilities or set-id bits. So a
+/// process holding that setting has a parent that is the watchdog, or one that behaves like it:
+/// the agent dies with it. A parent started otherwise (a shell, a service manager) is not
+/// recorded: a kill of it would be blamed on the agent.
+///
+/// The death signal is a setting of the thread, not of the process, and `execve` keeps it only
+/// for the thread that survives it: the main thread. Called from any other thread this finds
+/// none, so it says so and returns `None` instead of reading a setting that was never there.
+#[cfg(target_os = "linux")]
+#[must_use]
+pub fn watchdog_pid() -> Option<u32> {
+    // SAFETY: `getpid(2)` and `gettid(2)` take no argument, cannot fail and touch no memory.
+    let (pid, tid) = unsafe { (libc::getpid(), libc::syscall(libc::SYS_gettid)) };
+    if libc::c_long::from(pid) != tid {
+        tracing::warn!(
+            "sensor-linux-audit: the watchdog is looked up from a thread other than the main one, a SIGKILL of the watchdog will not be attributed"
+        );
+        return None;
+    }
+    let mut signal: libc::c_int = 0;
+    // SAFETY: `PR_GET_PDEATHSIG` writes one `int` through the pointer, which is valid for it.
+    let rc = unsafe { libc::prctl(libc::PR_GET_PDEATHSIG, &raw mut signal) };
+    // SAFETY: `getppid(2)` takes no argument, cannot fail and touches no memory.
+    let ppid = unsafe { libc::getppid() };
+    supervisor_pid(rc == 0, signal, ppid)
+}
+
+/// No watchdog is looked for off Linux: the audit fallback is a Linux sensor.
+#[cfg(not(target_os = "linux"))]
+#[must_use]
+pub fn watchdog_pid() -> Option<u32> {
+    None
+}
+
+/// The signal the watchdog asks for as its child's death signal (`SIGKILL`).
+const DEATH_SIGNAL: i32 = 9;
+
+/// [`watchdog_pid`] on what the kernel said: the parent's pid when the death signal is `SIGKILL`
+/// and the parent is a real process other than init.
+#[cfg_attr(not(any(test, target_os = "linux")), allow(dead_code))]
+fn supervisor_pid(read_ok: bool, death_signal: i32, ppid: i32) -> Option<u32> {
+    if !read_ok || death_signal != DEATH_SIGNAL {
+        return None;
+    }
+    u32::try_from(ppid).ok().filter(|&pid| pid > 1)
 }
 
 /// The latest record of a `SIGKILL` that hit `marker`'s instance among `lines`, dated at or after
@@ -490,6 +568,8 @@ pub fn read_marker(state_dir: &Path) -> Option<Marker> {
         timestamp_ns,
         serial,
     });
+    // Absent from a marker written before #342, `-` when there was no watchdog.
+    let watchdog_pid = parts.next().and_then(|pid| pid.parse().ok());
     Some(Marker {
         pid,
         pgid,
@@ -498,6 +578,7 @@ pub fn read_marker(state_dir: &Path) -> Option<Marker> {
         tids,
         uid,
         anchor,
+        watchdog_pid,
     })
 }
 
@@ -544,7 +625,7 @@ pub(crate) fn write_marker_unless(
         .join(",");
     writeln!(
         file,
-        "{} {} {} {} {} {} {} {}",
+        "{} {} {} {} {} {} {} {} {}",
         marker.pid,
         marker.started_ns,
         marker.pgid,
@@ -559,6 +640,9 @@ pub(crate) fn write_marker_unless(
         marker
             .anchor
             .map_or_else(|| "-".to_string(), |a| a.timestamp_ns.to_string()),
+        marker
+            .watchdog_pid
+            .map_or_else(|| "-".to_string(), |pid| pid.to_string()),
     )?;
     std::fs::rename(tmp, state_dir.join(MARKER))
 }
@@ -887,6 +971,7 @@ mod tests {
                 timestamp_ns: 1_794_826_302_839_000_000,
                 serial: 31337,
             }),
+            watchdog_pid: Some(4200),
         };
         write_marker(dir.path(), &marker).unwrap();
         assert_eq!(read_marker(dir.path()), Some(marker.clone()));
@@ -897,6 +982,7 @@ mod tests {
             tids: Vec::new(),
             uid: None,
             anchor: None,
+            watchdog_pid: None,
             ..marker
         };
         write_marker(dir.path(), &bare).unwrap();
@@ -905,6 +991,9 @@ mod tests {
         std::fs::write(dir.path().join(MARKER), "7 8 9 boot\n").unwrap();
         let old = read_marker(dir.path()).unwrap();
         assert_eq!((old.pid, old.pgid, old.tids, old.uid), (7, 9, vec![], None));
+        // A marker written before #342 has eight fields: no watchdog.
+        std::fs::write(dir.path().join(MARKER), "7 8 9 boot - 0 31337 99\n").unwrap();
+        assert_eq!(read_marker(dir.path()).unwrap().watchdog_pid, None);
         // A marker that stored only the serial (no time) has no usable anchor.
         std::fs::write(dir.path().join(MARKER), "7 8 9 boot - 0 31337\n").unwrap();
         assert_eq!(read_marker(dir.path()).unwrap().anchor, None);
@@ -1324,5 +1413,93 @@ mod tests {
         // A refresh that fires after the hook's removal must not put the marker back.
         write_marker_unless(dir.path(), &marker(0x100, 900), &stopping).unwrap();
         assert!(read_marker(dir.path()).is_none());
+    }
+
+    /// A watchdog (pid 3000) that started the agent (pid 4242, tids 4242 and 4243).
+    fn supervised(started_s: u64) -> Marker {
+        Marker {
+            pid: 4242,
+            tids: vec![4242, 4243],
+            watchdog_pid: Some(3000),
+            ..marker(4242, started_s)
+        }
+    }
+
+    fn kill_of(target: u32) -> SigkillRecord {
+        parse_kill_log_line(&at(2000, &format!("{target:x}"))).unwrap()
+    }
+
+    #[test]
+    fn a_sigkill_of_the_watchdog_hits_the_agent_it_started_and_names_the_watchdog() {
+        let m = supervised(1000);
+        let record = kill_of(3000);
+        assert!(m.is_hit_by(&record));
+        assert_eq!(m.signalled_pid(&record), 3000);
+        // The agent's own pid and a thread of it still report the agent.
+        assert_eq!(m.signalled_pid(&kill_of(4242)), 4242);
+        assert_eq!(m.signalled_pid(&kill_of(4243)), 4242);
+    }
+
+    #[test]
+    fn without_a_watchdog_a_kill_of_the_parent_is_not_the_agents() {
+        let started_by_a_shell = Marker {
+            watchdog_pid: None,
+            ..supervised(1000)
+        };
+        assert!(!started_by_a_shell.is_hit_by(&kill_of(3000)));
+        // A pid that is neither the agent's, a thread's nor the watchdog's is no one's.
+        assert!(!supervised(1000).is_hit_by(&kill_of(3001)));
+    }
+
+    /// The line captured on Debian 13.7 (kernel 6.12.107, auditd 4.0.2, ENRICHED, 2026-11-24) when
+    /// `/usr/bin/kill -KILL 1034` hit the watchdog (`a0=40a`) of the packaged unit (#342). The
+    /// agent it started (pid 1318, parent 1034) died with it; no record names the agent.
+    const WATCHDOG_KILL: &str = "type=SYSCALL msg=audit(1795519432.428:293): arch=c000003e syscall=62 success=yes exit=0 a0=40a a1=9 a2=0 a3=7fbb962effe0 items=0 ppid=1109 pid=1420 auid=1000 uid=0 gid=0 euid=0 suid=0 fsuid=0 egid=0 sgid=0 fsgid=0 tty=(none) ses=9 comm=\"kill\" exe=\"/usr/bin/kill\" subj=unconfined key=\"synthaea-kill\"\u{1d}ARCH=x86_64 SYSCALL=kill AUID=\"edr-lab\" UID=\"root\" GID=\"root\" EUID=\"root\" SUID=\"root\" FSUID=\"root\" EGID=\"root\" SGID=\"root\" FSGID=\"root\"";
+
+    #[test]
+    fn the_real_watchdog_kill_line_hits_the_agent_it_started() {
+        let record = parse_kill_log_line(WATCHDOG_KILL).expect("a SIGKILL record");
+        assert_eq!(record.target, KillTarget::Process(0x40a));
+        assert_eq!((record.sender_pid, record.comm.as_str()), (1420, "kill"));
+        // The agent of the captured run: pid 1318, started by the watchdog 1034 (0x40a).
+        let agent = Marker {
+            pid: 1318,
+            pgid: 1034,
+            watchdog_pid: Some(1034),
+            ..marker(1318, 1000)
+        };
+        assert!(agent.is_hit_by(&record));
+        assert_eq!(agent.signalled_pid(&record), 1034);
+        // Without the watchdog in the marker (the state before #342) the same line hits no one.
+        let before = Marker {
+            watchdog_pid: None,
+            ..agent
+        };
+        assert!(!before.is_hit_by(&record));
+    }
+
+    #[test]
+    fn the_watchdog_kill_is_found_in_the_log_and_replayed_with_its_sender() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("audit.log");
+        std::fs::write(&log, format!("{}\n", at(2000, "bb8"))).unwrap();
+        let replay = read_sigkill_of(&supervised(1000), false, &[log]);
+        let record = replay.record.expect("a record aimed at the watchdog");
+        assert_eq!(record.comm, "sh");
+        assert_eq!(supervised(1000).signalled_pid(&record), 3000);
+    }
+
+    #[test]
+    fn the_watchdog_is_the_parent_only_when_the_death_signal_says_it_started_the_agent() {
+        const SIGKILL: i32 = 9;
+        assert_eq!(supervisor_pid(true, SIGKILL, 3000), Some(3000));
+        // No death signal: started by a shell or a service manager.
+        assert_eq!(supervisor_pid(true, 0, 3000), None);
+        // Another death signal is not the watchdog's `SIGKILL`.
+        assert_eq!(supervisor_pid(true, 15, 3000), None);
+        // Reparented to init, or the setting could not be read.
+        assert_eq!(supervisor_pid(true, SIGKILL, 1), None);
+        assert_eq!(supervisor_pid(true, SIGKILL, 0), None);
+        assert_eq!(supervisor_pid(false, SIGKILL, 3000), None);
     }
 }

@@ -6,7 +6,6 @@ use aya_ebpf::{
     maps::{PerCpuArray, RingBuf},
     programs::TracePointContext,
 };
-use aya_log_ebpf::warn;
 use sensor_linux_wire::{FileDeleteEvent, FileRenameEvent, FileWriteEvent, is_filtered_path};
 
 use crate::{
@@ -76,10 +75,7 @@ fn try_sys_enter_write(ctx: TracePointContext) -> Result<u32, u32> {
         (*e).bytes_requested = count;
 
         if FILE_WRITE_EVENTS.output::<FileWriteEvent>(&*e, 0).is_err() {
-            warn!(
-                &ctx,
-                "sensor-linux-ebpf: ring buffer full, dropping write event"
-            );
+            crate::count_ring_drop(sensor_linux_wire::ring::FILE_WRITE);
         }
     }
 
@@ -111,7 +107,7 @@ fn try_sys_enter_unlink(ctx: TracePointContext) -> Result<u32, u32> {
             .map_err(|_| 1u32)?
     };
 
-    emit_file_delete_event(&ctx, pathname_ptr)
+    emit_file_delete_event(pathname_ptr)
 }
 
 pub fn sys_enter_unlinkat(ctx: TracePointContext) -> u32 {
@@ -124,11 +120,11 @@ fn try_sys_enter_unlinkat(ctx: TracePointContext) -> Result<u32, u32> {
             .map_err(|_| 1u32)?
     };
 
-    emit_file_delete_event(&ctx, pathname_ptr)
+    emit_file_delete_event(pathname_ptr)
 }
 
 /// Shared by `sys_enter_unlink` and `sys_enter_unlinkat` above.
-fn emit_file_delete_event(ctx: &TracePointContext, pathname_ptr: u64) -> Result<u32, u32> {
+fn emit_file_delete_event(pathname_ptr: u64) -> Result<u32, u32> {
     let comm = bpf_get_current_comm().map_err(|_| 1u32)?;
     let uid_gid = aya_ebpf::helpers::bpf_get_current_uid_gid();
 
@@ -156,10 +152,7 @@ fn emit_file_delete_event(ctx: &TracePointContext, pathname_ptr: u64) -> Result<
             .output::<FileDeleteEvent>(&*e, 0)
             .is_err()
         {
-            warn!(
-                ctx,
-                "sensor-linux-ebpf: ring buffer full, dropping delete event"
-            );
+            crate::count_ring_drop(sensor_linux_wire::ring::FILE_DELETE);
         }
     }
 
@@ -218,7 +211,7 @@ fn try_sys_enter_rename(ctx: TracePointContext) -> Result<u32, u32> {
             .map_err(|_| 1u32)?
     };
 
-    emit_file_rename_event(&ctx, AT_FDCWD, oldname_ptr, AT_FDCWD, newname_ptr)
+    emit_file_rename_event(AT_FDCWD, oldname_ptr, AT_FDCWD, newname_ptr)
 }
 
 pub fn sys_enter_renameat(ctx: TracePointContext) -> u32 {
@@ -246,7 +239,7 @@ fn try_sys_enter_renameat(ctx: TracePointContext) -> Result<u32, u32> {
             .map_err(|_| 1u32)?
     } as i32;
 
-    emit_file_rename_event(&ctx, olddfd, oldname_ptr, newdfd, newname_ptr)
+    emit_file_rename_event(olddfd, oldname_ptr, newdfd, newname_ptr)
 }
 
 pub fn sys_enter_renameat2(ctx: TracePointContext) -> u32 {
@@ -274,12 +267,11 @@ fn try_sys_enter_renameat2(ctx: TracePointContext) -> Result<u32, u32> {
             .map_err(|_| 1u32)?
     } as i32;
 
-    emit_file_rename_event(&ctx, olddfd, oldname_ptr, newdfd, newname_ptr)
+    emit_file_rename_event(olddfd, oldname_ptr, newdfd, newname_ptr)
 }
 
 /// Shared by `sys_enter_rename`/`sys_enter_renameat`/`sys_enter_renameat2` above.
 fn emit_file_rename_event(
-    ctx: &TracePointContext,
     olddfd: i32,
     oldname_ptr: u64,
     newdfd: i32,
@@ -323,10 +315,7 @@ fn emit_file_rename_event(
             .output::<FileRenameEvent>(&*e, 0)
             .is_err()
         {
-            warn!(
-                ctx,
-                "sensor-linux-ebpf: ring buffer full, dropping rename event"
-            );
+            crate::count_ring_drop(sensor_linux_wire::ring::FILE_RENAME);
         }
     }
 

@@ -45,9 +45,35 @@ mod procmem;
 mod raw;
 mod uprobe;
 
-pub(crate) use arch::SYS_EXIT_RET_OFFSET;
-use aya_ebpf::{helpers::bpf_get_current_pid_tgid, macros::map, maps::HashMap};
+use aya_ebpf::{
+    helpers::bpf_get_current_pid_tgid,
+    macros::map,
+    maps::{HashMap, PerCpuArray},
+};
 use sensor_linux_wire::{LineageEntry, TASK_COMM_LEN};
+
+/// Events each ring buffer could not take because it was full, per CPU, one slot per ring
+/// (`sensor_linux_wire::ring`, #304). Userspace sums the CPUs and logs the growth.
+#[map]
+static RING_DROPS: PerCpuArray<u64> =
+    PerCpuArray::with_max_entries(sensor_linux_wire::ring::COUNT, 0);
+
+/// Counts one event lost because `ring`'s buffer was full (a `sensor_linux_wire::ring` slot).
+///
+/// Counted, not logged: a drop means the sensor is already overloaded, and an aya-log record
+/// per lost event goes through another ring, the agent's formatter and its log file (#304).
+#[inline(always)]
+pub(crate) fn count_ring_drop(ring: u32) {
+    if let Some(drops) = RING_DROPS.get_ptr_mut(ring) {
+        // SAFETY: `drops` is this CPU's own slot of a per-CPU array, valid for the whole program.
+        // A program does not nest on its own CPU, but three slots are shared by several programs
+        // (`SIGNAL`: the kill/tgkill tracepoints and the `signal_generate` raw tracepoint, which
+        // can fire from interrupt context; `DNS_QUERY` and `TLS_CAPTURE`: two uprobes each). One
+        // of them interrupting another's read-add-write on the same CPU loses one count, never
+        // memory safety: an accepted error for a diagnostic counter.
+        unsafe { *drops += 1 };
+    }
+}
 
 // Raw scheduler tracepoints expose task pointers instead of formatted event records.
 // Their field offsets come from the running kernel's BTF in `userspace/src/btf.rs`;

@@ -5,12 +5,15 @@ use aya_ebpf::{
     helpers::{bpf_get_current_comm, bpf_get_current_pid_tgid},
     macros::map,
     maps::{Array, HashMap, PerCpuArray, RingBuf},
-    programs::{RawTracePointContext, TracePointContext},
+    programs::TracePointContext,
 };
 use aya_log_ebpf::warn;
 use sensor_linux_wire::SignalEvent;
 
-use crate::{fill_event_meta, into_ret};
+use crate::{
+    arch::{SyscallRecord, arg_offset},
+    fill_event_meta, into_ret,
+};
 
 /// Single-slot map holding the agent's own pid, written by userspace before any
 /// signal probe below is attached (issue #362). Filters `kill`/`tgkill` at the
@@ -77,28 +80,16 @@ static SIGNAL_SCRATCH: PerCpuArray<SignalEvent> = PerCpuArray::with_max_entries(
 
 /// Offsets of the `syscalls:sys_enter_kill` tracepoint: `pid`(16), `sig`(24) on
 /// `x86_64/aarch64` — same inferred-not-verified status as the mount offsets above.
-#[cfg(any(bpf_target_arch = "x86_64", bpf_target_arch = "aarch64"))]
-const KILL_PID_OFFSET: usize = 16;
-#[cfg(any(bpf_target_arch = "x86_64", bpf_target_arch = "aarch64"))]
-const KILL_SIG_OFFSET: usize = 24;
-#[cfg(bpf_target_arch = "x86")]
-const KILL_PID_OFFSET: usize = 12;
-#[cfg(bpf_target_arch = "x86")]
-const KILL_SIG_OFFSET: usize = 16;
+const KILL_PID_OFFSET: usize = arg_offset(0);
+const KILL_SIG_OFFSET: usize = arg_offset(1);
 
 /// Offsets of the `syscalls:sys_enter_tgkill` tracepoint: `tgid`(16), `tid`(24),
 /// `sig`(32) on `x86_64/aarch64` — same inferred-not-verified status as the mount
 /// offsets above. `tgid` is the field compared against `SIGNAL_WATCH_PID`, the
 /// same whole-process identity `kill(2)`'s `pid` argument carries — `tid` (the
 /// specific thread within that group) is read but not otherwise used.
-#[cfg(any(bpf_target_arch = "x86_64", bpf_target_arch = "aarch64"))]
-const TGKILL_TGID_OFFSET: usize = 16;
-#[cfg(any(bpf_target_arch = "x86_64", bpf_target_arch = "aarch64"))]
-const TGKILL_SIG_OFFSET: usize = 32;
-#[cfg(bpf_target_arch = "x86")]
-const TGKILL_TGID_OFFSET: usize = 12;
-#[cfg(bpf_target_arch = "x86")]
-const TGKILL_SIG_OFFSET: usize = 20;
+const TGKILL_TGID_OFFSET: usize = arg_offset(0);
+const TGKILL_SIG_OFFSET: usize = arg_offset(2);
 
 // `tkill(2)` is deliberately NOT attached: it takes a thread id, not a
 // thread-group id, and this filter watches a whole-process pid
@@ -114,14 +105,8 @@ pub fn sys_enter_kill(ctx: TracePointContext) -> u32 {
 }
 
 fn try_sys_enter_kill(ctx: TracePointContext) -> Result<u32, u32> {
-    #[cfg(any(bpf_target_arch = "x86_64", bpf_target_arch = "aarch64"))]
-    let pid: u64 = unsafe { ctx.read_at(KILL_PID_OFFSET).map_err(|_| 1u32)? };
-    #[cfg(bpf_target_arch = "x86")]
-    let pid: u64 = unsafe { ctx.read_at::<u32>(KILL_PID_OFFSET).map_err(|_| 1u32)? as u64 };
-    #[cfg(any(bpf_target_arch = "x86_64", bpf_target_arch = "aarch64"))]
-    let sig: u64 = unsafe { ctx.read_at(KILL_SIG_OFFSET).map_err(|_| 1u32)? };
-    #[cfg(bpf_target_arch = "x86")]
-    let sig: u64 = unsafe { ctx.read_at::<u32>(KILL_SIG_OFFSET).map_err(|_| 1u32)? as u64 };
+    let pid: u64 = unsafe { ctx.read_ulong_arg(KILL_PID_OFFSET).map_err(|_| 1u32)? };
+    let sig: u64 = unsafe { ctx.read_ulong_arg(KILL_SIG_OFFSET).map_err(|_| 1u32)? };
 
     emit_signal_event(&ctx, pid as u32, sig as u32)
 }
@@ -131,14 +116,8 @@ pub fn sys_enter_tgkill(ctx: TracePointContext) -> u32 {
 }
 
 fn try_sys_enter_tgkill(ctx: TracePointContext) -> Result<u32, u32> {
-    #[cfg(any(bpf_target_arch = "x86_64", bpf_target_arch = "aarch64"))]
-    let tgid: u64 = unsafe { ctx.read_at(TGKILL_TGID_OFFSET).map_err(|_| 1u32)? };
-    #[cfg(bpf_target_arch = "x86")]
-    let tgid: u64 = unsafe { ctx.read_at::<u32>(TGKILL_TGID_OFFSET).map_err(|_| 1u32)? as u64 };
-    #[cfg(any(bpf_target_arch = "x86_64", bpf_target_arch = "aarch64"))]
-    let sig: u64 = unsafe { ctx.read_at(TGKILL_SIG_OFFSET).map_err(|_| 1u32)? };
-    #[cfg(bpf_target_arch = "x86")]
-    let sig: u64 = unsafe { ctx.read_at::<u32>(TGKILL_SIG_OFFSET).map_err(|_| 1u32)? as u64 };
+    let tgid: u64 = unsafe { ctx.read_ulong_arg(TGKILL_TGID_OFFSET).map_err(|_| 1u32)? };
+    let sig: u64 = unsafe { ctx.read_ulong_arg(TGKILL_SIG_OFFSET).map_err(|_| 1u32)? };
 
     emit_signal_event(&ctx, tgid as u32, sig as u32)
 }
@@ -166,10 +145,7 @@ fn emit_signal_event(ctx: &TracePointContext, target_pid: u32, sig: u32) -> Resu
         }
 
         if SIGNAL_EVENTS.output::<SignalEvent>(&*e, 0).is_err() {
-            warn!(
-                ctx,
-                "sensor-linux-ebpf: ring buffer full, dropping signal event"
-            );
+            crate::count_ring_drop(sensor_linux_wire::ring::SIGNAL);
         }
     }
 
@@ -226,11 +202,7 @@ pub(crate) fn watched_tool_sigcgt(tgid: u32) -> Option<u64> {
 /// a process (not the kernel): `raw_signal_generate` checked both. A kill of a tool does not take
 /// the agent down, so the ring buffer is enough: nothing goes to `SIGNAL_TAMPER_LAST`.
 #[inline(always)]
-pub(crate) fn emit_tool_signal_event(
-    ctx: &RawTracePointContext,
-    target_tgid: u32,
-    sig: u32,
-) -> Result<u32, u32> {
+pub(crate) fn emit_tool_signal_event(target_tgid: u32, sig: u32) -> Result<u32, u32> {
     let e = SIGNAL_SCRATCH.get_ptr_mut(0).ok_or(1u32)?;
     // SAFETY: `e` is this CPU's scratch slot (one per CPU, and a probe does not nest on its
     // own CPU), valid for a `SignalEvent`; `fill_signal_event` initialises it before `output`
@@ -241,10 +213,7 @@ pub(crate) fn emit_tool_signal_event(
             if let Some(drops) = SIGNAL_TOOL_DROPS.get_ptr_mut(0) {
                 *drops += 1;
             }
-            warn!(
-                ctx,
-                "sensor-linux-ebpf: ring buffer full, dropping signal event"
-            );
+            crate::count_ring_drop(sensor_linux_wire::ring::SIGNAL);
         }
     }
     Ok(0)

@@ -6,7 +6,6 @@ use aya_ebpf::{
     maps::{PerCpuArray, RingBuf},
     programs::TracePointContext,
 };
-use aya_log_ebpf::warn;
 use sensor_linux_wire::{FileChmodEvent, FileChownEvent, is_filtered_path};
 
 use crate::{
@@ -57,7 +56,7 @@ fn try_sys_enter_chmod(ctx: TracePointContext) -> Result<u32, u32> {
     };
     let mode: u64 = unsafe { ctx.read_ulong_arg(CHMOD_MODE_OFFSET).map_err(|_| 1u32)? };
 
-    emit_file_chmod_event(&ctx, filename_ptr, mode)
+    emit_file_chmod_event(filename_ptr, mode)
 }
 
 pub fn sys_enter_fchmodat(ctx: TracePointContext) -> u32 {
@@ -71,15 +70,11 @@ fn try_sys_enter_fchmodat(ctx: TracePointContext) -> Result<u32, u32> {
     };
     let mode: u64 = unsafe { ctx.read_ulong_arg(FCHMODAT_MODE_OFFSET).map_err(|_| 1u32)? };
 
-    emit_file_chmod_event(&ctx, filename_ptr, mode)
+    emit_file_chmod_event(filename_ptr, mode)
 }
 
 /// Shared by `sys_enter_chmod` and `sys_enter_fchmodat` above.
-fn emit_file_chmod_event(
-    ctx: &TracePointContext,
-    filename_ptr: u64,
-    mode: u64,
-) -> Result<u32, u32> {
+fn emit_file_chmod_event(filename_ptr: u64, mode: u64) -> Result<u32, u32> {
     let comm = bpf_get_current_comm().map_err(|_| 1u32)?;
     let uid_gid = aya_ebpf::helpers::bpf_get_current_uid_gid();
 
@@ -105,10 +100,7 @@ fn emit_file_chmod_event(
         (*e).mode = mode as u32;
 
         if FILE_CHMOD_EVENTS.output::<FileChmodEvent>(&*e, 0).is_err() {
-            warn!(
-                ctx,
-                "sensor-linux-ebpf: ring buffer full, dropping chmod event"
-            );
+            crate::count_ring_drop(sensor_linux_wire::ring::FILE_CHMOD);
         }
     }
 
@@ -156,7 +148,7 @@ fn try_sys_enter_chown(ctx: TracePointContext) -> Result<u32, u32> {
     let user: u64 = unsafe { ctx.read_ulong_arg(CHOWN_USER_OFFSET).map_err(|_| 1u32)? };
     let group: u64 = unsafe { ctx.read_ulong_arg(CHOWN_GROUP_OFFSET).map_err(|_| 1u32)? };
 
-    emit_file_chown_event(&ctx, filename_ptr, user, group)
+    emit_file_chown_event(filename_ptr, user, group)
 }
 
 pub fn sys_enter_lchown(ctx: TracePointContext) -> u32 {
@@ -171,7 +163,7 @@ fn try_sys_enter_lchown(ctx: TracePointContext) -> Result<u32, u32> {
     let user: u64 = unsafe { ctx.read_ulong_arg(LCHOWN_USER_OFFSET).map_err(|_| 1u32)? };
     let group: u64 = unsafe { ctx.read_ulong_arg(LCHOWN_GROUP_OFFSET).map_err(|_| 1u32)? };
 
-    emit_file_chown_event(&ctx, filename_ptr, user, group)
+    emit_file_chown_event(filename_ptr, user, group)
 }
 
 pub fn sys_enter_fchownat(ctx: TracePointContext) -> u32 {
@@ -189,16 +181,11 @@ fn try_sys_enter_fchownat(ctx: TracePointContext) -> Result<u32, u32> {
             .map_err(|_| 1u32)?
     };
 
-    emit_file_chown_event(&ctx, filename_ptr, user, group)
+    emit_file_chown_event(filename_ptr, user, group)
 }
 
 /// Shared by `sys_enter_chown`, `sys_enter_lchown`, and `sys_enter_fchownat` above.
-fn emit_file_chown_event(
-    ctx: &TracePointContext,
-    filename_ptr: u64,
-    user: u64,
-    group: u64,
-) -> Result<u32, u32> {
+fn emit_file_chown_event(filename_ptr: u64, user: u64, group: u64) -> Result<u32, u32> {
     let comm = bpf_get_current_comm().map_err(|_| 1u32)?;
     let uid_gid = aya_ebpf::helpers::bpf_get_current_uid_gid();
 
@@ -225,10 +212,7 @@ fn emit_file_chown_event(
         (*e).gid = group as u32;
 
         if FILE_CHOWN_EVENTS.output::<FileChownEvent>(&*e, 0).is_err() {
-            warn!(
-                ctx,
-                "sensor-linux-ebpf: ring buffer full, dropping chown event"
-            );
+            crate::count_ring_drop(sensor_linux_wire::ring::FILE_CHOWN);
         }
     }
 

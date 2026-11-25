@@ -6,7 +6,6 @@ use aya_ebpf::{
     maps::{PerCpuArray, RingBuf},
     programs::RetProbeContext,
 };
-use aya_log_ebpf::warn;
 use sensor_linux_wire::ReadlineInputEvent;
 
 use crate::{fill_event_meta, into_ret};
@@ -65,10 +64,7 @@ fn try_readline_exit(ctx: RetProbeContext) -> Result<u32, u32> {
             .output::<ReadlineInputEvent>(&*e, 0)
             .is_err()
         {
-            warn!(
-                &ctx,
-                "sensor-linux-ebpf: ring buffer full, dropping readline event"
-            );
+            crate::count_ring_drop(sensor_linux_wire::ring::READLINE);
         }
     }
 

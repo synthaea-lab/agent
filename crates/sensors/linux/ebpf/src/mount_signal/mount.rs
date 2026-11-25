@@ -10,10 +10,12 @@ use aya_ebpf::{
     maps::{PerCpuArray, RingBuf},
     programs::TracePointContext,
 };
-use aya_log_ebpf::warn;
 use sensor_linux_wire::MountEvent;
 
-use crate::{fill_event_meta, into_ret};
+use crate::{
+    arch::{SyscallRecord, arg_offset},
+    fill_event_meta, into_ret,
+};
 
 /// Ring buffer shared with userspace for `mount`/`umount2` events.
 #[map]
@@ -34,22 +36,10 @@ const MS_RDONLY: u64 = 1;
 /// `/sys/kernel/tracing/events/syscalls/sys_enter_mount/format` — matched the
 /// standard `syscalls:*` layout inferred here on first write, no offset changes
 /// needed.
-#[cfg(any(bpf_target_arch = "x86_64", bpf_target_arch = "aarch64"))]
-const MOUNT_SOURCE_PTR_OFFSET: usize = 16;
-#[cfg(any(bpf_target_arch = "x86_64", bpf_target_arch = "aarch64"))]
-const MOUNT_TARGET_PTR_OFFSET: usize = 24;
-#[cfg(any(bpf_target_arch = "x86_64", bpf_target_arch = "aarch64"))]
-const MOUNT_FSTYPE_PTR_OFFSET: usize = 32;
-#[cfg(any(bpf_target_arch = "x86_64", bpf_target_arch = "aarch64"))]
-const MOUNT_FLAGS_OFFSET: usize = 40;
-#[cfg(bpf_target_arch = "x86")]
-const MOUNT_SOURCE_PTR_OFFSET: usize = 12;
-#[cfg(bpf_target_arch = "x86")]
-const MOUNT_TARGET_PTR_OFFSET: usize = 16;
-#[cfg(bpf_target_arch = "x86")]
-const MOUNT_FSTYPE_PTR_OFFSET: usize = 20;
-#[cfg(bpf_target_arch = "x86")]
-const MOUNT_FLAGS_OFFSET: usize = 24;
+const MOUNT_SOURCE_PTR_OFFSET: usize = arg_offset(0);
+const MOUNT_TARGET_PTR_OFFSET: usize = arg_offset(1);
+const MOUNT_FSTYPE_PTR_OFFSET: usize = arg_offset(2);
+const MOUNT_FLAGS_OFFSET: usize = arg_offset(3);
 
 /// glibc's `umount2(2)` libc wrapper maps to a kernel syscall the kernel itself
 /// (`fs/namespace.c`) names plain `umount` — `SYSCALL_DEFINE2(umount, ...)`, not
@@ -60,43 +50,28 @@ const MOUNT_FLAGS_OFFSET: usize = 24;
 /// Offsets: `name`(16, the target path), `flags`(24). Verified on 2026-09-23 on
 /// Ubuntu 22.04 (kernel 5.15.0-91-generic, `x86_64`) via
 /// `/sys/kernel/tracing/events/syscalls/sys_enter_umount/format`.
-#[cfg(any(bpf_target_arch = "x86_64", bpf_target_arch = "aarch64"))]
-const UMOUNT_TARGET_PTR_OFFSET: usize = 16;
-#[cfg(bpf_target_arch = "x86")]
-const UMOUNT_TARGET_PTR_OFFSET: usize = 12;
+const UMOUNT_TARGET_PTR_OFFSET: usize = arg_offset(0);
 
 pub fn sys_enter_mount(ctx: TracePointContext) -> u32 {
     into_ret(try_sys_enter_mount(ctx))
 }
 
 fn try_sys_enter_mount(ctx: TracePointContext) -> Result<u32, u32> {
-    #[cfg(any(bpf_target_arch = "x86_64", bpf_target_arch = "aarch64"))]
-    let source_ptr: u64 = unsafe { ctx.read_at(MOUNT_SOURCE_PTR_OFFSET).map_err(|_| 1u32)? };
-    #[cfg(bpf_target_arch = "x86")]
     let source_ptr: u64 = unsafe {
-        ctx.read_at::<u32>(MOUNT_SOURCE_PTR_OFFSET)
-            .map_err(|_| 1u32)? as u64
+        ctx.read_ulong_arg(MOUNT_SOURCE_PTR_OFFSET)
+            .map_err(|_| 1u32)?
     };
-    #[cfg(any(bpf_target_arch = "x86_64", bpf_target_arch = "aarch64"))]
-    let target_ptr: u64 = unsafe { ctx.read_at(MOUNT_TARGET_PTR_OFFSET).map_err(|_| 1u32)? };
-    #[cfg(bpf_target_arch = "x86")]
     let target_ptr: u64 = unsafe {
-        ctx.read_at::<u32>(MOUNT_TARGET_PTR_OFFSET)
-            .map_err(|_| 1u32)? as u64
+        ctx.read_ulong_arg(MOUNT_TARGET_PTR_OFFSET)
+            .map_err(|_| 1u32)?
     };
-    #[cfg(any(bpf_target_arch = "x86_64", bpf_target_arch = "aarch64"))]
-    let fstype_ptr: u64 = unsafe { ctx.read_at(MOUNT_FSTYPE_PTR_OFFSET).map_err(|_| 1u32)? };
-    #[cfg(bpf_target_arch = "x86")]
     let fstype_ptr: u64 = unsafe {
-        ctx.read_at::<u32>(MOUNT_FSTYPE_PTR_OFFSET)
-            .map_err(|_| 1u32)? as u64
+        ctx.read_ulong_arg(MOUNT_FSTYPE_PTR_OFFSET)
+            .map_err(|_| 1u32)?
     };
-    #[cfg(any(bpf_target_arch = "x86_64", bpf_target_arch = "aarch64"))]
-    let flags: u64 = unsafe { ctx.read_at(MOUNT_FLAGS_OFFSET).map_err(|_| 1u32)? };
-    #[cfg(bpf_target_arch = "x86")]
-    let flags: u64 = unsafe { ctx.read_at::<u32>(MOUNT_FLAGS_OFFSET).map_err(|_| 1u32)? as u64 };
+    let flags: u64 = unsafe { ctx.read_ulong_arg(MOUNT_FLAGS_OFFSET).map_err(|_| 1u32)? };
 
-    emit_mount_event(&ctx, target_ptr, source_ptr, fstype_ptr, flags, true)
+    emit_mount_event(target_ptr, source_ptr, fstype_ptr, flags, true)
 }
 
 pub fn sys_enter_umount(ctx: TracePointContext) -> u32 {
@@ -104,15 +79,12 @@ pub fn sys_enter_umount(ctx: TracePointContext) -> u32 {
 }
 
 fn try_sys_enter_umount(ctx: TracePointContext) -> Result<u32, u32> {
-    #[cfg(any(bpf_target_arch = "x86_64", bpf_target_arch = "aarch64"))]
-    let target_ptr: u64 = unsafe { ctx.read_at(UMOUNT_TARGET_PTR_OFFSET).map_err(|_| 1u32)? };
-    #[cfg(bpf_target_arch = "x86")]
     let target_ptr: u64 = unsafe {
-        ctx.read_at::<u32>(UMOUNT_TARGET_PTR_OFFSET)
-            .map_err(|_| 1u32)? as u64
+        ctx.read_ulong_arg(UMOUNT_TARGET_PTR_OFFSET)
+            .map_err(|_| 1u32)?
     };
 
-    emit_mount_event(&ctx, target_ptr, 0, 0, 0, false)
+    emit_mount_event(target_ptr, 0, 0, 0, false)
 }
 
 /// Shared by `sys_enter_mount` and `sys_enter_umount` above. `source_ptr`/
@@ -125,7 +97,6 @@ fn try_sys_enter_umount(ctx: TracePointContext) -> Result<u32, u32> {
 /// `raw_sys_enter` fails to load and the agent exits seconds after it starts.
 #[inline(always)]
 fn emit_mount_event(
-    ctx: &TracePointContext,
     mount_point_ptr: u64,
     source_ptr: u64,
     fstype_ptr: u64,
@@ -166,10 +137,7 @@ fn emit_mount_event(
         (*e).mounted = mounted;
 
         if MOUNT_EVENTS.output::<MountEvent>(&*e, 0).is_err() {
-            warn!(
-                ctx,
-                "sensor-linux-ebpf: ring buffer full, dropping mount event"
-            );
+            crate::count_ring_drop(sensor_linux_wire::ring::MOUNT);
         }
     }
 

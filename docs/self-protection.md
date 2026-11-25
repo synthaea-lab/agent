@@ -124,8 +124,9 @@ the same observable, telemetry stops, and
   [`SilenceMonitor::poll`](../crates/tamper/src/heartbeat.rs) reports a
   [`SilenceVerdict`](../crates/tamper/src/heartbeat.rs) once per silence episode for a
   counter static past its deadline, and re-arms when it advances. A sensor that never
-  pulses is caught one deadline after registration. A sensor switched off on purpose
-  is unregistered first, so it is not reported.
+  pulses is caught one deadline after registration. A sensor that is switched off on
+  purpose (an optional capture whose flag is not set) is never registered, so it is not
+  reported.
 - [`silence::spawn_monitor`](../apps/agent/src/silence.rs) polls every 10 s
   (`POLL_INTERVAL`) on its own thread and emits each verdict as a `T1562` alert through
   `DetectionSink::emit_tamper`, which also counts it for the health beacon. The same
@@ -254,8 +255,10 @@ audit fallback sensor the same replay reads auditd's log instead
 ([audit-fallback.md](sensors/linux/audit-fallback.md#sigkill-of-the-agent)): the restarted agent
 finds the `SIGKILL` record aimed at its predecessor's pid and reports the sender, **only when the
 operator loaded** [`synthaea-kill.rules`](../packaging/linux/audit/synthaea-kill.rules), which the
-packages neither install nor load. A `systemctl kill` leaves no such record and is not attributed
-([#275](https://github.com/synthaea-lab/agent/issues/275)).
+packages neither install nor load. A `systemctl kill` leaves no such record and is not
+attributed (a permanent limit, decided in
+[#275](https://github.com/synthaea-lab/agent/issues/275)). A SIGKILL of the watchdog is
+attributed ([#342](https://github.com/synthaea-lab/agent/issues/342)).
 Kernel-mediated stops that involve no signal
 from a process (a CPU rlimit, a cgroup memory limit, `cgroup.freeze`) are read from how
 they are set: the command (`systemctl freeze|set-property`, a memory or task limit, or a
@@ -349,7 +352,7 @@ are compile-time constants.
   [`probation.rs`](../apps/watchdog/src/probation.rs).
 - Pin, world-writable refusal, permission hardening: [`apps/watchdog/src/tamper.rs`](../apps/watchdog/src/tamper.rs).
 - Service SDDL: [`service/windows.rs`](../apps/watchdog/src/service/windows.rs).
-- Silence monitor episodes, re-arming, unregister: [`tamper/src/heartbeat.rs`](../crates/tamper/src/heartbeat.rs);
+- Silence monitor episodes, re-arming: [`tamper/src/heartbeat.rs`](../crates/tamper/src/heartbeat.rs);
   silence to alert: [`apps/agent/src/silence.rs`](../apps/agent/src/silence.rs).
 - Manifest verification: [`tamper/src/integrity.rs`](../crates/tamper/src/integrity.rs) and
   [`apps/agent/src/integrity.rs`](../apps/agent/src/integrity.rs).

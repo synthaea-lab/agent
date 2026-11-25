@@ -206,6 +206,7 @@ pub(crate) fn record_sched_process_exec(pid: u32, filename_ptr: *const u8) -> u3
             core::mem::size_of::<ExecEvent>() + argv_len,
         );
         if EXEC_EVENTS.output::<[u8]>(bytes, 0).is_err() {
+            crate::count_ring_drop(sensor_linux_wire::ring::EXEC);
             return 1;
         }
     }

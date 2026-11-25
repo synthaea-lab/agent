@@ -105,6 +105,7 @@ impl AuditSensor {
             // SAFETY: `getuid(2)` takes no argument, cannot fail and touches no memory.
             uid: Some(unsafe { libc::getuid() }),
             anchor: crate::killrec::newest_anchor(&self.log_paths),
+            watchdog_pid: crate::killrec::watchdog_pid(),
         };
         *self.marker.lock().unwrap_or_else(|e| e.into_inner()) = Some(this.clone());
         if let Err(e) = crate::killrec::write_marker_unless(dir, &this, stopping) {
@@ -132,17 +133,34 @@ impl AuditSensor {
             );
             return ReplayOutcome::NoRecord;
         };
-        tracing::warn!(
-            sender_pid = record.sender_pid,
-            target_pid = previous_pid,
-            "sensor-linux-audit: the previous agent instance was sent SIGKILL, reporting it"
-        );
+        // The pid the signal went to: the watchdog's when the record names it (#342).
+        let signalled_pid = previous
+            .as_ref()
+            .map_or(previous_pid, |m| m.signalled_pid(&record));
+        if signalled_pid == previous_pid {
+            tracing::warn!(
+                sender_pid = record.sender_pid,
+                target_pid = previous_pid,
+                "sensor-linux-audit: the previous agent instance was sent SIGKILL, reporting it"
+            );
+        } else {
+            tracing::warn!(
+                sender_pid = record.sender_pid,
+                watchdog_pid = signalled_pid,
+                previous_pid,
+                "sensor-linux-audit: the previous agent instance's watchdog was sent SIGKILL, which ended the agent too, reporting it"
+            );
+        }
+        // This agent's own executable names the old instance, not the watchdog: the watchdog's
+        // image is not known here, so the event leaves it out and the rule prints `?`.
+        let target_image = (signalled_pid == previous_pid)
+            .then(|| std::env::current_exe().ok())
+            .flatten()
+            .map(|exe| exe.to_string_lossy().into_owned());
         sink.on_event(normalize::sigkill_event(
             &record,
-            previous_pid,
-            std::env::current_exe()
-                .ok()
-                .map(|exe| exe.to_string_lossy().into_owned()),
+            signalled_pid,
+            target_image,
         ));
         // A stop signal that came before this instance wrote its marker left the predecessor's
         // marker on disk (the write is skipped once the process is stopping). The kill is reported
@@ -529,6 +547,52 @@ mod tests {
             Some(own)
         );
         assert!(replayed(&sensor).is_empty());
+    }
+
+    #[test]
+    fn a_kill_of_the_previous_instances_watchdog_is_reported_against_the_watchdog() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("audit.log");
+        // The previous agent (pid 255) was started by the watchdog (pid 0x1f4 = 500), which was
+        // sent SIGKILL: the audit record names 500, and the agent died with it (#342).
+        std::fs::write(&log, format!("{}\n", kill_line("1f4"))).unwrap();
+        crate::killrec::write_marker(
+            dir.path(),
+            &crate::killrec::Marker {
+                pid: 0xff,
+                pgid: 0xff,
+                started_ns: 900 * 1_000_000_000,
+                boot_id: crate::killrec::current_boot_id(),
+                watchdog_pid: Some(0x1f4),
+                ..crate::killrec::Marker::default()
+            },
+        )
+        .unwrap();
+
+        let (events, outcome) = replayed_with_outcome(&sensor_in(dir.path(), log));
+        assert_eq!(outcome, ReplayOutcome::Reported);
+        let [schema::Event::Signal(signal)] = events.as_slice() else {
+            panic!("expected one Signal event: {events:?}");
+        };
+        assert_eq!(signal.target_pid, 0x1f4, "the pid the signal went to");
+        assert_eq!(
+            signal.target_image_path, None,
+            "not this agent's executable"
+        );
+        assert_eq!(signal.meta.pid, 20, "the sender is the meta");
+    }
+
+    #[test]
+    fn a_kill_of_a_parent_that_was_not_the_watchdog_is_not_reported() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("audit.log");
+        std::fs::write(&log, format!("{}\n", kill_line("1f4"))).unwrap();
+        // The previous agent has no watchdog on record: pid 500 was a shell or init.
+        previous_marker(dir.path(), 0xff, 900);
+
+        let (events, outcome) = replayed_with_outcome(&sensor_in(dir.path(), log));
+        assert!(events.is_empty(), "{events:?}");
+        assert_eq!(outcome, ReplayOutcome::NoRecord);
     }
 
     #[test]

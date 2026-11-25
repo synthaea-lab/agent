@@ -8,6 +8,10 @@ all-features = true
 # RUSTSEC advisories: any vulnerable or yanked dependency fails the build.
 version = 2
 yanked = "deny"
+# cargo-deny 0.22 (action 2.1.3) defaults `unmaintained` to the `workspace` scope: only our own
+# crates would be checked. We keep `all`, the scope before 0.22, so an unmaintained transitive
+# dependency (bincode via yara-x, below) still fails the build instead of passing unseen.
+unmaintained = "all"
 # Scoped, justified exceptions — each names its blast radius and revisit condition.
 # Nothing here expires on its own (#919): CI's `-D unknown-advisory -D
 # advisory-not-detected` (see .github/workflows/ci.yml) is what actually enforces
