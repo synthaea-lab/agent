@@ -756,18 +756,36 @@ mod tests {
     mod zone_wiring {
         use super::*;
 
-        const MIDNIGHT_UTC: u64 = 1_793_318_400 * 1_000_000_000;
-        const HOUR: u64 = 3_600_000_000_000;
+        /// Friday 2026-10-30 00:00 UTC: not a weekend in any zone the tests use, so the
+        /// weekend exemption plays no part in what they read.
+        const FRIDAY_2026_10_30_MIDNIGHT_UTC_NS: u64 = 1_793_318_400 * 1_000_000_000;
+        const NANOS_PER_HOUR: u64 = 3_600_000_000_000;
 
-        fn sink(name: &str) -> (Arc<DetectionSink>, std::path::PathBuf) {
-            finish_run_sink(name)
+        /// A fresh sink and rule state in a directory that is removed even if the test fails.
+        /// Each assertion takes its own: the rules remember a logon, so an alert on one sink
+        /// would silence a later, earlier-in-time logon on the same sink (8 h quiet period).
+        fn fresh_sink() -> (Arc<DetectionSink>, tempfile::TempDir) {
+            let dir = tempfile::tempdir().unwrap();
+            let sink = Arc::new(
+                DetectionSink::new(
+                    rules::RuleState::new(),
+                    &dir.path().join("alerts.ndjson"),
+                    Some(&dir.path().join("events.jsonl")),
+                    None,
+                    None,
+                    &dir.path().join("content"),
+                    &dir.path().join("ml-registry"),
+                )
+                .unwrap(),
+            );
+            (sink, dir)
         }
 
         fn odd_hour_alerts(sink: &DetectionSink, hour_utc: u64) -> usize {
             let event = schema::AuthEvent {
                 target_user: "mallory".into(),
                 meta: schema::EventMeta {
-                    timestamp_ns: MIDNIGHT_UTC + hour_utc * HOUR,
+                    timestamp_ns: FRIDAY_2026_10_30_MIDNIGHT_UTC_NS + hour_utc * NANOS_PER_HOUR,
                     ..schema::fixtures::meta()
                 },
                 ..schema::fixtures::auth()
@@ -778,32 +796,41 @@ mod tests {
                 .count()
         }
 
+        /// Zone only: UTC+9 (no daylight saving). 12:00 UTC is 21:00 on the host, after the
+        /// working day; 02:00 UTC is 11:00, inside it. Each hour has its own sink.
         #[test]
-        fn the_platform_zone_turns_the_rule_on_and_the_operator_offset_wins_over_it() {
+        fn the_platform_zone_alone_turns_odd_hour_logon_on() {
             let tz = super::super::localzone::TzGuard::new();
-
-            // Zone only: UTC+9 (no daylight saving). 12:00 UTC is 21:00 on the host, after the
-            // working day; 02:00 UTC is 11:00, inside it.
             tz.set("JST-9");
-            let (zone_only, dir_a) = sink("zone-only");
-            apply_detection(&zone_only, &config::DetectionConfig::default());
-            assert_eq!(odd_hour_alerts(&zone_only, 12), 1, "21:00 host time");
-            assert_eq!(odd_hour_alerts(&zone_only, 2), 0, "11:00 host time");
 
-            // The same zone, and an operator offset of UTC-5: the offset decides. 12:00 UTC is
-            // now 07:00 on the host (inside), 02:00 UTC is 21:00 the day before (outside).
-            let (overridden, dir_b) = sink("zone-overridden");
+            let (late, _late_dir) = fresh_sink();
+            apply_detection(&late, &config::DetectionConfig::default());
+            assert_eq!(odd_hour_alerts(&late, 12), 1, "21:00 host time");
+
+            let (morning, _morning_dir) = fresh_sink();
+            apply_detection(&morning, &config::DetectionConfig::default());
+            assert_eq!(odd_hour_alerts(&morning, 2), 0, "11:00 host time");
+        }
+
+        /// The same zone and an operator offset of UTC-5: the offset decides. 12:00 UTC is
+        /// 07:00 on the host (inside the working day), 02:00 UTC is 21:00 the day
+        /// before.
+        #[test]
+        fn an_operator_utc_offset_overrides_the_platform_zone() {
+            let tz = super::super::localzone::TzGuard::new();
+            tz.set("JST-9");
             let operator = config::DetectionConfig {
                 utc_offset_minutes: Some(-300),
                 ..config::DetectionConfig::default()
             };
-            apply_detection(&overridden, &operator);
-            assert_eq!(odd_hour_alerts(&overridden, 12), 0, "07:00 host time");
-            assert_eq!(odd_hour_alerts(&overridden, 2), 1, "21:00 host time");
 
-            drop((zone_only, overridden));
-            let _ = std::fs::remove_dir_all(dir_a);
-            let _ = std::fs::remove_dir_all(dir_b);
+            let (noon, _noon_dir) = fresh_sink();
+            apply_detection(&noon, &operator);
+            assert_eq!(odd_hour_alerts(&noon, 12), 0, "07:00 host time");
+
+            let (night, _night_dir) = fresh_sink();
+            apply_detection(&night, &operator);
+            assert_eq!(odd_hour_alerts(&night, 2), 1, "21:00 host time");
         }
     }
 }

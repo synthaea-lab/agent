@@ -135,7 +135,8 @@ mod imp {
 /// `TZ` is process-wide, and `tzset`/`localtime_r` read it. A test that sets it, or that runs
 /// code reaching [`utc_offset_minutes_at`] (`common::apply_detection`, so every `start_pipeline`
 /// test), holds a `TzGuard` for its whole body. The guard puts the previous `TZ` back when it
-/// drops, so no test leaves its zone to the next one.
+/// drops, so no test leaves its zone to the next one. The lock orders only the Rust-side access to
+/// `TZ`: it does not stop a `set_var` from racing a libc `getenv` of another variable.
 #[cfg(all(test, unix))]
 pub(super) struct TzGuard {
     _lock: std::sync::MutexGuard<'static, ()>,
@@ -236,6 +237,11 @@ mod tests {
     fn the_guard_puts_the_previous_zone_back() {
         let guard = TzGuard::new();
         let outside = std::env::var_os("TZ");
+        assert_ne!(
+            outside.as_deref(),
+            Some(std::ffi::OsStr::new("JST-9")),
+            "the test needs an outer zone different from the one it sets"
+        );
         guard.set("JST-9");
         assert_eq!(
             std::env::var_os("TZ").as_deref(),
