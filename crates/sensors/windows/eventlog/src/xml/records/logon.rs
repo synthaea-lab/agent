@@ -29,6 +29,7 @@ use crate::xml::{
 /// `Sandbox`); the fixtures in this
 /// module's tests are trimmed but otherwise faithful to that capture.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[allow(missing_docs)] // #362
 pub struct LogonEvent {
     pub record_id: u64,
     /// 4624, 4625, 4648, or 4672 — parsed from the block's own `<EventID>`

@@ -122,6 +122,9 @@ edition = "2024"
 # carry its own `[lints.rust]` table.
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(bpf_target_arch, values("x86", "x86_64", "aarch64"))'] }
 
+# CLAUDE.md: every `pub` item is documented. CI runs with -D warnings, so this is binding.
+missing_docs = "warn"
+
 [workspace.lints.clippy]
 # Hard bans: debug/placeholder constructs never ship.
 dbg_macro = "deny"

@@ -16,6 +16,7 @@ use crate::{
 /// The engine does not evaluate rules by platform on its own; [`SigmaEngine::load_dir_for`] is
 /// what keeps a host from loading the rules of the others.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(missing_docs)] // #362
 pub enum Platform {
     Linux,
     Windows,
@@ -194,6 +195,7 @@ impl SigmaEngine {
             .collect()
     }
 
+    /// Number of rules currently loaded.
     #[must_use]
     pub fn rule_count(&self) -> usize {
         self.rules.len()

@@ -132,6 +132,7 @@ impl Default for LinuxSensor {
 }
 
 impl LinuxSensor {
+    /// A sensor with the UDP/53 DNS capture off; enable it with [`Self::with_dns_udp_capture`] before `run`.
     #[must_use]
     pub fn new() -> Self {
         Self {

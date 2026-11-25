@@ -58,6 +58,7 @@ use policy::ResponsePolicy;
 /// this is one enum covering both the acted and observe-only cases rather than two
 /// separate code paths.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(missing_docs)] // #362
 pub enum QuarantineOutcome {
     /// `path` was moved into `quarantine_dir` under a digest-based name. Identical
     /// payloads use a numeric suffix so each original path has its own record.

@@ -11,6 +11,7 @@ use crate::xml::{
 /// `<LogFileCleared>` element. Raw as written; `sensor.rs` decides what a
 /// missing field means.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(missing_docs)] // #362
 pub struct LogClearedRecord {
     pub record_id: u64,
     pub event_id: u32,

@@ -93,6 +93,7 @@ pub const PROC_EVENT_EXIT: u32 = 0x8000_0000;
 /// nothing to cross-check them against yet, so they fold into [`Other`](ProcEvent::Other)
 /// rather than getting their own dead variant.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(missing_docs)] // #362
 pub enum ProcEvent {
     Fork {
         parent_pid: u32,

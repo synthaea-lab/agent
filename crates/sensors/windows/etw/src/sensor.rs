@@ -560,6 +560,8 @@ pub struct WindowsSensor {
 }
 
 impl WindowsSensor {
+    /// A sensor with its own, unshared [`EtwShedding`] counters, for callers that do not report
+    /// them; the agent uses [`Self::with_shedding`].
     #[must_use]
     pub fn new(names: EtwNames) -> Self {
         Self::with_shedding(names, EtwShedding::default())

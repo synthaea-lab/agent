@@ -19,6 +19,7 @@ use std::{fs::File, io, path::Path};
 
 /// The user behind a scan request, as the sensor saw them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(missing_docs)] // #362
 pub struct Requester {
     pub uid: u32,
     pub gid: u32,

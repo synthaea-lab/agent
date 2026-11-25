@@ -18,6 +18,7 @@ use std::io;
 
 /// One line of `/proc/<pid>/maps`.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(missing_docs)] // #362
 pub struct MapsEntry {
     pub start: u64,
     /// Exclusive end.
@@ -31,6 +32,7 @@ pub struct MapsEntry {
 
 /// Why a maps line was refused.
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
+#[allow(missing_docs)] // #362
 pub enum MapsError {
     #[error("maps line has no address range")]
     NoRange,

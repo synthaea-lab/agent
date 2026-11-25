@@ -7,6 +7,7 @@ use crate::xml::scan::{attribute_value, element_text, event_field, unescape_xml_
 /// `<UserData>` / `<RuleAndFileData>` rather than the
 /// `<EventData><Data Name=...>` shape the Security channel uses.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(missing_docs)] // #362
 pub struct AppLockerEvent {
     pub record_id: u64,
     /// `System/EventID`, one of the channel's audited or enforced decision ids.

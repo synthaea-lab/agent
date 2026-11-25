@@ -7,6 +7,7 @@ use serde::{Deserialize, Deserializer};
 
 /// Sigma rule as loaded from the YAML.
 #[derive(Debug, Deserialize)]
+#[allow(missing_docs)] // #362
 pub struct SigmaRule {
     pub title: String,
     #[serde(default)]
@@ -142,12 +143,15 @@ pub enum Selection {
 /// A Sigma value can be a scalar or a list (implicit OR).
 #[derive(Debug, Deserialize)]
 #[serde(untagged)]
+#[allow(missing_docs)] // #362
 pub enum ValueList {
     Single(String),
     Many(Vec<String>),
 }
 
 impl ValueList {
+    /// Borrows the values as a vector of `&str`, whether the YAML held a single scalar or a
+    /// list. Allocates; the order is the YAML order.
     #[must_use]
     pub fn as_slice(&self) -> Vec<&str> {
         match self {
@@ -159,6 +163,7 @@ impl ValueList {
 
 /// Alert emitted when a Sigma rule matches.
 #[derive(Debug, Clone)]
+#[allow(missing_docs)] // #362
 pub struct SigmaAlert {
     pub title: String,
     pub tags: Vec<String>,

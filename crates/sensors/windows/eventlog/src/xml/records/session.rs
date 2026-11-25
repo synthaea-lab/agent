@@ -19,6 +19,7 @@ use crate::xml::{
 /// in these fields. The 21/23 shapes were checked on a Windows 11 26200 host
 /// (2026-10-05): the console session logs them too, with `Address` `LOCAL`.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(missing_docs)] // #362
 pub struct TerminalSessionEvent {
     pub record_id: u64,
     pub event_id: u32,

@@ -17,6 +17,8 @@ use crate::{
 /// a flood starve the stop signal.
 const DRAIN_BUDGET: usize = 256;
 
+/// [`Sensor`](schema::sensor::Sensor) fed by the kernel audit netlink stream: reads records,
+/// classifies them and emits exec, connect and `SELinux` denial events. Stopped through `stop`.
 pub struct AuditSensor {
     stop: Arc<Notify>,
     /// The agent's state directory, where a marker with this instance's pid lets the next one
@@ -52,6 +54,8 @@ fn process_group() -> u32 {
 }
 
 impl AuditSensor {
+    /// A sensor with no state directory: it reads the live stream but does not replay the previous
+    /// instance's `SIGKILL` from auditd's log (see [`Self::with_state_dir`]).
     #[must_use]
     pub fn new() -> Self {
         Self {

@@ -15,6 +15,7 @@ pub const WIRE_VERSION: u32 = 1;
 /// Direction of a filtered flow, from the endpoint's perspective.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[allow(missing_docs)] // #362
 pub enum FlowDirection {
     Outbound,
     Inbound,
@@ -25,6 +26,7 @@ pub enum FlowDirection {
 /// stream.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
+#[allow(missing_docs)] // #362
 pub enum NeRecord {
     /// A new socket flow observed by `NEFilterDataProvider`, reported at
     /// flow-establishment time (the `ConnectEvent`-shaped fact).

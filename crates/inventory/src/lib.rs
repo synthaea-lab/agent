@@ -36,6 +36,7 @@ pub type PackageSnapshot = BTreeMap<String, String>;
 
 /// What happened to one package between two snapshots.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(missing_docs)] // #362
 pub enum PackageChangeKind {
     Added,
     Removed,
@@ -45,6 +46,7 @@ pub enum PackageChangeKind {
 /// One package's change between two snapshots, enough to build the
 /// `schema::PackageChangeEvent` the agent emits for it.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(missing_docs)] // #362
 pub struct PackageChange {
     pub package: String,
     pub kind: PackageChangeKind,

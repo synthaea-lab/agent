@@ -160,6 +160,7 @@ pub use wire::{DiagMsg, IPPROTO_TCP, IPPROTO_UDP, TCP_CLOSE, TCP_ESTABLISHED, TC
 /// crate doc), so `Other` is purely defensive — a kernel returning something outside the requested mask
 /// would be a bug worth seeing, not a panic.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(missing_docs)] // #362
 pub enum SocketState {
     Established,
     Listen,
@@ -182,6 +183,7 @@ impl From<u8> for SocketState {
 
 /// One socket from a [`snapshot`], joined to the PID(s) holding it open.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(missing_docs)] // #362
 pub struct SocketSnapshotEntry {
     /// `IPPROTO_TCP` or `IPPROTO_UDP`: the dump this entry came from.
     pub protocol: u8,

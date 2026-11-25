@@ -9,6 +9,7 @@ use std::net::SocketAddr;
 /// the process snapshot taken alongside it and are `None` when that process was
 /// not found there (exited mid-poll, or the snapshot failed).
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(missing_docs)] // #362
 pub struct ListenerEntry {
     pub pid: u32,
     pub ppid: Option<u32>,

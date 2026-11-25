@@ -12,7 +12,10 @@ use std::collections::{HashMap, HashSet};
 /// The parser reads the one field it needs (`nlmsg_type`, offset 4) directly.
 const NLMSGHDR_SIZE: usize = 16;
 
+/// One audit netlink message after header and `audit(sec.ms:seq):` stamp parsing. `fields` holds
+/// the `key=value` pairs with quotes stripped; `unquoted_fields` remembers which values were bare.
 #[derive(Debug, Clone)]
+#[allow(missing_docs)] // #362
 pub struct AuditRecord {
     pub record_type: u32, // AUDIT_EXECVE = 1309, AUDIT_SOCKADDR = 1306
     pub timestamp_sec: u64,

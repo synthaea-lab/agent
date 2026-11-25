@@ -7,7 +7,10 @@ use schema::{Event, EventMeta, ExecEvent, HttpRequestEvent, detection::Severity}
 
 use crate::{bus::EventBus, event::is_file_write};
 
+/// A co-occurrence finding emitted by the correlator. Same shape as `rules::Alert`, plus
+/// `trigger_event` for findings a timer emits after the fact.
 #[derive(Debug, Clone)]
+#[allow(missing_docs)] // #362
 pub struct CorrelationAlert {
     pub technique: &'static str,
     /// Analyst-facing severity of this co-occurrence pattern (issue #615). Ranks

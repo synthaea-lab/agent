@@ -27,6 +27,7 @@ pub use tcc::TccJoiner;
 
 /// Errors from parsing a unified-log record or driving `log stream`.
 #[derive(Debug, thiserror::Error)]
+#[allow(missing_docs)] // #362
 pub enum UnifiedLogError {
     #[error("failed to parse log line as JSON: {0}")]
     Json(#[from] serde_json::Error),

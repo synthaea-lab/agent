@@ -43,6 +43,8 @@ pub struct NormalizedLogStream<R> {
 }
 
 impl<R: BufRead> NormalizedLogStream<R> {
+    /// Wraps `reader` (NDJSON from `log stream`). Starts with an empty TCC joiner, an empty
+    /// rate window and `shed_events` at 0.
     pub fn new(reader: R) -> Self {
         Self {
             lines: reader.lines(),

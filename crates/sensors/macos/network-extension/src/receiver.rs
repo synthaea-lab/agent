@@ -24,6 +24,8 @@ pub struct NormalizedNeStream<R> {
 }
 
 impl<R: BufRead> NormalizedNeStream<R> {
+    /// Wraps `reader` (one accepted extension connection). Lines are parsed lazily as the
+    /// iterator is advanced; `skew_skipped` starts at 0.
     pub fn new(reader: R) -> Self {
         Self {
             lines: reader.lines(),

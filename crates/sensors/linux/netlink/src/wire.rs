@@ -31,7 +31,9 @@ pub const NLM_F_DUMP: u16 = 0x100 | 0x200;
 
 pub const AF_INET: u8 = 2;
 pub const AF_INET6: u8 = 10;
+/// `IPPROTO_TCP`: `idiag_protocol` value selecting a TCP dump.
 pub const IPPROTO_TCP: u8 = 6;
+/// `IPPROTO_UDP`: `idiag_protocol` value selecting a UDP dump.
 pub const IPPROTO_UDP: u8 = 17;
 
 /// Bit position convention shared by the request's `states` mask and the
@@ -41,6 +43,7 @@ pub const IPPROTO_UDP: u8 = 17;
 /// `state == 10`, matching the `1 << 10` bit this crate set in the request mask
 /// that included it.
 pub const TCP_ESTABLISHED: u8 = 1;
+/// `TCP_LISTEN`: state of a socket in `listen(2)`; also the bit position in the request's `states` mask.
 pub const TCP_LISTEN: u8 = 10;
 /// `TCP_CLOSE`: what `sock_diag` reports for an UDP socket that is bound but not
 /// `connect()`ed (a datagram server's usual shape); a connected UDP socket reports
@@ -124,6 +127,7 @@ impl DiagRequestV2 {
 /// struct is parsed; extended attributes past byte [`DIAG_MSG_LEN`] (unrequested,
 /// since `idiag_ext = 0` above) are not read.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(missing_docs)] // #362
 pub struct DiagMsg {
     pub family: u8,
     pub state: u8,

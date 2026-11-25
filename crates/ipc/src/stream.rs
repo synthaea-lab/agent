@@ -341,6 +341,8 @@ mod platform {
         }
     }
 
+    /// Connected Unix-domain-socket stream, server or client side. Implements
+    /// `AsyncRead`/`AsyncWrite` by forwarding to the inner `UnixStream`.
     pub struct Stream {
         inner: UnixStream,
     }
