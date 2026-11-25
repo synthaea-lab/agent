@@ -231,7 +231,7 @@ impl CorrelationEngine {
             pending_web_shells: VecDeque::with_capacity(MAX_PENDING_WEB_SHELLS),
             recent_web_requests: VecDeque::with_capacity(MAX_RECENT_WEB_REQUESTS),
             web_shell_shedding: WebShellShedding::default(),
-            udp_flows: UdpFlowGate::new(window.as_nanos() as u64),
+            udp_flows: UdpFlowGate::new(),
             beliefs: BoundedMap::new(BELIEF_CAP),
             pid_entities: BoundedMap::new(ENTITY_CAP),
             fired: BoundedMap::new(BELIEF_CAP),

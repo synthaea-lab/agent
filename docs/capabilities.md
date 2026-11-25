@@ -12,7 +12,7 @@ What the agent can do today, area by area, with the code and tests that back eac
 
 Every `partial` and `planned` row links a tracking issue; `tools/check-docs.py` fails CI otherwise.
 
-Totals: 271 capabilities, 152 built, 79 partial, 40 planned.
+Totals: 271 capabilities, 152 built, 80 partial, 39 planned.
 
 ## Contents
 
@@ -208,7 +208,7 @@ Totals: 271 capabilities, 152 built, 79 partial, 40 planned.
 | Process start/exit with real PEB command line, token SID + integrity level, parent lineage and kernel incarnation stamps | built | crates/sensors/windows/etw/src/providers.rs process_provider/on_process_start; kernel_process.rs tests; winapi.rs read_process_cmdline/read_process_user/read_process_sequence_number; pid_cache.rs tests; tests/kernel_process_keyword_mask.rs (ignored, needs elevation) |  | [sensors/windows/etw-enrichment.md#event-metadata](sensors/windows/etw-enrichment.md#event-metadata) |
 | Image/DLL load events (Kernel-Process EID 5) for tracked processes | built | providers.rs on_image_load; kernel_process.rs tests; providers.rs test kernel_process_reads_process_thread_image_and_silo_events (Windows) |  | [sensors/windows/etw.md#providers](sensors/windows/etw.md#providers) |
 | File create/write events with drive-letter paths and 8.3 short-name expansion | built | providers.rs file_provider; normalize.rs normalize_nt_path/disposition_to_flags tests; long_path.rs tests; tests/kernel_file_keyword_mask.rs (ignored) |  | [sensors/windows/etw-enrichment.md#paths](sensors/windows/etw-enrichment.md#paths) |
-| TCP connect (IPv4/IPv6) and UDP send events with per-flow dedup | built | providers.rs network_provider; kernel_network.rs id mapping and flow tests; normalize.rs ConnectDedup tests; providers/real_session.rs passed elevated at 8af1e104 on Windows 11 26300; correlator UDP flow gate (one UdpSend per flow per window on the bus); refused connections not reported |  | [sensors/windows/etw.md#providers](sensors/windows/etw.md#providers) |
+| TCP connect (IPv4/IPv6) and UDP send events with per-flow dedup | built | providers.rs network_provider; kernel_network.rs id mapping and flow tests; normalize.rs ConnectDedup tests; providers/real_session.rs passed elevated at 8af1e104 on Windows 11 26300; correlator UDP flow gate (at most one UdpSend per flow per second on the bus); refused connections not reported |  | [sensors/windows/etw.md#providers](sensors/windows/etw.md#providers) |
 | AMSI de-obfuscated script content with hash dedup and per-process budget | built | providers.rs amsi_provider; amsi.rs decode_text/AmsiGate with 9 tests |  | [sensors/windows/etw.md#bounds-and-back-pressure](sensors/windows/etw.md#bounds-and-back-pressure) |
 | BITS job events attributed to the client process, Microsoft update hosts filtered | built | bits.rs BitsJobs/is_microsoft_update_url (14 tests); tests/robustness.rs |  | [sensors/windows/etw-enrichment.md#bits-jobs](sensors/windows/etw-enrichment.md#bits-jobs) |
 | Mark-of-the-web (Zone.Identifier) write as FileQuarantine and removal as FileDelete | built | zone_identifier.rs parse/QuarantineDedup/mark_removal (23 tests); tests/robustness.rs never-panic suite |  | [sensors/windows/etw-enrichment.md#mark-of-the-web](sensors/windows/etw-enrichment.md#mark-of-the-web) |

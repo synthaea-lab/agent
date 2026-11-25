@@ -72,9 +72,12 @@ evicted by time. The engine uses a 60 s window
 - **One datagram per UDP flow.** A `UdpSend` is one datagram, so a QUIC transfer or
   a UDP loop would put thousands of events a second on the bus.
   [`UdpFlowGate`](../crates/correlator/src/udp_flows.rs) admits the first `UdpSend`
-  of each flow `(pid, incarnation, daddr, dport)`, then the first one a full window
-  after the last admission, so an active flow keeps one event on the bus. The
-  datagrams it keeps off are counted (`repeats_suppressed`), and so are the flows its
+  of each flow `(pid, incarnation, daddr, dport)`, then the first one a second after
+  the last admission, so an active flow keeps at most one event per second on the
+  bus. Re-admitting only a full window later would be a reset bucket: the admitted
+  datagram would leave the bus just as suppression ended, and a datagram sent late
+  in the window would never reach the rules. The datagrams the gate keeps off are
+  counted (`repeats_suppressed`), and so are the flows its
   16 384-flow map forgets at the cap (`flows_evicted`): a forgotten flow is admitted
   again, never missed.
 - **Bounds.** The bus is bounded by time only. A flood of correlated events inside
@@ -433,7 +436,7 @@ reads only whether the alert raised by *this* event is `BAYES`; see
 | State | Bound | Overflow behavior |
 | --- | --- | --- |
 | `EventBus` | 60 s of events | time-evicted only; no count cap |
-| UDP flow gate | 16 384 flows, one `UdpSend` per flow per window | repeats kept off the bus, `repeats_suppressed`; LRU eviction, `flows_evicted` |
+| UDP flow gate | 16 384 flows, at most one `UdpSend` per flow per second | repeats kept off the bus, `repeats_suppressed`; LRU eviction, `flows_evicted` |
 | beliefs | 16 384 (`BELIEF_CAP`) | LRU eviction (`store::BoundedMap`), counted |
 | `pid_entities`, `masquerading`, `service_mains`, `login_sessions` | 65 536 (`ENTITY_CAP`) | LRU eviction, counted |
 | `fired` (alert dedup) | 16 384 | LRU eviction: at worst one repeated alert |
