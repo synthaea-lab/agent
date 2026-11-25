@@ -160,7 +160,9 @@ mod platform {
     /// raw HANDLE (which would work syscall-wise but is not something
     /// tokio's API commits to supporting across versions).
     pub enum Stream {
+        /// The accepted end of a connection, held by the pipe server.
         Server(NamedPipeServer),
+        /// The connecting end, held by a client that opened the pipe.
         Client(NamedPipeClient),
     }
 
