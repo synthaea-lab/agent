@@ -75,6 +75,39 @@ class CfgTestItems(unittest.TestCase):
         ])
         self.assertEqual(tool.count_platform_cfg(text), 1)
 
+    def test_a_one_line_braced_item_does_not_hide_the_code_after_it(self) -> None:
+        for item in ("fn helper() {}", "struct S {}", "impl Trait for X {}"):
+            with self.subTest(item=item):
+                text = "\n".join([
+                    "#[cfg(test)]",
+                    item,
+                    "",
+                    "#[cfg(windows)]",
+                    "fn platform_branch() {",
+                    "}",
+                ])
+                self.assertEqual(tool.count_platform_cfg(text), 1)
+
+    def test_an_item_on_the_attribute_line_does_not_hide_the_next_item(self) -> None:
+        text = "\n".join([
+            "#[cfg(test)] use a::b;",
+            "#[cfg(windows)]",
+            "fn platform_branch() {",
+            "}",
+        ])
+        self.assertEqual(tool.count_platform_cfg(text), 1)
+
+    def test_an_attribute_line_item_with_a_body_is_skipped_whole(self) -> None:
+        text = "\n".join([
+            "#[cfg(test)] mod tests {",
+            "    #[cfg(unix)]",
+            "    fn fixture() {}",
+            "}",
+            "#[cfg(windows)]",
+            "fn real() {}",
+        ])
+        self.assertEqual(tool.count_platform_cfg(text), 1)
+
     def test_a_test_module_in_the_middle_hides_only_itself(self) -> None:
         text = "\n".join([
             "#[cfg(test)]",

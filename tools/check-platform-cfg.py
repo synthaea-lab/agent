@@ -98,18 +98,23 @@ def _cfg_text(lines: list[str], index: int, start: int) -> str:
 def _skip_test_item(lines: list[str], index: int) -> int:
     """Index of the first line after the item a column-0 `#[cfg(test)]` at `index` opens.
 
-    A one-line item or one that ends in `;` is skipped alone; an item with a body runs to the
-    `}` at column 0 that rustfmt puts at its end.
+    A one-line item (ends in `;`, or its braces balance on the line) is skipped alone; an item
+    with a body runs to the `}` at column 0 that rustfmt puts at its end. The item may start on
+    the attribute's own line (`#[cfg(test)] use a::b;`).
     """
-    i = index + 1
+    rest = lines[index][len("#[cfg(test)]"):].strip()
+    same_line = bool(rest) and not rest.startswith("#[")
+    i = index if same_line else index + 1
     while i < len(lines):
-        line = lines[i].strip()
+        line = rest if same_line and i == index else lines[i].strip()
         if line.startswith("#[") or line == "":
             i += 1
             continue
         if line.endswith(";"):
             return i + 1
         if "{" in line:
+            if line.count("{") == line.count("}"):
+                return i + 1
             while i < len(lines) and not _closes_item(lines, i):
                 i += 1
             return i + 1
