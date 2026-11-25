@@ -89,9 +89,12 @@ the defining crate, so a new variant without an arm there is a compile error.
 [`HealthBeacon`](../crates/schema/src/lib.rs) is **not** an `Event` variant. It
 has no originating process and goes over a separate transport channel. Its
 counters (spool bytes and drops, enrichment drops, rarity, IOC, watchdog and
-tamper counters, parent-image cache evictions) are all `#[serde(default)]`, so a
-beacon from an older agent still parses, with zeros
-([`tests/health_beacon.rs`](../crates/schema/tests/health_beacon.rs)).
+tamper counters, parent-image cache evictions, alerts the log file refused, and
+the eBPF ring losses) are all `#[serde(default)]`, so a beacon from an older
+agent still parses, with zeros
+([`tests/health_beacon.rs`](../crates/schema/tests/health_beacon.rs)). That test,
+not `SCHEMA_VERSION`, protects the beacon: the versioned fixtures cover `Event`
+only, so a new beacon counter is additive and does not bump the version.
 
 ### Event families
 

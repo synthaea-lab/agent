@@ -2130,6 +2130,16 @@ pub struct HealthBeacon {
     /// alert still reached stderr and `cli detections`. Zero in an older beacon (#167).
     #[serde(default)]
     pub alerts_dropped: u64,
+    /// Cumulative events the Linux eBPF probes lost to a full ring buffer, summed over every ring
+    /// (#304, #335): telemetry that never left the kernel. The per-ring breakdown is in the
+    /// agent's log. Zero on other platforms and in a beacon from an older agent.
+    #[serde(default)]
+    pub ring_dropped: u64,
+    /// The part of `ring_dropped` lost from the exec ring: process starts the rules never saw,
+    /// whose children also get no `parent_image_path` from them. Zero on other platforms and in an
+    /// older beacon.
+    #[serde(default)]
+    pub exec_ring_dropped: u64,
     /// Cumulative entries the Windows ETW sensor's pid cache dropped at its cap: a later event of
     /// such a process misses its image path (issue #178). Zero on other platforms and in a
     /// beacon from an older agent.

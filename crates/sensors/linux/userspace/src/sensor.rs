@@ -24,7 +24,7 @@ use crate::{
     normalize,
     parent_image::{ExecStamps, IMAGE_CACHE_CAP, ParentImageEvictions, ParentImages},
     proc::{exec_argv, read_proc_environ_security, read_proc_images},
-    ring_drops::RingDrops,
+    ring_drops::{RingDropTotals, RingDrops},
     rings::{RingBuffers, drain_ready, drain_wire, readable_or_pending},
     unit_procs::{ToolProcs, ToolWatch, UnitResolver},
 };
@@ -119,6 +119,7 @@ fn signal_target(
 pub struct LinuxSensor {
     stop: Arc<Notify>,
     evictions: Arc<ParentImageEvictions>,
+    ring_drops: Arc<RingDropTotals>,
     /// Whether the UDP/53 DNS capture program is attached (#458 part 3). Fixed for the life of the
     /// sensor.
     dns_udp: bool,
@@ -136,6 +137,7 @@ impl LinuxSensor {
         Self {
             stop: Arc::new(Notify::new()),
             evictions: Arc::new(ParentImageEvictions::default()),
+            ring_drops: Arc::new(RingDropTotals::default()),
             dns_udp: false,
         }
     }
@@ -156,6 +158,13 @@ impl LinuxSensor {
     #[must_use]
     pub fn parent_image_evictions(&self) -> Arc<ParentImageEvictions> {
         Arc::clone(&self.evictions)
+    }
+
+    /// The running totals of events the probes lost to full ring buffers, for the agent's health
+    /// beacon (#335). Same handle for the life of the sensor, like [`Self::parent_image_evictions`].
+    #[must_use]
+    pub fn ring_drop_totals(&self) -> Arc<RingDropTotals> {
+        Arc::clone(&self.ring_drops)
     }
 
     async fn run_async(&mut self, sink: Box<dyn EventSink>) -> Result<(), SensorError> {
@@ -273,7 +282,7 @@ impl LinuxSensor {
         };
 
         let mut rings = RingBuffers::open(&mut ebpf, set_time_live)?;
-        let mut ring_drops = RingDrops::take(&mut ebpf)?;
+        let mut ring_drops = RingDrops::take(&mut ebpf, Arc::clone(&self.ring_drops))?;
         let mut ring_drop_report = tokio::time::interval(RING_DROP_REPORT_INTERVAL);
 
         tracing::info!(
