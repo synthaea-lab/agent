@@ -304,7 +304,7 @@ pub(crate) fn cmd_run(opts: super::RunOptions) -> anyhow::Result<()> {
 
     // Select the primary sensor (eBPF or audit fallback) before creating heartbeats
     // so telemetry reports the correct sensor type.
-    let (mut sensor, sensor_name, evictions) =
+    let (mut sensor, sensor_name, sensor_totals) =
         select_sensor(enable_dns_capture, &storage.state_dir);
 
     // Automated response (#25): policy off by default (observe-only), opted into
@@ -426,7 +426,7 @@ pub(crate) fn cmd_run(opts: super::RunOptions) -> anyhow::Result<()> {
         Arc::new(crate::host_counters::AgentHostCounters::new(
             Arc::clone(&pipeline.sink),
             crate::host_counters::WatchdogReport::from_env(),
-            evictions,
+            sensor_totals,
         )),
     );
     // Workers wound down after `sensor.run` returns (#316).
