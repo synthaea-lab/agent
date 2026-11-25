@@ -161,7 +161,14 @@ fn is_cgroup_limit_write(path: &[u8], flags: i64, is_mutation: bool) -> bool {
 /// the mutation.
 #[must_use]
 pub fn is_filtered_path(path: &[u8], flags: i64, is_mutation: bool) -> bool {
-    drops_by_prefix(path, flags, is_mutation) && !may_leave_its_prefix(path)
+    // The scan runs first, on every path, rather than only on the ones the prefixes would
+    // drop: the verifier then reaches it in one state per call site instead of one per prefix
+    // branch, which is what its cost multiplies by. The answer is the same, since a path
+    // that may leave its prefix is never dropped and any other path is decided by prefix.
+    if may_leave_its_prefix(path) {
+        return false;
+    }
+    drops_by_prefix(path, flags, is_mutation)
 }
 
 /// Whether the kernel can resolve `path` (already known to start with a filtered prefix)
