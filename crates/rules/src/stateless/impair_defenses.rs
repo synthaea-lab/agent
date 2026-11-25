@@ -1,6 +1,10 @@
-//! Impair Defenses (T1562): event logging disabled, security processes signalled.
+//! Impair Defenses (T1562): event logging disabled, security processes signalled, the agent's
+//! pinned state removed, an `AppArmor` profile unloaded.
 
-use schema::{ExecEvent, User, detection::Severity};
+use schema::{
+    AGENT_BPF_PIN_DIR, AGENT_TAMPER_PIN_NAME_PREFIX, ExecEvent, FileDeleteEvent, FileOpenEvent,
+    User, detection::Severity, has_write_intent,
+};
 
 use crate::Alert;
 
@@ -384,6 +388,64 @@ pub(crate) fn check_signal_events_lost(event: &schema::SignalEvent) -> Option<Al
              security tool, or one too busy to read them, can hide a kill, and the lost signals \
              may include the SIGKILL, so this is High",
             event.signals_lost
+        ),
+    })
+}
+
+/// AGENT-PIN-REMOVED (T1562.001, #356): a pin in the agent's bpffs directory removed. The pin
+/// is what keeps a `SIGKILL` of the agent attributable after its restart (#362), so removing it
+/// first and killing second leaves the kill with no sender: this alert is what remains.
+///
+/// The agent never removes its own pin while its probes run: it clears a pin left by another
+/// user (#589) before the probes are attached, so every removal the sensor reports is someone
+/// else's. A package purge that removes the directory alerts too, which is a stop of the agent
+/// worth seeing. Read with `.`, `..` and `/proc/<pid>/root/` resolved; a relative path (after a
+/// `cd`) is read on the pin's file name, since the event carries no directory. High.
+#[must_use]
+pub(crate) fn check_agent_pin_removed(event: &FileDeleteEvent) -> Option<Alert> {
+    is_agent_pin(&event.path).then(|| Alert {
+        technique: "T1562.001",
+        severity: Severity::High,
+        message: format!(
+            "pid={} comm={}: removed the agent's pinned state {}: a SIGKILL of the agent will              not be attributable after its restart",
+            event.meta.pid, event.meta.comm, event.path,
+        ),
+    })
+}
+
+/// Whether `path` names an entry in [`AGENT_BPF_PIN_DIR`], or, relative, the tamper pin itself.
+fn is_agent_pin(path: &str) -> bool {
+    let Some(segments) = crate::lexical_path::absolute_segments(path) else {
+        let segments = crate::lexical_path::lexical_segments(path);
+        return segments
+            .last()
+            .is_some_and(|name| name.starts_with(AGENT_TAMPER_PIN_NAME_PREFIX));
+    };
+    let pin_dir = crate::lexical_path::lexical_segments(AGENT_BPF_PIN_DIR);
+    segments.len() > pin_dir.len() && segments.starts_with(&pin_dir)
+}
+
+/// The file `AppArmor` unloads a profile through, under securityfs.
+const APPARMOR_PROFILE_REMOVAL: [&str; 2] = ["apparmor", ".remove"];
+
+/// APPARMOR-PROFILE-REMOVED (T1562.001, #356): a write-intent open of the `AppArmor` `.remove` file,
+/// which unloads a confinement profile (`aa-disable`, `aa-teardown`, `apparmor_parser -R`). The
+/// open does not carry which profile, so any removal alerts. Package removal of a confined
+/// program unloads its profile too, hence Medium: rare, and worth a look when it is not a
+/// package operation. Read on the last two segments, so a non-normalized spelling or a
+/// securityfs mounted elsewhere is read too.
+#[must_use]
+pub(crate) fn check_apparmor_profile_removed(event: &FileOpenEvent) -> Option<Alert> {
+    if !has_write_intent(event.flags) {
+        return None;
+    }
+    let segments = crate::lexical_path::lexical_segments(&event.path);
+    segments.ends_with(&APPARMOR_PROFILE_REMOVAL).then(|| Alert {
+        technique: "T1562.001",
+        severity: Severity::Medium,
+        message: format!(
+            "pid={} comm={}: wrote AppArmor's profile-removal file {}: a confinement profile              was unloaded",
+            event.meta.pid, event.meta.comm, event.path,
         ),
     })
 }

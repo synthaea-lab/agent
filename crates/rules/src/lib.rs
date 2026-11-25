@@ -24,6 +24,7 @@ mod impactctx;
 mod inventory;
 mod ld_trust;
 mod ldap;
+mod lexical_path;
 mod logon;
 mod lsass;
 mod memfd_state;

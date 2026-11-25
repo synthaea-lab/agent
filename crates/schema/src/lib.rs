@@ -559,6 +559,17 @@ pub const FLAG_PERSISTENCE_TASK_UPDATE_ARTIFACT: u32 = 0x0080_0000;
 /// Left out on purpose: the Windows `EventLog` service (T1562.002, #800), the firewall
 /// services (T1562.004) and this agent's own service (stopped by its own package scripts on
 /// every upgrade, and unable to alert on its own stop).
+/// The bpffs directory holding the Linux agent's pinned maps (#362): the sensor pins
+/// `SIGNAL_TAMPER_LAST` there so a `SIGKILL` stays attributable across the restart, and the
+/// rules treat removing anything in it as tampering (AGENT-PIN-REMOVED, #356). One constant
+/// for both, so the rule cannot drift from where the sensor pins.
+pub const AGENT_BPF_PIN_DIR: &str = "/sys/fs/bpf/synthaea";
+
+/// The name of the agent's `SIGNAL_TAMPER_LAST` pin in [`AGENT_BPF_PIN_DIR`], before its wire
+/// version. The rule reads a relative removal (`cd /sys/fs/bpf/synthaea && rm signal_tamper_*`)
+/// by this name, since such an event carries no directory.
+pub const AGENT_TAMPER_PIN_NAME_PREFIX: &str = "signal_tamper_last_v";
+
 pub const SECURITY_SERVICES: &[&str] = &[
     // Linux
     "auditd",

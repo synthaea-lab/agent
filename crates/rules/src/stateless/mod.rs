@@ -24,7 +24,8 @@ pub(crate) use defense_evasion::{
 pub(crate) use execution::{check_base64_decode, check_encoded_powershell};
 pub(crate) use impact::check_recovery_inhibit;
 pub(crate) use impair_defenses::{
-    check_event_logging_disable_exec, check_security_process_signal, check_signal_events_lost,
+    check_agent_pin_removed, check_apparmor_profile_removed, check_event_logging_disable_exec,
+    check_security_process_signal, check_signal_events_lost,
 };
 pub(crate) use indicator_removal::{
     check_log_clear_exec, check_log_file_delete, is_package_manager_comm,
@@ -78,13 +79,17 @@ pub fn evaluate_file_open(event: &FileOpenEvent) -> Vec<Alert> {
         .chain(check_btm_launch_item_persistence(event))
         .chain(check_alternate_data_stream_write(event))
         .chain(crate::securitytool::check_security_tool_cgroup_write(event))
+        .chain(check_apparmor_profile_removed(event))
         .collect()
 }
 
 /// Evaluates all stateless rules applicable to a `FileDeleteEvent`.
 #[must_use]
 pub fn evaluate_file_delete(event: &schema::FileDeleteEvent) -> Vec<Alert> {
-    check_log_file_delete(event).into_iter().collect()
+    check_log_file_delete(event)
+        .into_iter()
+        .chain(check_agent_pin_removed(event))
+        .collect()
 }
 
 /// Evaluates all stateless rules applicable to a `SignalEvent`.
