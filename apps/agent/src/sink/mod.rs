@@ -498,6 +498,14 @@ impl DetectionSink {
             .set_local_zone(zone, now_secs)
     }
 
+    /// Runs one auth event through the rules and returns their alerts, without writing them to
+    /// the alert log. The rules still remember the logon (first-seen account, odd-hour quiet
+    /// period), so a test that reads several logons gives each its own sink.
+    #[cfg(all(test, unix))]
+    pub(crate) fn auth_alerts_for_test(&self, event: &schema::AuthEvent) -> Vec<rules::Alert> {
+        self.rule_state.lock_recovering().on_auth(event)
+    }
+
     /// Installs the executables allowed to touch a canary (#81). Called once, with the
     /// tripwires.
     pub(crate) fn set_canary_allow(&self, allow: crate::deception::CanaryAllow) {

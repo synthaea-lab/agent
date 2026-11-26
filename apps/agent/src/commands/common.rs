@@ -705,6 +705,9 @@ mod tests {
 
     #[test]
     fn the_run_prelude_builds_the_sink_and_plants_the_canaries() {
+        // `start_pipeline` reads the host's zone, which on Unix is `TZ`.
+        #[cfg(unix)]
+        let _tz = super::localzone::TzGuard::new();
         let fixture = PreludeFixture::new();
         let pipeline = start_pipeline(&fixture.options(None), rules::RuleState::new())
             .expect("the standalone prelude");
@@ -726,6 +729,8 @@ mod tests {
     /// the agent's own, not an event's, so `--alert-details` does not change it.
     #[test]
     fn the_run_prelude_reports_an_upload_that_could_not_start_and_goes_on() {
+        #[cfg(unix)]
+        let _tz = super::localzone::TzGuard::new();
         let fixture = PreludeFixture::new();
         let missing_ca = fixture.dir.path().join("no-such-ca.pem");
         let server = crate::upload::ControlPlane {
@@ -745,5 +750,89 @@ mod tests {
             recent.iter().map(|a| &a.technique).collect::<Vec<_>>()
         );
         drop(pipeline);
+    }
+
+    /// #15: the agent's own wiring of the platform zone. `localzone` and the rules each have
+    /// tests; this one runs `apply_detection` and reads what the rules then decide.
+    #[cfg(unix)]
+    mod zone_wiring {
+        use super::*;
+
+        /// Friday 2026-10-30 00:00 UTC: not a weekend in any zone the tests use, so the
+        /// weekend exemption plays no part in what they read.
+        const FRIDAY_2026_10_30_MIDNIGHT_UTC_NS: u64 = 1_793_318_400 * 1_000_000_000;
+        const NANOS_PER_HOUR: u64 = 3_600_000_000_000;
+
+        /// A fresh sink and rule state in a directory that is removed even if the test fails.
+        /// Each assertion takes its own: the rules remember a logon, so an alert on one sink
+        /// would silence a later, earlier-in-time logon on the same sink (8 h quiet period).
+        fn fresh_sink() -> (Arc<DetectionSink>, tempfile::TempDir) {
+            let dir = tempfile::tempdir().unwrap();
+            let sink = Arc::new(
+                DetectionSink::new(
+                    rules::RuleState::new(),
+                    &dir.path().join("alerts.ndjson"),
+                    Some(&dir.path().join("events.jsonl")),
+                    None,
+                    None,
+                    &dir.path().join("content"),
+                    &dir.path().join("ml-registry"),
+                )
+                .unwrap(),
+            );
+            (sink, dir)
+        }
+
+        fn odd_hour_alerts(sink: &DetectionSink, hour_utc: u64) -> usize {
+            let event = schema::AuthEvent {
+                target_user: "mallory".into(),
+                meta: schema::EventMeta {
+                    timestamp_ns: FRIDAY_2026_10_30_MIDNIGHT_UTC_NS + hour_utc * NANOS_PER_HOUR,
+                    ..schema::fixtures::meta()
+                },
+                ..schema::fixtures::auth()
+            };
+            sink.auth_alerts_for_test(&event)
+                .iter()
+                .filter(|a| a.message.contains("outside the working hours"))
+                .count()
+        }
+
+        /// Zone only: UTC+9 (no daylight saving). 12:00 UTC is 21:00 on the host, after the
+        /// working day; 02:00 UTC is 11:00, inside it. Each hour has its own sink.
+        #[test]
+        fn the_platform_zone_alone_turns_odd_hour_logon_on() {
+            let tz = super::super::localzone::TzGuard::new();
+            tz.set("JST-9");
+
+            let (late, _late_dir) = fresh_sink();
+            apply_detection(&late, &config::DetectionConfig::default());
+            assert_eq!(odd_hour_alerts(&late, 12), 1, "21:00 host time");
+
+            let (morning, _morning_dir) = fresh_sink();
+            apply_detection(&morning, &config::DetectionConfig::default());
+            assert_eq!(odd_hour_alerts(&morning, 2), 0, "11:00 host time");
+        }
+
+        /// The same zone and an operator offset of UTC-5: the offset decides. 12:00 UTC is
+        /// 07:00 on the host (inside the working day), 02:00 UTC is 21:00 the day
+        /// before.
+        #[test]
+        fn an_operator_utc_offset_overrides_the_platform_zone() {
+            let tz = super::super::localzone::TzGuard::new();
+            tz.set("JST-9");
+            let operator = config::DetectionConfig {
+                utc_offset_minutes: Some(-300),
+                ..config::DetectionConfig::default()
+            };
+
+            let (noon, _noon_dir) = fresh_sink();
+            apply_detection(&noon, &operator);
+            assert_eq!(odd_hour_alerts(&noon, 12), 0, "07:00 host time");
+
+            let (night, _night_dir) = fresh_sink();
+            apply_detection(&night, &operator);
+            assert_eq!(odd_hour_alerts(&night, 2), 1, "21:00 host time");
+        }
     }
 }
