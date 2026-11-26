@@ -15,17 +15,22 @@ use serde::{Deserialize, Serialize};
 
 use crate::Event;
 
-/// Analyst-facing severity. Ordered: `Low < Medium < High < Critical`.
+/// Analyst-facing severity rank. Ordered: `Low < Medium < High < Critical`.
+///
+/// A rank says where a finding sits in the analyst's queue and how findings fuse; it carries no
+/// confidence. No severity, `Critical` included, gates a destructive action on its own (see
+/// `docs/response.md`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Severity {
-    /// Informational or low-confidence activity; review when convenient.
+    /// The lowest rank; a Sigma `level` of `informational` or `low` maps here.
     Low,
-    /// Suspicious activity worth analyst review.
+    /// Between `Low` and `High`; a Sigma `level: medium` maps here.
     Medium,
-    /// Likely malicious activity needing prompt attention.
+    /// The lowest fused severity that writes a `RESPONSE-ESCALATE` alert
+    /// (`response::ESCALATION_THRESHOLD`).
     High,
-    /// Confirmed or near-certain compromise needing immediate response.
+    /// The highest rank; a Sigma `level: critical` maps here.
     Critical,
 }
 

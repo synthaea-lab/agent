@@ -654,6 +654,10 @@ pub enum User {
 }
 
 /// Metadata common to every event: identity of the emitting process.
+///
+/// A source that cannot name an actor leaves the parts it cannot fill empty (for example `pid` 0
+/// or [`User::Unknown`]); the doc on each event type says which parts, and what `meta` names
+/// instead where the event has no acting process.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EventMeta {
     /// Process id of the emitting process.
@@ -722,7 +726,7 @@ pub struct ContainerContext {
 /// Process execution.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ExecEvent {
-    /// Identity of the process the event is attributed to; sources that cannot name an actor leave parts of it empty, see the type docs.
+    /// The acting process; see [`EventMeta`].
     pub meta: EventMeta,
     /// Full path of the executed image, as the platform reports it (normalized to a
     /// drive-letter path on Windows — audit F-5).
@@ -911,7 +915,7 @@ pub fn has_write_intent(flags: u32) -> bool {
 /// File open/create.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FileOpenEvent {
-    /// Identity of the process the event is attributed to; sources that cannot name an actor leave parts of it empty, see the type docs.
+    /// The acting process; see [`EventMeta`].
     pub meta: EventMeta,
     /// Path of the opened file, as the sensor reports it.
     pub path: String,
@@ -989,7 +993,7 @@ pub struct FileOpenEvent {
 /// characteristics are understood.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FileWriteEvent {
-    /// Identity of the process the event is attributed to; sources that cannot name an actor leave parts of it empty, see the type docs.
+    /// The acting process; see [`EventMeta`].
     pub meta: EventMeta,
     /// The file descriptor written to, in the writing process's own fd table —
     /// meaningful only paired with `meta.pid`, and reused across the process's
@@ -1006,7 +1010,7 @@ pub struct FileWriteEvent {
 /// mark-of-the-web removed (#442); `path` is then the stream path.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FileDeleteEvent {
-    /// Identity of the process the event is attributed to; sources that cannot name an actor leave parts of it empty, see the type docs.
+    /// The acting process; see [`EventMeta`].
     pub meta: EventMeta,
     /// Path of the deleted file.
     pub path: String,
@@ -1017,7 +1021,7 @@ pub struct FileDeleteEvent {
 /// `new_path`'s suffix relative to `old_path`'s.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FileRenameEvent {
-    /// Identity of the process the event is attributed to; sources that cannot name an actor leave parts of it empty, see the type docs.
+    /// The acting process; see [`EventMeta`].
     pub meta: EventMeta,
     /// Path before the rename.
     pub old_path: String,
@@ -1043,7 +1047,7 @@ pub struct FileRenameEvent {
 /// malicious intent.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FileSetTimeEvent {
-    /// Identity of the process the event is attributed to; sources that cannot name an actor leave parts of it empty, see the type docs.
+    /// The acting process; see [`EventMeta`].
     pub meta: EventMeta,
     /// Normalized path captured by the minifilter before the operation.
     pub path: String,
@@ -1061,7 +1065,7 @@ pub struct FileSetTimeEvent {
 /// `desired_access` is the caller's requested `ACCESS_MASK`, not the rights granted or later used.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RawVolumeOpenEvent {
-    /// Identity of the process the event is attributed to; sources that cannot name an actor leave parts of it empty, see the type docs.
+    /// The acting process; see [`EventMeta`].
     pub meta: EventMeta,
     /// Kernel device name captured from the attached volume (for example `\\Device\\HarddiskVolume3`).
     pub volume: String,
@@ -1073,7 +1077,7 @@ pub struct RawVolumeOpenEvent {
 /// (fd-only, no path) is deferred — see `sensor-linux-wire::FileChmodEvent`'s doc.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FileChmodEvent {
-    /// Identity of the process the event is attributed to; sources that cannot name an actor leave parts of it empty, see the type docs.
+    /// The acting process; see [`EventMeta`].
     pub meta: EventMeta,
     /// Path whose mode changed.
     pub path: String,
@@ -1088,7 +1092,7 @@ pub struct FileChmodEvent {
 /// `sensor-linux-wire::FileChownEvent`'s doc.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FileChownEvent {
-    /// Identity of the process the event is attributed to; sources that cannot name an actor leave parts of it empty, see the type docs.
+    /// The acting process; see [`EventMeta`].
     pub meta: EventMeta,
     /// Path whose owner changed.
     pub path: String,
@@ -1107,7 +1111,7 @@ pub struct FileChownEvent {
 /// extended-attribute equivalent of `chmod +s` (T1222.002).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FileSetxattrEvent {
-    /// Identity of the process the event is attributed to; sources that cannot name an actor leave parts of it empty, see the type docs.
+    /// The acting process; see [`EventMeta`].
     pub meta: EventMeta,
     /// Path whose extended attribute was set.
     pub path: String,
@@ -1121,7 +1125,7 @@ pub struct FileSetxattrEvent {
 /// evasion signal in its own right, independent of what `setxattr` ever wrote.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FileRemovexattrEvent {
-    /// Identity of the process the event is attributed to; sources that cannot name an actor leave parts of it empty, see the type docs.
+    /// The acting process; see [`EventMeta`].
     pub meta: EventMeta,
     /// Path whose extended attribute was removed.
     pub path: String,
@@ -1141,7 +1145,7 @@ pub struct FileRemovexattrEvent {
 /// `sensor-linux-wire::SocketBindEvent`'s doc for why).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SocketBindEvent {
-    /// Identity of the process the event is attributed to; sources that cannot name an actor leave parts of it empty, see the type docs.
+    /// The acting process; see [`EventMeta`].
     pub meta: EventMeta,
     /// Local address the socket is bound to.
     pub local_addr: core::net::IpAddr,
@@ -1162,7 +1166,7 @@ pub struct SocketBindEvent {
 /// address as if it were real.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SocketListenEvent {
-    /// Identity of the process the event is attributed to; sources that cannot name an actor leave parts of it empty, see the type docs.
+    /// The acting process; see [`EventMeta`].
     pub meta: EventMeta,
     /// Local address of the listening socket, when the sensor resolved it.
     pub local_addr: Option<core::net::IpAddr>,
@@ -1182,7 +1186,7 @@ pub struct SocketListenEvent {
 /// kernel-side call returns).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SocketAcceptEvent {
-    /// Identity of the process the event is attributed to; sources that cannot name an actor leave parts of it empty, see the type docs.
+    /// The acting process; see [`EventMeta`].
     pub meta: EventMeta,
     /// The listening socket's fd (`accept`/`accept4`'s first argument).
     pub listen_fd: u32,
@@ -1207,7 +1211,7 @@ pub struct SocketAcceptEvent {
 /// to report.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SocketCreateEvent {
-    /// Identity of the process the event is attributed to; sources that cannot name an actor leave parts of it empty, see the type docs.
+    /// The acting process; see [`EventMeta`].
     pub meta: EventMeta,
     /// `AF_INET` (2), `AF_INET6` (10), `AF_PACKET` (17), `AF_NETLINK` (16), ...
     pub domain: i32,
@@ -1228,7 +1232,7 @@ pub struct SocketCreateEvent {
 /// [`AuthEvent`]).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PtraceEvent {
-    /// Identity of the process the event is attributed to; sources that cannot name an actor leave parts of it empty, see the type docs.
+    /// The acting process; see [`EventMeta`].
     pub meta: EventMeta,
     /// The raw `request` argument (see `<sys/ptrace.h>`) — not decoded to a name
     /// here, same "sensor reports, detection interprets" split as elsewhere.
@@ -1249,7 +1253,7 @@ pub struct PtraceEvent {
 /// credential-dumping/memory-scraping primitive on Linux.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProcessVmReadEvent {
-    /// Identity of the process the event is attributed to; sources that cannot name an actor leave parts of it empty, see the type docs.
+    /// The acting process; see [`EventMeta`].
     pub meta: EventMeta,
     /// The process being read FROM.
     pub target_pid: u32,
@@ -1270,7 +1274,7 @@ pub struct ProcessVmReadEvent {
 /// interface. Classic shellcode-injection primitive.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProcessVmWriteEvent {
-    /// Identity of the process the event is attributed to; sources that cannot name an actor leave parts of it empty, see the type docs.
+    /// The acting process; see [`EventMeta`].
     pub meta: EventMeta,
     /// The process being written TO.
     pub target_pid: u32,
@@ -1290,7 +1294,7 @@ pub struct ProcessVmWriteEvent {
 /// path on disk).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MemfdCreateEvent {
-    /// Identity of the process the event is attributed to; sources that cannot name an actor leave parts of it empty, see the type docs.
+    /// The acting process; see [`EventMeta`].
     pub meta: EventMeta,
     /// The caller-supplied display name — cosmetic only per `memfd_create(2)`
     /// (shows up as the target of `/proc/<pid>/fd/<n>`), not a real path.
@@ -1314,7 +1318,7 @@ pub struct MemfdCreateEvent {
 /// noise; a successful resolution always produces a 3008.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DnsQueryEvent {
-    /// Identity of the process the event is attributed to; sources that cannot name an actor leave parts of it empty, see the type docs.
+    /// The acting process; see [`EventMeta`].
     pub meta: EventMeta,
     /// The queried domain name, as the OS received it from the application.
     pub query: String,
@@ -1377,7 +1381,7 @@ pub enum DefenderEventKind {
 /// empty.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DefenderEvent {
-    /// Identity of the process the event is attributed to; sources that cannot name an actor leave parts of it empty, see the type docs.
+    /// The acting process; see [`EventMeta`].
     pub meta: EventMeta,
     /// Which Defender event this is; selects which of the other fields are filled.
     pub kind: DefenderEventKind,
@@ -1450,7 +1454,7 @@ pub enum NtlmDirection {
 /// brute-force burst rule.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NtlmAuthEvent {
-    /// Identity of the process the event is attributed to; sources that cannot name an actor leave parts of it empty, see the type docs.
+    /// The acting process; see [`EventMeta`].
     pub meta: EventMeta,
     /// Whether the host was the client or the server of the NTLM exchange.
     pub direction: NtlmDirection,
@@ -1487,7 +1491,7 @@ pub struct NtlmAuthEvent {
 /// `Security UserID` for 104), [`User::Unknown`] when the event names none.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LogClearedEvent {
-    /// Identity of the process the event is attributed to; sources that cannot name an actor leave parts of it empty, see the type docs.
+    /// The acting process; see [`EventMeta`].
     pub meta: EventMeta,
     /// The channel cleared, as Windows names it (`Security`, `System`,
     /// `Microsoft-Windows-PowerShell/Operational`, ...).
@@ -1547,7 +1551,7 @@ pub enum KerberosDelegationFailureKind {
 /// choice [`LogClearedEvent::subject_user`] makes when a SID isn't the shape the data comes in.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct KerberosDelegationFailureEvent {
-    /// Identity of the process the event is attributed to; sources that cannot name an actor leave parts of it empty, see the type docs.
+    /// The acting process; see [`EventMeta`].
     pub meta: EventMeta,
     /// Which delegation failure this is.
     pub kind: KerberosDelegationFailureKind,
@@ -1583,7 +1587,7 @@ pub struct KerberosDelegationFailureEvent {
 /// posture as [`WmiActivityEvent`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LdapSearchEvent {
-    /// Identity of the process the event is attributed to; sources that cannot name an actor leave parts of it empty, see the type docs.
+    /// The acting process; see [`EventMeta`].
     pub meta: EventMeta,
     /// The search filter as sent (RFC 4515 text).
     pub filter: String,
@@ -1604,7 +1608,7 @@ pub struct LdapSearchEvent {
 /// depending on the event ID; the other is `None`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WmiActivityEvent {
-    /// Identity of the process the event is attributed to; sources that cannot name an actor leave parts of it empty, see the type docs.
+    /// The acting process; see [`EventMeta`].
     pub meta: EventMeta,
     /// WMI namespace (e.g. `ROOT\\CIMv2`).
     pub namespace: String,
@@ -1629,7 +1633,7 @@ pub struct WmiActivityEvent {
 /// message_number)`. Single-record scripts have `message_number = message_total = 1`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ScriptBlockEvent {
-    /// Identity of the process the event is attributed to; sources that cannot name an actor leave parts of it empty, see the type docs.
+    /// The acting process; see [`EventMeta`].
     pub meta: EventMeta,
     /// Opaque identifier shared by all fragments of the same script block.
     pub script_block_id: String,
@@ -1665,7 +1669,7 @@ pub struct ScriptBlockEvent {
 /// and rate-limits per process; see the sensor's `amsi` module.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AmsiContentEvent {
-    /// Identity of the process the event is attributed to; sources that cannot name an actor leave parts of it empty, see the type docs.
+    /// The acting process; see [`EventMeta`].
     pub meta: EventMeta,
     /// AMSI session handle: scans that belong together (e.g. the fragments of
     /// one `PowerShell` command) share it. Opaque.
@@ -1706,7 +1710,7 @@ pub struct AmsiContentEvent {
 /// (first seen as a load of `amsi.dll` into an unexpected process).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ImageLoadEvent {
-    /// Identity of the process the event is attributed to; sources that cannot name an actor leave parts of it empty, see the type docs.
+    /// The acting process; see [`EventMeta`].
     pub meta: EventMeta,
     /// Full path of the loaded image, normalized to drive-letter form (same
     /// normalization as [`ExecEvent::image_path`], audit F-5).
@@ -1726,7 +1730,7 @@ pub struct ImageLoadEvent {
 /// clients look the same (#715 measured about 1 to 2 per second on an idle host).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RemoteThreadEvent {
-    /// Identity of the process the event is attributed to; sources that cannot name an actor leave parts of it empty, see the type docs.
+    /// The acting process; see [`EventMeta`].
     pub meta: EventMeta,
     /// The process that owns the new thread.
     pub target_pid: u32,
@@ -1758,7 +1762,7 @@ pub struct RemoteThreadEvent {
 /// with their status: a refused attempt on a protected LSASS is still an attempt.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProcessAccessEvent {
-    /// Identity of the process the event is attributed to; sources that cannot name an actor leave parts of it empty, see the type docs.
+    /// The acting process; see [`EventMeta`].
     pub meta: EventMeta,
     /// The caller's full image path, when the sensor could resolve it: the evidence an
     /// expected-reader exclusion decides on (<https://github.com/synthaea-lab/agent/issues/45>), since `meta.comm` is only its file
@@ -1787,7 +1791,7 @@ pub struct ProcessAccessEvent {
 /// the familiar Win32 hive prefix (`HKLM\...`) by the sensor.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RegistrySetEvent {
-    /// Identity of the process the event is attributed to; sources that cannot name an actor leave parts of it empty, see the type docs.
+    /// The acting process; see [`EventMeta`].
     pub meta: EventMeta,
     /// Normalized registry key path (e.g. `HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Run`).
     pub key: String,
@@ -1810,7 +1814,7 @@ pub struct RegistrySetEvent {
 /// tier — they are dropped at the sensor, not forwarded.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AssemblyLoadEvent {
-    /// Identity of the process the event is attributed to; sources that cannot name an actor leave parts of it empty, see the type docs.
+    /// The acting process; see [`EventMeta`].
     pub meta: EventMeta,
     /// Fully qualified assembly name (e.g. `MyPayload, Version=0.0.0.0, ...`).
     pub assembly_name: String,
@@ -1830,7 +1834,7 @@ pub struct AssemblyLoadEvent {
 /// have detection value at this tier.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SmbConnectEvent {
-    /// Identity of the process the event is attributed to; sources that cannot name an actor leave parts of it empty, see the type docs.
+    /// The acting process; see [`EventMeta`].
     pub meta: EventMeta,
     /// Server name as the SMB client resolved it (e.g. `\\WIN-TARGET` or `\\192.168.1.10`).
     pub server_name: String,
@@ -1866,7 +1870,7 @@ pub enum BitsJobState {
 /// `sensor-windows`; the job's owner is not a filter.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BitsJobEvent {
-    /// Identity of the process the event is attributed to; sources that cannot name an actor leave parts of it empty, see the type docs.
+    /// The acting process; see [`EventMeta`].
     pub meta: EventMeta,
     /// The job GUID, braces included, as BITS writes it.
     pub job_id: String,
@@ -1899,7 +1903,7 @@ pub struct BitsJobEvent {
 /// manager, and no probe produces it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct UnitStopEvent {
-    /// Identity of the process the event is attributed to; sources that cannot name an actor leave parts of it empty, see the type docs.
+    /// The acting process; see [`EventMeta`].
     pub meta: EventMeta,
     /// The unit as the journal names it (`auditd.service`).
     pub unit: String,
@@ -1916,7 +1920,7 @@ pub struct UnitStopEvent {
 /// on this type should aggregate on `(pid, daddr, dport)` before alerting.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct UdpSendEvent {
-    /// Identity of the process the event is attributed to; sources that cannot name an actor leave parts of it empty, see the type docs.
+    /// The acting process; see [`EventMeta`].
     pub meta: EventMeta,
     /// Destination address (IPv4 only at this tier).
     pub daddr: core::net::IpAddr,
@@ -1934,7 +1938,7 @@ pub struct UdpSendEvent {
 /// buffer length requested.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct UdpRecvEvent {
-    /// Identity of the process the event is attributed to; sources that cannot name an actor leave parts of it empty, see the type docs.
+    /// The acting process; see [`EventMeta`].
     pub meta: EventMeta,
     /// Sender's address (the remote end of the datagram).
     pub peer_addr: core::net::IpAddr,
@@ -1974,7 +1978,7 @@ pub const IPPROTO_UDP: u8 = 17;
 /// reason to share a baseline entry.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ListenPortEvent {
-    /// Identity of the process the event is attributed to; sources that cannot name an actor leave parts of it empty, see the type docs.
+    /// The acting process; see [`EventMeta`].
     pub meta: EventMeta,
     /// Local address the socket listens on.
     pub local_addr: core::net::IpAddr,
@@ -2039,7 +2043,7 @@ pub enum ShellType {
 /// to disable this capture or apply process/library allowlists.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TlsCaptureEvent {
-    /// Identity of the process the event is attributed to; sources that cannot name an actor leave parts of it empty, see the type docs.
+    /// The acting process; see [`EventMeta`].
     pub meta: EventMeta,
     /// Direction of data flow (read = inbound/decrypted, write = outbound/encrypted).
     pub direction: TlsDirection,
@@ -2062,7 +2066,7 @@ pub struct TlsCaptureEvent {
 /// is the consumer's responsibility.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ReadlineInputEvent {
-    /// Identity of the process the event is attributed to; sources that cannot name an actor leave parts of it empty, see the type docs.
+    /// The acting process; see [`EventMeta`].
     pub meta: EventMeta,
     /// Shell type (bash or zsh).
     pub shell_type: ShellType,
@@ -2073,7 +2077,7 @@ pub struct ReadlineInputEvent {
 /// Outbound network connection.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ConnectEvent {
-    /// Identity of the process the event is attributed to; sources that cannot name an actor leave parts of it empty, see the type docs.
+    /// The acting process; see [`EventMeta`].
     pub meta: EventMeta,
     /// Destination address, v4 or v6 (audit F-7: v6 is first-class, not an unset flag).
     pub daddr: core::net::IpAddr,
@@ -2099,7 +2103,7 @@ pub struct ConnectEvent {
 /// same "snapshot, not a discrete trace" caveat as [`ListenPortEvent`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NetworkFlowEvent {
-    /// Identity of the process the event is attributed to; sources that cannot name an actor leave parts of it empty, see the type docs.
+    /// The acting process; see [`EventMeta`].
     pub meta: EventMeta,
     /// This host's side of the attributed socket (see the join doc above) — the
     /// stable per-flow identity a poll-based source needs: unlike a discrete
@@ -2365,7 +2369,7 @@ pub enum SessionState {
 /// `user` unknown), not an actor. The account is [`Self::target_user`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionEvent {
-    /// Identity of the process the event is attributed to; sources that cannot name an actor leave parts of it empty, see the type docs.
+    /// The acting process; see [`EventMeta`].
     pub meta: EventMeta,
     /// Session transition this event reports.
     pub state: SessionState,
@@ -2472,7 +2476,7 @@ pub struct GatekeeperVerdictEvent {
 /// the signal that the file arrived from outside.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FileQuarantineEvent {
-    /// Identity of the process the event is attributed to; sources that cannot name an actor leave parts of it empty, see the type docs.
+    /// The acting process; see [`EventMeta`].
     pub meta: EventMeta,
     /// The quarantined file.
     pub path: String,
@@ -2496,7 +2500,7 @@ pub struct FileQuarantineEvent {
 /// unmounts destroying evidence.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MountEvent {
-    /// Identity of the process the event is attributed to; sources that cannot name an actor leave parts of it empty, see the type docs.
+    /// The acting process; see [`EventMeta`].
     pub meta: EventMeta,
     /// Where the filesystem is (or was) mounted.
     pub mount_point: String,
@@ -2524,7 +2528,7 @@ pub struct MountEvent {
 /// `meta` is the *sender* — the interesting party in a tamper attempt.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SignalEvent {
-    /// Identity of the process the event is attributed to; sources that cannot name an actor leave parts of it empty, see the type docs.
+    /// The acting process; see [`EventMeta`].
     pub meta: EventMeta,
     /// Signal number, platform-native (SIGKILL=9, SIGTERM=15, ...).
     pub signal: u32,
@@ -2577,7 +2581,7 @@ fn is_zero_u64(n: &u64) -> bool {
 /// family, per the v19 precedent.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct XpcConnectEvent {
-    /// Identity of the process the event is attributed to; sources that cannot name an actor leave parts of it empty, see the type docs.
+    /// The acting process; see [`EventMeta`].
     pub meta: EventMeta,
     /// The requested service name (e.g. `com.apple.tccd`).
     pub service_name: String,
@@ -2627,7 +2631,7 @@ pub const POLICY_MECHANISM_WDAC: &str = "wdac";
 /// `action` is still `None` for an AVC variant the parser doesn't recognize.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PolicyDenialEvent {
-    /// Identity of the process the event is attributed to; sources that cannot name an actor leave parts of it empty, see the type docs.
+    /// The acting process; see [`EventMeta`].
     pub meta: EventMeta,
     /// Which security mechanism denied the action — see
     /// [`POLICY_MECHANISM_SELINUX`] and [`POLICY_MECHANISM_APPLOCKER`] for the
@@ -2688,7 +2692,7 @@ pub enum KernelModuleAction {
 /// module loading is one of the highest-signal kernel-tampering events on Linux.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct KernelModuleEvent {
-    /// Identity of the process the event is attributed to; sources that cannot name an actor leave parts of it empty, see the type docs.
+    /// The acting process; see [`EventMeta`].
     pub meta: EventMeta,
     /// Whether the module was loaded or unloaded.
     pub action: KernelModuleAction,
@@ -2724,7 +2728,7 @@ pub struct KernelModuleEvent {
 /// evasion and kernel backdoor detection.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BpfEvent {
-    /// Identity of the process the event is attributed to; sources that cannot name an actor leave parts of it empty, see the type docs.
+    /// The acting process; see [`EventMeta`].
     pub meta: EventMeta,
     /// Raw `bpf_cmd` value (`<linux/bpf.h>`) — always one of the three
     /// filtered commands above; not decoded to a name here, same
@@ -2751,7 +2755,7 @@ pub const PR_SET_SECUREBITS: u32 = 28;
 /// interpret, not a verdict.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PrctlEvent {
-    /// Identity of the process the event is attributed to; sources that cannot name an actor leave parts of it empty, see the type docs.
+    /// The acting process; see [`EventMeta`].
     pub meta: EventMeta,
     /// Raw `prctl` option: always [`PR_SET_SECUREBITS`] or [`PR_CAPBSET_DROP`];
     /// not decoded to a name here, same "sensor reports, detection interprets"
@@ -2798,7 +2802,7 @@ pub struct HttpEvidence {
 /// carries no process. `meta.timestamp_ns` is when the agent read the line.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HttpRequestEvent {
-    /// Identity of the process the event is attributed to; sources that cannot name an actor leave parts of it empty, see the type docs.
+    /// The acting process; see [`EventMeta`].
     pub meta: EventMeta,
     /// The client, when the log holds an address. `None` for a resolved host name
     /// (`HostnameLookups On`), never a fabricated one.
@@ -2816,8 +2820,8 @@ pub struct HttpRequestEvent {
     pub status: u16,
     /// Which suspicious-request signature matched.
     pub signature: HttpSignature,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     /// Evidence for the match, when the signature carries any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub evidence: Option<HttpEvidence>,
     /// For [`HttpSignature::ScannerUserAgent`]: the name of the matched tool
     /// (`sqlmap`, `nikto`), not the `User-Agent` string.
@@ -2882,21 +2886,21 @@ pub enum PackageChangeKind {
 /// snapshot (issue #87). Not a kernel event: the diff runs periodically against the
 /// package manager's own database (`dpkg`/`rpm`/...), so `meta.pid`/`ppid` are 0 and
 /// `meta.comm` names the package manager, same convention as [`HttpRequestEvent`].
-/// `previous_version`/`version` are `None` exactly when [`Self::change`] is
-/// `Removed`/`Added` respectively — both `Some` only for `Upgraded`.
+/// `previous_version` is `None` exactly when [`Self::change`] is `Added`, and `version` is `None`
+/// exactly when it is `Removed`; both are `Some` only for `Upgraded`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PackageChangeEvent {
-    /// Identity of the process the event is attributed to; sources that cannot name an actor leave parts of it empty, see the type docs.
+    /// The acting process; see [`EventMeta`].
     pub meta: EventMeta,
     /// Name of the package that changed.
     pub package: String,
     /// Whether the package was added, removed or upgraded.
     pub change: PackageChangeKind,
+    /// Version before the change; `None` when the package was not installed before.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    /// Version before the change; `None` when the package was not installed or the source does not report it.
     pub previous_version: Option<String>,
+    /// Version after the change; `None` when the package was removed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    /// Version after the change; `None` when the package was removed or the source does not report it.
     pub version: Option<String>,
 }
 
@@ -2904,9 +2908,9 @@ pub struct PackageChangeEvent {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum IdentityChangeKind {
-    /// `setuid(2)` family: real/effective uid.
+    /// `setuid(2)`: real/effective uid.
     SetUid,
-    /// `setgid(2)` family: real/effective gid.
+    /// `setgid(2)`: real/effective gid.
     SetGid,
     /// `setresuid(2)`: real, effective and saved uid.
     SetResUid,
@@ -2925,7 +2929,7 @@ pub enum IdentityChangeKind {
 /// canonical exploit-success signal.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct IdentityChangeEvent {
-    /// Identity of the process the event is attributed to; sources that cannot name an actor leave parts of it empty, see the type docs.
+    /// The acting process; see [`EventMeta`].
     pub meta: EventMeta,
     /// Which identity-changing syscall ran.
     pub kind: IdentityChangeKind,
@@ -2951,7 +2955,7 @@ pub struct IdentityChangeEvent {
 /// `CAP_SYS_ADMIN` takes.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CapSetEvent {
-    /// Identity of the process the event is attributed to; sources that cannot name an actor leave parts of it empty, see the type docs.
+    /// The acting process; see [`EventMeta`].
     pub meta: EventMeta,
     /// The target process. `0` means "the calling process itself" — this is
     /// `capset(2)`'s own documented meaning for pid 0, not an absent value,
@@ -2980,7 +2984,7 @@ pub enum NamespaceSyscall {
 /// `unshare(2)`, creating a new namespace.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NamespaceEvent {
-    /// Identity of the process the event is attributed to; sources that cannot name an actor leave parts of it empty, see the type docs.
+    /// The acting process; see [`EventMeta`].
     pub meta: EventMeta,
     /// Which syscall changed the namespace.
     pub syscall: NamespaceSyscall,
@@ -3004,131 +3008,74 @@ pub struct NamespaceEvent {
 /// Note: Control-plane messages like [`HealthBeacon`] are NOT part of this enum.
 /// They flow through a separate channel at the transport layer to avoid polluting
 /// the telemetry pipeline with non-process events.
+///
+/// On the wire an event is tagged by the `snake_case` variant name in a `"type"` field next to the
+/// payload's own fields (`{"type": "exec", ...}`); the server and the fixtures key on it.
 #[non_exhaustive]
+#[expect(missing_docs, reason = "each variant wraps a documented payload type")]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Event {
-    /// See [`ExecEvent`].
     Exec(ExecEvent),
-    /// See [`FileOpenEvent`].
     FileOpen(FileOpenEvent),
-    /// See [`ConnectEvent`].
     Connect(ConnectEvent),
-    /// See [`DnsQueryEvent`].
     DnsQuery(DnsQueryEvent),
-    /// See [`RegistrySetEvent`].
     RegistrySet(RegistrySetEvent),
-    /// See [`ImageLoadEvent`].
     ImageLoad(ImageLoadEvent),
-    /// See [`ScriptBlockEvent`].
     ScriptBlock(ScriptBlockEvent),
-    /// See [`AmsiContentEvent`].
     AmsiContent(AmsiContentEvent),
-    /// See [`DefenderEvent`].
     Defender(DefenderEvent),
-    /// See [`LdapSearchEvent`].
     LdapSearch(LdapSearchEvent),
-    /// See [`NtlmAuthEvent`].
     NtlmAuth(NtlmAuthEvent),
-    /// See [`LogClearedEvent`].
     LogCleared(LogClearedEvent),
-    /// See [`KerberosDelegationFailureEvent`].
     KerberosDelegationFailure(KerberosDelegationFailureEvent),
-    /// See [`WmiActivityEvent`].
     WmiActivity(WmiActivityEvent),
-    /// See [`AssemblyLoadEvent`].
     AssemblyLoad(AssemblyLoadEvent),
-    /// See [`SmbConnectEvent`].
     SmbConnect(SmbConnectEvent),
-    /// See [`UdpSendEvent`].
     UdpSend(UdpSendEvent),
-    /// See [`UdpRecvEvent`].
     UdpRecv(UdpRecvEvent),
-    /// See [`AuthEvent`].
     Auth(AuthEvent),
-    /// See [`SessionEvent`].
     Session(SessionEvent),
-    /// See [`ListenPortEvent`].
     ListenPort(ListenPortEvent),
-    /// See [`NetworkFlowEvent`].
     NetworkFlow(NetworkFlowEvent),
-    /// See [`TlsCaptureEvent`].
     TlsCapture(TlsCaptureEvent),
-    /// See [`ReadlineInputEvent`].
     ReadlineInput(ReadlineInputEvent),
-    /// See [`FileWriteEvent`].
     FileWrite(FileWriteEvent),
-    /// See [`FileDeleteEvent`].
     FileDelete(FileDeleteEvent),
-    /// See [`FileRenameEvent`].
     FileRename(FileRenameEvent),
-    /// See [`FileSetTimeEvent`].
     FileSetTime(FileSetTimeEvent),
-    /// See [`RawVolumeOpenEvent`].
     RawVolumeOpen(RawVolumeOpenEvent),
-    /// See [`SocketBindEvent`].
     SocketBind(SocketBindEvent),
-    /// See [`FileChmodEvent`].
     FileChmod(FileChmodEvent),
-    /// See [`FileChownEvent`].
     FileChown(FileChownEvent),
-    /// See [`SocketListenEvent`].
     SocketListen(SocketListenEvent),
-    /// See [`SocketAcceptEvent`].
     SocketAccept(SocketAcceptEvent),
-    /// See [`SocketCreateEvent`].
     SocketCreate(SocketCreateEvent),
-    /// See [`TccDecisionEvent`].
     TccDecision(TccDecisionEvent),
-    /// See [`GatekeeperVerdictEvent`].
     GatekeeperVerdict(GatekeeperVerdictEvent),
-    /// See [`FileQuarantineEvent`].
     FileQuarantine(FileQuarantineEvent),
-    /// See [`MountEvent`].
     Mount(MountEvent),
-    /// See [`SignalEvent`].
     Signal(SignalEvent),
-    /// See [`XpcConnectEvent`].
     XpcConnect(XpcConnectEvent),
-    /// See [`FileSetxattrEvent`].
     FileSetxattr(FileSetxattrEvent),
-    /// See [`FileRemovexattrEvent`].
     FileRemovexattr(FileRemovexattrEvent),
-    /// See [`PolicyDenialEvent`].
     PolicyDenial(PolicyDenialEvent),
-    /// See [`KernelModuleEvent`].
     KernelModule(KernelModuleEvent),
-    /// See [`BpfEvent`].
     BpfOperation(BpfEvent),
-    /// See [`PtraceEvent`].
     Ptrace(PtraceEvent),
-    /// See [`ProcessVmReadEvent`].
     ProcessVmRead(ProcessVmReadEvent),
-    /// See [`ProcessVmWriteEvent`].
     ProcessVmWrite(ProcessVmWriteEvent),
-    /// See [`MemfdCreateEvent`].
     MemfdCreate(MemfdCreateEvent),
-    /// See [`IdentityChangeEvent`].
     IdentityChange(IdentityChangeEvent),
-    /// See [`CapSetEvent`].
     CapSet(CapSetEvent),
-    /// See [`NamespaceEvent`].
     Namespace(NamespaceEvent),
-    /// See [`PrctlEvent`].
     Prctl(PrctlEvent),
-    /// See [`HttpRequestEvent`].
     HttpRequest(HttpRequestEvent),
-    /// See [`HttpSummaryEvent`].
     HttpSummary(HttpSummaryEvent),
-    /// See [`PackageChangeEvent`].
     PackageChange(PackageChangeEvent),
-    /// See [`BitsJobEvent`].
     BitsJob(BitsJobEvent),
-    /// See [`UnitStopEvent`].
     UnitStop(UnitStopEvent),
-    /// See [`RemoteThreadEvent`].
     RemoteThread(RemoteThreadEvent),
-    /// See [`ProcessAccessEvent`].
     ProcessAccess(ProcessAccessEvent),
 }
 
