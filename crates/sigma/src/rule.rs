@@ -175,7 +175,8 @@ pub struct SigmaAlert {
     pub tags: Vec<String>,
     /// Description of the rule that matched; empty if the rule has none.
     pub description: String,
-    /// Severity mapped from the rule's `level`; `Low` only for a hand-built rule with none set.
+    /// Mapped from the rule's `level` (`informational` and `low` both give `Low`); `Low` for a rule
+    /// that never went through `validate()` and so has no `level`.
     pub severity: Severity,
     /// ATT&CK technique ids (`T1234`, `T1234.001`) extracted from `tags`, normalized
     /// to bare uppercase form — issue #74. `tags` keeps the full raw list (tactic

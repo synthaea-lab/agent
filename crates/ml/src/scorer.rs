@@ -79,9 +79,9 @@ pub enum ScorerError {
         feature: String,
         /// The offending input value.
         value: f32,
-        /// Lower training bound of that feature.
+        /// Lower bound of that feature: the training minimum minus the margin.
         min: f32,
-        /// Upper training bound of that feature.
+        /// Upper bound of that feature: the training maximum plus the margin.
         max: f32,
     },
 }
