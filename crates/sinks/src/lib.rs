@@ -117,9 +117,10 @@ fn needs_tail_repair(path: &Path) -> bool {
 /// engines emit into this record.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AlertRecord {
-    /// Time of the detection, in nanoseconds.
+    /// When the record was written, in nanoseconds since the UNIX epoch.
     pub timestamp_ns: u64,
-    /// ATT&CK technique the detection maps to.
+    /// ATT&CK technique id, or the label of an internal finding (`RESPONSE-ESCALATE`, `BAYES`,
+    /// `Sigma`, the watchdog's `SELF-PROTECTION`).
     pub technique: String,
     /// Human-readable description of what was detected.
     pub message: String,

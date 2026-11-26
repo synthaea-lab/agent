@@ -13,7 +13,9 @@ pub enum TransportError {
     ServerError {
         /// HTTP status code of the response.
         status: u16,
-        /// The server's error message, or the response body when it gave none.
+        /// The server's `error`, `message` or `reason` string, else the response body, else
+        /// `http status: N` when the body is empty. The body is read up to 2 KiB, and control and
+        /// bidi characters are stripped, so a log reader can trust it is one printable line.
         message: String,
     },
 

@@ -57,8 +57,7 @@ pub struct ScanOutcome {
     pub matches: Vec<YaraMatch>,
 }
 
-/// Cumulative scan counters for the queue. `dropped` counts requests that could not be queued
-/// (queue full or closed).
+/// Cumulative scan counters for the queue.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct ScanStats {
     /// Scans fully handled: the match callback, when there was a match, has returned.
