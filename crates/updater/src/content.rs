@@ -141,8 +141,8 @@ impl ContentEntry {
 /// Field order is alphabetical and fixed by declaration — canonicalization
 /// relies on it, exactly like [`crate::manifest::ReleaseManifest`].
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[allow(missing_docs)] // #362
 pub struct ContentManifest {
+    /// The content files this release lists, each with its path and hash.
     pub entries: Vec<ContentEntry>,
     /// Monotone, strictly increasing per `ring`. See [`Self::check_release_version`].
     pub release_version: u64,

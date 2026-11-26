@@ -8,12 +8,16 @@ use thiserror::Error;
 
 /// Everything that can go wrong staging, verifying, or promoting a release.
 #[derive(Debug, Error)]
-#[allow(missing_docs)] // #362
 pub enum UpdaterError {
     /// The manifest's `schema_version` is not one this build understands
     /// (ADR-0015 Decision 2: readers reject an unknown value outright).
     #[error("manifest schema_version {found} is not supported (expected {expected})")]
-    SchemaVersionUnsupported { found: u32, expected: u32 },
+    SchemaVersionUnsupported {
+        /// The `schema_version` the manifest carries.
+        found: u32,
+        /// The `schema_version` this build understands.
+        expected: u32,
+    },
 
     /// The manifest's Ed25519 signature does not verify against the embedded
     /// public key.
@@ -28,14 +32,22 @@ pub enum UpdaterError {
     /// `release_version` is not strictly greater than the currently installed
     /// one (ADR-0015 Decision 2: anti-rollback-attack check).
     #[error("release {offered} is not newer than the installed release {current}")]
-    ReleaseNotNewer { offered: u64, current: u64 },
+    ReleaseNotNewer {
+        /// The `release_version` the manifest offers.
+        offered: u64,
+        /// The `release_version` currently installed.
+        current: u64,
+    },
 
     /// A content manifest lists nothing while the agent has applied content: applying it
     /// would delete every recorded file and leave the agent with no rules. A release that
     /// really withdraws everything must be a deliberate, separate decision; an empty or
     /// mis-globbed build must not be able to do it by accident.
     #[error("the manifest lists no content but {would_remove} applied file(s) would be removed")]
-    EmptyContentManifest { would_remove: usize },
+    EmptyContentManifest {
+        /// How many applied files the empty manifest would remove.
+        would_remove: usize,
+    },
 
     /// A content manifest's `ring` does not match the ring the caller actually
     /// requested. A valid signature only proves "we signed this manifest", not
@@ -43,7 +55,12 @@ pub enum UpdaterError {
     /// correctly-signed manifest for a different (e.g. less-vetted canary) ring
     /// would still verify and be accepted.
     #[error("manifest is for ring `{found}`, expected `{requested}`")]
-    RingMismatch { requested: String, found: String },
+    RingMismatch {
+        /// The ring the caller asked for.
+        requested: String,
+        /// The ring the manifest declares.
+        found: String,
+    },
 
     /// `release_version` is on the local ban list — a previous install of this
     /// exact release failed its health check (ADR-0015 Decision 6).
@@ -65,29 +82,48 @@ pub enum UpdaterError {
 
     /// A file the manifest lists is missing from the staged release directory.
     #[error("staged release is missing manifest entry `{path}`")]
-    StagedFileMissing { path: PathBuf },
+    StagedFileMissing {
+        /// The manifest entry path that has no file in the staged directory.
+        path: PathBuf,
+    },
 
     /// A staged file's content does not match the manifest's recorded hash.
     #[error("staged file `{path}` hash mismatch (expected {expected}, found {actual})")]
     StagedFileMismatch {
+        /// The staged file whose hash differs.
         path: PathBuf,
+        /// The hash the manifest records.
         expected: String,
+        /// The hash computed from the staged file.
         actual: String,
     },
 
     /// A snapshot manifest's `kind` is not one this build knows (ADR-0033: only `common-set`).
     #[error("snapshot manifest kind `{found}` is not supported")]
-    SnapshotKindUnsupported { found: String },
+    SnapshotKindUnsupported {
+        /// The `kind` the snapshot manifest declares.
+        found: String,
+    },
 
     /// A snapshot manifest's `built_at` is not later than the snapshot in force: a replay or a
     /// rollback of the server's own state. The snapshot in force stays (ADR-0033 decision 3).
     #[error("snapshot built at {offered} is not newer than the one in force ({current})")]
-    SnapshotNotNewer { offered: u64, current: u64 },
+    SnapshotNotNewer {
+        /// The `built_at` of the offered snapshot.
+        offered: u64,
+        /// The `built_at` of the snapshot in force.
+        current: u64,
+    },
 
     /// A snapshot manifest claims to be built further in the future than the clock-skew
     /// tolerance allows: a wrong server clock, or a manifest made to outlive its maximum age.
     #[error("snapshot built at {built_at} is dated beyond now ({now}) plus the tolerance")]
-    SnapshotFromFuture { built_at: u64, now: u64 },
+    SnapshotFromFuture {
+        /// The `built_at` the manifest claims.
+        built_at: u64,
+        /// The local clock reading it was compared with.
+        now: u64,
+    },
 
     /// The artifact does not match the signed manifest that names it (size, hash, or a header
     /// that disagrees with the manifest).
@@ -105,17 +141,30 @@ pub enum UpdaterError {
     #[error(
         "key-rotation manifest does not apply: it retires a {role} key this install does not trust"
     )]
-    RotationDoesNotApply { role: &'static str },
+    RotationDoesNotApply {
+        /// The key role (`release` or `content`) the manifest tried to retire a key for.
+        role: &'static str,
+    },
 
     /// A key-rotation manifest is past its `expires_at`.
     #[error("key-rotation manifest expired at {expires_at} (now {now})")]
-    RotationExpired { expires_at: u64, now: u64 },
+    RotationExpired {
+        /// The manifest's `expires_at`.
+        expires_at: u64,
+        /// The local clock reading it was compared with.
+        now: u64,
+    },
 
     /// A key-rotation manifest is dated beyond now plus the clock-skew tolerance.
     #[error(
         "key-rotation manifest issued at {issued_at} is dated beyond now ({now}) plus the tolerance"
     )]
-    RotationNotYetValid { issued_at: u64, now: u64 },
+    RotationNotYetValid {
+        /// The manifest's `issued_at`.
+        issued_at: u64,
+        /// The local clock reading it was compared with.
+        now: u64,
+    },
 
     /// The file that records the applied key rotations exists but cannot be trusted: it does not
     /// parse, one of its rotations does not verify under the embedded `recovery` key, they are not
@@ -123,7 +172,10 @@ pub enum UpdaterError {
     /// Refused rather than ignored: a file that exists proves a rotation happened, and falling
     /// back to the embedded keys could re-trust a key that was rotated away from.
     #[error("the key-rotation record is not trustworthy: {reason}")]
-    TrustStateCorrupt { reason: String },
+    TrustStateCorrupt {
+        /// Which of the checks on the record failed.
+        reason: String,
+    },
 
     /// The install already holds [`crate::trust_state::MAX_ROTATIONS`] rotations.
     #[error("this install already holds the maximum of {0} recorded key rotations")]
@@ -133,7 +185,9 @@ pub enum UpdaterError {
     /// specifics (missing permissions, disk full, etc).
     #[error("I/O error on {path}: {source}")]
     Io {
+        /// The file or directory the operation was on.
         path: PathBuf,
+        /// The underlying I/O error.
         #[source]
         source: std::io::Error,
     },
@@ -143,7 +197,9 @@ pub enum UpdaterError {
     /// never expected from this crate's own [`crate::layout::Layout::persist_manifest`].
     #[error("manifest at {path} is corrupt: {source}")]
     ManifestCorrupt {
+        /// The persisted manifest file.
         path: PathBuf,
+        /// The JSON error from parsing it.
         #[source]
         source: serde_json::Error,
     },

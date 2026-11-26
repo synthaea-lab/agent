@@ -116,10 +116,12 @@ fn needs_tail_repair(path: &Path) -> bool {
 /// on-disk record stays a sink concern: the agent converts whatever its detection
 /// engines emit into this record.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[allow(missing_docs)] // #362
 pub struct AlertRecord {
+    /// Time of the detection, in nanoseconds.
     pub timestamp_ns: u64,
+    /// ATT&CK technique the detection maps to.
     pub technique: String,
+    /// Human-readable description of what was detected.
     pub message: String,
 }
 

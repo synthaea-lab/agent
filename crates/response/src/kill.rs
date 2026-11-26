@@ -14,21 +14,36 @@ use policy::ResponsePolicy;
 /// #25's "policy off = observe-only" acceptance criterion: observing is not a
 /// different code path from acting, just a different variant of the same result).
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[allow(missing_docs)] // #362
 pub enum KillOutcome {
     /// The process was signaled; `terminate` reported success.
-    Killed { pid: u32 },
+    Killed {
+        /// Process id that was signaled.
+        pid: u32,
+    },
     /// `policy.kill_enabled` was false — no signal was sent.
-    ObserveOnly { pid: u32 },
+    ObserveOnly {
+        /// Process id that would have been signaled.
+        pid: u32,
+    },
     /// `policy.kill_enabled` was true, but `terminate` failed (already exited,
     /// permission denied, ...). `error` is `terminate`'s error rendered to a string,
     /// not a structured type — this crate has no opinion on the caller's OS error type.
-    Failed { pid: u32, error: String },
+    Failed {
+        /// Process id `terminate` was called on.
+        pid: u32,
+        /// `terminate`'s error, rendered to a string.
+        error: String,
+    },
     /// The pid is one this crate never signals, whatever the policy says (see
     /// [`protected_reason`]). Reported instead of [`KillOutcome::ObserveOnly`]
     /// even with kill disabled, so the audit line says the truth: it would not
     /// have been killed, rather than that it would have.
-    Refused { pid: u32, reason: &'static str },
+    Refused {
+        /// The protected process id that was not signaled.
+        pid: u32,
+        /// Why the pid is protected, as returned by [`protected_reason`].
+        reason: &'static str,
+    },
 }
 
 /// Why `pid` must never be handed to `terminate`, or `None` when it may be.

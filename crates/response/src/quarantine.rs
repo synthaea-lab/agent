@@ -58,20 +58,30 @@ use policy::ResponsePolicy;
 /// this is one enum covering both the acted and observe-only cases rather than two
 /// separate code paths.
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[allow(missing_docs)] // #362
 pub enum QuarantineOutcome {
     /// `path` was moved into `quarantine_dir` under a digest-based name. Identical
     /// payloads use a numeric suffix so each original path has its own record.
     Quarantined {
+        /// The path the file had before it was moved.
         original: PathBuf,
+        /// Where the file now lives inside `quarantine_dir`.
         quarantined_at: PathBuf,
+        /// Lowercase hex SHA-256 of the quarantined content.
         sha256_hex: String,
     },
     /// `policy.quarantine_enabled` was false — `path` was left untouched.
-    ObserveOnly { path: PathBuf },
+    ObserveOnly {
+        /// The path that would have been quarantined.
+        path: PathBuf,
+    },
     /// Policy allowed it, but hashing or the move failed (already gone, permission
     /// denied, ...). `error` is the underlying `io::Error` rendered to a string.
-    Failed { path: PathBuf, error: String },
+    Failed {
+        /// The path whose quarantine failed.
+        path: PathBuf,
+        /// The underlying `io::Error`, rendered to a string.
+        error: String,
+    },
 }
 
 /// Policy-gates quarantining `path` into `quarantine_dir` (created if missing).
