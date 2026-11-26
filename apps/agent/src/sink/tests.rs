@@ -537,7 +537,7 @@ fn quarantine_fixture(
 #[test]
 fn a_yara_match_with_quarantine_disabled_leaves_the_payload_and_says_observe_only() {
     let (dir, hooks, log, payload) = quarantine_fixture("quarantine-off", false);
-    super::quarantine_matched_payload(&hooks, &payload, &log);
+    super::yara::quarantine_matched_payload(&hooks, &payload, &log);
     assert!(payload.exists(), "policy off must never move the file");
     assert!(
         !dir.join("quarantine").exists(),
@@ -551,7 +551,7 @@ fn a_yara_match_with_quarantine_disabled_leaves_the_payload_and_says_observe_onl
 #[test]
 fn a_yara_match_with_quarantine_enabled_moves_the_payload_and_audits_it() {
     let (dir, hooks, log, payload) = quarantine_fixture("quarantine-on", true);
-    super::quarantine_matched_payload(&hooks, &payload, &log);
+    super::yara::quarantine_matched_payload(&hooks, &payload, &log);
     assert!(!payload.exists(), "the payload must be moved out of place");
     let moved: Vec<_> = std::fs::read_dir(dir.join("quarantine"))
         .unwrap()
@@ -1369,14 +1369,14 @@ fn a_payload_already_in_quarantine_is_left_alone() {
     // The quarantine write is itself a file event the sensor sees; matching it
     // again must not quarantine the file into itself.
     let (dir, hooks, log, payload) = quarantine_fixture("quarantine-loop", true);
-    super::quarantine_matched_payload(&hooks, &payload, &log);
+    super::yara::quarantine_matched_payload(&hooks, &payload, &log);
     let before = std::fs::read_dir(dir.join("quarantine")).unwrap().count();
     let quarantined = std::fs::read_dir(dir.join("quarantine"))
         .unwrap()
         .map(|e| e.unwrap().path())
         .find(|p| p.extension().is_none())
         .unwrap();
-    super::quarantine_matched_payload(&hooks, &quarantined, &log);
+    super::yara::quarantine_matched_payload(&hooks, &quarantined, &log);
     assert!(quarantined.exists());
     assert_eq!(
         std::fs::read_dir(dir.join("quarantine")).unwrap().count(),
@@ -2709,7 +2709,7 @@ fn a_yara_match_and_a_rule_alert_on_the_same_entity_and_technique_are_one_verdic
         Vec::new(),
     );
 
-    let absorbed = super::fuse_yara_match(
+    let absorbed = super::yara::fuse_yara_match(
         &sink.verdict,
         &yara_context(&meta),
         &yara_match("T1105", schema::detection::Severity::Low),
@@ -2731,7 +2731,7 @@ fn a_yara_match_on_a_different_entity_is_its_own_verdict() {
         comm: "dropper".into(),
         ..schema::fixtures::meta()
     };
-    let fused = super::fuse_yara_match(
+    let fused = super::yara::fuse_yara_match(
         &sink.verdict,
         &yara_context(&meta),
         &yara_match("T1105", schema::detection::Severity::High),
@@ -2989,7 +2989,7 @@ fn a_yara_match_from_a_recycled_parent_does_not_inherit_the_previous_parents_ver
         parent_process_generation: Some(1),
         ..schema::fixtures::meta()
     };
-    super::fuse_yara_match(
+    super::yara::fuse_yara_match(
         &sink.verdict,
         &yara_context(&first),
         &yara_match("T1105", schema::detection::Severity::Critical),
@@ -3000,7 +3000,7 @@ fn a_yara_match_from_a_recycled_parent_does_not_inherit_the_previous_parents_ver
         parent_process_generation: Some(2),
         ..first
     };
-    let fused = super::fuse_yara_match(
+    let fused = super::yara::fuse_yara_match(
         &sink.verdict,
         &yara_context(&recycled),
         &yara_match("T1071", schema::detection::Severity::Low),

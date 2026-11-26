@@ -101,7 +101,7 @@ a warning is logged. On Windows there is no uid, and every path is scanned.
 
 ### What a match does
 
-The callback built in [`start_yara`](../../apps/agent/src/sink/mod.rs) does three things:
+The callback built in [`start_yara`](../../apps/agent/src/sink/yara.rs) does three things:
 
 1. **Fuses** each match into the writer's verdict entity (`fuse_yara_match`), keyed by the
    rule's technique. A native rule or Sigma finding of the same technique on that entity
@@ -133,7 +133,7 @@ The crate holds the policy: what to read, how much and how often
 [`MemorySource`](../../crates/yara/src/memory.rs) trait. On Linux that is
 [`ProcMemSource`](../../apps/agent/src/memscan.rs), which reads `/proc/<pid>/maps` and
 `/proc/<pid>/mem` through `sensor-linux-procmem`. No other platform has a source yet, so
-[`start_memscan`](../../apps/agent/src/sink/mod.rs) returns `Load::Absent` there.
+[`start_memscan`](../../apps/agent/src/sink/yara.rs) returns `Load::Absent` there.
 
 ### What is read
 
@@ -178,7 +178,7 @@ capability overrides it.
 
 ### What a memory match does
 
-[`report_memory_matches`](../../apps/agent/src/sink/mod.rs) fuses each matching rule into the scanned
+[`report_memory_matches`](../../apps/agent/src/sink/yara.rs) fuses each matching rule into the scanned
 process's entity (the same path as a file match) and records a `YARA-MEM` line with the region
 counts. It quarantines nothing: there is no file to move.
 

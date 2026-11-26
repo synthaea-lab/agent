@@ -327,11 +327,11 @@ Totals: 273 capabilities, 153 built, 79 partial, 41 planned.
 
 | Capability | Status | Evidence | Tracking issue | Docs |
 | --- | --- | --- | --- | --- |
-| Budgeted background YARA-X scan of files opened for write, attributed to the writing process and fused into its verdict | built | crates/yara/src/queue.rs ScanQueue (512 cap, 200 ms settle) and its tests; apps/agent/src/sink/mod.rs detect_file_open, start_yara, fuse_yara_match; crates/yara/tests/content.rs |  | [detection/yara.md#file-scanning](detection/yara.md#file-scanning) |
+| Budgeted background YARA-X scan of files opened for write, attributed to the writing process and fused into its verdict | built | crates/yara/src/queue.rs ScanQueue (512 cap, 200 ms settle) and its tests; apps/agent/src/sink/mod.rs detect_file_open; apps/agent/src/sink/yara.rs start_yara, fuse_yara_match; crates/yara/tests/content.rs |  | [detection/yara.md#file-scanning](detection/yara.md#file-scanning) |
 | Per-user read check so the agent's CAP_DAC_READ_SEARCH cannot be aimed at files the requester cannot read | built | crates/yara/src/access.rs Requester::open and its tests; RuleSet::scan_file_as |  | [detection/yara.md#reading-on-the-requesters-behalf](detection/yara.md#reading-on-the-requesters-behalf) |
 | Triggered, budgeted process-memory scanning on Linux (memfd exec → scan executable file-less regions) | built | crates/yara/src/memory.rs scan_memory, MemoryScanQueue, MemoryBudget with tests; apps/agent/src/memscan.rs ProcMemSource; sink request_memory_scan on T1620 and its sink test. Reading other uids needs CAP_SYS_PTRACE, not granted by default |  | [detection/yara.md#process-memory-scanning](detection/yara.md#process-memory-scanning) |
-| Quarantine of a YARA-matched file | partial | apps/agent/src/sink/mod.rs quarantine_matched_payload; sink tests a_yara_match_with_quarantine_enabled_moves_the_payload_and_audits_it. Only Linux calls enable_response; on Windows and macOS --enable-quarantine is ignored and no RESPONSE-QUARANTINE line is written | [#97](https://github.com/synthaea-lab/agent/issues/97) | [detection/yara.md#what-a-match-does](detection/yara.md#what-a-match-does) |
-| Process-memory scanning on Windows and macOS | planned | start_memscan returns Load::Absent off Linux (apps/agent/src/sink/mod.rs); no MemorySource implementation for those platforms | [#32](https://github.com/synthaea-lab/agent/issues/32) | [detection/yara.md#platform-differences](detection/yara.md#platform-differences) |
+| Quarantine of a YARA-matched file | partial | apps/agent/src/sink/yara.rs quarantine_matched_payload; sink tests a_yara_match_with_quarantine_enabled_moves_the_payload_and_audits_it. Only Linux calls enable_response; on Windows and macOS --enable-quarantine is ignored and no RESPONSE-QUARANTINE line is written | [#97](https://github.com/synthaea-lab/agent/issues/97) | [detection/yara.md#what-a-match-does](detection/yara.md#what-a-match-does) |
+| Process-memory scanning on Windows and macOS | planned | start_memscan returns Load::Absent off Linux (apps/agent/src/sink/yara.rs); no MemorySource implementation for those platforms | [#32](https://github.com/synthaea-lab/agent/issues/32) | [detection/yara.md#platform-differences](detection/yara.md#platform-differences) |
 
 ### IOC matching
 
@@ -390,7 +390,7 @@ Totals: 273 capabilities, 153 built, 79 partial, 41 planned.
 
 | Capability | Status | Evidence | Tracking issue | Docs |
 | --- | --- | --- | --- | --- |
-| Cross-engine verdict fusion per entity: max severity/score, same-technique dedup window from first sighting, bounded evidence | built | crates/verdict/src/lib.rs VerdictEngine::record; unit tests in the same file; wired via apps/agent/src/sink/mod.rs record_detection and fuse_yara_match |  | [correlation.md#verdict-fusion](correlation.md#verdict-fusion) |
+| Cross-engine verdict fusion per entity: max severity/score, same-technique dedup window from first sighting, bounded evidence | built | crates/verdict/src/lib.rs VerdictEngine::record; unit tests in the same file; wired via apps/agent/src/sink/recording.rs record_detection and apps/agent/src/sink/yara.rs fuse_yara_match |  | [correlation.md#verdict-fusion](correlation.md#verdict-fusion) |
 | Operator suppression of a technique on an entity (cli suppress/unsuppress, bounded) | built | VerdictEngine::suppress/unsuppress/suppressions, DetectionSink::suppress_verdict, apps/agent/src/ipc_handler.rs, apps/cli/src/main.rs; tests the_suppression_list_is_bounded etc. in verdict/src/lib.rs (runtime only, cleared on restart) |  | [correlation.md#verdict-fusion](correlation.md#verdict-fusion) |
 
 ## Response and self-protection
