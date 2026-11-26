@@ -7,11 +7,14 @@ use serde::{Deserialize, Deserializer};
 
 /// Sigma rule as loaded from the YAML.
 #[derive(Debug, Deserialize)]
-#[allow(missing_docs)] // #362
 pub struct SigmaRule {
+    /// Human-readable rule name; copied into [`SigmaAlert::title`].
     pub title: String,
+    /// Free-text explanation of what the rule detects; empty when the YAML omits it.
     #[serde(default)]
     pub description: String,
+    /// Sigma tags, such as `attack.execution` or `attack.t1059.001`; the ATT&CK technique ids
+    /// of an alert are derived from them.
     #[serde(default)]
     pub tags: Vec<String>,
     /// Required by `validate()` for any rule shipped through
@@ -38,6 +41,7 @@ pub struct SigmaRule {
     /// `validate()` refuses anything this engine would evaluate against the wrong events.
     #[serde(default)]
     pub logsource: Option<LogSource>,
+    /// Selections and the condition that combines them.
     pub detection: Detection,
     /// The condition, parsed once (at validation, or on first evaluation of a rule that was
     /// never validated): what evaluation runs, so the text is never re-parsed per event.
@@ -143,9 +147,10 @@ pub enum Selection {
 /// A Sigma value can be a scalar or a list (implicit OR).
 #[derive(Debug, Deserialize)]
 #[serde(untagged)]
-#[allow(missing_docs)] // #362
 pub enum ValueList {
+    /// One scalar value.
     Single(String),
+    /// A YAML list of values: a match on any of them is a match (implicit OR).
     Many(Vec<String>),
 }
 
@@ -163,11 +168,14 @@ impl ValueList {
 
 /// Alert emitted when a Sigma rule matches.
 #[derive(Debug, Clone)]
-#[allow(missing_docs)] // #362
 pub struct SigmaAlert {
+    /// Title of the rule that matched.
     pub title: String,
+    /// Raw tag list of the rule, tactic tags included.
     pub tags: Vec<String>,
+    /// Description of the rule that matched; empty if the rule has none.
     pub description: String,
+    /// Severity mapped from the rule's `level`; `Low` only for a hand-built rule with none set.
     pub severity: Severity,
     /// ATT&CK technique ids (`T1234`, `T1234.001`) extracted from `tags`, normalized
     /// to bare uppercase form — issue #74. `tags` keeps the full raw list (tactic

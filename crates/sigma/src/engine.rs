@@ -16,10 +16,13 @@ use crate::{
 /// The engine does not evaluate rules by platform on its own; [`SigmaEngine::load_dir_for`] is
 /// what keeps a host from loading the rules of the others.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[allow(missing_docs)] // #362
 pub enum Platform {
+    /// Linux hosts: the `linux/` rule directory.
     Linux,
+    /// Windows hosts: the `windows/` rule directory.
     Windows,
+    /// macOS hosts: the `macos/` rule directory plus the shared `linux/` one (see
+    /// [`Platform::rule_dirs`]).
     MacOs,
 }
 

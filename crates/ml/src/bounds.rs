@@ -18,10 +18,14 @@ use crate::scorer::ScorerError;
 /// avoid false rejections on legitimate edge cases. Loaded from
 /// `model_metadata.json` alongside the ONNX model.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[allow(missing_docs)] // #362
 pub struct FeatureBounds {
+    /// Feature names in model input order, used only to name the offender in
+    /// [`ScorerError::FeatureOutOfBounds`]. Index `i` describes `min_values[i]` and
+    /// `max_values[i]`.
     pub feature_names: Vec<String>,
+    /// Inclusive lower bound per feature: the training minimum minus the margin.
     pub min_values: Vec<f32>,
+    /// Inclusive upper bound per feature: the training maximum plus the margin.
     pub max_values: Vec<f32>,
 }
 
