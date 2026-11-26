@@ -42,10 +42,13 @@ use store::BoundedMap;
 /// with the same rule as the rest of the stack: two known, different stamps are two
 /// incarnations, and a `None` on either side cannot disprove identity.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-#[allow(missing_docs)] // #362
 pub struct EntityKey {
+    /// Parent process id of the process the findings are about.
     pub ppid: u32,
+    /// Command name (`comm`) of the process.
     pub comm: String,
+    /// Incarnation stamp of the parent `ppid`, when the sensor gave one; tells a recycled
+    /// parent pid apart from the original.
     pub parent_generation: Option<u64>,
 }
 
@@ -131,9 +134,10 @@ impl EntityState {
 /// technique, source and (bounded) piece of evidence folded into this entity
 /// so far.
 #[derive(Debug, Clone, PartialEq)]
-#[allow(missing_docs)] // #362
 pub struct Verdict {
+    /// The entity this snapshot is about.
     pub entity: EntityKey,
+    /// The highest severity among the folded findings.
     pub severity: Severity,
     /// The highest-confidence score seen across every contributing source, when
     /// any source carried one. Simple max composition, not a weighted blend: a

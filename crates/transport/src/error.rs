@@ -7,11 +7,17 @@ pub type Result<T> = std::result::Result<T, TransportError>;
 
 /// Errors that can occur during transport operations.
 #[derive(Debug, Error)]
-#[allow(missing_docs)] // #362
 pub enum TransportError {
     /// Server returned an error status code.
     #[error("server error: {status} - {message}")]
-    ServerError { status: u16, message: String },
+    ServerError {
+        /// HTTP status code of the response.
+        status: u16,
+        /// The server's `error`, `message` or `reason` string, else the response body, else
+        /// `http status: N` when the body is empty. The body is read up to 2 KiB, and control and
+        /// bidi characters are stripped, so a log reader can trust it is one printable line.
+        message: String,
+    },
 
     /// Network error (connection refused, timeout, etc.).
     #[error("network error: {0}")]
@@ -46,7 +52,10 @@ pub enum TransportError {
     /// lost silently: the segment is not acknowledged, so the next drain delivers it again, and
     /// only the attempt budget skips it, with a warning that counts what was dropped.
     #[error("{count} event(s) cannot be sent under the body limit")]
-    Unsendable { count: usize },
+    Unsendable {
+        /// How many events of the segment could not be shortened.
+        count: usize,
+    },
 
     /// Server is unreachable (for graceful degradation).
     #[error("server unreachable")]

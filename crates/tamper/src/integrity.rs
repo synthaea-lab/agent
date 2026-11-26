@@ -102,25 +102,33 @@ impl Manifest {
 
 /// What is wrong with one protected path (each variant is one failed check).
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[allow(missing_docs)] // #362
 pub enum ViolationKind {
     /// The file exists and was hashed, but the hash does not match the manifest —
     /// the artifact was replaced or edited.
-    Modified { expected: String, actual: String },
+    Modified {
+        /// Hash the manifest records for the path.
+        expected: String,
+        /// Hash computed from the file on disk.
+        actual: String,
+    },
     /// The protected path is gone — an uninstall or a move as a prelude to a swap.
     Missing,
     /// The path exists but could not be read as a regular file (a FIFO/device
     /// planted at the path, a permissions change, an I/O error).
     Unreadable,
     /// The file grew past [`MAX_VERIFY_BYTES`] — suspicious in its own right.
-    Oversized { size: u64 },
+    Oversized {
+        /// Size of the file in bytes.
+        size: u64,
+    },
 }
 
 /// One protected path that failed verification.
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[allow(missing_docs)] // #362
 pub struct IntegrityViolation {
+    /// The protected path that failed its check.
     pub path: PathBuf,
+    /// Which check failed.
     pub kind: ViolationKind,
 }
 

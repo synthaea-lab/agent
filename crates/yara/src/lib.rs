@@ -33,25 +33,40 @@ pub const MAX_SCAN_BYTES: u64 = 64 * 1024 * 1024;
 /// Errors from loading rules or running a scan. Rule-loading variants name the path or rule
 /// identifier at fault.
 #[derive(Debug, thiserror::Error)]
-#[allow(missing_docs)] // #362
 pub enum YaraError {
+    /// A rule file or directory could not be read.
     #[error("failed to read {path}: {source}")]
     Io {
+        /// The file or directory that failed to read.
         path: String,
+        /// The underlying I/O error.
         source: std::io::Error,
     },
+    /// A rule file did not compile.
     #[error("rule compilation failed in {path}: {message}")]
-    Compile { path: String, message: String },
+    Compile {
+        /// The rule file that failed to compile.
+        path: String,
+        /// The compiler's error message.
+        message: String,
+    },
     /// Issue #73: every rule must carry severity/technique/falsepositives in its
     /// `meta:` block. Names the rule identifier — the file path isn't available
     /// once rules are compiled into one `yara_x::Rules` set.
     #[error("missing or invalid rule metadata in `{identifier}`: {what}")]
-    MissingMetadata { identifier: String, what: String },
+    MissingMetadata {
+        /// Identifier of the offending rule.
+        identifier: String,
+        /// Which `meta:` entry is missing or invalid.
+        what: String,
+    },
     /// The OS refused a scan worker thread (`EAGAIN`: a thread or process limit). `thread` names
     /// the worker, so a log line says which one the host could not start.
     #[error("failed to start the {thread} thread: {source}")]
     Spawn {
+        /// Name of the worker thread that could not be started.
         thread: &'static str,
+        /// The error the OS returned.
         source: std::io::Error,
     },
 }
@@ -69,10 +84,12 @@ struct RuleMetadata {
 /// One YARA match, with the metadata required by issues #73/#74 attached — the
 /// scanner no longer hands back a bare rule identifier only.
 #[derive(Debug, Clone)]
-#[allow(missing_docs)] // #362
 pub struct YaraMatch {
+    /// Identifier of the matching rule.
     pub identifier: String,
+    /// Severity from the rule's `meta:` block.
     pub severity: Severity,
+    /// ATT&CK technique from the rule's `meta:` block.
     pub technique: String,
 }
 
