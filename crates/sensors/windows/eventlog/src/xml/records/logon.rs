@@ -29,8 +29,8 @@ use crate::xml::{
 /// `Sandbox`); the fixtures in this
 /// module's tests are trimmed but otherwise faithful to that capture.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
-#[allow(missing_docs)] // #362
 pub struct LogonEvent {
+    /// `<EventRecordID>`: the record's id in its channel, the poller's resume cursor.
     pub record_id: u64,
     /// 4624, 4625, 4648, or 4672 — parsed from the block's own `<EventID>`
     /// rather than passed in, so one poller can query all four IDs at once.
@@ -39,9 +39,13 @@ pub struct LogonEvent {
     /// "Microsoft-Windows-Security-Auditing" provider runs inside LSASS for
     /// every event this module parses, not the account's own process.
     pub pid: u32,
+    /// `SubjectUserSid`: the security context Windows associates with the event, see the type doc.
     pub subject_user_sid: Option<String>,
+    /// `SubjectUserName`, same context as [`Self::subject_user_sid`].
     pub subject_user_name: Option<String>,
+    /// `TargetUserSid`: the account logging in. Never present on 4648; absent on 4672.
     pub target_user_sid: Option<String>,
+    /// `TargetUserName`: the account logging in. Absent on 4672.
     pub target_user_name: Option<String>,
     /// `None` for a local console/service logon, where Windows reports the
     /// literal sentinel `"-"` rather than omitting the field — filtered out
@@ -50,6 +54,8 @@ pub struct LogonEvent {
     /// Hex status code (4625 only). Combined with `sub_status` by `sensor.rs`
     /// into `schema::AuthEvent::status_code`.
     pub status: Option<String>,
+    /// Hex `SubStatus` (4625 only): the more specific reason, joined to `status` as
+    /// `status/sub_status` by `sensor.rs`.
     pub sub_status: Option<String>,
     /// When the event happened (`<TimeCreated SystemTime>`), not when it was read.
     pub time_created_ns: Option<u64>,

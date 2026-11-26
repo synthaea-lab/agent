@@ -5,9 +5,11 @@ use crate::xml::scan::{data_field, data_u32, extract_between};
 /// Fields of one `Microsoft-Windows-CodeIntegrity/Operational` 3076/3077 event
 /// (WDAC audit / enforced verdict, #283).
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[allow(missing_docs)] // #362
 pub struct CodeIntegrityEvent {
+    /// `<EventRecordID>`: the record's id in its channel, the poller's resume cursor.
     pub record_id: u64,
+    /// `<EventID>`: 3076 (audit: the policy would have blocked it) or 3077 (enforced: it was
+    /// blocked). 0 if the block has none.
     pub event_id: u32,
     /// `File Name`: the image that failed the policy, as an **NT device path**
     /// (`\Device\HarddiskVolume3\...`), not a drive-letter path.

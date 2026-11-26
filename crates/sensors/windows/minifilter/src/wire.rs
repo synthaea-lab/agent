@@ -50,41 +50,60 @@ pub struct Counters {
 }
 
 /// What a message reports.
+///
+/// Every path is the NT device path the driver saw (`\Device\HarddiskVolume3\...`), decoded
+/// lossily from UTF-16 (an unpaired surrogate becomes U+FFFD); `events::to_event` rewrites the
+/// device prefix to a drive letter. A path of more than [`MAX_PATH_UNITS`] code units is cut
+/// and its `truncated` flag set.
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[allow(missing_docs)] // #362
 pub enum Body {
     /// The queue has been empty for a while: the driver and its sender thread are alive.
     Heartbeat,
     /// A delete was requested and accepted (disposition or delete-on-close). The file goes away
     /// at the last handle close, and another handle can still cancel it.
     Delete {
+        /// The file to be deleted.
         path: String,
         /// Requested at open (`FILE_DELETE_ON_CLOSE`) rather than by a disposition.
         on_close: bool,
+        /// `path` was cut, see [`Body`].
         truncated: bool,
     },
     /// A rename that succeeded.
     Rename {
+        /// The name before the rename.
         old_path: String,
+        /// The name after the rename.
         new_path: String,
+        /// `old_path` was cut, see [`Body`].
         old_truncated: bool,
+        /// `new_path` was cut, see [`Body`].
         new_truncated: bool,
     },
     /// An accepted `FileBasicInformation` timestamp request. Values are the caller's raw
     /// 100-ns FILETIME values since 1601; zero means unchanged, and -1/-2 are Windows
     /// auto-update sentinels. The event does not claim the requested time was persisted.
     SetTime {
+        /// The file whose timestamps were requested.
         path: String,
+        /// Requested `CreationTime`, raw (see the variant).
         creation_time: i64,
+        /// Requested `LastAccessTime`, raw (see the variant).
         last_access_time: i64,
+        /// Requested `LastWriteTime`, raw (see the variant).
         last_write_time: i64,
+        /// Requested `ChangeTime`, raw (see the variant).
         change_time: i64,
+        /// `path` was cut, see [`Body`].
         truncated: bool,
     },
     /// A successful open of a mounted logical volume, with the caller's requested access mask.
     RawVolumeOpen {
+        /// The volume's device path (`\Device\HarddiskVolume3`), not a file on it.
         volume: String,
+        /// The requested access mask, not the granted one.
         desired_access: u32,
+        /// `volume` was cut, see [`Body`].
         truncated: bool,
     },
 }
@@ -108,53 +127,98 @@ impl Body {
 
 /// One decoded message.
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[allow(missing_docs)] // #362
 pub struct Message {
     /// Per-connection sequence number, starting at 1: a gap means records were lost.
     pub seq: u64,
     /// When the driver saw the operation, in nanoseconds since the Unix epoch.
     pub timestamp_ns: u64,
+    /// Process id of the requester, as the pre-operation saw it. `events::to_event` clamps a value
+    /// above `u32::MAX` to 0.
     pub pid: u64,
+    /// Thread id of the requester, as the pre-operation saw it.
     pub tid: u64,
+    /// The driver's loss counters at the time it sent this message.
     pub counters: Counters,
+    /// What happened.
     pub body: Body,
 }
 
 /// Why a message was refused. Each one means the driver and the agent disagree on the format
 /// (or the bytes are not from the driver): the caller drops the message and counts it.
+///
+/// Each payload is the offending value, as the message states it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
-#[allow(missing_docs)] // #362
 pub enum WireError {
+    /// Fewer bytes than [`HEADER_LEN`]; the payload is the byte count.
     #[error("message of {0} bytes is shorter than the {HEADER_LEN}-byte header")]
     TooShort(usize),
+    /// More bytes than [`MAX_MESSAGE_LEN`]; the payload is the byte count.
     #[error("message of {0} bytes is longer than the largest the driver sends")]
     TooLong(usize),
+    /// A `kind` that is none of heartbeat, delete, rename, set-time or raw-volume open.
     #[error("unknown message kind {0}")]
     UnknownKind(u16),
+    /// Flag bits the decoder does not know; the payload holds only the unknown bits.
     #[error("unknown flag bits {0:#06x}")]
     UnknownFlags(u16),
+    /// Known flag bits that this message kind never sets (for example delete-on-close on a
+    /// rename).
     #[error("flags {flags:#06x} do not apply to message kind {kind}")]
-    FlagsForKind { kind: u16, flags: u16 },
+    FlagsForKind {
+        /// The message kind.
+        kind: u16,
+        /// The flags as received, not only the offending bits.
+        flags: u16,
+    },
+    /// An `old`/`new` path length, in UTF-16 units, that the kind does not allow (a heartbeat has
+    /// none, a rename has both, the others only `old`).
     #[error("path lengths {old} and {new} do not fit message kind {kind}")]
-    PathLengthsForKind { kind: u16, old: u16, new: u16 },
+    PathLengthsForKind {
+        /// The message kind.
+        kind: u16,
+        /// The old-path length in UTF-16 code units.
+        old: u16,
+        /// The new-path length in UTF-16 code units.
+        new: u16,
+    },
+    /// A path length above [`MAX_PATH_UNITS`]; the payload is that length.
     #[error("path of {0} UTF-16 units is longer than the driver's cap")]
     PathTooLong(u16),
+    /// The byte count does not equal the header plus the two announced paths.
     #[error("message of {actual} bytes, its header announces {expected}")]
-    LengthMismatch { expected: usize, actual: usize },
+    LengthMismatch {
+        /// Header length plus both paths, from the header's path lengths.
+        expected: usize,
+        /// The bytes received.
+        actual: usize,
+    },
+    /// A sequence number of 0; the driver starts at 1.
     #[error("sequence number 0 (the driver starts at 1)")]
     ZeroSequence,
+    /// A timestamp earlier than 1970-01-01; the payload is the raw `FILETIME` (100 ns since 1601).
     #[error("timestamp {0} is before 1970")]
     TimestampBeforeEpoch(i64),
+    /// A timestamp whose nanosecond count exceeds `u64`; the payload is the raw `FILETIME`.
     #[error("timestamp {0} does not fit in a 64-bit nanosecond count")]
     TimestampOverflow(i64),
+    /// A set-time message whose four timestamps are all zero (nothing requested).
     #[error("set-time event contains no requested timestamp")]
     EmptySetTime,
+    /// A message of another kind with a nonzero set-time field.
     #[error("message kind {kind} has nonzero set-time fields")]
-    SetTimeFieldsForKind { kind: u16 },
+    SetTimeFieldsForKind {
+        /// The message kind.
+        kind: u16,
+    },
+    /// A set-time timestamp below -2, the lowest Windows sentinel; the payload is that value.
     #[error("set-time field {0} is below the Windows -2 auto-update sentinel")]
     InvalidSetTime(i64),
+    /// A message of a kind other than raw-volume open with a nonzero `desired_access`.
     #[error("message kind {kind} has nonzero desired-access field")]
-    DesiredAccessForKind { kind: u16 },
+    DesiredAccessForKind {
+        /// The message kind.
+        kind: u16,
+    },
 }
 
 /// Decodes one message payload.

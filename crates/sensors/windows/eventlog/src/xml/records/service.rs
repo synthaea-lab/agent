@@ -5,9 +5,10 @@ use crate::xml::scan::extract_between;
 /// Fields extracted from a 7045 ("A service was installed in the system") `<Event>`
 /// block — System log, no audit prerequisite.
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[allow(missing_docs)] // #362
 pub struct ServiceInstallEvent {
+    /// `<EventRecordID>`: the record's id in its channel, the poller's resume cursor.
     pub record_id: u64,
+    /// `ServiceName` as the event writes it. Empty if missing.
     pub service_name: String,
     /// As passed to `CreateService()`/`sc create` — already a normal Windows path
     /// (possibly with trailing arguments), not an NT kernel device path. Do NOT run
