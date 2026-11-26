@@ -1737,7 +1737,9 @@ pub struct RegistrySetEvent {
     /// Registry data type (`1=REG_SZ`, `2=REG_EXPAND_SZ`, `3=REG_BINARY`, `4=REG_DWORD`, ...).
     pub data_type: u32,
     /// String representation of the value data for `REG_SZ` / `REG_EXPAND_SZ` types.
-    /// `None` for binary or DWORD types where string decoding is not meaningful.
+    /// `None` for binary or DWORD types where string decoding is not meaningful, and for
+    /// every write on Windows 11 26300, whose kernel delivers no captured data: no rule may
+    /// depend on it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub data: Option<String>,
 }
