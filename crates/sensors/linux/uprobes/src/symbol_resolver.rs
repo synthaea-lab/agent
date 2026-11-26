@@ -31,11 +31,11 @@ pub struct SymbolInfo {
 /// SSL/TLS library type identified from path.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LibraryType {
-    /// OpenSSL, or any `libssl` (BoringSSL shares the file name, so it lands here too).
+    /// OpenSSL, or any `libssl` (`BoringSSL` shares the file name, so it lands here too).
     OpenSSL,
-    /// BoringSSL. Reserved: `from_path` matches on file name only and never returns it today.
+    /// `BoringSSL`. Reserved: `from_path` matches on file name only and never returns it today.
     BoringSSL,
-    /// GnuTLS (`libgnutls`).
+    /// `GnuTLS` (`libgnutls`).
     GnuTLS,
     /// Not recognized from the file name.
     Unknown,
