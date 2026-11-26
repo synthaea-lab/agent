@@ -83,7 +83,6 @@ pub use stateless::{
 /// A detection finding from a stateless or stateful rule. Carries the technique, an analyst-
 /// facing severity and a message; it never triggers a response by itself.
 #[derive(Debug, Clone)]
-#[allow(missing_docs)] // #362
 pub struct Alert {
     /// ATT&CK identifier of the detected technique.
     pub technique: &'static str,
@@ -91,6 +90,7 @@ pub struct Alert {
     /// construction site (issue #615). It ranks and fuses findings (`verdict`); it
     /// is not a response trigger, and no destructive action may be gated on it.
     pub severity: Severity,
+    /// Analyst-facing description of what was detected.
     pub message: String,
 }
 

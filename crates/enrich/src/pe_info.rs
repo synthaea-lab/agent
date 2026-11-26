@@ -36,11 +36,15 @@ use std::path::Path;
 /// `None` here must never be read as "unsigned" or any other value judgment —
 /// only "not present or not read."
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-#[allow(missing_docs)] // #362
 pub struct PeInfo {
+    /// `OriginalFilename` of the version resource: the name the binary was built
+    /// under, which differs from the on-disk name when the file was renamed.
     pub original_file_name: Option<String>,
+    /// `CompanyName` of the version resource.
     pub company_name: Option<String>,
+    /// `FileDescription` of the version resource.
     pub file_description: Option<String>,
+    /// `ProductName` of the version resource.
     pub product_name: Option<String>,
 }
 
