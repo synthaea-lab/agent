@@ -1,0 +1,13 @@
+{
+  "type": "kernel_module",
+  "meta": {
+    "pid": 9011,
+    "ppid": 1,
+    "user": { "os": "unix", "uid": 0, "gid": 0 },
+    "timestamp_ns": 1756900029000000000,
+    "comm": "modprobe"
+  },
+  "action": "load_fd",
+  "fd": 3,
+  "path": "/usr/lib/modules/6.12.0/kernel/drivers/net/dummy.ko.xz"
+}

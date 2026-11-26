@@ -12,6 +12,37 @@ forward, so the sensor only reports signals aimed at two kinds of target, and fi
 Both produce `SignalEvent` on the `SIGNAL_EVENTS` ring (64 KiB). The sender is `meta` (so the
 container resolved is the sender's), the target is `target_pid`.
 
+### A signal from the agent's watchdog
+
+The watchdog kills the agent on a stalled heartbeat, so that `SIGKILL` is not tampering
+([#322](https://github.com/synthaea-lab/agent/issues/322)). The watchdog spawns the agent
+and sets `SYNTHAEA_WATCHDOG_RESTARTS` in its environment; an agent started that way checks, once at
+start, that its parent runs the installed watchdog (`/proc/<ppid>/exe` is the `watchdog` binary
+next to the agent's), and reads the watchdog's `starttime`
+([`watchdog`](../../../crates/sensors/linux/userspace/src/watchdog.rs)). The variable alone proves
+nothing, since whoever starts the agent can set it. A signal sets `sender_is_watchdog` when its
+sender has the watchdog's pid, was sent after the end of the clock tick the watchdog started in,
+**and** the watchdog is still the agent's parent when the signal is judged: a pid is not reused
+while its process lives, and a dead parent is never the parent again, so no other process can have
+held the pid at that moment. The last check does not rely on the `PR_SET_PDEATHSIG` the watchdog
+sets on the agent, which a credential change in the agent would clear.
+The T1562.001 rule then reports a reliable signal to the agent at Low and says so, instead of High.
+A signal from the watchdog to a security tool stays as it was.
+
+Only the heartbeat kill reads Low. The same watchdog restarts the agent after it, so the replay
+finds its sender as its parent. Two of the watchdog's kills still read High (#322 stays open for
+them):
+
+- **A probation rollback.** The watchdog kills the agent, then exits so the service manager restarts
+  it from the rolled-back release. The next agent's parent is a new watchdog with another pid, so the
+  replayed kill matches nothing.
+- **The audit fallback.** Its replay from auditd's log
+  ([audit-fallback.md](audit-fallback.md#sigkill-of-the-agent)) does not identify the watchdog.
+
+The sender's name and cgroup are not used: a root sender chooses both (one write to the agent
+unit's `cgroup.procs` moves it there, and that move is not detected). The check works the same
+without systemd (OpenRC), since it relies only on the process tree.
+
 ## Signals to the agent
 
 Userspace writes its own pid into [`SIGNAL_WATCH_PID`](../../../crates/sensors/linux/ebpf/src/mount_signal/signal.rs)
@@ -135,3 +166,12 @@ gets the agent's exe; any other target gets neither, so it cannot read as a sign
   [#49](https://github.com/synthaea-lab/agent/issues/49)).
 - Only the agent's own pid is watched on the `kill`/`tgkill` path; the watchdog process is not. That
   path compares the pid argument as the sender wrote it, in the sender's pid namespace.
+- A watchdog restarted between the kill and the replay (a restart of the whole unit) has started
+  after the replayed `SIGKILL`, so that kill stays High even when the old watchdog sent it. After a
+  suspend, `starttime` (which counts suspended time) can look later than the signal's `ktime`
+  (which does not), with the same fail-safe result.
+- A watchdog whose binary was replaced on disk after it started (`/proc/<pid>/exe` ends in
+  ` (deleted)`), or an agent started with an explicit `--agent-bin` outside the watchdog's
+  directory, is not taken for the watchdog: its kills stay High. Root can still pass for the
+  watchdog by running the real watchdog binary, or through `ptrace`; `systemctl kill` already
+  reads Low as a signal from the service manager.

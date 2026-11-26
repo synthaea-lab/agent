@@ -1,0 +1,14 @@
+{
+  "type": "ldap_search",
+  "meta": {
+    "pid": 3740,
+    "ppid": 0,
+    "user": { "os": "windows", "sid": "S-1-5-21-1004336348-1177238915-682003330-1001", "integrity_level": 8192 },
+    "timestamp_ns": 1759396502000000000,
+    "comm": "powershell.exe"
+  },
+  "filter": "(&(samAccountType=805306368)(servicePrincipalName=*))",
+  "base_dn": "DC=lab,DC=local",
+  "scope": 2,
+  "attributes": ["sAMAccountName", "servicePrincipalName"]
+}

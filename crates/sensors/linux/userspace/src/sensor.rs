@@ -6,7 +6,7 @@
 //! reuses them for the preflight (loads each program without attaching it), which is
 //! not part of the `Sensor` contract.
 
-use std::{sync::Arc, time::Duration};
+use std::{path::Path, sync::Arc, time::Duration};
 
 use schema::sensor::{Capabilities, EventSink, Sensor, SensorError};
 use sensor_linux_container::ContainerResolver;
@@ -27,7 +27,11 @@ use crate::{
     ring_drops::{RingDropTotals, RingDrops},
     rings::{RingBuffers, drain_ready, drain_wire, readable_or_pending},
     unit_procs::{ToolProcs, ToolWatch, UnitResolver},
+    watchdog::{ProcTable, Watchdog},
 };
+
+/// Where a live host's process table is mounted.
+const PROC_ROOT: &str = "/proc";
 
 /// The file a `finit_module(2)` event's fd points at (#457), read from
 /// `/proc/<pid>/fd/<fd>` while the event is drained. Racy by nature: the
@@ -93,26 +97,74 @@ fn sweep_survived_sigkill(slot: &mut TamperSlot, own_pid: u32, boot_epoch_offset
     }
 }
 
-/// The image and unit reported for a signal's target. A target on the watch list is a security
+/// What is reported about a signal's sender and target. A target on the watch list is a security
 /// tool: its unit and the exe read at scan time (the process may be gone by now). Anything else
 /// is the agent itself (`SIGNAL_WATCH_PID`). A target that is neither (a tool gone from every
 /// scan) gets no image and no unit, never the agent's: it must not read as a signal to the agent.
-fn signal_target(
+/// The sender is checked against the agent's watchdog (#322).
+fn signal_parties(
     event: &wire::SignalEvent,
     tool_procs: &ToolProcs,
-    own_pid: u32,
-    self_exe: Option<&String>,
-) -> (Option<String>, Option<String>) {
+    own: &OwnProcess,
+) -> normalize::SignalParties {
     let tool = tool_procs
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .get(&event.target_pid)
         .cloned();
-    match tool {
+    let (target_image_path, target_unit) = match tool {
         Some(tool) => (tool.exe, Some(tool.unit)),
-        None if event.target_pid == own_pid => (self_exe.cloned(), None),
+        None if event.target_pid == own.pid => (own.exe.clone(), None),
         None => (None, None),
+    };
+    normalize::SignalParties {
+        target_image_path,
+        target_unit,
+        sender_is_watchdog: own.sent_by_watchdog(event),
     }
+}
+
+/// What the signal path knows about the agent's own process: the target it watches, and the
+/// watchdog that may legitimately kill it.
+struct OwnProcess {
+    pid: u32,
+    exe: Option<String>,
+    watchdog: Option<Watchdog>,
+    /// The agent's parent pid now; `getppid` on a real host. Read per signal: a watchdog that
+    /// is no longer the parent proves nothing by its pid (`watchdog.rs`).
+    current_parent: fn() -> u32,
+}
+
+impl OwnProcess {
+    fn sent_by_watchdog(&self, event: &wire::SignalEvent) -> bool {
+        self.watchdog.is_some_and(|watchdog| {
+            watchdog.sent(
+                event.meta.pid,
+                event.meta.timestamp_ns,
+                (self.current_parent)(),
+            )
+        })
+    }
+
+    /// The parties of the `SIGKILL` that killed the previous instance, replayed after the
+    /// restart. The watchdog that restarted this agent is the one that killed the previous
+    /// instance only if it was already running at the kill: `sent_by_watchdog` checks it.
+    fn replayed_kill_parties(&self, previous: &wire::SignalEvent) -> normalize::SignalParties {
+        normalize::SignalParties {
+            target_image_path: self.exe.clone(),
+            target_unit: None,
+            sender_is_watchdog: self.sent_by_watchdog(previous),
+        }
+    }
+}
+
+/// The watchdog with `pid`, read from the live process table; `None` without one, or when that
+/// process does not run the watchdog installed next to `agent_exe`.
+fn read_watchdog(pid: Option<u32>, agent_exe: Option<&str>) -> Option<Watchdog> {
+    // SAFETY: `sysconf` reads a constant system value and touches no memory of ours.
+    let ticks_per_second = unsafe { libc::sysconf(libc::_SC_CLK_TCK) };
+    let table = ProcTable::new(PROC_ROOT, u64::try_from(ticks_per_second).ok()?);
+    table.watchdog(pid?, Path::new(agent_exe?))
 }
 
 /// Linux sensor (eBPF). `run` blocks until Ctrl-C or [`Sensor::stop`].
@@ -123,6 +175,8 @@ pub struct LinuxSensor {
     /// Whether the UDP/53 DNS capture program is attached (#458 part 3). Fixed for the life of the
     /// sensor.
     dns_udp: bool,
+    /// The pid of the watchdog that started this agent, if one did (#322).
+    watchdog_pid: Option<u32>,
 }
 
 impl Default for LinuxSensor {
@@ -140,7 +194,17 @@ impl LinuxSensor {
             evictions: Arc::new(ParentImageEvictions::default()),
             ring_drops: Arc::new(RingDropTotals::default()),
             dns_udp: false,
+            watchdog_pid: None,
         }
+    }
+
+    /// The pid of the watchdog supervising this agent (its parent), so a signal it sends the
+    /// agent is reported as the watchdog's (#322). `None`, the default, for an agent started
+    /// without its watchdog: then no sender is taken for it. Fixed at start.
+    #[must_use]
+    pub fn with_watchdog_pid(mut self, pid: Option<u32>) -> Self {
+        self.watchdog_pid = pid;
+        self
     }
 
     /// Attaches the UDP/53 DNS capture program (#458 part 3): the first bytes of a
@@ -182,9 +246,15 @@ impl LinuxSensor {
         // The signal filter only ever watches this process (v1 scope), so this is
         // resolved once rather than per event — see `normalize::signal`'s doc
         // comment.
-        let self_exe = std::env::current_exe()
+        let exe = std::env::current_exe()
             .ok()
             .map(|p| p.display().to_string());
+        let own = OwnProcess {
+            pid: own_pid,
+            watchdog: read_watchdog(self.watchdog_pid, exe.as_deref()),
+            exe,
+            current_parent: std::os::unix::process::parent_id,
+        };
 
         match aya_log::EbpfLogger::init(&mut ebpf) {
             Err(e) => {
@@ -305,8 +375,7 @@ impl LinuxSensor {
             sink.on_event(normalize::signal(
                 &previous,
                 offset,
-                self_exe.clone(),
-                None,
+                own.replayed_kill_parties(&previous),
                 containers.resolve(previous.meta.cgroup_id),
             ));
             clear_tamper_slot(&mut tamper_slot)?;
@@ -387,8 +456,8 @@ impl LinuxSensor {
                 // The container is the SENDER's (meta is the sender, as for every event type):
                 // it attributes e.g. a container-escape kill attempt to the container it came from.
                 guard = rings.signal.readable_mut() => drain_wire(guard, sink, own_pid, |e: &wire::SignalEvent| {
-                    let (image, unit) = signal_target(e, &tool_procs, own_pid, self_exe.as_ref());
-                    normalize::signal(e, offset, image, unit, containers.resolve(e.meta.cgroup_id))
+                    let parties = signal_parties(e, &tool_procs, &own);
+                    normalize::signal(e, offset, parties, containers.resolve(e.meta.cgroup_id))
                 })?,
                 guard = rings.kernel_module.readable_mut() => drain_wire(guard, sink, own_pid, |e: &wire::KernelModuleEvent| normalize::kernel_module(e, finit_module_path(e), offset, containers.resolve(e.meta.cgroup_id)))?,
                 guard = rings.bpf.readable_mut() => drain_wire(guard, sink, own_pid, |e: &wire::BpfEvent| normalize::bpf_operation(e, offset, containers.resolve(e.meta.cgroup_id)))?,
@@ -464,5 +533,126 @@ mod evictions_handle_tests {
             !Arc::ptr_eq(&first, &LinuxSensor::new().parent_image_evictions()),
             "each sensor has its own"
         );
+    }
+}
+
+/// The wiring that decides whether a kill of the agent reads Low (#322): the rule itself is
+/// tested in `watchdog.rs`, these pin which watchdog and which parent the sensor feeds it.
+#[cfg(test)]
+mod watchdog_sender_tests {
+    use std::{fs, os::unix::fs::symlink};
+
+    use sensor_linux_wire as wire;
+
+    use super::{OwnProcess, ProcTable};
+
+    const WATCHDOG_PID: u32 = 4242;
+    const AGENT_EXE: &str = "/opt/synthaea/current/agent";
+    /// The watchdog's `starttime` is tick 10 at 100 ticks a second, so it had started by 110 ms.
+    const WATCHDOG_STARTED_BY_NS: u64 = 110_000_000;
+
+    fn watchdog_is_parent() -> u32 {
+        WATCHDOG_PID
+    }
+
+    fn init_is_parent() -> u32 {
+        1
+    }
+
+    /// The agent, supervised by a watchdog at `WATCHDOG_PID` running `watchdog_exe`.
+    fn agent_supervised_by(watchdog_exe: &str, current_parent: fn() -> u32) -> OwnProcess {
+        let root = tempfile::tempdir().unwrap();
+        let process = root.path().join(WATCHDOG_PID.to_string());
+        fs::create_dir_all(&process).unwrap();
+        fs::write(
+            process.join("stat"),
+            format!("{WATCHDOG_PID} (watchdog) S 1 1 1 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 10 0 0"),
+        )
+        .unwrap();
+        symlink(watchdog_exe, process.join("exe")).unwrap();
+        let watchdog = ProcTable::new(root.path(), 100)
+            .watchdog(WATCHDOG_PID, std::path::Path::new(AGENT_EXE));
+        OwnProcess {
+            pid: 500,
+            exe: Some(AGENT_EXE.to_string()),
+            watchdog,
+            current_parent,
+        }
+    }
+
+    fn sigkill_from(pid: u32, timestamp_ns: u64) -> wire::SignalEvent {
+        wire::SignalEvent {
+            meta: wire::EventMeta {
+                pid,
+                ppid: 1,
+                uid: 0,
+                gid: 0,
+                timestamp_ns,
+                comm: [0; wire::TASK_COMM_LEN],
+                cgroup_id: 0,
+                process_generation: 0,
+                parent_generation: 0,
+            },
+            signal: 9,
+            target_pid: 500,
+        }
+    }
+
+    #[test]
+    fn a_replayed_kill_from_the_running_watchdog_is_the_watchdogs() {
+        let agent = agent_supervised_by("/opt/synthaea/current/watchdog", watchdog_is_parent);
+        let kill = sigkill_from(WATCHDOG_PID, WATCHDOG_STARTED_BY_NS + 1);
+        assert!(agent.replayed_kill_parties(&kill).sender_is_watchdog);
+    }
+
+    #[test]
+    fn a_replayed_kill_from_another_pid_is_not_the_watchdogs() {
+        let agent = agent_supervised_by("/opt/synthaea/current/watchdog", watchdog_is_parent);
+        let kill = sigkill_from(WATCHDOG_PID + 1, WATCHDOG_STARTED_BY_NS + 1);
+        assert!(!agent.replayed_kill_parties(&kill).sender_is_watchdog);
+    }
+
+    /// A probation rollback: the old watchdog kills the agent and exits, and the service manager
+    /// starts a new watchdog (another pid) that starts this agent. That kill stays High (#322).
+    #[test]
+    fn a_kill_by_a_watchdog_that_exited_before_the_replay_is_not_the_current_watchdogs() {
+        let agent = agent_supervised_by("/opt/synthaea/current/watchdog", watchdog_is_parent);
+        let previous_watchdog = WATCHDOG_PID - 7;
+        let kill = sigkill_from(previous_watchdog, WATCHDOG_STARTED_BY_NS - 1);
+        assert!(!agent.replayed_kill_parties(&kill).sender_is_watchdog);
+    }
+
+    #[test]
+    fn a_replayed_kill_sent_before_the_watchdog_started_is_not_the_watchdogs() {
+        let agent = agent_supervised_by("/opt/synthaea/current/watchdog", watchdog_is_parent);
+        let kill = sigkill_from(WATCHDOG_PID, WATCHDOG_STARTED_BY_NS - 1);
+        assert!(!agent.replayed_kill_parties(&kill).sender_is_watchdog);
+    }
+
+    /// Jihair54's case S on agent#323: a root shell stops the watchdog, kills the agent and
+    /// starts it again with the watchdog's environment variable. The shell is the parent.
+    #[test]
+    fn a_kill_from_a_parent_that_is_not_the_watchdog_binary_is_not_the_watchdogs() {
+        let agent = agent_supervised_by("/usr/bin/bash", watchdog_is_parent);
+        let kill = sigkill_from(WATCHDOG_PID, WATCHDOG_STARTED_BY_NS + 1);
+        assert!(!agent.replayed_kill_parties(&kill).sender_is_watchdog);
+    }
+
+    #[test]
+    fn a_kill_after_the_watchdog_stopped_being_the_parent_is_not_the_watchdogs() {
+        let agent = agent_supervised_by("/opt/synthaea/current/watchdog", init_is_parent);
+        let kill = sigkill_from(WATCHDOG_PID, WATCHDOG_STARTED_BY_NS + 1);
+        assert!(!agent.sent_by_watchdog(&kill));
+    }
+
+    #[test]
+    fn an_agent_started_without_a_watchdog_takes_no_sender_for_one() {
+        let agent = OwnProcess {
+            pid: 500,
+            exe: Some(AGENT_EXE.to_string()),
+            watchdog: None,
+            current_parent: watchdog_is_parent,
+        };
+        assert!(!agent.sent_by_watchdog(&sigkill_from(WATCHDOG_PID, u64::MAX)));
     }
 }

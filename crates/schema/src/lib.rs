@@ -360,7 +360,11 @@ pub mod time;
 /// Linux exec probe reads a head and a tail window of the argument block and says
 /// how much of it lies between them. First claimed 67;
 /// <https://github.com/synthaea-lab/agent/issues/41> merged first and took it, so this takes 68.
-pub const SCHEMA_VERSION: u32 = 68;
+///
+/// Bumped 68 → 69 for [`SignalEvent::sender_is_watchdog`]
+/// (<https://github.com/synthaea-lab/agent/issues/322>), so a signal from the agent's own watchdog
+/// is told from an intruder's.
+pub const SCHEMA_VERSION: u32 = 69;
 
 /// Bytes of argv, one separator per token included, a sensor keeps for one exec
 /// ([`bound_argv`], #1112).
@@ -2490,6 +2494,14 @@ pub struct SignalEvent {
     /// agent's own pid.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub target_unit: Option<String>,
+    /// The sender is the watchdog that supervises the agent (Linux,
+    /// <https://github.com/synthaea-lab/agent/issues/322>), which kills it on a stalled heartbeat
+    /// or a rollback: its pid is the agent's parent's, and that parent was already running when
+    /// the signal was sent, so the pid cannot have been another process's. Neither the sender's
+    /// name nor its cgroup is trusted for this: root can choose both. Absent (false) elsewhere,
+    /// for an agent started without its watchdog, and in an older event.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub sender_is_watchdog: bool,
     /// The sender in `meta` may not be the process that sent the signal (Linux, #1103): the
     /// siginfo's `si_code` was `SI_TIMER`, `SI_MESGQ` or `SI_ASYNCIO`, which the kernel sets from
     /// interrupt or completion context, where the current task is a bystander. A process can also

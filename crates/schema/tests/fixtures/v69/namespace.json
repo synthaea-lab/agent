@@ -1,0 +1,13 @@
+{
+  "type": "namespace",
+  "meta": {
+    "pid": 9009,
+    "ppid": 1,
+    "user": { "os": "unix", "uid": 0, "gid": 0 },
+    "timestamp_ns": 1756900027000000000,
+    "comm": "nsenter"
+  },
+  "syscall": "set_ns",
+  "fd": 3,
+  "flags": 1073741824
+}

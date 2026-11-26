@@ -40,6 +40,9 @@ mod syscall;
 // Which processes belong to a listed security unit, for the `signal_generate` probe (#1103).
 #[cfg(target_os = "linux")]
 mod unit_procs;
+// Whether a signal's sender is the agent's own watchdog (#322).
+#[cfg(target_os = "linux")]
+mod watchdog;
 #[cfg(all(target_os = "linux", ebpf_embedded))]
 pub use ebpf::verifier_loader;
 #[cfg(target_os = "linux")]
