@@ -17,21 +17,27 @@ use goblin::elf::Elf;
 
 /// ELF symbol with its offset and source library.
 #[derive(Debug, Clone)]
-#[allow(missing_docs)] // #362
 pub struct SymbolInfo {
+    /// Symbol name (for example `SSL_read`).
     pub name: String,
+    /// Offset of the symbol in the library file, the value a uprobe is attached at.
     pub offset: u64,
+    /// Path of the library the symbol was found in.
     pub library_path: PathBuf,
+    /// Family of that library.
     pub library_type: LibraryType,
 }
 
 /// SSL/TLS library type identified from path.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[allow(missing_docs)] // #362
 pub enum LibraryType {
+    /// OpenSSL, or any `libssl` (BoringSSL shares the file name, so it lands here too).
     OpenSSL,
+    /// BoringSSL. Reserved: `from_path` matches on file name only and never returns it today.
     BoringSSL,
+    /// GnuTLS (`libgnutls`).
     GnuTLS,
+    /// Not recognized from the file name.
     Unknown,
 }
 
@@ -51,11 +57,12 @@ impl LibraryType {
 
 /// Symbol resolution error.
 #[derive(Debug, thiserror::Error)]
-#[allow(missing_docs)] // #362
 pub enum ResolverError {
     #[error("I/O error: {0}")]
+    /// Reading the library file failed.
     Io(#[from] std::io::Error),
     #[error("ELF parse error: {0}")]
+    /// The file is not a parseable ELF object.
     Elf(#[from] goblin::error::Error),
 }
 

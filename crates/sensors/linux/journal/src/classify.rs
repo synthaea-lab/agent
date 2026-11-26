@@ -46,16 +46,19 @@ use crate::JournalRecord;
 /// match with a field we couldn't extract is still reported (the category itself is
 /// the useful signal), just with that field empty.
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[allow(missing_docs)] // #362
 pub enum JournalEvent {
     /// Successful SSH login (`sshd`, "Accepted ..." — password or pubkey).
     SshAccepted {
+        /// The account that logged in.
         user: Option<String>,
+        /// The client address, as sshd printed it.
         source_addr: Option<String>,
     },
     /// Failed SSH login attempt (bad password, or a nonexistent account probed).
     SshFailed {
+        /// The account the attempt named, which may not exist.
         user: Option<String>,
+        /// The client address, as sshd printed it.
         source_addr: Option<String>,
     },
     /// A PAM-backed session opened, keyed by the PAM service name (`"sudo"`,
@@ -63,11 +66,16 @@ pub enum JournalEvent {
     /// `pam_unix(<service>:session):` prefix, so any PAM service using
     /// `pam_unix` is covered without a per-binary allowlist.
     PamSessionOpened {
+        /// The PAM service name (`sudo`, `sshd`, `su`, `login`, ...).
         service: String,
+        /// The account the session is opened for, from `for user <name>`.
         target_user: Option<String>,
     },
     /// The matching close for a [`JournalEvent::PamSessionOpened`].
-    PamSessionClosed { service: String },
+    PamSessionClosed {
+        /// The PAM service name the session belonged to.
+        service: String,
+    },
     /// A PAM authentication failure (wrong password) for the `sudo`/`su`
     /// service — parsed from the standard `pam_unix(<service>:auth):
     /// authentication failure; ...` line. Only emitted for `sudo`/`su`:
@@ -76,6 +84,7 @@ pub enum JournalEvent {
     /// double-count, same reasoning as [`JournalEvent::PamSessionOpened`]'s own
     /// restriction (#381, T1548.003).
     PamAuthFailure {
+        /// The PAM service whose authentication failed: `sudo` or `su`.
         service: String,
         /// The `logname=` field: who typed the (wrong) password. For `sudo` it is
         /// the join key when `user=` is missing from the line (the two name the
@@ -94,6 +103,7 @@ pub enum JournalEvent {
     /// A `sudo` invocation with its logged command line (the `sudo:session` PAM
     /// wrapper around it is reported separately as `PamSessionOpened`/`Closed`).
     SudoCommand {
+        /// The account that ran `sudo`, from the line's `<user> : ...` prefix.
         invoking_user: Option<String>,
         /// The `USER=` field: the real escalation target (`root` by default, or
         /// whoever `-u` names). Unlike [`JournalEvent::PamAuthFailure`]'s own
@@ -104,14 +114,24 @@ pub enum JournalEvent {
         /// precisely because it is *not* the same account a preceding failure
         /// would have named.
         target_user: Option<String>,
+        /// The full `COMMAND=` value as logged: the executable and its arguments.
         command: Option<String>,
     },
     /// A systemd unit finished starting successfully.
-    UnitStarted { unit: Option<String> },
+    UnitStarted {
+        /// The unit name (`nginx.service`).
+        unit: Option<String>,
+    },
     /// A systemd unit finished stopping.
-    UnitStopped { unit: Option<String> },
+    UnitStopped {
+        /// The unit name.
+        unit: Option<String>,
+    },
     /// A systemd unit's start job failed.
-    UnitFailed { unit: Option<String> },
+    UnitFailed {
+        /// The unit name.
+        unit: Option<String>,
+    },
 }
 
 /// Classifies one journal record. `None` means "not one of #93's allowlisted

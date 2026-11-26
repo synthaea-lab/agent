@@ -51,15 +51,18 @@ pub const MAX_LINE_BYTES: usize = 8 * 1024;
 
 /// Why a line did not match its preset.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
-#[allow(missing_docs)] // #362
 pub enum ParseError {
     #[error("line ended before the field {0:?}")]
+    /// The line ended before the named field.
     MissingField(&'static str),
     #[error("a quoted or bracketed field is not terminated")]
+    /// A quoted or bracketed field has no closing delimiter.
     Unterminated,
     #[error("field {0:?} is not valid: {1:?}")]
+    /// The named field is present but its value is invalid; the payload is the offending text.
     BadField(&'static str, String),
     #[error("unexpected data after the last field of the format")]
+    /// Data remains after the last field of the format.
     TrailingData,
     /// The line was longer than [`MAX_LINE_BYTES`], was cut, and the rest does not
     /// parse. Not evidence that the source's format is wrong.

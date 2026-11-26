@@ -10,14 +10,21 @@ use crate::wire::{NLMSG_HDR_LEN, NlMsgHeader};
 
 /// A message whose header cannot be trusted. The rest of the buffer is not walked after one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
-#[allow(missing_docs)] // #362
 pub enum FrameError {
     /// The header's length field is smaller than the header itself.
     #[error("netlink message length {len} is shorter than its {NLMSG_HDR_LEN}-byte header")]
-    ShorterThanHeader { len: u32 },
+    ShorterThanHeader {
+        /// The length the header declared.
+        len: u32,
+    },
     /// The header's length field reaches past the end of the received bytes.
     #[error("netlink message of {len} bytes overruns the {available} bytes received")]
-    Overrun { len: u32, available: usize },
+    Overrun {
+        /// The length the header declared.
+        len: u32,
+        /// Bytes actually left in the buffer (starting at this message).
+        available: usize,
+    },
 }
 
 /// Iterates over the messages in `buf` as `(msg_type, payload)`, payload being the bytes after the

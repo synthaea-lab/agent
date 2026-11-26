@@ -109,11 +109,12 @@ const SCANNERS: &[(&str, &str)] = &[
 
 /// What a request matched.
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[allow(missing_docs)] // #362
 pub struct Match {
+    /// Which signature the request matched.
     pub signature: HttpSignature,
     /// The parameter and its raw value, for the signatures that live in a value.
     pub evidence: Option<(String, String)>,
+    /// The scanner's name (`nikto`, `sqlmap`, ...) for a scanner user agent, never the raw string; `None` for every other signature.
     pub scanner: Option<&'static str>,
 }
 

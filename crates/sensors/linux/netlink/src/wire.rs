@@ -127,15 +127,22 @@ impl DiagRequestV2 {
 /// struct is parsed; extended attributes past byte [`DIAG_MSG_LEN`] (unrequested,
 /// since `idiag_ext = 0` above) are not read.
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[allow(missing_docs)] // #362
 pub struct DiagMsg {
+    /// Address family (`AF_INET` or `AF_INET6`).
     pub family: u8,
+    /// Raw TCP state number (`idiag_state`).
     pub state: u8,
+    /// Local address.
     pub local: IpAddr,
+    /// Local port, host byte order.
     pub local_port: u16,
+    /// Remote address.
     pub remote: IpAddr,
+    /// Remote port, host byte order.
     pub remote_port: u16,
+    /// UID of the socket's owner.
     pub uid: u32,
+    /// Socket inode number.
     pub inode: u32,
 }
 

@@ -183,9 +183,10 @@ impl CgroupIdCache {
 /// One entry in [`DockerInfoCache`]: either a lookup is already running for this
 /// container id (don't start a second one), or it finished with whatever it found
 /// (`DockerContainerInfo`'s fields are already `Option` for "asked, got nothing").
-#[allow(missing_docs)] // #362
 pub enum DockerLookupState {
+    /// A lookup task is running for this id and has not finished.
     Pending,
+    /// The lookup finished; the info may hold `None` fields when the daemon said nothing.
     Done(DockerContainerInfo),
 }
 

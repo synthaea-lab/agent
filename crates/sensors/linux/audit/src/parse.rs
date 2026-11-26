@@ -15,12 +15,16 @@ const NLMSGHDR_SIZE: usize = 16;
 /// One audit netlink message after header and `audit(sec.ms:seq):` stamp parsing. `fields` holds
 /// the `key=value` pairs with quotes stripped; `unquoted_fields` remembers which values were bare.
 #[derive(Debug, Clone)]
-#[allow(missing_docs)] // #362
 pub struct AuditRecord {
+    /// Netlink message type (`nlmsg_type`). `AUDIT_EXECVE` = 1309, `AUDIT_SOCKADDR` = 1306.
     pub record_type: u32, // AUDIT_EXECVE = 1309, AUDIT_SOCKADDR = 1306
+    /// Seconds part of the `audit(sec.ms:seq):` stamp.
     pub timestamp_sec: u64,
+    /// Milliseconds part of the stamp.
     pub timestamp_ms: u32,
+    /// Serial number from the stamp: records of one audit event share it.
     pub seq: u64,
+    /// The `key=value` pairs of the message body, quotes stripped.
     pub fields: HashMap<String, String>,
     /// Keys whose value arrived on the wire *unquoted* (`a0=2F62696E2F6C73`,
     /// not `a0="/bin/ls"`) — the kernel's own signal for "this needed

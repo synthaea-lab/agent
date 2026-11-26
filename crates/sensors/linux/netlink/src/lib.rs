@@ -160,13 +160,15 @@ pub use wire::{DiagMsg, IPPROTO_TCP, IPPROTO_UDP, TCP_CLOSE, TCP_ESTABLISHED, TC
 /// crate doc), so `Other` is purely defensive — a kernel returning something outside the requested mask
 /// would be a bug worth seeing, not a panic.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[allow(missing_docs)] // #362
 pub enum SocketState {
+    /// `TCP_ESTABLISHED`: a connected TCP socket.
     Established,
+    /// `TCP_LISTEN`: a listening TCP socket.
     Listen,
     /// A UDP socket bound to a local port and not `connect()`ed: the datagram
     /// equivalent of [`Self::Listen`] (`sock_diag` reports it as `TCP_CLOSE`).
     Unconnected,
+    /// A raw state outside the requested mask; the payload is the kernel's value.
     Other(u8),
 }
 
@@ -183,16 +185,19 @@ impl From<u8> for SocketState {
 
 /// One socket from a [`snapshot`], joined to the PID(s) holding it open.
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[allow(missing_docs)] // #362
 pub struct SocketSnapshotEntry {
     /// `IPPROTO_TCP` or `IPPROTO_UDP`: the dump this entry came from.
     pub protocol: u8,
+    /// Local address and port.
     pub local: SocketAddr,
+    /// Remote address and port (unspecified for a listener or an unconnected UDP socket).
     pub remote: SocketAddr,
+    /// The socket's state.
     pub state: SocketState,
     /// UID of the socket's owning process, from the kernel — independent of the
     /// `/proc` join below, and still populated even when that join finds nothing.
     pub uid: u32,
+    /// The socket's inode: the join key against `/proc/<pid>/fd` `socket:[inode]` links.
     pub inode: u32,
     /// PIDs whose open file descriptors point at this socket's inode. Usually
     /// one; more than one when a listener is shared across forked workers before

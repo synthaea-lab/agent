@@ -543,19 +543,22 @@ pub const MAX_READLINE_INPUT: usize = 512;
 /// `uid`/`gid` come from `bpf_get_current_uid_gid()` (low/high 32 bits).
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
-#[allow(missing_docs)] // #362
 pub struct EventMeta {
+    /// Thread-group ID (`tgid`) of the emitting process, as `bpf_get_current_pid_tgid() >> 32`.
     pub pid: u32,
     /// Parent PID (`real_parent->tgid`). Since issue #53 this comes from the
     /// `PROC_LINEAGE` fork-tracking map (`sched_process_fork` + `/proc` priming), not
     /// a frozen-offset `task_struct` walk — `0` when the parent forked before the
     /// probe attached and priming missed it.
     pub ppid: u32,
+    /// UID of the emitting task (low 32 bits of `bpf_get_current_uid_gid()`).
     pub uid: u32,
+    /// GID of the emitting task (high 32 bits of `bpf_get_current_uid_gid()`).
     pub gid: u32,
     /// `bpf_ktime_get_ns()`: nanoseconds since boot (monotonic), NOT epoch — the
     /// loader adds the boot-to-epoch offset during normalization.
     pub timestamp_ns: u64,
+    /// Short command name (`bpf_get_current_comm`): NUL-terminated, kernel-truncated to 15 bytes.
     pub comm: [u8; TASK_COMM_LEN],
     /// `bpf_get_current_cgroup_id()`, captured at probe time, not resolved lazily
     /// against `/proc` at drain time (issue #204) — the userspace loader maps this
@@ -575,14 +578,15 @@ pub struct EventMeta {
 /// Process execution (`sched:sched_process_exec`, success only).
 #[repr(C)]
 #[derive(Clone, Copy)]
-#[allow(missing_docs)] // #362
 pub struct ExecEvent {
+    /// The process that called `exec`, after the exec (`comm` is the new image's short name).
     pub meta: EventMeta,
     /// Authoritative executed-image path: the kernel's `bprm->filename`, read from the
     /// `sched_process_exec` tracepoint's `__data_loc filename` field. NOT `argv[0]`,
     /// which the caller sets freely (`execve("/tmp/x", {"/usr/bin/sshd"}, …)`).
     /// `\0`-terminated, truncated at `MAX_PATH_LEN` (a sensor property).
     pub image: [u8; MAX_PATH_LEN],
+    /// Valid bytes in `image`, NUL excluded.
     pub image_len: u16,
     /// Parent short name at exec time, from the `PROC_LINEAGE` map. Empty when the
     /// parent forked before the probe attached and `/proc` priming missed it.
@@ -616,8 +620,8 @@ pub struct ExecEvent {
 /// command line costs the ring only its own bytes (ADR-0045, "Wire and ring").
 #[repr(C)]
 #[derive(Clone, Copy)]
-#[allow(missing_docs)] // #362
 pub struct ExecRecord {
+    /// The fixed part: sent first, `size_of::<ExecEvent>()` bytes.
     pub event: ExecEvent,
     /// The head window, then the tail window, packed: `argv[..head]` then `argv[head..head + tail]`.
     pub argv: [u8; ARGV_WINDOW_BYTES],
@@ -706,9 +710,10 @@ pub fn parse_exec_record(item: &[u8]) -> Result<(ExecEvent, ExecArgv<'_>), ExecR
 /// binding kernel (issue #53). Also written from userspace, so the layout is shared.
 #[repr(C)]
 #[derive(Clone, Copy)]
-#[allow(missing_docs)] // #362
 pub struct LineageEntry {
+    /// The parent's pid (tgid) at fork time.
     pub ppid: u32,
+    /// The parent's short name at fork time, NUL-padded to 15 bytes.
     pub comm: [u8; TASK_COMM_LEN],
     /// `1` once this process has exec'd since the fork that created the entry (set by the exec
     /// probe), `0` for a process that forked and has not exec'd: a subshell, which runs its
@@ -734,11 +739,14 @@ pub const PRIMED_GENERATION_BIT: u64 = 1 << 63;
 /// caller, not resolved against `dfd` (known limitation, documented in the probe).
 #[repr(C)]
 #[derive(Clone, Copy)]
-#[allow(missing_docs)] // #362
 pub struct FileOpenEvent {
+    /// The opening process.
     pub meta: EventMeta,
+    /// The path argument of `openat`, raw, NUL-padded, cut at `MAX_PATH_LEN`.
     pub path: [u8; MAX_PATH_LEN],
+    /// Valid bytes in `path`.
     pub path_len: u16,
+    /// The `open(2)` flags (`O_RDONLY`, `O_CREAT`, ...), raw.
     pub flags: u32,
 }
 
@@ -750,10 +758,12 @@ pub struct FileOpenEvent {
 /// actual bytes written (the syscall's return value) is not observed here.
 #[repr(C)]
 #[derive(Clone, Copy)]
-#[allow(missing_docs)] // #362
 pub struct FileWriteEvent {
+    /// The writing process.
     pub meta: EventMeta,
+    /// The file descriptor written to, in the writer's table.
     pub fd: u32,
+    /// The `count` argument at syscall entry, not the bytes actually written.
     pub bytes_requested: u64,
 }
 
@@ -762,10 +772,12 @@ pub struct FileWriteEvent {
 /// `FileOpenEvent::path`.
 #[repr(C)]
 #[derive(Clone, Copy)]
-#[allow(missing_docs)] // #362
 pub struct FileDeleteEvent {
+    /// The deleting process.
     pub meta: EventMeta,
+    /// The path argument of `unlink`/`unlinkat`, raw, NUL-padded, cut at `MAX_PATH_LEN`.
     pub path: [u8; MAX_PATH_LEN],
+    /// Valid bytes in `path`.
     pub path_len: u16,
 }
 
@@ -778,17 +790,23 @@ pub struct FileDeleteEvent {
 /// entirely in `new_path`'s suffix, no fd resolution needed to see it.
 #[repr(C)]
 #[derive(Clone, Copy)]
-#[allow(missing_docs)] // #362
 pub struct FileRenameEvent {
+    /// The renaming process.
     pub meta: EventMeta,
+    /// The source path, raw, NUL-padded, cut at `MAX_PATH_LEN`.
     pub old_path: [u8; MAX_PATH_LEN],
+    /// Valid bytes in `old_path`.
     pub old_path_len: u16,
+    /// The destination path, raw, NUL-padded, cut at `MAX_PATH_LEN`.
     pub new_path: [u8; MAX_PATH_LEN],
+    /// Valid bytes in `new_path`.
     pub new_path_len: u16,
     /// Explicit padding so the `i32`s below are 4-aligned without implicit padding
     /// bytes. Always zero.
     pub reserved: u16,
+    /// Directory fd `old_path` is relative to; `AT_FDCWD` (-100) for the working directory.
     pub old_dfd: i32,
+    /// Directory fd `new_path` is relative to; `AT_FDCWD` (-100) for the working directory.
     pub new_dfd: i32,
 }
 
@@ -797,10 +815,12 @@ pub struct FileRenameEvent {
 /// same known limitation as `FileOpenEvent::path`. `fchmod(2)` (fd-only) is deferred.
 #[repr(C)]
 #[derive(Clone, Copy)]
-#[allow(missing_docs)] // #362
 pub struct FileChmodEvent {
+    /// The process changing the mode.
     pub meta: EventMeta,
+    /// The path argument, raw, NUL-padded, cut at `MAX_PATH_LEN`.
     pub path: [u8; MAX_PATH_LEN],
+    /// Valid bytes in `path`.
     pub path_len: u16,
     /// The requested mode bits (`umode_t`), truncated to 32 bits — the tracepoint
     /// promotes it to 8 bytes on the wire but only the low 16 bits are ever
@@ -816,12 +836,16 @@ pub struct FileChmodEvent {
 /// own semantics — passed through as-is, not specially interpreted here.
 #[repr(C)]
 #[derive(Clone, Copy)]
-#[allow(missing_docs)] // #362
 pub struct FileChownEvent {
+    /// The process changing the owner.
     pub meta: EventMeta,
+    /// The path argument, raw, NUL-padded, cut at `MAX_PATH_LEN`.
     pub path: [u8; MAX_PATH_LEN],
+    /// Valid bytes in `path`.
     pub path_len: u16,
+    /// The requested owner, `u32::MAX` for "leave unchanged".
     pub uid: u32,
+    /// The requested group, `u32::MAX` for "leave unchanged".
     pub gid: u32,
 }
 
@@ -846,9 +870,10 @@ pub const SET_TIME_COMPONENT_LEN: usize = 32;
 /// `flags`.
 #[repr(C)]
 #[derive(Clone, Copy)]
-#[allow(missing_docs)] // #362
 pub struct FileSetTimeEvent {
+    /// The process changing the timestamps.
     pub meta: EventMeta,
+    /// Dentry names, NUL-padded: `components[0]` is the file, then its parents toward the root. Only the first `depth` are filled.
     pub components: [[u8; SET_TIME_COMPONENT_LEN]; SET_TIME_COMPONENTS],
     /// How many slots of `components` are filled.
     pub depth: u8,
@@ -859,9 +884,13 @@ pub struct FileSetTimeEvent {
     /// Explicit padding so the `i64`s below are 8-aligned without implicit padding
     /// bytes. Always zero.
     pub reserved1: u32,
+    /// Requested access time, seconds; meaningful only with [`SET_TIME_ATIME`].
     pub atime_sec: i64,
+    /// Requested access time, nanoseconds part.
     pub atime_nsec: i64,
+    /// Requested modification time, seconds; meaningful only with [`SET_TIME_MTIME`].
     pub mtime_sec: i64,
+    /// Requested modification time, nanoseconds part.
     pub mtime_nsec: i64,
 }
 
@@ -872,12 +901,16 @@ pub struct FileSetTimeEvent {
 /// not `value` — see this file's `WIRE_VERSION` v12 changelog.
 #[repr(C)]
 #[derive(Clone, Copy)]
-#[allow(missing_docs)] // #362
 pub struct FileSetxattrEvent {
+    /// The process setting the attribute.
     pub meta: EventMeta,
+    /// The path argument, raw, NUL-padded, cut at `MAX_PATH_LEN`.
     pub path: [u8; MAX_PATH_LEN],
+    /// Valid bytes in `path`.
     pub path_len: u16,
+    /// The attribute name (`user.foo`, `security.capability`, ...), NUL-padded, cut at `MAX_XATTR_NAME_LEN`.
     pub name: [u8; MAX_XATTR_NAME_LEN],
+    /// Valid bytes in `name`.
     pub name_len: u16,
 }
 
@@ -886,27 +919,34 @@ pub struct FileSetxattrEvent {
 /// `FileSetxattrEvent`.
 #[repr(C)]
 #[derive(Clone, Copy)]
-#[allow(missing_docs)] // #362
 pub struct FileRemovexattrEvent {
+    /// The process removing the attribute.
     pub meta: EventMeta,
+    /// The path argument, raw, NUL-padded, cut at `MAX_PATH_LEN`.
     pub path: [u8; MAX_PATH_LEN],
+    /// Valid bytes in `path`.
     pub path_len: u16,
+    /// The attribute name, NUL-padded, cut at `MAX_XATTR_NAME_LEN`.
     pub name: [u8; MAX_XATTR_NAME_LEN],
+    /// Valid bytes in `name`.
     pub name_len: u16,
 }
 
 /// Outbound network connection (`syscalls:sys_enter_connect`, `AF_INET/AF_INET6` only).
 #[repr(C)]
 #[derive(Clone, Copy)]
-#[allow(missing_docs)] // #362
 pub struct ConnectEvent {
+    /// The connecting process.
     pub meta: EventMeta,
     /// Raw bytes of `sin_addr` in memory order — not a native-endian integer, to
     /// avoid the byte-reversal bug observed in real conditions on 2026-08-13
     /// (127.0.0.11 displayed as "11.0.0.127").
     pub daddr_v4: [u8; 4],
+    /// Destination address when `is_ipv6`, raw bytes in memory order; zeroed otherwise.
     pub daddr_v6: [u8; 16],
+    /// Destination port, host byte order.
     pub dport: u16,
+    /// Selects `daddr_v6` (`true`) or `daddr_v4` (`false`).
     pub is_ipv6: bool,
 }
 
@@ -919,12 +959,16 @@ pub struct ConnectEvent {
 /// binds too).
 #[repr(C)]
 #[derive(Clone, Copy)]
-#[allow(missing_docs)] // #362
 pub struct SocketBindEvent {
+    /// The binding process.
     pub meta: EventMeta,
+    /// Bound address when not `is_ipv6`, raw bytes in memory order.
     pub laddr_v4: [u8; 4],
+    /// Bound address when `is_ipv6`, raw bytes in memory order; zeroed otherwise.
     pub laddr_v6: [u8; 16],
+    /// Bound port, host byte order.
     pub lport: u16,
+    /// Selects `laddr_v6` (`true`) or `laddr_v4` (`false`).
     pub is_ipv6: bool,
 }
 
@@ -936,13 +980,18 @@ pub struct SocketBindEvent {
 /// not captured — see this file's `WIRE_VERSION` v9 changelog.
 #[repr(C)]
 #[derive(Clone, Copy)]
-#[allow(missing_docs)] // #362
 pub struct UdpSendEvent {
+    /// The sending process.
     pub meta: EventMeta,
+    /// Destination address when not `is_ipv6`, raw bytes in memory order.
     pub daddr_v4: [u8; 4],
+    /// Destination address when `is_ipv6`, raw bytes in memory order; zeroed otherwise.
     pub daddr_v6: [u8; 16],
+    /// Destination port, host byte order.
     pub dport: u16,
+    /// Selects `daddr_v6` (`true`) or `daddr_v4` (`false`).
     pub is_ipv6: bool,
+    /// The requested payload size (`len` at syscall entry), not the bytes sent.
     pub size: u32,
 }
 
@@ -952,13 +1001,18 @@ pub struct UdpSendEvent {
 /// changelog for the entry/exit correlation.
 #[repr(C)]
 #[derive(Clone, Copy)]
-#[allow(missing_docs)] // #362
 pub struct UdpRecvEvent {
+    /// The receiving process.
     pub meta: EventMeta,
+    /// Sender address when not `is_ipv6`, raw bytes in memory order.
     pub peer_addr_v4: [u8; 4],
+    /// Sender address when `is_ipv6`, raw bytes in memory order; zeroed otherwise.
     pub peer_addr_v6: [u8; 16],
+    /// Sender port, host byte order.
     pub peer_port: u16,
+    /// Selects `peer_addr_v6` (`true`) or `peer_addr_v4` (`false`).
     pub is_ipv6: bool,
+    /// Bytes received (the syscall's return value).
     pub size: u32,
 }
 
@@ -969,12 +1023,16 @@ pub struct UdpRecvEvent {
 /// bind-correlation and `addr_resolved` semantics.
 #[repr(C)]
 #[derive(Clone, Copy)]
-#[allow(missing_docs)] // #362
 pub struct SocketListenEvent {
+    /// The listening process.
     pub meta: EventMeta,
+    /// Bound address when not `is_ipv6`; zeroed unless `addr_resolved`.
     pub laddr_v4: [u8; 4],
+    /// Bound address when `is_ipv6`; zeroed unless `addr_resolved`.
     pub laddr_v6: [u8; 16],
+    /// Bound port, host byte order; meaningful only when `addr_resolved`.
     pub lport: u16,
+    /// Selects `laddr_v6` (`true`) or `laddr_v4` (`false`); meaningful only when `addr_resolved`.
     pub is_ipv6: bool,
     /// Whether `laddr_v4`/`laddr_v6`/`lport`/`is_ipv6` came from a real correlated
     /// `bind(2)` observation. `false` means this sensor never saw a matching
@@ -994,16 +1052,20 @@ pub struct SocketListenEvent {
 /// `sys_enter`/`sys_exit` correlation mechanism. Only emitted on success.
 #[repr(C)]
 #[derive(Clone, Copy)]
-#[allow(missing_docs)] // #362
 pub struct SocketAcceptEvent {
+    /// The accepting process (the server).
     pub meta: EventMeta,
     /// The listening socket's fd (`accept`/`accept4`'s first argument).
     pub listen_fd: u32,
     /// The newly accepted connection's fd (`accept`/`accept4`'s return value).
     pub accepted_fd: u32,
+    /// Client address when not `is_ipv6`, raw bytes in memory order.
     pub peer_addr_v4: [u8; 4],
+    /// Client address when `is_ipv6`, raw bytes in memory order; zeroed otherwise.
     pub peer_addr_v6: [u8; 16],
+    /// Client port, host byte order.
     pub peer_port: u16,
+    /// Selects `peer_addr_v6` (`true`) or `peer_addr_v4` (`false`).
     pub is_ipv6: bool,
 }
 
@@ -1013,8 +1075,8 @@ pub struct SocketAcceptEvent {
 /// the `sys_enter`/`sys_exit` correlation. Only emitted on success.
 #[repr(C)]
 #[derive(Clone, Copy)]
-#[allow(missing_docs)] // #362
 pub struct SocketCreateEvent {
+    /// The process creating the socket.
     pub meta: EventMeta,
     /// `AF_INET`, `AF_INET6`, `AF_PACKET`, `AF_NETLINK`, ... — not filtered, unlike
     /// `ConnectEvent`/`SocketBindEvent`: a non-IP domain is exactly the signal this
@@ -1023,6 +1085,7 @@ pub struct SocketCreateEvent {
     /// `SOCK_STREAM`, `SOCK_DGRAM`, `SOCK_RAW`, ... masked of `SOCK_CLOEXEC`/
     /// `SOCK_NONBLOCK`, which the kernel ORs into the same argument.
     pub socket_type: i32,
+    /// The `protocol` argument (`0` = the type's default, or `IPPROTO_*`).
     pub protocol: i32,
     /// The new fd (`socket(2)`'s return value).
     pub fd: u32,
@@ -1035,17 +1098,21 @@ pub struct SocketCreateEvent {
 /// target path. `move_mount(2)` is not captured here.
 #[repr(C)]
 #[derive(Clone, Copy)]
-#[allow(missing_docs)] // #362
 pub struct MountEvent {
+    /// The process calling `mount(2)` or `umount2(2)`.
     pub meta: EventMeta,
+    /// The mount target (the only path an unmount takes), NUL-padded, cut at `MAX_PATH_LEN`.
     pub mount_point: [u8; MAX_PATH_LEN],
+    /// Valid bytes in `mount_point`.
     pub mount_point_len: u16,
     /// The `source` argument to `mount(2)` (device node, bind-mount source path,
     /// image path). Zero-length on `umount2(2)`, which has none.
     pub source: [u8; MAX_PATH_LEN],
+    /// Valid bytes in `source`.
     pub source_len: u16,
     /// Zero-length on `umount2(2)`, which has no filesystem type argument.
     pub fs_type: [u8; MAX_FS_TYPE_LEN],
+    /// Valid bytes in `fs_type`.
     pub fs_type_len: u8,
     /// `mount(2)`'s `mountflags & MS_RDONLY`, computed at probe time. Always
     /// `false` on an unmount (`readonly` is not a meaningful `umount2(2)` concept).
@@ -1063,11 +1130,12 @@ pub struct MountEvent {
 /// same convention as macOS's `SignalToEsClient`.
 #[repr(C)]
 #[derive(Clone, Copy)]
-#[allow(missing_docs)] // #362
 pub struct SignalEvent {
+    /// The sender of the signal, not the target.
     pub meta: EventMeta,
     /// Signal number, platform-native (`SIGKILL` = 9, `SIGTERM` = 15, ...).
     pub signal: u32,
+    /// The target's pid (a thread-group id for the `signal_generate` source).
     pub target_pid: u32,
 }
 
@@ -1076,8 +1144,8 @@ pub struct SignalEvent {
 /// SUID-binary-abuse and privilege-drop/escalation primitive.
 #[repr(C)]
 #[derive(Clone, Copy)]
-#[allow(missing_docs)] // #362
 pub struct IdentityChangeEvent {
+    /// The process changing its identity.
     pub meta: EventMeta,
     /// 0=setuid, 1=setgid, 2=setresuid, 3=setresgid, 4=setfsuid, 5=setfsgid.
     pub kind: u8,
@@ -1099,15 +1167,18 @@ pub struct IdentityChangeEvent {
 /// a `_LINUX_CAPABILITY_VERSION_1` header, which has no second element.
 #[repr(C)]
 #[derive(Clone, Copy)]
-#[allow(missing_docs)] // #362
 pub struct CapSetEvent {
+    /// The process calling `capset(2)`.
     pub meta: EventMeta,
     /// `cap_user_header_t.pid` — the target process. `0` means "the calling
     /// process itself" (`capset(2)`'s own documented meaning for pid 0, not
     /// a probe failure sentinel).
     pub target_pid: u32,
+    /// The requested effective set, 64-bit mask.
     pub effective: u64,
+    /// The requested permitted set, 64-bit mask.
     pub permitted: u64,
+    /// The requested inheritable set, 64-bit mask.
     pub inheritable: u64,
 }
 
@@ -1116,8 +1187,8 @@ pub struct CapSetEvent {
 /// `unshare(2)` (creating a new namespace).
 #[repr(C)]
 #[derive(Clone, Copy)]
-#[allow(missing_docs)] // #362
 pub struct NamespaceEvent {
+    /// The process changing namespace.
     pub meta: EventMeta,
     /// 0 = setns, 1 = unshare.
     pub syscall: u8,
@@ -1134,8 +1205,8 @@ pub struct NamespaceEvent {
 /// `PR_SET_SECUREBITS` and `PR_CAPBSET_DROP` (see this file's v19 changelog).
 #[repr(C)]
 #[derive(Clone, Copy)]
-#[allow(missing_docs)] // #362
 pub struct PrctlEvent {
+    /// The process calling `prctl(2)`.
     pub meta: EventMeta,
     /// Raw `prctl` option — always 28 (`PR_SET_SECUREBITS`) or 24
     /// (`PR_CAPBSET_DROP`).
@@ -1151,8 +1222,8 @@ pub struct PrctlEvent {
 /// (`SSL_write`) or after decryption (`SSL_read`) for C2 beacon detection.
 #[repr(C)]
 #[derive(Clone, Copy)]
-#[allow(missing_docs)] // #362
 pub struct TlsCaptureEvent {
+    /// The process whose TLS buffer was captured.
     pub meta: EventMeta,
     /// 0 = read (post-decryption), 1 = write (pre-encryption).
     pub direction: u8,
@@ -1170,8 +1241,8 @@ pub struct TlsCaptureEvent {
 /// that never trigger execve (cd, export, alias, etc.).
 #[repr(C)]
 #[derive(Clone, Copy)]
-#[allow(missing_docs)] // #362
 pub struct ReadlineInputEvent {
+    /// The shell process that read the line.
     pub meta: EventMeta,
     /// 0 = bash, 1 = zsh. Identifies which shell was probed.
     pub shell_type: u8,
@@ -1186,13 +1257,14 @@ pub struct ReadlineInputEvent {
 /// (unload by name). The classic rootkit-installation primitive.
 #[repr(C)]
 #[derive(Clone, Copy)]
-#[allow(missing_docs)] // #362
 pub struct KernelModuleEvent {
+    /// The process loading or unloading the module.
     pub meta: EventMeta,
     /// `delete_module(2)`'s `name` argument — the only one of the three
     /// syscalls that names the module directly (see this file's v12
     /// changelog). Zero-length for `init_module`/`finit_module`.
     pub name: [u8; MAX_MODULE_NAME_LEN],
+    /// Valid bytes in `name`.
     pub name_len: u16,
     /// `finit_module(2)`'s fd argument. `-1` for `init_module`/`delete_module`.
     pub fd: i32,
@@ -1212,8 +1284,8 @@ pub struct KernelModuleEvent {
 /// changelog) — eBPF-based defense evasion and kernel backdoor detection.
 #[repr(C)]
 #[derive(Clone, Copy)]
-#[allow(missing_docs)] // #362
 pub struct BpfEvent {
+    /// The process calling `bpf(2)`.
     pub meta: EventMeta,
     /// Raw `bpf_cmd` value (`<linux/bpf.h>`) — always one of the three
     /// filtered commands above; not decoded to a name here, same
@@ -1229,8 +1301,8 @@ pub struct BpfEvent {
 /// the detection logic's own job into the sensor.
 #[repr(C)]
 #[derive(Clone, Copy)]
-#[allow(missing_docs)] // #362
 pub struct PtraceEvent {
+    /// The tracer: the process calling `ptrace(2)`.
     pub meta: EventMeta,
     /// The `request` argument (`PTRACE_ATTACH`, `PTRACE_PEEKDATA`, ... — see
     /// `<sys/ptrace.h>`). Kept as the raw integer, not decoded to a name, here —
@@ -1255,8 +1327,8 @@ pub struct PtraceEvent {
 /// for secrets — is the same).
 #[repr(C)]
 #[derive(Clone, Copy)]
-#[allow(missing_docs)] // #362
 pub struct ProcessVmReadEvent {
+    /// The reading process.
     pub meta: EventMeta,
     /// The `pid` argument — the process being read FROM.
     pub target_pid: u32,
@@ -1266,6 +1338,7 @@ pub struct ProcessVmReadEvent {
     /// one — same "volume signal, not full resolution" tradeoff `FileWriteEvent`
     /// makes for `write(2)`.
     pub local_iov_count: u64,
+    /// `riovcnt`: `struct iovec` entries on the target's side.
     pub remote_iov_count: u64,
     /// `remote_iov[0].iov_len` — how many bytes of the target's memory the first
     /// (and, for the overwhelmingly common single-entry call, only) requested
@@ -1279,12 +1352,14 @@ pub struct ProcessVmReadEvent {
 /// word-at-a-time interface. Classic shellcode-injection primitive.
 #[repr(C)]
 #[derive(Clone, Copy)]
-#[allow(missing_docs)] // #362
 pub struct ProcessVmWriteEvent {
+    /// The writing process.
     pub meta: EventMeta,
     /// The `pid` argument — the process being written TO.
     pub target_pid: u32,
+    /// `liovcnt`: `struct iovec` entries on the caller's side.
     pub local_iov_count: u64,
+    /// `riovcnt`: `struct iovec` entries on the target's side.
     pub remote_iov_count: u64,
     /// `remote_iov[0].iov_len` — how many bytes are being written into the
     /// target's memory by the first requested region. Same caveats as
@@ -1298,14 +1373,15 @@ pub struct ProcessVmWriteEvent {
 /// touches a real path on disk.
 #[repr(C)]
 #[derive(Clone, Copy)]
-#[allow(missing_docs)] // #362
 pub struct MemfdCreateEvent {
+    /// The process creating the memfd.
     pub meta: EventMeta,
     /// The caller-supplied display name (`name` argument) — cosmetic only per
     /// `memfd_create(2)` (shows up as the target of `/proc/<pid>/fd/<n>`), not a
     /// real path, but attacker tooling that names it `/tmp/x` or similar to look
     /// like a real file on a process listing is itself a signal.
     pub name: [u8; MAX_PATH_LEN],
+    /// Valid bytes in `name`.
     pub name_len: u16,
     /// The `flags` argument (`MFD_CLOEXEC`, `MFD_ALLOW_SEALING`, ...).
     pub flags: u32,
@@ -1330,10 +1406,12 @@ pub struct DnsAnswer {
 /// and bounded answer-list capture.
 #[repr(C)]
 #[derive(Clone, Copy)]
-#[allow(missing_docs)] // #362
 pub struct GetAddrInfoEvent {
+    /// The process resolving the name.
     pub meta: EventMeta,
+    /// The node name asked for, NUL-padded, cut at `MAX_DNS_QUERY_LEN`.
     pub query: [u8; MAX_DNS_QUERY_LEN],
+    /// Valid bytes in `query`.
     pub query_len: u16,
     /// `getaddrinfo(3)`'s return code: `0` on success, a negative `EAI_*`
     /// constant on failure (`EAI_NONAME`, `EAI_AGAIN`, ...) — not decoded to
@@ -1369,16 +1447,21 @@ pub struct GetAddrInfoEvent {
 /// message whose question already fits (a name is at most 255 bytes).
 #[repr(C)]
 #[derive(Clone, Copy)]
-#[allow(missing_docs)] // #362
 pub struct DnsUdpQueryEvent {
+    /// The process sending the query.
     pub meta: EventMeta,
     /// Destination of the datagram: the `sendto` address, or the address the socket was
     /// connected to. Raw bytes in memory order, like [`ConnectEvent::daddr_v4`].
     pub daddr_v4: [u8; 4],
+    /// Destination address when `is_ipv6`, raw bytes in memory order; zeroed otherwise.
     pub daddr_v6: [u8; 16],
+    /// Destination port, host byte order (53 for what this event captures).
     pub dport: u16,
+    /// Valid bytes in `payload`, at most [`MAX_DNS_UDP_PAYLOAD`].
     pub payload_len: u16,
+    /// Selects `daddr_v6` (`true`) or `daddr_v4` (`false`).
     pub is_ipv6: bool,
+    /// The first bytes of the DNS message, NUL-padded past `payload_len`.
     pub payload: [u8; MAX_DNS_UDP_PAYLOAD],
 }
 

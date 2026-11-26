@@ -132,12 +132,16 @@ fn read_be64(value: &[u8]) -> Option<u64> {
 /// beacon detection; a protocol without ports, e.g. ICMP, still decodes with
 /// `src_port`/`dst_port` left `None`, not rejected).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[allow(missing_docs)] // #362
 pub struct FlowTuple {
+    /// Source address of this side of the flow.
     pub src: IpAddr,
+    /// Destination address of this side of the flow.
     pub dst: IpAddr,
+    /// IP protocol number (6 = TCP, 17 = UDP).
     pub protocol: u8,
+    /// Source port, `None` for a protocol without ports.
     pub src_port: Option<u16>,
+    /// Destination port, `None` for a protocol without ports.
     pub dst_port: Option<u16>,
 }
 
@@ -227,9 +231,10 @@ impl FlowTuple {
 /// counter is therefore an environment fact, not a parse failure — see
 /// [`ConntrackFlow::counters_orig`]/[`counters_reply`](ConntrackFlow::counters_reply).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[allow(missing_docs)] // #362
 pub struct FlowCounters {
+    /// Packets seen in this direction.
     pub packets: u64,
+    /// Bytes seen in this direction.
     pub bytes: u64,
 }
 
@@ -265,18 +270,28 @@ impl FlowCounters {
 /// (simultaneous-open detection); the ambiguity is the kernel's, not a gap in
 /// this decode.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[allow(missing_docs)] // #362
 pub enum TcpState {
+    /// `TCP_CONNTRACK_NONE` (0): no state tracked.
     None,
+    /// `SYN_SENT` (1): a SYN was seen, no reply yet.
     SynSent,
+    /// `SYN_RECV` (2): the SYN-ACK was seen.
     SynRecv,
+    /// `ESTABLISHED` (3): handshake complete.
     Established,
+    /// `FIN_WAIT` (4): the first FIN was seen.
     FinWait,
+    /// `CLOSE_WAIT` (5): the peer's FIN was acknowledged.
     CloseWait,
+    /// `LAST_ACK` (6): waiting for the final ACK of a FIN.
     LastAck,
+    /// `TIME_WAIT` (7): closed, kept briefly for stray packets.
     TimeWait,
+    /// `CLOSE` (8): the flow was reset or closed.
     Close,
+    /// Value 9, the kernel's obsolete `LISTEN`, reused as `SYN_SENT2` (see the type doc).
     Listen,
+    /// A raw state value outside 0..=9.
     Other(u8),
 }
 
@@ -320,18 +335,24 @@ fn parse_tcp_state(protoinfo_value: &[u8]) -> Option<TcpState> {
 /// One conntrack table entry, decoded to the fields this crate's beacon
 /// cross-check needs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[allow(missing_docs)] // #362
 pub struct ConntrackFlow {
+    /// The original direction: the side that opened the flow.
     pub orig: FlowTuple,
+    /// The reply direction, as the kernel sees it after NAT.
     pub reply: FlowTuple,
     /// `IPS_*` bitmask from `<linux/netfilter/nf_conntrack_common.h>` — not
     /// decoded to individual flags here, callers needing e.g.
     /// `IPS_ASSURED`/`IPS_SEEN_REPLY` can mask this directly.
     pub status: u32,
+    /// Seconds before the kernel expires the entry (`CTA_TIMEOUT`).
     pub timeout_secs: u32,
+    /// The conntrack mark (`CTA_MARK`), 0 when unset.
     pub mark: u32,
+    /// The kernel's entry ID (`CTA_ID`).
     pub id: u32,
+    /// Original-direction counters, `None` unless accounting is enabled.
     pub counters_orig: Option<FlowCounters>,
+    /// Reply-direction counters, `None` unless accounting is enabled.
     pub counters_reply: Option<FlowCounters>,
     /// `CTA_PROTOINFO`'s TCP state, when this flow is TCP and the kernel sent
     /// one — see [`parse_tcp_state`]'s doc for what collapses to `None`.
