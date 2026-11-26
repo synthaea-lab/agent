@@ -273,6 +273,27 @@ fn a_timer_stamp_on_a_separate_var_mount_does_not_alert() {
 }
 
 #[test]
+fn a_long_timer_stamp_name_cut_by_the_probe_does_not_alert() {
+    // `stamp-dnf-automatic-install.timer` is over the probe's 31 bytes, so it loses `.timer`.
+    let path = "/.../var/lib/systemd/timers/stamp-dnf-automatic-install.tim";
+    assert!(set_time_by_init(path).is_empty(), "{path}");
+}
+
+#[test]
+fn a_stamp_name_without_timer_still_alerts_unless_the_probe_cut_it() {
+    for path in [
+        // 31 bytes, but the sensor did not mark the path as cut: the name is complete.
+        "/var/lib/systemd/timers/stamp-dnf-automatic-install.tim",
+        // Marked as cut, but shorter than the probe's limit: this name was not the one cut.
+        "/.../var/lib/systemd/timers/stamp-short.tim",
+        // Cut to the limit, but not a stamp.
+        "/.../var/lib/systemd/timers/other-dnf-automatic-install.tim",
+    ] {
+        assert_eq!(set_time_by_init(path).len(), 1, "{path}");
+    }
+}
+
+#[test]
 fn pid_1_setting_a_time_anywhere_else_still_alerts() {
     for path in [
         "/etc/passwd",

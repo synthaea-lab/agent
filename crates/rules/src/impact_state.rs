@@ -58,6 +58,14 @@ pub(crate) const SET_TIME_ALERT_WINDOW_NS: u64 = 60_000_000_000;
 /// `Persistent=true` timer.
 const SYSTEMD_TIMER_STAMP_PARENTS: [&str; 2] = ["systemd", "timers"];
 
+/// The longest dentry name the Linux `inode_setattr` probe keeps: one byte under
+/// `wire::SET_TIME_COMPONENT_LEN`, for the NUL. A longer name arrives cut to this many bytes,
+/// and the path then starts with [`TRUNCATED_PATH_MARK`].
+const PROBE_NAME_KEPT_BYTES: usize = 31;
+
+/// The prefix the Linux sensor puts on a path whose dentry chain or a name in it was cut.
+const TRUNCATED_PATH_MARK: &str = "/...";
+
 /// Whether `event` is systemd stamping a persistent timer (#353): pid 1 sets the mtime of
 /// `/var/lib/systemd/timers/stamp-<unit>.timer` every time such a timer fires, so every
 /// systemd host with `logrotate.timer`, `fstrim.timer` or `dnf-makecache.timer` raised a Low
@@ -65,18 +73,32 @@ const SYSTEMD_TIMER_STAMP_PARENTS: [&str; 2] = ["systemd", "timers"];
 ///
 /// Keyed on pid 1, not on `comm`: the Linux sensor reports the tgid of the initial pid
 /// namespace (`bpf_get_current_pid_tgid`), where only init itself is 1 (a container's own init
-/// has a host pid), and no process can rename or start its way into it. Read on the last three
-/// segments, not the full path: the hook rebuilds the path from dentries, so on a host where
-/// `/var` or `/var/lib` is its own mount the mount prefix is missing (`lsm.md`). Only the stamp
-/// is skipped: pid 1 setting a time on any other file still alerts.
+/// has a host pid), and no process can rename or start its way into it. Only the stamp is
+/// skipped: pid 1 setting a time on any other file still alerts.
 fn is_systemd_timer_stamp(event: &schema::FileSetTimeEvent) -> bool {
-    let mut segments = event.path.rsplit('/');
+    event.meta.pid == 1 && is_timer_stamp_path(&event.path)
+}
+
+/// Whether `path` names a timer stamp, read on its last three segments rather than the full
+/// path: the hook rebuilds the path from dentries, so on a host where `/var` or `/var/lib` is
+/// its own mount the mount prefix is missing (`lsm.md`). That loose match also accepts
+/// `systemd/timers/stamp-*` at the root of any filesystem, or below a cut chain. It is safe only
+/// because the caller requires pid 1: neither relax that check nor reuse this matcher without it.
+fn is_timer_stamp_path(path: &str) -> bool {
+    let mut segments = path.rsplit('/');
     let name = segments.next().unwrap_or_default();
     let parents: Vec<&str> = segments.take(SYSTEMD_TIMER_STAMP_PARENTS.len()).collect();
-    event.meta.pid == 1
-        && name.starts_with("stamp-")
-        && name.ends_with(".timer")
+    is_timer_stamp_name(name, path.starts_with(TRUNCATED_PATH_MARK))
         && parents.iter().rev().eq(SYSTEMD_TIMER_STAMP_PARENTS.iter())
+}
+
+/// Whether `name` is `stamp-<unit>.timer`. A unit name over 19 characters reaches the rule cut
+/// to [`PROBE_NAME_KEPT_BYTES`], without its `.timer` (#360 review): such a name, in a path the
+/// sensor marked as cut, counts as long as it starts with `stamp-`. A complete name, such as
+/// `stamp-x.timer.bak`, must still end in `.timer`.
+fn is_timer_stamp_name(name: &str, path_was_cut: bool) -> bool {
+    let cut_by_probe = path_was_cut && name.len() == PROBE_NAME_KEPT_BYTES;
+    name.starts_with("stamp-") && (name.ends_with(".timer") || cut_by_probe)
 }
 
 /// The sliding history of the file-impact rules. The rules that trust a process by its binary
