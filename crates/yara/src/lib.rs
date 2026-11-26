@@ -27,9 +27,13 @@ pub use memory::{
 pub use queue::{ScanContext, ScanOutcome, ScanQueue, ScanStats};
 use schema::detection::Severity;
 
+/// Largest file, in bytes (64 MiB), that is scanned; larger files are skipped.
 pub const MAX_SCAN_BYTES: u64 = 64 * 1024 * 1024;
 
+/// Errors from loading rules or running a scan. Rule-loading variants name the path or rule
+/// identifier at fault.
 #[derive(Debug, thiserror::Error)]
+#[allow(missing_docs)] // #362
 pub enum YaraError {
     #[error("failed to read {path}: {source}")]
     Io {
@@ -65,6 +69,7 @@ struct RuleMetadata {
 /// One YARA match, with the metadata required by issues #73/#74 attached — the
 /// scanner no longer hands back a bare rule identifier only.
 #[derive(Debug, Clone)]
+#[allow(missing_docs)] // #362
 pub struct YaraMatch {
     pub identifier: String,
     pub severity: Severity,

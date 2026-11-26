@@ -141,12 +141,12 @@ With a control plane configured, [`upload::start`](../apps/agent/src/upload.rs) 
 | `journal-tail`, `journal-canary` | Linux | [`spawn_journal_tail`](../apps/agent/src/commands/linux.rs) | With the process |
 | `avc-reader` | Linux, eBPF primary | [`spawn_avc_reader`](../apps/agent/src/commands/linux.rs) | `ShutdownPlan` |
 | `log-sources` | Linux, if `[logs]` is configured | [`log_sources::spawn`](../apps/agent/src/log_sources.rs) | `ShutdownPlan` |
-| `uprobes-supervisor`, `uprobes` | Linux | [`spawn_uprobes_supervisor`](../apps/agent/src/commands/linux.rs) | With the process |
+| `uprobes` | Linux, if a capture flag is set | [`spawn_uprobes_sensor`](../apps/agent/src/commands/linux.rs) | With the process |
 | `self-integrity`, `inventory` | Linux | `integrity::spawn_monitor`, `inventory::spawn_monitor` | With the process |
 | `socket-poller`, `minifilter`, Event Log thread | Windows | [`run_windows_sensors`](../apps/agent/src/commands/windows.rs) | Shutdown flag, then joined |
 | `socket-poller`, `unifiedlog-tail`, `ne-receiver` | macOS | [`run_macos_sensors`](../apps/agent/src/commands/macos.rs) | Stop flag, or the `log stream` child being killed |
 
-**A thread the OS refuses.** The threads that used to `.expect` their spawn (21 of them) are now started through [`spawn::spawn_named`](../apps/agent/src/spawn.rs), which returns the OS error (`EAGAIN`: a container or `RLIMIT_NPROC` limit, a full pid table) with the thread's name in the message. The starters pass it up and `agent run` exits with it, such as `could not start the heartbeat thread: ...`, instead of panicking with a backtrace that does not say which thread it was starting (AC-016, [#159](https://github.com/synthaea-lab/agent/issues/159)). Two threads are started after start-up and so cannot fail `run`: the `uprobes` sensor, which the uprobes supervisor starts and restarts when the wanted captures change, and the journal canary, which the journal tail starts. A refusal there is logged (`uprobes sensor not started`, `journal canary not started`) and the thread stays off. The uprobes heartbeat is watched for as long as a capture is wanted, whether or not the thread runs, so a refused start is reported as silence, and it is unregistered when nothing is wanted any more, so a capture switched off after a refusal is not reported as tampering. The journal heartbeat pulses on every line `journalctl` delivers, so a canary that never started is noticed only on an idle host, where the journal sensor goes silent. The YARA workers belong to the optional engines: [`yara::ScanQueue::start`](../crates/yara/src/queue.rs) and [`yara::MemoryScanQueue::start`](../crates/yara/src/memory.rs) return `YaraError::Spawn`, and the sink treats it like a rule directory that does not load: logged at error level (`yara: file scanning not started`), that engine stays unloaded, and on a content reload the previous engine is kept.
+**A thread the OS refuses.** The threads that used to `.expect` their spawn (21 of them) are now started through [`spawn::spawn_named`](../apps/agent/src/spawn.rs), which returns the OS error (`EAGAIN`: a container or `RLIMIT_NPROC` limit, a full pid table) with the thread's name in the message. The starters pass it up and `agent run` exits with it, such as `could not start the heartbeat thread: ...`, instead of panicking with a backtrace that does not say which thread it was starting (AC-016, [#159](https://github.com/synthaea-lab/agent/issues/159)). One thread is started after start-up and so cannot fail `run`: the journal canary, which the journal tail starts. A refusal there is logged (`journal canary not started`) and the thread stays off. The `uprobes` sensor is started by `cmd_run` itself, only when a capture flag is set, so its refusal is a start-up failure like the others (`could not start the uprobes thread: ...`). Its heartbeat is registered only in that case, so a capture that is off never accrues silence. The journal heartbeat pulses on every line `journalctl` delivers, so a canary that never started is noticed only on an idle host, where the journal sensor goes silent. The YARA workers belong to the optional engines: [`yara::ScanQueue::start`](../crates/yara/src/queue.rs) and [`yara::MemoryScanQueue::start`](../crates/yara/src/memory.rs) return `YaraError::Spawn`, and the sink treats it like a rule directory that does not load: logged at error level (`yara: file scanning not started`), that engine stays unloaded, and on a content reload the previous engine is kept.
 
 Shared mutable state in `DetectionSink` is behind `Mutex`es (`RuleState`, correlator, Sigma, YARA, verdict), because several producer threads call `on_event` at once. Code takes a lock, collects alerts, and releases the lock before recording them. `record_rule_alerts` takes the rule-state lock again, so stateful rule steps go through `DetectionSink::rule_alerts`, which releases the lock before recording.
 
@@ -163,20 +163,20 @@ Common to every OS ([`try_main`](../apps/agent/src/main.rs)):
    - The CA bundle (`--ca-cert`, then `server.ca_cert`) applies in all cases.
 4. Resolve the content directory. The default is `<storage.state_dir>/content`.
 
-Then [`wire_run_pipeline`](../apps/agent/src/commands/common.rs), in this order:
+Then [`start_pipeline`](../apps/agent/src/commands/common.rs) takes the options by reference and does the same four steps on every platform. The first is `wire_run_pipeline`, in this order:
 
 1. Transport first, because the sink needs the spool handles. If setting up upload fails and `server.offline_fallback` is on (the default), the agent runs without upload and raises an `UPLOAD-DISABLED` alert ([`start_or_disable`](../apps/agent/src/upload.rs)). Without this fallback, an agent missing its certificates would detect nothing, and the watchdog would roll back an otherwise healthy release.
 2. `DetectionSink::new`: alert log, enrichment worker, correlator, ML scorer, Sigma, YARA, IOC, common set. Absent content is not an error.
 3. Correlator ticker. Then the control-plane URL is registered so the agent's own traffic does not raise IOC findings. Then snapshot fetch, the banner, the heartbeat writer and the IPC server.
 
-After that, each platform calls `set_stderr_details`, `apply_detection` and `plant_canaries` before any sensor starts, so the first canary touch is already matched.
+After that, `start_pipeline` itself calls `set_stderr_details`, `apply_detection` and `plant_canaries` before any sensor starts, so the first canary touch is already matched. Each platform's `cmd_run` passes only its own seeded `RuleState`.
 
 ### Linux
 
 [`linux::cmd_run`](../apps/agent/src/commands/linux.rs) runs these steps in order:
 
 1. `kill_loudness::block_termination_signals()`. This **must** come before any other thread exists, because threads inherit the signal mask when they are created.
-2. `wire_run_pipeline` with a `RuleState` seeded from `/proc`, the `ld.so.conf` library directories and a `sock_diag` listener snapshot. A failed snapshot leaves the listener baseline empty.
+2. `start_pipeline` with a `RuleState` seeded from `/proc`, the `ld.so.conf` library directories and a `sock_diag` listener snapshot. A failed snapshot leaves the listener baseline empty.
 3. Start the kill-loudness watcher.
 4. Select the sensor ([`select_sensor`](../apps/agent/src/commands/linux.rs)). eBPF is used if [`can_use_ebpf`](../apps/agent/src/commands/linux.rs) passes: privileges (root, or `CAP_BPF`+`CAP_PERFMON` / `CAP_SYS_ADMIN`), BTF present, object loads, first program accepted by the verifier. Otherwise the audit fallback is used, at lower fidelity.
 5. `enable_response`.
@@ -186,7 +186,7 @@ After that, each platform calls `set_stderr_details`, `apply_detection` and `pla
    - AVC: about 6 s, registered only if its worker will run;
    - uprobes: registered only while it runs.
 7. Start the silence monitor, the integrity and inventory monitors, and the health beacon (each one registered with a `ShutdownPlan` where noted in the thread table).
-8. Start the netlink poller, journal tail, AVC reader (only when eBPF is primary, because `AuditSensor` already reads AVC records), log sources and uprobes supervisor. Attach the observation-only BPF-LSM `file_open` hook, best-effort; its `Ebpf` handle must stay alive.
+8. Start the netlink poller, journal tail, AVC reader (only when eBPF is primary, because `AuditSensor` already reads AVC records), log sources and the uprobes sensor (only when a capture flag is set). Attach the observation-only BPF-LSM `file_open` hook, best-effort; its `Ebpf` handle must stay alive.
 9. Run the primary sensor behind `PulsingSink(ProtectedResourceGuard(sink))`. This blocks.
 
 `agent status` on Linux is a non-invasive preflight. It loads every raw-tracepoint program through the verifier without attaching any, and exits non-zero if one is rejected ([`cmd_status`](../apps/agent/src/commands/linux.rs)).
@@ -268,7 +268,7 @@ sensor. This is a decision, not an accident: the alternative (let the panic spre
 watchdog's hang detection to restart the agent) loses every event in flight and the state built so far.
 
 - `LockExt::lock_recovering` for `Mutex`, `RwLockExt::{read,write}_recovering` for `RwLock`, and
-  `CondvarExt::{wait_while,wait_timeout}_recovering` for the two condvar waits the agent has.
+  `CondvarExt::wait_timeout_recovering` for the condvar wait the agent has.
 - `apps/agent` denies `clippy::unwrap_used` outside tests at the crate root, so a bare `unwrap` on a
   lock cannot come back; the same lint used to be set on the sink module alone.
 - Out of scope, and why: counting recoveries in the health beacon (a schema change, a separate issue);

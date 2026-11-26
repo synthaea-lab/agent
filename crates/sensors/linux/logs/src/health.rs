@@ -18,6 +18,7 @@ pub const MIN_LINES: u32 = 10;
 
 /// A window in which at least half of the lines that reached a parser were rejected.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(missing_docs)] // #362
 pub struct Misparse {
     pub parsed: u32,
     pub failed: u32,
@@ -34,6 +35,7 @@ pub struct MisparseWatch {
 }
 
 impl MisparseWatch {
+    /// A watch with no lines counted; the window starts at the first [`Self::record`] call.
     #[must_use]
     pub fn new() -> Self {
         Self::default()

@@ -36,6 +36,7 @@ use crate::{RuleSet, ScanContext, YaraError, YaraMatch};
 /// Permissions of a mapped region.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[allow(clippy::struct_excessive_bools)] // r/w/x/p are four independent mapping flags
+#[allow(missing_docs)] // #362
 pub struct RegionPerms {
     pub read: bool,
     pub write: bool,
@@ -72,6 +73,7 @@ pub enum RegionKind {
 
 /// One mapped region of a process.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(missing_docs)] // #362
 pub struct MemoryRegion {
     pub start: u64,
     /// Exclusive end.
@@ -165,6 +167,7 @@ impl Default for MemoryBudget {
 
 /// What one memory scan did, including everything it chose not to do.
 #[derive(Debug, Clone, Default)]
+#[allow(missing_docs)] // #362
 pub struct MemoryScanReport {
     /// Distinct matching rules across all scanned regions.
     pub matches: Vec<YaraMatch>,
@@ -236,6 +239,7 @@ pub fn scan_memory(
 
 /// One scan's result, delivered when it found something.
 #[derive(Debug, Clone)]
+#[allow(missing_docs)] // #362
 pub struct MemoryScanOutcome {
     pub pid: u32,
     pub generation: Option<u64>,
@@ -423,6 +427,9 @@ impl MemoryScanQueue {
         true
     }
 
+    /// Snapshot of the memory-scan counters: completed scans, requests shed (queue full,
+    /// cooldown, rate limit) and unreadable targets. Counters are cumulative and read
+    /// `Relaxed`.
     #[must_use]
     pub fn stats(&self) -> MemoryScanStats {
         MemoryScanStats {

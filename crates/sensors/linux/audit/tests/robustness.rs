@@ -8,7 +8,7 @@
 //! are structural (truncation, missing markers, non-UTF-8), all covered
 //! explicitly below.
 
-use sensor_linux_audit::parse_audit_message;
+use sensor_linux_audit::{killrec::parse_kill_log_line, parse_audit_message};
 
 /// Minimal deterministic PRNG (Knuth LCG) — reproducible corpus, no deps.
 fn lcg(state: &mut u64) -> u64 {
@@ -100,5 +100,71 @@ fn never_panics_classifying_hostile_execve_pieces() {
         if let Ok(record) = parse_audit_message(&raw) {
             let _ = sensor_linux_audit::classify(&record);
         }
+    }
+}
+
+/// A `SIGKILL` record as the log file holds it, followed by the enriched block.
+const KILL_LINE: &str = "type=SYSCALL msg=audit(1794826302.839:128): arch=c000003e syscall=62 success=yes exit=0 a0=ffff69d3 a1=9 a2=0 a3=7fe3bcb9fac0 items=0 ppid=2237 pid=2241 auid=1000 uid=0 gid=0 euid=0 suid=0 fsuid=0 egid=0 sgid=0 fsgid=0 tty=(none) ses=4 comm=\"bash\" exe=\"/usr/bin/bash\" key=\"synthaea-kill\"\u{1d}ARCH=x86_64 SYSCALL=kill";
+
+#[test]
+fn the_kill_line_parser_never_panics_on_arbitrary_bytes() {
+    let mut state = 0x4B11_u64;
+    for _ in 0..2_000 {
+        let len = (lcg(&mut state) % 400) as usize;
+        let buf: Vec<u8> = (0..len).map(|_| (lcg(&mut state) >> 33) as u8).collect();
+        let _ = parse_kill_log_line(&String::from_utf8_lossy(&buf));
+    }
+}
+
+#[test]
+fn the_kill_line_parser_never_panics_on_every_truncation_or_mutation_of_a_valid_line() {
+    assert!(
+        parse_kill_log_line(KILL_LINE).is_some(),
+        "baseline must parse"
+    );
+    for cut in 0..KILL_LINE.len() {
+        if let Some(prefix) = KILL_LINE.get(..cut) {
+            let _ = parse_kill_log_line(prefix);
+        }
+    }
+    // Every numeric field replaced by a hostile value, one at a time.
+    for hostile in [
+        "",
+        "0",
+        "-1",
+        "ffffffffffffffff",
+        "18446744073709551616",
+        "4294967296",
+    ] {
+        for field in [
+            "a0=ffff69d3",
+            "a1=9",
+            "pid=2241",
+            "ppid=2237",
+            "uid=0",
+            "auid=1000",
+            "syscall=62",
+        ] {
+            let _ = parse_kill_log_line(&KILL_LINE.replace(
+                field,
+                &format!("{}={hostile}", field.split('=').next().unwrap()),
+            ));
+        }
+    }
+}
+
+#[test]
+fn the_kill_line_parser_never_panics_on_a_hostile_timestamp() {
+    for stamp in [
+        "18446744073.999:1",
+        "18446744073709551615.999:1",
+        "18446744073709551616.0:1",
+        "0.4294967295:1",
+        "1.1000:1",
+        ".:",
+        "-1.5:1",
+    ] {
+        let line = KILL_LINE.replace("1794826302.839:128", stamp);
+        let _ = parse_kill_log_line(&line);
     }
 }

@@ -14,7 +14,6 @@ use schema::sensor::{EventSink as _, Sensor as _};
 use tamper::heartbeat::{SensorHeartbeat, SilenceMonitor};
 
 use crate::{
-    captures::{CaptureSet, Captures, HeartbeatWatch, UprobesAction, heartbeat_watch, plan},
     protected::ProtectedResourceGuard,
     shutdown::{ShutdownPlan, sleep_unless_stopped},
     silence::{PulsingSink, SourceStatus},
@@ -176,30 +175,41 @@ fn has_bpf_capabilities() -> bool {
 /// Selects sensor: eBPF if available, audit fallback otherwise.
 /// Returns (sensor, `sensor_name`) for correct telemetry.
 ///
-/// The third value reads what the eBPF sensor's parent-image cache has dropped, for the health
-/// beacon (#863); the audit fallback has no such cache.
+/// The third value reads the eBPF sensor's loss totals for the health beacon: what its
+/// parent-image cache dropped (#863) and what its probes lost to full rings (#335). The audit
+/// fallback has neither.
 fn select_sensor(
     enable_dns_capture: bool,
+    state_dir: &std::path::Path,
 ) -> (
     Box<dyn schema::sensor::Sensor>,
     &'static str,
-    Option<crate::host_counters::EvictionReader>,
+    Option<crate::host_counters::SensorTotalsReader>,
 ) {
     if can_use_ebpf() {
         tracing::info!("Using eBPF sensor (primary)");
         // `--enable-dns-capture` also turns on the socket-level query capture (#458 part 3).
         let sensor = sensor_linux::LinuxSensor::new().with_dns_udp_capture(enable_dns_capture);
         let evictions = sensor.parent_image_evictions();
+        let ring_drops = sensor.ring_drop_totals();
         return (
             Box::new(sensor),
             "linux-ebpf",
-            Some(Box::new(move || (evictions.live(), evictions.dead()))),
+            Some(Box::new(move || {
+                let (ring_dropped, exec_ring_dropped) = ring_drops.snapshot();
+                crate::host_counters::SensorTotals {
+                    parent_image_evicted_live: evictions.live(),
+                    parent_image_evicted_dead: evictions.dead(),
+                    ring_dropped,
+                    exec_ring_dropped,
+                }
+            })),
         );
     }
 
     tracing::warn!("eBPF unavailable — using audit fallback (reduced fidelity)");
     (
-        Box::new(sensor_linux_audit::AuditSensor::new()),
+        Box::new(sensor_linux_audit::AuditSensor::new().with_state_dir(state_dir.to_path_buf())),
         "linux-audit",
         None,
     )
@@ -250,22 +260,23 @@ fn can_use_ebpf() -> bool {
 /// blanket `EventSink for Arc<T>`) since `LinuxSensor::run` needs to own its sink
 /// for `Sensor`'s lifetime but the poller thread outlives no particular caller.
 pub(crate) fn cmd_run(opts: super::RunOptions) -> anyhow::Result<()> {
+    // The fields bound as `_` are not ignored: `start_pipeline` reads them from `opts` below.
     let super::RunOptions {
         alerts,
         events,
         storage,
-        alert_details,
+        alert_details: _,
         enable_kill,
         enable_quarantine,
         enable_tls_capture,
         enable_readline_capture,
         enable_dns_capture,
-        server,
-        ipc_endpoint,
-        content_dir,
+        server: _,
+        ipc_endpoint: _,
+        content_dir: _,
         log_sources,
-        deception,
-        detection,
+        deception: _,
+        detection: _,
         config_path,
     } = opts;
     // Kill-loudness (#71): must run before any other thread exists — the signal mask
@@ -273,36 +284,28 @@ pub(crate) fn cmd_run(opts: super::RunOptions) -> anyhow::Result<()> {
     // own worker threads.
     crate::kill_loudness::block_termination_signals();
 
-    let pipeline = super::common::wire_run_pipeline(
-        seeded_rule_state(),
-        alerts,
-        events,
-        server,
-        ipc_endpoint,
-        content_dir,
-        storage,
-    )?;
-    // #319. Set before any sensor starts; the one alert `wire_run_pipeline` can raise
-    // itself (UPLOAD-DISABLED) is the agent's own text, not an event's.
-    pipeline.sink.alert_log().set_stderr_details(alert_details);
-    super::common::apply_detection(&pipeline.sink, detection);
-    super::common::plant_canaries(
-        &pipeline.sink,
-        deception,
-        storage,
-        pipeline.transport.as_ref(),
-    );
+    let pipeline = super::common::start_pipeline(&opts, seeded_rule_state())?;
     let sink = Arc::clone(&pipeline.sink);
 
     // The watcher thread itself can start any time after the mask above — only the
     // masking has to precede every other thread. Started here (not right after the
     // masking call) so it can hold a clone of the sink's enrich queue for #341's
     // bounded shutdown drain.
-    crate::kill_loudness::spawn_watcher(alerts.to_path_buf(), sink.enrich_queue().clone())?;
+    // A stop by SIGTERM, SIGHUP or SIGQUIT ends in the watcher's `exit`, which never returns to the
+    // audit sensor's own clean-stop code: the watcher removes the audit fallback's instance marker,
+    // or every restart would leave one and the next start would report an unclean stop. Only this
+    // instance's own marker: until the sensor has replayed it, the file is the predecessor's.
+    let marker_dir = storage.state_dir.clone();
+    crate::kill_loudness::spawn_watcher(
+        alerts.to_path_buf(),
+        sink.enrich_queue().clone(),
+        move || sensor_linux_audit::killrec::remove_own_marker(&marker_dir),
+    )?;
 
     // Select the primary sensor (eBPF or audit fallback) before creating heartbeats
     // so telemetry reports the correct sensor type.
-    let (mut sensor, sensor_name, evictions) = select_sensor(enable_dns_capture);
+    let (mut sensor, sensor_name, sensor_totals) =
+        select_sensor(enable_dns_capture, &storage.state_dir);
 
     // Automated response (#25): policy off by default (observe-only), opted into
     // per flag. Quarantine lands next to alerts.ndjson, the same "derived, no
@@ -371,14 +374,6 @@ pub(crate) fn cmd_run(opts: super::RunOptions) -> anyhow::Result<()> {
     };
     let avc_heartbeat = SensorHeartbeat::new("linux-avc");
     let silence_monitor = Arc::new(Mutex::new(SilenceMonitor::new()));
-    // The optional uprobe captures as configured. Nothing widens them yet: a posture overlay will
-    // (ADR-0035, third slice); the supervisor below already follows the set.
-    let capture_set = CaptureSet::new(Captures {
-        tls: enable_tls_capture,
-        readline: enable_readline_capture,
-        dns: enable_dns_capture,
-    });
-    let uprobes_monitor = Arc::clone(&silence_monitor);
     {
         let now_ns = schema::time::now_ns();
         let mut mon = silence_monitor.lock_recovering();
@@ -397,6 +392,13 @@ pub(crate) fn cmd_run(opts: super::RunOptions) -> anyhow::Result<()> {
             NO_CANARY_SILENCE_DEADLINE_NS,
             now_ns,
         );
+        if enable_tls_capture || enable_readline_capture || enable_dns_capture {
+            mon.register(
+                uprobes_heartbeat.clone(),
+                NO_CANARY_SILENCE_DEADLINE_NS,
+                now_ns,
+            );
+        }
         if runs_avc_worker {
             mon.register(avc_heartbeat.clone(), AVC_SILENCE_DEADLINE_NS, now_ns);
         }
@@ -424,7 +426,7 @@ pub(crate) fn cmd_run(opts: super::RunOptions) -> anyhow::Result<()> {
         Arc::new(crate::host_counters::AgentHostCounters::new(
             Arc::clone(&pipeline.sink),
             crate::host_counters::WatchdogReport::from_env(),
-            evictions,
+            sensor_totals,
         )),
     );
     // Workers wound down after `sensor.run` returns (#316).
@@ -450,12 +452,15 @@ pub(crate) fn cmd_run(opts: super::RunOptions) -> anyhow::Result<()> {
         )?;
     }
     crate::log_sources::spawn(sink.clone(), log_sources, alerts, &mut shutdown)?;
-    spawn_uprobes_supervisor(
-        sink.clone(),
-        uprobes_heartbeat,
-        uprobes_monitor,
-        capture_set,
-    )?;
+    if enable_tls_capture || enable_readline_capture || enable_dns_capture {
+        spawn_uprobes_sensor(
+            sink.clone(),
+            uprobes_heartbeat,
+            enable_tls_capture,
+            enable_readline_capture,
+            enable_dns_capture,
+        )?;
+    }
 
     // Observation-only BPF-LSM coverage (issue #91/#313): best-effort, never
     // fails `cmd_run`. `_lsm_ebpf` must stay bound for the rest of this function
@@ -930,133 +935,50 @@ fn spawn_journal_canary() -> std::io::Result<()> {
     Ok(())
 }
 
-/// The uprobes thread that is running, and the captures it was started with.
-struct RunningUprobes {
-    captures: Captures,
-    stop: sensor_linux_uprobes::UprobesStopHandle,
-    thread: std::thread::JoinHandle<()>,
-}
-
-impl RunningUprobes {
-    /// Stops the sensor and waits for the thread to end, which unloads its eBPF object. Safe on a
-    /// thread that has already ended (the sensor failed): the stop is kept and the join returns.
-    fn stop(self) {
-        self.stop.stop();
-        if self.thread.join().is_err() {
-            tracing::warn!("the uprobes thread panicked");
-        }
-    }
-}
-
-/// Starts the uprobes sensor with exactly `captures` (issue #90: TLS plaintext taps via
-/// `SSL_read`/`SSL_write` uprobes, shell readline capture; issue #267 Phase 1: DNS query capture
-/// via a `getaddrinfo(3)` uprobe). `captures` is never empty: `plan` starts nothing for an empty
-/// set.
-fn start_uprobes(
+/// Spawns the background thread running the uprobes sensor (issue #90: TLS
+/// plaintext taps via `SSL_read`/`SSL_write` uprobes, shell readline capture;
+/// issue #267 Phase 1: DNS query capture via a `getaddrinfo(3)` uprobe) when at
+/// least one capture is enabled by CLI flag. Only called when the caller has
+/// already checked `enable_tls_capture || enable_readline_capture ||
+/// enable_dns_capture` — `cmd_run` doesn't spawn this thread at all otherwise,
+/// so a deliberately-disabled capture costs nothing at runtime, not even a
+/// parked thread.
+///
+/// The captures are read once at start and never change while the agent runs
+/// (`docs/sensors/linux/uprobes.md`, "Captures are fixed at start").
+///
+/// Unlike [`spawn_netlink_poller`]/[`spawn_journal_tail`] above, `UprobesSensor`
+/// implements `Sensor` — the same trait the primary eBPF/audit sensor does — so
+/// its own blocking `run` owns this thread and `PulsingSink` (the primary sensor's
+/// own wrapper) pulses `heartbeat` on every event, rather than a manual per-item
+/// pulse. No `ProtectedResourceGuard` here: unlike the primary eBPF sensor, this
+/// one never produces `FileOpen` events.
+///
+/// # Errors
+///
+/// The OS refused the thread; `cmd_run` exits with it like any other start-up failure. The
+/// heartbeat is already registered by then, but the agent does not run.
+fn spawn_uprobes_sensor(
     sink: Arc<DetectionSink>,
     heartbeat: SensorHeartbeat,
-    captures: Captures,
-) -> std::io::Result<RunningUprobes> {
-    let mut config = sensor_linux_uprobes::UprobesConfig::new();
-    if captures.tls {
-        config = config.with_tls_enabled();
-    }
-    if captures.readline {
-        config = config.with_readline_enabled();
-    }
-    if captures.dns {
-        config = config.with_dns_enabled();
-    }
-    let mut sensor = sensor_linux_uprobes::UprobesSensor::with_config(config);
-    let stop = sensor.stop_handle();
-    let thread = crate::spawn::spawn_named("uprobes", move || {
+    enable_tls_capture: bool,
+    enable_readline_capture: bool,
+    enable_dns_capture: bool,
+) -> std::io::Result<()> {
+    crate::spawn::spawn_named("uprobes", move || {
+        let mut config = sensor_linux_uprobes::UprobesConfig::new();
+        if enable_tls_capture {
+            config = config.with_tls_enabled();
+        }
+        if enable_readline_capture {
+            config = config.with_readline_enabled();
+        }
+        if enable_dns_capture {
+            config = config.with_dns_enabled();
+        }
+        let mut sensor = sensor_linux_uprobes::UprobesSensor::with_config(config);
         if let Err(e) = sensor.run(Box::new(PulsingSink::new(sink, heartbeat))) {
             tracing::warn!(error = %e, "uprobes sensor failed");
-        }
-    })?;
-    Ok(RunningUprobes {
-        captures,
-        stop,
-        thread,
-    })
-}
-
-/// [`start_uprobes`] for the supervisor, which runs long after start-up and so cannot fail
-/// `cmd_run`: a thread the OS refuses is logged and the sensor stays off (the silence monitor
-/// watches its heartbeat from the moment the supervisor registered it, so the gap is reported).
-fn start_uprobes_or_log(
-    sink: &Arc<DetectionSink>,
-    heartbeat: &SensorHeartbeat,
-    captures: Captures,
-) -> Option<RunningUprobes> {
-    match start_uprobes(sink.clone(), heartbeat.clone(), captures) {
-        Ok(running) => Some(running),
-        Err(e) => {
-            tracing::error!(error = %e, "uprobes sensor not started");
-            None
-        }
-    }
-}
-
-/// Keeps the uprobes thread running exactly the captures `captures` says are wanted, and keeps
-/// its heartbeat watched by the silence monitor only while it runs: a capture that is off is
-/// deliberate, and must never accrue silence (a stalled sensor is reported as tampering). With
-/// nothing configured and nothing widened it parks on the set and costs nothing.
-///
-/// The sensor reads its config once, so a change **restarts** it: the eBPF object is unloaded
-/// and loaded again, and capture has a gap in between (on the way up, and again when a widening
-/// ends). A live attach and detach on the running sensor would avoid the gap and is a separate
-/// piece of work.
-fn spawn_uprobes_supervisor(
-    sink: Arc<DetectionSink>,
-    heartbeat: SensorHeartbeat,
-    monitor: Arc<Mutex<SilenceMonitor>>,
-    captures: CaptureSet,
-) -> std::io::Result<()> {
-    crate::spawn::spawn_named("uprobes-supervisor", move || {
-        let mut running: Option<RunningUprobes> = None;
-        // Whether the heartbeat is watched follows what is wanted, not what runs: a start the OS
-        // refuses leaves nothing running, and switching the capture off must still unregister.
-        let mut registered = false;
-        let mut wanted = captures.effective();
-        loop {
-            if heartbeat_watch(registered, wanted) == HeartbeatWatch::Watch {
-                monitor.lock_recovering().register(
-                    heartbeat.clone(),
-                    NO_CANARY_SILENCE_DEADLINE_NS,
-                    schema::time::now_ns(),
-                );
-                registered = true;
-            }
-            let current = running.as_ref().map_or(Captures::NONE, |r| r.captures);
-            match plan(current, wanted) {
-                UprobesAction::Idle => {}
-                UprobesAction::Start(set) => {
-                    tracing::info!(?set, "starting the uprobes sensor");
-                    running = start_uprobes_or_log(&sink, &heartbeat, set);
-                }
-                UprobesAction::Restart(set) => {
-                    tracing::info!(
-                        ?set,
-                        "restarting the uprobes sensor with other captures: capture has a gap while it reloads"
-                    );
-                    if let Some(old) = running.take() {
-                        old.stop();
-                    }
-                    running = start_uprobes_or_log(&sink, &heartbeat, set);
-                }
-                UprobesAction::Stop => {
-                    tracing::info!("stopping the uprobes sensor: no capture is wanted any more");
-                    if let Some(old) = running.take() {
-                        old.stop();
-                    }
-                }
-            }
-            if heartbeat_watch(registered, wanted) == HeartbeatWatch::Unwatch {
-                monitor.lock_recovering().unregister(heartbeat.name());
-                registered = false;
-            }
-            wanted = captures.wait_until_differs(wanted);
         }
     })?;
     Ok(())

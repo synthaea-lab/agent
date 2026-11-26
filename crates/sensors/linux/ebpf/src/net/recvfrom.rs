@@ -11,10 +11,13 @@ use aya_ebpf::{
     maps::{LruHashMap, PerCpuArray, RingBuf},
     programs::TracePointContext,
 };
-use aya_log_ebpf::warn;
-use sensor_linux_wire::{TASK_COMM_LEN, UdpRecvEvent};
+use sensor_linux_wire::UdpRecvEvent;
 
-use crate::{AF_INET, AF_INET6, SYS_EXIT_RET_OFFSET, fill_lineage, into_ret};
+use crate::{
+    AF_INET, AF_INET6,
+    arch::{SYS_EXIT_RET_OFFSET, SyscallRecord, arg_offset},
+    fill_event_meta, into_ret,
+};
 
 /// Ring buffer shared with userspace for `recvfrom` events.
 #[map]
@@ -43,40 +46,26 @@ struct RecvfromArgs {
 static RECVFROM_ARGS: LruHashMap<u64, RecvfromArgs> = LruHashMap::with_max_entries(1024, 0);
 
 /// Offsets of `addr`(48) and `addr_len`(56) in `syscalls:sys_enter_recvfrom`
-/// (x86_64/aarch64): `fd`(16), `ubuf`(24), `size`(32), `flags`(40), the same layout
+/// (`x86_64`/`aarch64`): `fd`(16), `ubuf`(24), `size`(32), `flags`(40), the same layout
 /// `sys_enter_sendto` reports. Verified on 2026-10-05 on Alpine (kernel 6.18.50-0-virt,
-/// x86_64) via `/sys/kernel/tracing/events/syscalls/sys_enter_recvfrom/format`.
-#[cfg(any(bpf_target_arch = "x86_64", bpf_target_arch = "aarch64"))]
-const RECVFROM_ADDR_PTR_OFFSET: usize = 48;
-#[cfg(any(bpf_target_arch = "x86_64", bpf_target_arch = "aarch64"))]
-const RECVFROM_ADDR_LEN_PTR_OFFSET: usize = 56;
+/// `x86_64`) via `/sys/kernel/tracing/events/syscalls/sys_enter_recvfrom/format`.
+///
 /// i686: inferred, not independently verified (see `sys_enter_open`'s i686 note).
-#[cfg(bpf_target_arch = "x86")]
-const RECVFROM_ADDR_PTR_OFFSET: usize = 28;
-#[cfg(bpf_target_arch = "x86")]
-const RECVFROM_ADDR_LEN_PTR_OFFSET: usize = 32;
+const RECVFROM_ADDR_PTR_OFFSET: usize = arg_offset(4);
+const RECVFROM_ADDR_LEN_PTR_OFFSET: usize = arg_offset(5);
 
 pub fn sys_enter_recvfrom(ctx: TracePointContext) -> u32 {
     into_ret(stash_recvfrom_addr(&ctx))
 }
 
 fn stash_recvfrom_addr(ctx: &TracePointContext) -> Result<u32, u32> {
-    #[cfg(any(bpf_target_arch = "x86_64", bpf_target_arch = "aarch64"))]
-    let addr_ptr: u64 = unsafe { ctx.read_at(RECVFROM_ADDR_PTR_OFFSET).map_err(|_| 1u32)? };
-    #[cfg(any(bpf_target_arch = "x86_64", bpf_target_arch = "aarch64"))]
-    let addr_len_ptr: u64 = unsafe {
-        ctx.read_at(RECVFROM_ADDR_LEN_PTR_OFFSET)
+    let addr_ptr: u64 = unsafe {
+        ctx.read_ulong_arg(RECVFROM_ADDR_PTR_OFFSET)
             .map_err(|_| 1u32)?
     };
-    #[cfg(bpf_target_arch = "x86")]
-    let addr_ptr: u64 = unsafe {
-        ctx.read_at::<u32>(RECVFROM_ADDR_PTR_OFFSET)
-            .map_err(|_| 1u32)? as u64
-    };
-    #[cfg(bpf_target_arch = "x86")]
     let addr_len_ptr: u64 = unsafe {
-        ctx.read_at::<u32>(RECVFROM_ADDR_LEN_PTR_OFFSET)
-            .map_err(|_| 1u32)? as u64
+        ctx.read_ulong_arg(RECVFROM_ADDR_LEN_PTR_OFFSET)
+            .map_err(|_| 1u32)?
     };
 
     let pid_tgid = bpf_get_current_pid_tgid();
@@ -102,10 +91,7 @@ pub fn sys_exit_recvfrom(ctx: TracePointContext) -> u32 {
 /// whose `addr` buffer still holds whatever the caller put there), or the sender's
 /// address family isn't `AF_INET`/`AF_INET6`.
 fn try_sys_exit_recvfrom(ctx: TracePointContext) -> Result<u32, u32> {
-    #[cfg(any(bpf_target_arch = "x86_64", bpf_target_arch = "aarch64"))]
-    let ret: i64 = unsafe { ctx.read_at(SYS_EXIT_RET_OFFSET).map_err(|_| 1u32)? };
-    #[cfg(bpf_target_arch = "x86")]
-    let ret: i64 = unsafe { ctx.read_at::<i32>(SYS_EXIT_RET_OFFSET).map_err(|_| 1u32)? as i64 };
+    let ret: i64 = unsafe { ctx.read_long_arg(SYS_EXIT_RET_OFFSET).map_err(|_| 1u32)? };
 
     let pid_tgid = bpf_get_current_pid_tgid();
     let args = match unsafe { RECVFROM_ARGS.get(&pid_tgid) } {
@@ -155,17 +141,7 @@ fn try_sys_exit_recvfrom(ctx: TracePointContext) -> Result<u32, u32> {
     unsafe {
         core::ptr::write_bytes(e, 0, 1);
 
-        (*e).meta.pid = (pid_tgid >> 32) as u32;
-        fill_lineage(&mut (*e).meta);
-        (*e).meta.uid = uid_gid as u32;
-        (*e).meta.gid = (uid_gid >> 32) as u32;
-        (*e).meta.timestamp_ns = aya_ebpf::helpers::bpf_ktime_get_ns();
-        (*e).meta.cgroup_id = aya_ebpf::helpers::bpf_get_current_cgroup_id();
-        let mut i = 0usize;
-        while i < TASK_COMM_LEN {
-            (*e).meta.comm[i] = comm[i];
-            i += 1;
-        }
+        fill_event_meta(&mut (*e).meta, (pid_tgid >> 32) as u32, uid_gid, &comm);
         (*e).peer_addr_v4 = v4;
         (*e).peer_addr_v6 = v6;
         (*e).peer_port = u16::from_be(port_be);
@@ -173,10 +149,7 @@ fn try_sys_exit_recvfrom(ctx: TracePointContext) -> Result<u32, u32> {
         (*e).size = ret as u32;
 
         if UDP_RECV_EVENTS.output::<UdpRecvEvent>(&*e, 0).is_err() {
-            warn!(
-                &ctx,
-                "sensor-linux-ebpf: ring buffer full, dropping udp recv event"
-            );
+            crate::count_ring_drop(sensor_linux_wire::ring::UDP_RECV);
         }
     }
 

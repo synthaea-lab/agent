@@ -80,7 +80,10 @@ pub use stateless::{
     evaluate_raw_volume_open, evaluate_signal,
 };
 
+/// A detection finding from a stateless or stateful rule. Carries the technique, an analyst-
+/// facing severity and a message; it never triggers a response by itself.
 #[derive(Debug, Clone)]
+#[allow(missing_docs)] // #362
 pub struct Alert {
     /// ATT&CK identifier of the detected technique.
     pub technique: &'static str,

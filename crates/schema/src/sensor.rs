@@ -20,6 +20,7 @@ pub type SensorError = Box<dyn core::error::Error + Send + Sync + 'static>;
 /// reflect what `run` actually emits — never an optimistic static value; the
 /// conformance suite asserts it against observed behavior.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[allow(missing_docs)] // #362
 pub struct Capabilities {
     pub exec_events: bool,
     pub file_events: bool,
@@ -41,6 +42,8 @@ pub struct Capabilities {
 /// so new telemetry categories reach existing sinks without a breaking trait change —
 /// sinks match on the variants they understand and ignore the rest.
 pub trait EventSink: Send + Sync {
+    /// Handles one normalized event. `Event` is `#[non_exhaustive]`: match the variants the sink
+    /// understands and ignore the rest.
     fn on_event(&self, event: Event);
 }
 

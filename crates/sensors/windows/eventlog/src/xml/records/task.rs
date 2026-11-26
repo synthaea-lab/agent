@@ -5,6 +5,7 @@ use crate::xml::scan::{extract_between, opt_data, unescape_xml_entities};
 /// Fields extracted from a 4698 ("A scheduled task was created") `<Event>` block —
 /// Security log, requires the "Other Object Access Events" audit subcategory.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(missing_docs)] // #362
 pub struct ScheduledTaskEvent {
     pub record_id: u64,
     /// e.g. `\TestTask` — the Task Scheduler path, not just the leaf name.
@@ -66,6 +67,7 @@ fn parse_task_block_with_content_field(
 /// name and the user context that registered it — no serialized XML task
 /// content, so no action path.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(missing_docs)] // #362
 pub struct TaskSchedulerOpRegisteredEvent {
     pub record_id: u64,
     /// PID of the reporting process (`<Execution ProcessID='...'>`) — the

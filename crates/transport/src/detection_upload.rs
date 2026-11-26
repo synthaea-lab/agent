@@ -29,6 +29,7 @@ const SERVER_INVALID_PAYLOAD: &str = "Invalid payload";
 /// The retry identity is persisted in the same spool record as its detection.
 /// Reopening an in-flight segment therefore reuses the exact same key.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[allow(missing_docs)] // #362
 pub struct QueuedDetection {
     pub key: String,
     pub detection: Detection,

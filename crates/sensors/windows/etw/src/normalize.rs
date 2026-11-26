@@ -132,6 +132,9 @@ pub struct OrphanedSessionSelection {
     pub possibly_truncated: bool,
 }
 
+/// Picks the ETW sessions whose name starts with `prefix` from an enumeration of at most
+/// `capacity` entries. `api_reported_more` (the API said more sessions exist) or a full buffer
+/// (`capacity > 0` and `sessions.len() >= capacity`) sets `possibly_truncated`.
 #[must_use]
 pub fn select_orphaned_sessions(
     sessions: &[SessionStats],
@@ -386,6 +389,8 @@ pub struct ConnectDedup {
 }
 
 impl ConnectDedup {
+    /// Creates a deduplicator that suppresses repeats of one flow seen within `window_ns`
+    /// nanoseconds.
     #[must_use]
     pub fn new(window_ns: u64) -> Self {
         Self {

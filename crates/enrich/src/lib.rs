@@ -42,6 +42,7 @@ const CACHE_CAP: usize = 16_384;
 
 /// What enrichment knows about one file.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(missing_docs)] // #362
 pub struct FileEnrichment {
     /// Lowercase hex SHA-256; `None` when the file was unreadable or over budget.
     pub sha256: Option<String>,
@@ -118,6 +119,8 @@ impl Default for Enricher {
 }
 
 impl Enricher {
+    /// Creates an enricher with an empty verdict cache, bounded to `CACHE_CAP` entries (LRU
+    /// eviction).
     #[must_use]
     pub fn new() -> Self {
         Self {

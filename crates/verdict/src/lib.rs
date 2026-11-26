@@ -42,6 +42,7 @@ use store::BoundedMap;
 /// with the same rule as the rest of the stack: two known, different stamps are two
 /// incarnations, and a `None` on either side cannot disprove identity.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[allow(missing_docs)] // #362
 pub struct EntityKey {
     pub ppid: u32,
     pub comm: String,
@@ -130,6 +131,7 @@ impl EntityState {
 /// technique, source and (bounded) piece of evidence folded into this entity
 /// so far.
 #[derive(Debug, Clone, PartialEq)]
+#[allow(missing_docs)] // #362
 pub struct Verdict {
     pub entity: EntityKey,
     pub severity: Severity,
@@ -189,6 +191,9 @@ pub struct VerdictEngine {
 }
 
 impl VerdictEngine {
+    /// Creates an engine with no tracked entities and no suppression marks. `dedup_window_ns`
+    /// is the fixed window, in nanoseconds, from a technique's first sighting within which a
+    /// repeat is a duplicate (see `TechniqueRecord`).
     #[must_use]
     pub fn new(dedup_window_ns: u64) -> Self {
         Self {

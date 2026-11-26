@@ -11,6 +11,7 @@ use crate::xml::scan::{data_field, data_u32, extract_between};
 /// "Élevée", `Action Name` as "Supprimer"): only the numeric ids and the
 /// untranslated `Threat Name` / `Path` are read, never the `* Name` texts.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(missing_docs)] // #362
 pub struct DefenderLogEvent {
     pub record_id: u64,
     pub event_id: u32,

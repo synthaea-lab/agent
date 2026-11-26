@@ -152,7 +152,7 @@ platform-independent; its unit tests run on every CI leg. Invariants it enforces
 
 | Where | What happens when full | Visible as |
 | --- | --- | --- |
-| A ring buffer | `output` fails; the record is lost | an aya-log `warn!` per drop ("ring buffer full, dropping ... event"); not counted |
+| A ring buffer | `output` fails; the record is lost | `RING_DROPS`, one per-CPU counter per ring (`sensor_linux_wire::ring`), read every 10 s; one warning per ring that lost events in the interval ("ring buffer full, events dropped", with `ring`, `dropped`, `total`); the totals ride the health beacon as `ring_dropped` and `exec_ring_dropped` |
 | `SIGNAL_EVENTS` for tool signals | lost | `SIGNAL_TOOL_DROPS` per-CPU counter, read every 5 s; a `signals_lost` event is emitted so the rules can alert |
 | `PROC_LINEAGE` (65 536) | insert fails | events carry `ppid = 0` and no generation |
 | `PENDING_SYSCALL_EXIT` | LRU eviction; failed insert counted | `PENDING_SYSCALL_EXIT_DROPPED` (not read by the agent) |

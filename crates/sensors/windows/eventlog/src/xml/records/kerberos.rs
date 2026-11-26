@@ -9,6 +9,7 @@ use crate::xml::{
 /// delegation denied) or 202 (TGT session key export denied), same nine-field
 /// template (`#364`).
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(missing_docs)] // #362
 pub struct KerberosDelegationFailureRecord {
     pub record_id: u64,
     pub event_id: u32,

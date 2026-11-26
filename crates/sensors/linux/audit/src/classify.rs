@@ -4,7 +4,10 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
 use crate::parse::AuditRecord;
 
+/// An audit record reduced to what the sensor reports: an exec with its argv, an outbound connect,
+/// or a `SELinux` AVC denial. Built by [`classify`]; any other record type yields `None` there.
 #[derive(Debug)]
+#[allow(missing_docs)] // #362
 pub enum AuditEvent {
     Exec {
         pid: u32,

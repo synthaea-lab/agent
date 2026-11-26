@@ -14,6 +14,7 @@ use policy::ResponsePolicy;
 /// #25's "policy off = observe-only" acceptance criterion: observing is not a
 /// different code path from acting, just a different variant of the same result).
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(missing_docs)] // #362
 pub enum KillOutcome {
     /// The process was signaled; `terminate` reported success.
     Killed { pid: u32 },

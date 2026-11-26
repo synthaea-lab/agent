@@ -1,5 +1,5 @@
 //! Platform-independent composition of the `run` pipeline. The platform
-//! modules (`linux`, `windows`) own sensor selection and platform-only wiring
+//! modules (`linux`, `windows`, `macos`) own sensor selection and platform-only wiring
 //! (silence monitors, response, pollers); everything both share — transport,
 //! the detection sink, the banner, the progress heartbeat — is assembled here,
 //! so a new pipeline stage lands once instead of per-platform.
@@ -8,7 +8,7 @@ use std::sync::{Arc, Mutex};
 
 use tamper::heartbeat::SilenceMonitor;
 
-use super::localzone;
+use super::{RunOptions, localzone};
 use crate::{
     health::{
         DroppedCounter, HealthCollector, HealthCollectorConfig, HostCountersSource, NoopSpoolStats,
@@ -172,19 +172,50 @@ fn apply_platform_zone(sink: &DetectionSink) {
     }
 }
 
+/// What every platform's `cmd_run` does before its sensors, in this order: build the shared
+/// pipeline ([`wire_run_pipeline`]), set `--alert-details` (#319), hand the rules the host's
+/// time ([`apply_detection`]), and plant the canaries ([`plant_canaries`]).
+///
+/// `rule_state` is the platform's seeded process table (`seeded_rule_state`), the one thing
+/// that differs between the platforms here.
+pub(crate) fn start_pipeline(
+    opts: &RunOptions<'_>,
+    rule_state: rules::RuleState,
+) -> anyhow::Result<RunPipeline> {
+    let pipeline = wire_run_pipeline(opts, rule_state)?;
+    // #319. Set before any sensor starts; the one alert `wire_run_pipeline` can raise
+    // itself (UPLOAD-DISABLED) is the agent's own text, not an event's.
+    pipeline
+        .sink
+        .alert_log()
+        .set_stderr_details(opts.alert_details);
+    apply_detection(&pipeline.sink, opts.detection);
+    plant_canaries(
+        &pipeline.sink,
+        opts.deception,
+        opts.storage,
+        pipeline.transport.as_ref(),
+    );
+    Ok(pipeline)
+}
+
 /// Builds the shared pipeline: optional transport (spool + upload thread),
 /// the detection sink (spooling into it when transport is on), the operator
 /// banner, the progress-backed liveness heartbeat (#102), and the local IPC
 /// control channel served to `cli` (#388).
-pub(crate) fn wire_run_pipeline(
+fn wire_run_pipeline(
+    opts: &RunOptions<'_>,
     rule_state: rules::RuleState,
-    alerts: &std::path::Path,
-    events: Option<&std::path::Path>,
-    server: Option<crate::upload::ControlPlane<'_>>,
-    ipc_endpoint: &str,
-    content_dir: &std::path::Path,
-    storage: &config::StorageConfig,
 ) -> anyhow::Result<RunPipeline> {
+    let RunOptions {
+        alerts,
+        events,
+        server,
+        ipc_endpoint,
+        content_dir,
+        storage,
+        ..
+    } = *opts;
     // Transport first: the sink needs the spool handle at construction.
     let spool_cap = crate::upload::spool_cap_bytes(storage.spool_max_mb);
     let (transport, upload_disabled) = match server {
@@ -329,6 +360,12 @@ pub(crate) fn health_collector(
                 ioc_own_skipped = beacon.ioc_own_skipped,
                 ioc_sibling_skipped = beacon.ioc_sibling_skipped,
                 alerts_dropped = beacon.alerts_dropped,
+                ring_dropped = beacon.ring_dropped,
+                exec_ring_dropped = beacon.exec_ring_dropped,
+                etw_pid_cache_evicted = beacon.etw_pid_cache_evicted,
+                etw_silo_evicted = beacon.etw_silo_evicted,
+                etw_marks_dropped = beacon.etw_marks_dropped,
+                etw_quarantine_unremembered = beacon.etw_quarantine_unremembered,
                 "health beacon"
             );
             // #24/#134: the dedicated health channel — best-effort, an
@@ -602,5 +639,200 @@ mod tests {
             1,
             "the uploaders were told to stop before the queued finding was delivered"
         );
+    }
+
+    struct PreludeFixture {
+        dir: tempfile::TempDir,
+        storage: config::StorageConfig,
+        deception: config::DeceptionConfig,
+        detection: config::DetectionConfig,
+        canary_dir: std::path::PathBuf,
+        alerts: std::path::PathBuf,
+        content_dir: std::path::PathBuf,
+        ipc_endpoint: String,
+    }
+
+    impl PreludeFixture {
+        fn new() -> Self {
+            let dir = tempfile::tempdir().unwrap();
+            let canary_dir = dir.path().join("canaries");
+            std::fs::create_dir_all(&canary_dir).unwrap();
+            Self {
+                storage: config::StorageConfig {
+                    state_dir: dir.path().join("state"),
+                    spool_max_mb: 1,
+                },
+                deception: config::DeceptionConfig {
+                    canary_dirs: vec![canary_dir.clone()],
+                    ..Default::default()
+                },
+                detection: config::DetectionConfig::default(),
+                alerts: dir.path().join("alerts.ndjson"),
+                content_dir: dir.path().join("content"),
+                // A path under the temp dir. On Windows the endpoint is a named pipe name,
+                // not a path, so it fails to bind there; that is non-fatal (the agent runs
+                // without the IPC server), so the prelude test is the same on every OS.
+                ipc_endpoint: dir.path().join("agent.sock").display().to_string(),
+                canary_dir,
+                dir,
+            }
+        }
+
+        fn options<'a>(
+            &'a self,
+            server: Option<crate::upload::ControlPlane<'a>>,
+        ) -> RunOptions<'a> {
+            RunOptions {
+                alerts: &self.alerts,
+                events: None,
+                storage: &self.storage,
+                alert_details: true,
+                enable_kill: false,
+                enable_quarantine: false,
+                enable_tls_capture: false,
+                enable_readline_capture: false,
+                enable_dns_capture: false,
+                server,
+                ipc_endpoint: &self.ipc_endpoint,
+                content_dir: &self.content_dir,
+                log_sources: &[],
+                deception: &self.deception,
+                detection: &self.detection,
+                config_path: self.dir.path(),
+            }
+        }
+    }
+
+    #[test]
+    fn the_run_prelude_builds_the_sink_and_plants_the_canaries() {
+        // `start_pipeline` reads the host's zone, which on Unix is `TZ`.
+        #[cfg(unix)]
+        let _tz = super::localzone::TzGuard::new();
+        let fixture = PreludeFixture::new();
+        let pipeline = start_pipeline(&fixture.options(None), rules::RuleState::new())
+            .expect("the standalone prelude");
+
+        assert!(pipeline.transport.is_none(), "no server, no transport");
+        assert!(
+            std::fs::read_dir(&fixture.canary_dir)
+                .unwrap()
+                .next()
+                .is_some(),
+            "a canary file was planted in the configured directory"
+        );
+        drop(pipeline);
+    }
+
+    /// The one alert the prelude raises itself: an upload that cannot start with
+    /// `offline_fallback` on keeps detection running and says so. It is raised inside
+    /// `wire_run_pipeline`, before `start_pipeline` sets `alert_details` (#319): the text is
+    /// the agent's own, not an event's, so `--alert-details` does not change it.
+    #[test]
+    fn the_run_prelude_reports_an_upload_that_could_not_start_and_goes_on() {
+        #[cfg(unix)]
+        let _tz = super::localzone::TzGuard::new();
+        let fixture = PreludeFixture::new();
+        let missing_ca = fixture.dir.path().join("no-such-ca.pem");
+        let server = crate::upload::ControlPlane {
+            url: "https://127.0.0.1:1",
+            ca_cert: Some(&missing_ca),
+            client_cert: None,
+            offline_fallback: true,
+        };
+        let pipeline = start_pipeline(&fixture.options(Some(server)), rules::RuleState::new())
+            .expect("offline fallback keeps running");
+
+        assert!(pipeline.transport.is_none(), "the upload did not start");
+        let recent = pipeline.sink.alert_log().latest(10);
+        assert!(
+            recent.iter().any(|a| a.technique == "UPLOAD-DISABLED"),
+            "UPLOAD-DISABLED was not raised: {:?}",
+            recent.iter().map(|a| &a.technique).collect::<Vec<_>>()
+        );
+        drop(pipeline);
+    }
+
+    /// #15: the agent's own wiring of the platform zone. `localzone` and the rules each have
+    /// tests; this one runs `apply_detection` and reads what the rules then decide.
+    #[cfg(unix)]
+    mod zone_wiring {
+        use super::*;
+
+        /// Friday 2026-10-30 00:00 UTC: not a weekend in any zone the tests use, so the
+        /// weekend exemption plays no part in what they read.
+        const FRIDAY_2026_10_30_MIDNIGHT_UTC_NS: u64 = 1_793_318_400 * 1_000_000_000;
+        const NANOS_PER_HOUR: u64 = 3_600_000_000_000;
+
+        /// A fresh sink and rule state in a directory that is removed even if the test fails.
+        /// Each assertion takes its own: the rules remember a logon, so an alert on one sink
+        /// would silence a later, earlier-in-time logon on the same sink (8 h quiet period).
+        fn fresh_sink() -> (Arc<DetectionSink>, tempfile::TempDir) {
+            let dir = tempfile::tempdir().unwrap();
+            let sink = Arc::new(
+                DetectionSink::new(
+                    rules::RuleState::new(),
+                    &dir.path().join("alerts.ndjson"),
+                    Some(&dir.path().join("events.jsonl")),
+                    None,
+                    None,
+                    &dir.path().join("content"),
+                    &dir.path().join("ml-registry"),
+                )
+                .unwrap(),
+            );
+            (sink, dir)
+        }
+
+        fn odd_hour_alerts(sink: &DetectionSink, hour_utc: u64) -> usize {
+            let event = schema::AuthEvent {
+                target_user: "mallory".into(),
+                meta: schema::EventMeta {
+                    timestamp_ns: FRIDAY_2026_10_30_MIDNIGHT_UTC_NS + hour_utc * NANOS_PER_HOUR,
+                    ..schema::fixtures::meta()
+                },
+                ..schema::fixtures::auth()
+            };
+            sink.auth_alerts_for_test(&event)
+                .iter()
+                .filter(|a| a.message.contains("outside the working hours"))
+                .count()
+        }
+
+        /// Zone only: UTC+9 (no daylight saving). 12:00 UTC is 21:00 on the host, after the
+        /// working day; 02:00 UTC is 11:00, inside it. Each hour has its own sink.
+        #[test]
+        fn the_platform_zone_alone_turns_odd_hour_logon_on() {
+            let tz = super::super::localzone::TzGuard::new();
+            tz.set("JST-9");
+
+            let (late, _late_dir) = fresh_sink();
+            apply_detection(&late, &config::DetectionConfig::default());
+            assert_eq!(odd_hour_alerts(&late, 12), 1, "21:00 host time");
+
+            let (morning, _morning_dir) = fresh_sink();
+            apply_detection(&morning, &config::DetectionConfig::default());
+            assert_eq!(odd_hour_alerts(&morning, 2), 0, "11:00 host time");
+        }
+
+        /// The same zone and an operator offset of UTC-5: the offset decides. 12:00 UTC is
+        /// 07:00 on the host (inside the working day), 02:00 UTC is 21:00 the day
+        /// before.
+        #[test]
+        fn an_operator_utc_offset_overrides_the_platform_zone() {
+            let tz = super::super::localzone::TzGuard::new();
+            tz.set("JST-9");
+            let operator = config::DetectionConfig {
+                utc_offset_minutes: Some(-300),
+                ..config::DetectionConfig::default()
+            };
+
+            let (noon, _noon_dir) = fresh_sink();
+            apply_detection(&noon, &operator);
+            assert_eq!(odd_hour_alerts(&noon, 12), 0, "07:00 host time");
+
+            let (night, _night_dir) = fresh_sink();
+            apply_detection(&night, &operator);
+            assert_eq!(odd_hour_alerts(&night, 2), 1, "21:00 host time");
+        }
     }
 }

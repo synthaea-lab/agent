@@ -18,6 +18,7 @@ use crate::Event;
 /// Analyst-facing severity. Ordered: `Low < Medium < High < Critical`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[allow(missing_docs)] // #362
 pub enum Severity {
     Low,
     Medium,
@@ -29,6 +30,7 @@ pub enum Severity {
 #[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "engine", rename_all = "snake_case")]
+#[allow(missing_docs)] // #362
 pub enum DetectionSource {
     /// Native rule engine (stateless or stateful).
     Rule { rule_id: String },
@@ -111,6 +113,7 @@ pub struct ScoreAttribution {
 /// sensors observe, detections are what engines conclude; sinks and transport handle
 /// the two as distinct streams.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[allow(missing_docs)] // #362
 pub struct Detection {
     /// Nanoseconds since the UNIX epoch, engine clock (when the judgment was made,
     /// not when the triggering activity happened — that lives on the events).

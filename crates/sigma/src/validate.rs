@@ -36,7 +36,10 @@ const WINDOWS_ONLY_FIELDS: &[&str] = &["originalfilename", "company", "descripti
 /// from an `ExecEvent`.
 const SUPPORTED_CATEGORY: &str = "process_creation";
 
+/// Why a Sigma rule file was rejected at load time. Every variant names the offending `path` so
+/// a bad rule in a large directory is easy to locate.
 #[derive(Debug, thiserror::Error)]
+#[allow(missing_docs)] // #362
 pub enum SigmaError {
     #[error("failed to read {path}: {source}")]
     Io {

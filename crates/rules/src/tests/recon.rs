@@ -236,3 +236,109 @@ fn the_state_stays_bounded_under_many_lineages() {
         assert!(alerts.is_empty());
     }
 }
+
+/// What `discovery` says about `command`, run as its own process.
+fn classified(command: &str) -> Option<(&'static str, crate::recon::Category)> {
+    crate::recon::discovery(&run(1, SHELL, command, 0))
+}
+
+#[test]
+fn every_plain_discovery_program_is_named_after_itself_in_its_category() {
+    use crate::recon::Category::{Account, Network, Process, System};
+    let expected = [
+        ("ps", Process),
+        ("pgrep", Process),
+        ("pstree", Process),
+        ("tasklist", Process),
+        ("whoami", Account),
+        ("id", Account),
+        ("who", Account),
+        ("w", Account),
+        ("last", Account),
+        ("lastlog", Account),
+        ("quser", Account),
+        ("qwinsta", Account),
+        ("uname", System),
+        ("hostname", System),
+        ("hostnamectl", System),
+        ("systeminfo", System),
+        ("uptime", System),
+        ("lscpu", System),
+        ("lsb_release", System),
+        ("sw_vers", System),
+        ("system_profiler", System),
+        ("ifconfig", Network),
+        ("ipconfig", Network),
+        ("netstat", Network),
+        ("ss", Network),
+        ("arp", Network),
+        ("nbtstat", Network),
+        ("route", Network),
+    ];
+    for (program, category) in expected {
+        assert_eq!(
+            classified(program),
+            Some((program, category)),
+            "{program} with no argument"
+        );
+        assert_eq!(
+            classified(&format!("{program} -x some-argument")),
+            Some((program, category)),
+            "{program} with arguments"
+        );
+    }
+}
+
+#[test]
+fn the_programs_that_count_only_with_a_question_are_named_and_sorted_by_it() {
+    use crate::recon::Category::{Account, Network, Process, System};
+    let expected = [
+        ("ip addr", Some(("ip", Network))),
+        ("ip neighbour", Some(("ip", Network))),
+        ("ip netns list", None),
+        ("ip", None),
+        ("net user", Some(("net user", Account))),
+        ("net1 users", Some(("net user", Account))),
+        ("net group", Some(("net group", Account))),
+        ("net localgroup", Some(("net localgroup", Account))),
+        ("net accounts", Some(("net accounts", Account))),
+        ("net view", Some(("net view", Network))),
+        ("net share", Some(("net share", Network))),
+        ("net session", Some(("net session", Network))),
+        ("net config", Some(("net config", System))),
+        ("net use Z:", None),
+        ("dscl . list /Users", Some(("dscl", Account))),
+        ("dscl . read /Groups/admin", Some(("dscl", Account))),
+        ("dscl . list /Volumes", None),
+        ("dscl . create /Users/x", None),
+        ("getent passwd", Some(("getent", Account))),
+        ("getent group", Some(("getent", Account))),
+        ("getent hosts example.org", None),
+        ("wmic useraccount list", Some(("wmic accounts", Account))),
+        ("wmic group list", Some(("wmic accounts", Account))),
+        ("wmic os get caption", Some(("wmic system", System))),
+        ("wmic bios get", Some(("wmic system", System))),
+        ("wmic process list", Some(("wmic process", Process))),
+        ("wmic nicconfig get", Some(("wmic network", Network))),
+        ("wmic service list", None),
+        ("nltest /dclist:corp", Some(("nltest", Account))),
+        ("nltest /domain_trusts", Some(("nltest", Account))),
+        ("nltest /sc_query:corp", None),
+        ("cat /etc/passwd", Some(("read /etc/passwd", Account))),
+        ("tail -n 3 /etc/group", Some(("read /etc/passwd", Account))),
+        ("cat /etc/hostname", None),
+        ("less", None),
+        ("curl example.org", None),
+    ];
+    for (command, want) in expected {
+        assert_eq!(classified(command), want, "{command}");
+    }
+}
+
+#[test]
+fn no_discovery_program_is_listed_twice() {
+    let mut seen = std::collections::HashSet::new();
+    for (program, _) in crate::recon::DISCOVERY_PROGRAMS {
+        assert!(seen.insert(*program), "{program} is in the table twice");
+    }
+}

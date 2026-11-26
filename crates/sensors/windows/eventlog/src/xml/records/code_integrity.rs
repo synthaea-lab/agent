@@ -5,6 +5,7 @@ use crate::xml::scan::{data_field, data_u32, extract_between};
 /// Fields of one `Microsoft-Windows-CodeIntegrity/Operational` 3076/3077 event
 /// (WDAC audit / enforced verdict, #283).
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(missing_docs)] // #362
 pub struct CodeIntegrityEvent {
     pub record_id: u64,
     pub event_id: u32,

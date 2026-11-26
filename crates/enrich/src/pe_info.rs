@@ -36,6 +36,7 @@ use std::path::Path;
 /// `None` here must never be read as "unsigned" or any other value judgment —
 /// only "not present or not read."
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[allow(missing_docs)] // #362
 pub struct PeInfo {
     pub original_file_name: Option<String>,
     pub company_name: Option<String>,

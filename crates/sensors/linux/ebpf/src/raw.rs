@@ -20,6 +20,7 @@ use sensor_linux_wire::{
 
 use crate::{
     PROC_LINEAGE,
+    arch::{SysEnterRecord, SysExitRecord, read_kernel_ulong, to_clong, to_ulong_args},
     cred::{
         capset::sys_enter_capset,
         identity::{
@@ -41,6 +42,7 @@ use crate::{
         },
         xattr::{sys_enter_removexattr, sys_enter_setxattr},
     },
+    into_ret,
     kernel::{
         bpf::sys_enter_bpf,
         module::{sys_enter_delete_module, sys_enter_finit_module, sys_enter_init_module},
@@ -78,8 +80,8 @@ const EXIT_SOCKET: u32 = 5;
 static SYSCALL_DISPATCH: Array<u32> = Array::with_max_entries(MAX_SYSCALL_ID, 0);
 
 /// Handler tag and syscall number of an in-flight call whose event needs its
-/// return value. Five syscalls use this path: accept, accept4, memfd_create,
-/// recvfrom and socket. An LRU bounds blocked entries; sys_exit checks the actual
+/// return value. Five syscalls use this path: accept, accept4, `memfd_create`,
+/// recvfrom and socket. An LRU bounds blocked entries; `sys_exit` checks the actual
 /// syscall number before dispatch so stale tags cannot route unrelated exits.
 #[map]
 static PENDING_SYSCALL_EXIT: LruHashMap<u64, u64> = LruHashMap::with_max_entries(4096, 0);
@@ -141,6 +143,11 @@ const SEND_SIG_PRIV: usize = 1;
 /// architecture (the layout is userspace ABI).
 const SIGINFO_CODE_OFFSET: usize = 8;
 
+/// The bit of signal `sig` (1..=64) in a `SigCgt`-style set.
+const fn sig_bit(sig: u32) -> u64 {
+    1u64 << (sig - 1)
+}
+
 /// The signals a daemon commonly catches to reload or rotate (`SIGHUP`, `SIGUSR1`, `SIGUSR2`,
 /// the real-time range 32..=64), as a bit set (bit `sig - 1`). For a tool whose `SigCgt` (the
 /// value of its `SIGNAL_WATCH_TOOLS` entry, taken at scan time) has the bit, the signal is a
@@ -148,10 +155,10 @@ const SIGINFO_CODE_OFFSET: usize = 8;
 /// `SIGKILL`. `SIGTERM`, `SIGINT`, `SIGQUIT` and `SIGABRT` are never in this set: a handler for
 /// them is how a daemon shuts down.
 const RELOAD_SIGNALS: u64 = {
-    let mut set = (1u64 << (1 - 1)) | (1u64 << (10 - 1)) | (1u64 << (12 - 1));
+    let mut set = sig_bit(1) | sig_bit(10) | sig_bit(12);
     let mut sig = 32;
     while sig <= 64 {
-        set |= 1u64 << (sig - 1);
+        set |= sig_bit(sig);
         sig += 1;
     }
     set
@@ -272,33 +279,7 @@ pub fn raw_signal_generate(ctx: RawTracePointContext) -> u32 {
     if (aya_ebpf::helpers::bpf_get_current_pid_tgid() >> 32) as u32 == target {
         return 0;
     }
-    match emit_tool_signal_event(&ctx, target, sig) {
-        Ok(ret) | Err(ret) => ret,
-    }
-}
-
-#[cfg(any(bpf_target_arch = "x86_64", bpf_target_arch = "aarch64"))]
-#[repr(C)]
-struct SysEnterRecord {
-    common_header: [u32; 2],
-    id: i64,
-    args: [u64; 6],
-}
-
-#[cfg(bpf_target_arch = "x86")]
-#[repr(C)]
-struct SysEnterRecord {
-    common_header: [u32; 2],
-    id: i32,
-    args: [u32; 6],
-}
-
-#[cfg(any(bpf_target_arch = "x86_64", bpf_target_arch = "aarch64"))]
-#[repr(C)]
-struct SysExitRecord {
-    common_header: [u32; 2],
-    id: i64,
-    ret: i64,
+    into_ret(emit_tool_signal_event(target, sig))
 }
 
 // Keeping these synthetic tracepoint records in per-CPU maps avoids adding their
@@ -310,18 +291,13 @@ static SYSCALL_ENTER_SCRATCH: PerCpuArray<SysEnterRecord> = PerCpuArray::with_ma
 #[map]
 static SYSCALL_EXIT_SCRATCH: PerCpuArray<SysExitRecord> = PerCpuArray::with_max_entries(1, 0);
 
-#[cfg(bpf_target_arch = "x86")]
-#[repr(C)]
-struct SysExitRecord {
-    common_header: [u32; 2],
-    id: i32,
-    ret: i32,
-}
-
 #[raw_tracepoint(tracepoint = "sched_process_fork")]
 pub fn raw_sched_process_fork(ctx: RawTracePointContext) -> u32 {
     let parent = ctx.arg::<*const u8>(0);
     let child = ctx.arg::<*const u8>(1);
+    // SAFETY (the two pid reads and the `comm` read below): `parent` and `child` are the
+    // kernel's `task_struct` pointers from the tracepoint, read only through
+    // `bpf_probe_read_kernel` at loader-set offsets; a failed read is handled, not a fault.
     let parent_pid =
         unsafe { bpf_probe_read_kernel(parent.add(TASK_PID_OFFSET.load() as usize).cast::<i32>()) };
     let child_pid =
@@ -365,6 +341,8 @@ pub fn raw_sched_process_fork(ctx: RawTracePointContext) -> u32 {
 #[raw_tracepoint(tracepoint = "sched_process_exit")]
 pub fn raw_sched_process_exit(ctx: RawTracePointContext) -> u32 {
     let task = ctx.arg::<*const u8>(0);
+    // SAFETY: `task` is the kernel's exiting `task_struct` pointer from the tracepoint, read
+    // through `bpf_probe_read_kernel` at the loader-set pid offset; a failed read is skipped.
     if let Ok(pid) =
         unsafe { bpf_probe_read_kernel(task.add(TASK_PID_OFFSET.load() as usize).cast::<i32>()) }
     {
@@ -377,6 +355,9 @@ pub fn raw_sched_process_exit(ctx: RawTracePointContext) -> u32 {
 pub fn raw_sched_process_exec(ctx: RawTracePointContext) -> u32 {
     let task = ctx.arg::<*const u8>(0);
     let bprm = ctx.arg::<*const u8>(2);
+    // SAFETY (the pid and filename reads below): `task` and `bprm` are the kernel's
+    // `task_struct` and `linux_binprm` pointers from the tracepoint, read only through
+    // `bpf_probe_read_kernel` at loader-set offsets; a failed read is logged and skipped.
     let pid =
         unsafe { bpf_probe_read_kernel(task.add(TASK_PID_OFFSET.load() as usize).cast::<i32>()) };
     let filename = unsafe {
@@ -431,15 +412,9 @@ pub fn raw_sys_enter(ctx: RawTracePointContext) -> u32 {
             core::mem::size_of::<SysEnterRecord>(),
         );
     }
-    #[cfg(any(bpf_target_arch = "x86_64", bpf_target_arch = "aarch64"))]
     unsafe {
-        (*record).id = syscall_id;
-        (*record).args = args;
-    }
-    #[cfg(bpf_target_arch = "x86")]
-    unsafe {
-        (*record).id = syscall_id as i32;
-        (*record).args = args.map(|arg| arg as u32);
+        (*record).id = to_clong(syscall_id);
+        (*record).args = to_ulong_args(args);
     }
 
     let trace_ctx = TracePointContext::new(record.cast());
@@ -546,15 +521,9 @@ pub fn raw_dns_udp_enter(ctx: RawTracePointContext) -> u32 {
             core::mem::size_of::<SysEnterRecord>(),
         );
     }
-    #[cfg(any(bpf_target_arch = "x86_64", bpf_target_arch = "aarch64"))]
     unsafe {
-        (*record).id = syscall_id;
-        (*record).args = args;
-    }
-    #[cfg(bpf_target_arch = "x86")]
-    unsafe {
-        (*record).id = syscall_id as i32;
-        (*record).args = args.map(|arg| arg as u32);
+        (*record).id = to_clong(syscall_id);
+        (*record).args = to_ulong_args(args);
     }
 
     let trace_ctx = TracePointContext::new(record.cast());
@@ -594,13 +563,8 @@ pub fn raw_sys_exit(ctx: RawTracePointContext) -> u32 {
             core::mem::size_of::<SysExitRecord>(),
         );
     }
-    #[cfg(any(bpf_target_arch = "x86_64", bpf_target_arch = "aarch64"))]
     unsafe {
-        (*record).ret = return_value;
-    }
-    #[cfg(bpf_target_arch = "x86")]
-    unsafe {
-        (*record).ret = return_value as i32;
+        (*record).ret = to_clong(return_value);
     }
 
     let trace_ctx = TracePointContext::new(record.cast());
@@ -620,38 +584,24 @@ pub fn raw_sys_exit(ctx: RawTracePointContext) -> u32 {
 #[inline(always)]
 fn read_syscall_args(regs: *const u8) -> Option<[u64; 6]> {
     let offsets = SYSCALL_ARG_OFFSETS.load();
-    #[cfg(any(bpf_target_arch = "x86_64", bpf_target_arch = "aarch64"))]
-    {
-        Some([
-            unsafe { bpf_probe_read_kernel(regs.add(offsets[0] as usize).cast::<u64>()) }.ok()?,
-            unsafe { bpf_probe_read_kernel(regs.add(offsets[1] as usize).cast::<u64>()) }.ok()?,
-            unsafe { bpf_probe_read_kernel(regs.add(offsets[2] as usize).cast::<u64>()) }.ok()?,
-            unsafe { bpf_probe_read_kernel(regs.add(offsets[3] as usize).cast::<u64>()) }.ok()?,
-            unsafe { bpf_probe_read_kernel(regs.add(offsets[4] as usize).cast::<u64>()) }.ok()?,
-            unsafe { bpf_probe_read_kernel(regs.add(offsets[5] as usize).cast::<u64>()) }.ok()?,
-        ])
-    }
-    #[cfg(bpf_target_arch = "x86")]
-    {
-        Some([
-            unsafe { bpf_probe_read_kernel(regs.add(offsets[0] as usize).cast::<u32>()) }.ok()?
-                as u64,
-            unsafe { bpf_probe_read_kernel(regs.add(offsets[1] as usize).cast::<u32>()) }.ok()?
-                as u64,
-            unsafe { bpf_probe_read_kernel(regs.add(offsets[2] as usize).cast::<u32>()) }.ok()?
-                as u64,
-            unsafe { bpf_probe_read_kernel(regs.add(offsets[3] as usize).cast::<u32>()) }.ok()?
-                as u64,
-            unsafe { bpf_probe_read_kernel(regs.add(offsets[4] as usize).cast::<u32>()) }.ok()?
-                as u64,
-            unsafe { bpf_probe_read_kernel(regs.add(offsets[5] as usize).cast::<u32>()) }.ok()?
-                as u64,
-        ])
-    }
+    // SAFETY (every read below): `regs` is the kernel's `struct pt_regs *` from the raw
+    // tracepoint, never dereferenced here. Each argument slot is read at a loader-set offset
+    // through `read_kernel_ulong` (`bpf_probe_read_kernel`), which fails (`?` drops the
+    // event) on a bad address instead of faulting.
+    Some([
+        unsafe { read_kernel_ulong(regs.add(offsets[0] as usize)) }?,
+        unsafe { read_kernel_ulong(regs.add(offsets[1] as usize)) }?,
+        unsafe { read_kernel_ulong(regs.add(offsets[2] as usize)) }?,
+        unsafe { read_kernel_ulong(regs.add(offsets[3] as usize)) }?,
+        unsafe { read_kernel_ulong(regs.add(offsets[4] as usize)) }?,
+        unsafe { read_kernel_ulong(regs.add(offsets[5] as usize)) }?,
+    ])
 }
 
 fn read_syscall_nr(regs: *const u8) -> Option<u32> {
     let offset = SYSCALL_NR_OFFSET.load() as usize;
+    // SAFETY (each arch's read below): as in `read_syscall_args`, a `bpf_probe_read_kernel`
+    // of the kernel's `pt_regs` at a loader-set offset; a failed read returns `None`.
     #[cfg(bpf_target_arch = "x86_64")]
     {
         let value = unsafe { bpf_probe_read_kernel(regs.add(offset).cast::<u64>()) }.ok()?;

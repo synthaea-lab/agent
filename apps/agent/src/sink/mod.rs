@@ -498,6 +498,14 @@ impl DetectionSink {
             .set_local_zone(zone, now_secs)
     }
 
+    /// Runs one auth event through the rules and returns their alerts, without writing them to
+    /// the alert log. The rules still remember the logon (first-seen account, odd-hour quiet
+    /// period), so a test that reads several logons gives each its own sink.
+    #[cfg(all(test, unix))]
+    pub(crate) fn auth_alerts_for_test(&self, event: &schema::AuthEvent) -> Vec<rules::Alert> {
+        self.rule_state.lock_recovering().on_auth(event)
+    }
+
     /// Installs the executables allowed to touch a canary (#81). Called once, with the
     /// tripwires.
     pub(crate) fn set_canary_allow(&self, allow: crate::deception::CanaryAllow) {
@@ -591,10 +599,13 @@ impl DetectionSink {
         if let Some(sigma) = sigma_guard.as_ref() {
             let entity = entity_key(&event.meta);
             for hit in sigma.eval_exec(event) {
-                let technique = if hit.tags.is_empty() {
+                // The ATT&CK ids, not the raw `tags`: those keep the `attack.` prefix and the
+                // tactic tags (`attack.execution`), which the server's grouping folds to one
+                // base id, `attack`, so every Sigma detection related to every other.
+                let technique = if hit.techniques.is_empty() {
                     "Sigma".to_string()
                 } else {
-                    hit.tags.join("/")
+                    hit.techniques.join("/")
                 };
                 let source = schema::detection::DetectionSource::Sigma {
                     rule_id: hit.title.clone(),

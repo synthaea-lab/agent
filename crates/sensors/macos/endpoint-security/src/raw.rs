@@ -8,6 +8,7 @@
 
 /// Identity of the acting process, common to every raw event.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(missing_docs)] // #362
 pub struct RawMeta {
     pub pid: u32,
     pub ppid: u32,
@@ -26,6 +27,7 @@ pub struct RawMeta {
 /// `es_btm_item_type_t` — kept as the raw value plus a decoded view so an SDK
 /// addition degrades to `Other` instead of being dropped.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(missing_docs)] // #362
 pub enum BtmItemType {
     UserItem,
     App,
@@ -53,6 +55,7 @@ impl BtmItemType {
 /// One `EndpointSecurity` message, flattened and owned. Mirrors
 /// `shim/es_shim.h`'s `syn_es_event` — one variant per `syn_es_kind`.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(missing_docs)] // #362
 pub enum RawEsEvent {
     /// `ES_EVENT_TYPE_NOTIFY_EXEC` — `meta` describes the post-exec process.
     Exec {

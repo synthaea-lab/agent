@@ -34,6 +34,7 @@ mod providers;
 
 #[cfg(windows)]
 mod sensor;
+mod shed;
 #[cfg(any(windows, test))]
 mod silo;
 #[cfg(any(windows, test))]
@@ -43,6 +44,7 @@ mod winapi;
 pub mod zone_identifier;
 #[cfg(windows)]
 pub use sensor::{EtwNames, WindowsSensor};
+pub use shed::EtwShedding;
 #[cfg(windows)]
 pub use winapi::image_file_id;
 

@@ -6,10 +6,12 @@ use aya_ebpf::{
     maps::{PerCpuArray, RingBuf},
     programs::TracePointContext,
 };
-use aya_log_ebpf::warn;
-use sensor_linux_wire::{CapSetEvent, TASK_COMM_LEN};
+use sensor_linux_wire::CapSetEvent;
 
-use crate::{fill_lineage, into_ret};
+use crate::{
+    arch::{SyscallRecord, arg_offset},
+    fill_event_meta, into_ret,
+};
 
 /// Ring buffer shared with userspace for `capset` events.
 #[map]
@@ -21,15 +23,10 @@ static CAPSET_SCRATCH: PerCpuArray<CapSetEvent> = PerCpuArray::with_max_entries(
 
 /// Offsets of the `syscalls:sys_enter_capset` tracepoint (`hdrp`, `data`),
 /// assumed standard layout — see `SINGLE_ID_OFFSET`'s note in `identity.rs`.
-#[cfg(any(bpf_target_arch = "x86_64", bpf_target_arch = "aarch64"))]
-const CAPSET_HDRP_PTR_OFFSET: usize = 16;
-#[cfg(any(bpf_target_arch = "x86_64", bpf_target_arch = "aarch64"))]
-const CAPSET_DATA_PTR_OFFSET: usize = 24;
+///
 /// i686: inferred, not independently verified.
-#[cfg(bpf_target_arch = "x86")]
-const CAPSET_HDRP_PTR_OFFSET: usize = 12;
-#[cfg(bpf_target_arch = "x86")]
-const CAPSET_DATA_PTR_OFFSET: usize = 16;
+const CAPSET_HDRP_PTR_OFFSET: usize = arg_offset(0);
+const CAPSET_DATA_PTR_OFFSET: usize = arg_offset(1);
 
 pub fn sys_enter_capset(ctx: TracePointContext) -> u32 {
     into_ret(try_sys_enter_capset(ctx))
@@ -65,20 +62,14 @@ fn read_cap_data(ptr: u64) -> (u64, u64, u64) {
 }
 
 fn try_sys_enter_capset(ctx: TracePointContext) -> Result<u32, u32> {
-    #[cfg(any(bpf_target_arch = "x86_64", bpf_target_arch = "aarch64"))]
-    let hdrp_ptr: u64 = unsafe { ctx.read_at(CAPSET_HDRP_PTR_OFFSET).map_err(|_| 1u32)? };
-    #[cfg(bpf_target_arch = "x86")]
     let hdrp_ptr: u64 = unsafe {
-        ctx.read_at::<u32>(CAPSET_HDRP_PTR_OFFSET)
-            .map_err(|_| 1u32)? as u64
+        ctx.read_ulong_arg(CAPSET_HDRP_PTR_OFFSET)
+            .map_err(|_| 1u32)?
     };
 
-    #[cfg(any(bpf_target_arch = "x86_64", bpf_target_arch = "aarch64"))]
-    let data_ptr: u64 = unsafe { ctx.read_at(CAPSET_DATA_PTR_OFFSET).map_err(|_| 1u32)? };
-    #[cfg(bpf_target_arch = "x86")]
     let data_ptr: u64 = unsafe {
-        ctx.read_at::<u32>(CAPSET_DATA_PTR_OFFSET)
-            .map_err(|_| 1u32)? as u64
+        ctx.read_ulong_arg(CAPSET_DATA_PTR_OFFSET)
+            .map_err(|_| 1u32)?
     };
 
     let target_pid: u32 = if hdrp_ptr != 0 {
@@ -119,27 +110,19 @@ fn try_sys_enter_capset(ctx: TracePointContext) -> Result<u32, u32> {
     unsafe {
         core::ptr::write_bytes(e, 0, 1);
 
-        (*e).meta.pid = (bpf_get_current_pid_tgid() >> 32) as u32;
-        fill_lineage(&mut (*e).meta);
-        (*e).meta.uid = uid_gid as u32;
-        (*e).meta.gid = (uid_gid >> 32) as u32;
-        (*e).meta.timestamp_ns = aya_ebpf::helpers::bpf_ktime_get_ns();
-        (*e).meta.cgroup_id = aya_ebpf::helpers::bpf_get_current_cgroup_id();
-        let mut i = 0usize;
-        while i < TASK_COMM_LEN {
-            (*e).meta.comm[i] = comm[i];
-            i += 1;
-        }
+        fill_event_meta(
+            &mut (*e).meta,
+            (bpf_get_current_pid_tgid() >> 32) as u32,
+            uid_gid,
+            &comm,
+        );
         (*e).target_pid = target_pid;
         (*e).effective = effective;
         (*e).permitted = permitted;
         (*e).inheritable = inheritable;
 
         if CAPSET_EVENTS.output::<CapSetEvent>(&*e, 0).is_err() {
-            warn!(
-                &ctx,
-                "sensor-linux-ebpf: ring buffer full, dropping capset event"
-            );
+            crate::count_ring_drop(sensor_linux_wire::ring::CAPSET);
         }
     }
 

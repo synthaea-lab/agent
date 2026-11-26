@@ -293,6 +293,7 @@ pub const fn syscall_nr_from_i32(syscall_nr: i32) -> Option<u32> {
 ///   started with. Read with [`parse_exec_record`], never with a bare `read_unaligned`.
 pub const WIRE_VERSION: u32 = 28;
 
+/// Size of a kernel `comm` buffer (`TASK_COMM_LEN`): 15 bytes of process name plus the NUL.
 pub const TASK_COMM_LEN: usize = 16;
 
 /// Entries of the eBPF map `SIGNAL_WATCH_TOOLS` (#1103): the tgids of the processes of the listed
@@ -301,6 +302,175 @@ pub const TASK_COMM_LEN: usize = 16;
 /// removals that failed.
 pub const SIGNAL_WATCH_TOOLS_ENTRIES: u32 = 8192;
 
+/// Slots of the eBPF map `RING_DROPS` (#304): one per-CPU `u64` per ring buffer, counting the
+/// events its probes could not output because the ring was full. A probe bumps its ring's slot
+/// instead of logging each drop (a full ring is the moment the sensor is overloaded, and a log
+/// line per lost event was 11.5 M lines in 20 minutes on a 2-vCPU host); userspace sums the CPUs
+/// on a timer and logs one line per ring that lost events. Both sides are built from this table,
+/// so a slot means the same ring on each; the map is not pinned, so adding a ring needs no
+/// `WIRE_VERSION` bump.
+pub mod ring {
+    /// Slot of `EXEC_EVENTS`.
+    pub const EXEC: u32 = 0;
+    /// Slot of `FILE_OPEN_EVENTS`.
+    pub const FILE_OPEN: u32 = 1;
+    /// Slot of `FILE_WRITE_EVENTS`.
+    pub const FILE_WRITE: u32 = 2;
+    /// Slot of `FILE_DELETE_EVENTS`.
+    pub const FILE_DELETE: u32 = 3;
+    /// Slot of `FILE_RENAME_EVENTS`.
+    pub const FILE_RENAME: u32 = 4;
+    /// Slot of `FILE_CHMOD_EVENTS`.
+    pub const FILE_CHMOD: u32 = 5;
+    /// Slot of `FILE_CHOWN_EVENTS`.
+    pub const FILE_CHOWN: u32 = 6;
+    /// Slot of `FILE_SETXATTR_EVENTS`.
+    pub const FILE_SETXATTR: u32 = 7;
+    /// Slot of `FILE_REMOVEXATTR_EVENTS`.
+    pub const FILE_REMOVEXATTR: u32 = 8;
+    /// Slot of `FILE_SET_TIME_EVENTS`.
+    pub const FILE_SET_TIME: u32 = 9;
+    /// Slot of `CONNECT_EVENTS`.
+    pub const CONNECT: u32 = 10;
+    /// Slot of `SOCKET_BIND_EVENTS`.
+    pub const SOCKET_BIND: u32 = 11;
+    /// Slot of `SOCKET_LISTEN_EVENTS`.
+    pub const SOCKET_LISTEN: u32 = 12;
+    /// Slot of `SOCKET_ACCEPT_EVENTS`.
+    pub const SOCKET_ACCEPT: u32 = 13;
+    /// Slot of `SOCKET_CREATE_EVENTS`.
+    pub const SOCKET_CREATE: u32 = 14;
+    /// Slot of `UDP_SEND_EVENTS`.
+    pub const UDP_SEND: u32 = 15;
+    /// Slot of `UDP_RECV_EVENTS`.
+    pub const UDP_RECV: u32 = 16;
+    /// Slot of `DNS_UDP_EVENTS`.
+    pub const DNS_UDP: u32 = 17;
+    /// Slot of `DNS_QUERY_EVENTS`.
+    pub const DNS_QUERY: u32 = 18;
+    /// Slot of `TLS_CAPTURE_EVENTS`.
+    pub const TLS_CAPTURE: u32 = 19;
+    /// Slot of `READLINE_EVENTS`.
+    pub const READLINE: u32 = 20;
+    /// Slot of `MOUNT_EVENTS`.
+    pub const MOUNT: u32 = 21;
+    /// Slot of `SIGNAL_EVENTS`.
+    pub const SIGNAL: u32 = 22;
+    /// Slot of `KERNEL_MODULE_EVENTS`.
+    pub const KERNEL_MODULE: u32 = 23;
+    /// Slot of `BPF_EVENTS`.
+    pub const BPF: u32 = 24;
+    /// Slot of `PRCTL_EVENTS`.
+    pub const PRCTL: u32 = 25;
+    /// Slot of `PTRACE_EVENTS`.
+    pub const PTRACE: u32 = 26;
+    /// Slot of `PROCESS_VM_READ_EVENTS`.
+    pub const PROCESS_VM_READ: u32 = 27;
+    /// Slot of `PROCESS_VM_WRITE_EVENTS`.
+    pub const PROCESS_VM_WRITE: u32 = 28;
+    /// Slot of `MEMFD_CREATE_EVENTS`.
+    pub const MEMFD_CREATE: u32 = 29;
+    /// Slot of `IDENTITY_CHANGE_EVENTS`.
+    pub const IDENTITY_CHANGE: u32 = 30;
+    /// Slot of `CAPSET_EVENTS`.
+    pub const CAPSET: u32 = 31;
+    /// Slot of `NAMESPACE_EVENTS`.
+    pub const NAMESPACE: u32 = 32;
+
+    /// Entries of `RING_DROPS`.
+    pub const COUNT: u32 = 33;
+
+    /// The ring of each slot, as userspace names it in the drop summary; index = slot.
+    pub const NAMES: [&str; COUNT as usize] = [
+        "exec",
+        "file_open",
+        "file_write",
+        "file_delete",
+        "file_rename",
+        "file_chmod",
+        "file_chown",
+        "file_setxattr",
+        "file_removexattr",
+        "file_set_time",
+        "connect",
+        "socket_bind",
+        "socket_listen",
+        "socket_accept",
+        "socket_create",
+        "udp_send",
+        "udp_recv",
+        "dns_udp",
+        "dns_query",
+        "tls_capture",
+        "readline",
+        "mount",
+        "signal",
+        "kernel_module",
+        "bpf",
+        "prctl",
+        "ptrace",
+        "process_vm_read",
+        "process_vm_write",
+        "memfd_create",
+        "identity_change",
+        "capset",
+        "namespace",
+    ];
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        /// Each slot constant names its own ring: a reordered `NAMES` entry would report one
+        /// ring's drops under another's name.
+        #[test]
+        fn each_ring_slot_is_named_after_its_ring() {
+            let slots = [
+                (EXEC, "exec"),
+                (FILE_OPEN, "file_open"),
+                (FILE_WRITE, "file_write"),
+                (FILE_DELETE, "file_delete"),
+                (FILE_RENAME, "file_rename"),
+                (FILE_CHMOD, "file_chmod"),
+                (FILE_CHOWN, "file_chown"),
+                (FILE_SETXATTR, "file_setxattr"),
+                (FILE_REMOVEXATTR, "file_removexattr"),
+                (FILE_SET_TIME, "file_set_time"),
+                (CONNECT, "connect"),
+                (SOCKET_BIND, "socket_bind"),
+                (SOCKET_LISTEN, "socket_listen"),
+                (SOCKET_ACCEPT, "socket_accept"),
+                (SOCKET_CREATE, "socket_create"),
+                (UDP_SEND, "udp_send"),
+                (UDP_RECV, "udp_recv"),
+                (DNS_UDP, "dns_udp"),
+                (DNS_QUERY, "dns_query"),
+                (TLS_CAPTURE, "tls_capture"),
+                (READLINE, "readline"),
+                (MOUNT, "mount"),
+                (SIGNAL, "signal"),
+                (KERNEL_MODULE, "kernel_module"),
+                (BPF, "bpf"),
+                (PRCTL, "prctl"),
+                (PTRACE, "ptrace"),
+                (PROCESS_VM_READ, "process_vm_read"),
+                (PROCESS_VM_WRITE, "process_vm_write"),
+                (MEMFD_CREATE, "memfd_create"),
+                (IDENTITY_CHANGE, "identity_change"),
+                (CAPSET, "capset"),
+                (NAMESPACE, "namespace"),
+            ];
+            assert_eq!(slots.len(), COUNT as usize);
+            let mut seen = [false; COUNT as usize];
+            for (slot, name) in slots {
+                assert_eq!(NAMES[slot as usize], name);
+                assert!(!seen[slot as usize], "slot {slot} used twice");
+                seen[slot as usize] = true;
+            }
+        }
+    }
+}
+
 /// Set in [`SignalEvent::signal`] by the `signal_generate` probe when the siginfo's `si_code` is
 /// `SI_TIMER`, `SI_MESGQ` or `SI_ASYNCIO` (-2..=-4): codes the kernel sets from interrupt or
 /// completion context, where `current` is a bystander. A process can also **forge** them with
@@ -308,6 +478,7 @@ pub const SIGNAL_WATCH_TOOLS_ENTRIES: u32 = 8192;
 /// unreliable. Userspace strips the bit (`schema::SignalEvent::sender_unreliable`). Signal numbers
 /// are 1..=64, far below it.
 pub const SIGNAL_SENDER_UNRELIABLE: u32 = 0x8000_0000;
+/// Capacity in bytes of every path buffer in the wire events; longer paths are truncated by the probe.
 pub const MAX_PATH_LEN: usize = 256;
 /// Bytes of the argument block (`mm->arg_start .. mm->arg_end`) the exec probe captures at most
 /// (ADR-0045): the whole block when it fits, else [`ARGV_HEAD_BYTES`] from the start and
@@ -370,6 +541,7 @@ pub const MAX_READLINE_INPUT: usize = 512;
 /// `uid`/`gid` come from `bpf_get_current_uid_gid()` (low/high 32 bits).
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
+#[allow(missing_docs)] // #362
 pub struct EventMeta {
     pub pid: u32,
     /// Parent PID (`real_parent->tgid`). Since issue #53 this comes from the
@@ -401,6 +573,7 @@ pub struct EventMeta {
 /// Process execution (`sched:sched_process_exec`, success only).
 #[repr(C)]
 #[derive(Clone, Copy)]
+#[allow(missing_docs)] // #362
 pub struct ExecEvent {
     pub meta: EventMeta,
     /// Authoritative executed-image path: the kernel's `bprm->filename`, read from the
@@ -441,6 +614,7 @@ pub struct ExecEvent {
 /// command line costs the ring only its own bytes (ADR-0045, "Wire and ring").
 #[repr(C)]
 #[derive(Clone, Copy)]
+#[allow(missing_docs)] // #362
 pub struct ExecRecord {
     pub event: ExecEvent,
     /// The head window, then the tail window, packed: `argv[..head]` then `argv[head..head + tail]`.
@@ -530,6 +704,7 @@ pub fn parse_exec_record(item: &[u8]) -> Result<(ExecEvent, ExecArgv<'_>), ExecR
 /// binding kernel (issue #53). Also written from userspace, so the layout is shared.
 #[repr(C)]
 #[derive(Clone, Copy)]
+#[allow(missing_docs)] // #362
 pub struct LineageEntry {
     pub ppid: u32,
     pub comm: [u8; TASK_COMM_LEN],
@@ -557,6 +732,7 @@ pub const PRIMED_GENERATION_BIT: u64 = 1 << 63;
 /// caller, not resolved against `dfd` (known limitation, documented in the probe).
 #[repr(C)]
 #[derive(Clone, Copy)]
+#[allow(missing_docs)] // #362
 pub struct FileOpenEvent {
     pub meta: EventMeta,
     pub path: [u8; MAX_PATH_LEN],
@@ -572,6 +748,7 @@ pub struct FileOpenEvent {
 /// actual bytes written (the syscall's return value) is not observed here.
 #[repr(C)]
 #[derive(Clone, Copy)]
+#[allow(missing_docs)] // #362
 pub struct FileWriteEvent {
     pub meta: EventMeta,
     pub fd: u32,
@@ -583,6 +760,7 @@ pub struct FileWriteEvent {
 /// `FileOpenEvent::path`.
 #[repr(C)]
 #[derive(Clone, Copy)]
+#[allow(missing_docs)] // #362
 pub struct FileDeleteEvent {
     pub meta: EventMeta,
     pub path: [u8; MAX_PATH_LEN],
@@ -598,6 +776,7 @@ pub struct FileDeleteEvent {
 /// entirely in `new_path`'s suffix, no fd resolution needed to see it.
 #[repr(C)]
 #[derive(Clone, Copy)]
+#[allow(missing_docs)] // #362
 pub struct FileRenameEvent {
     pub meta: EventMeta,
     pub old_path: [u8; MAX_PATH_LEN],
@@ -616,6 +795,7 @@ pub struct FileRenameEvent {
 /// same known limitation as `FileOpenEvent::path`. `fchmod(2)` (fd-only) is deferred.
 #[repr(C)]
 #[derive(Clone, Copy)]
+#[allow(missing_docs)] // #362
 pub struct FileChmodEvent {
     pub meta: EventMeta,
     pub path: [u8; MAX_PATH_LEN],
@@ -634,6 +814,7 @@ pub struct FileChmodEvent {
 /// own semantics — passed through as-is, not specially interpreted here.
 #[repr(C)]
 #[derive(Clone, Copy)]
+#[allow(missing_docs)] // #362
 pub struct FileChownEvent {
     pub meta: EventMeta,
     pub path: [u8; MAX_PATH_LEN],
@@ -663,6 +844,7 @@ pub const SET_TIME_COMPONENT_LEN: usize = 32;
 /// `flags`.
 #[repr(C)]
 #[derive(Clone, Copy)]
+#[allow(missing_docs)] // #362
 pub struct FileSetTimeEvent {
     pub meta: EventMeta,
     pub components: [[u8; SET_TIME_COMPONENT_LEN]; SET_TIME_COMPONENTS],
@@ -688,6 +870,7 @@ pub struct FileSetTimeEvent {
 /// not `value` — see this file's `WIRE_VERSION` v12 changelog.
 #[repr(C)]
 #[derive(Clone, Copy)]
+#[allow(missing_docs)] // #362
 pub struct FileSetxattrEvent {
     pub meta: EventMeta,
     pub path: [u8; MAX_PATH_LEN],
@@ -701,6 +884,7 @@ pub struct FileSetxattrEvent {
 /// `FileSetxattrEvent`.
 #[repr(C)]
 #[derive(Clone, Copy)]
+#[allow(missing_docs)] // #362
 pub struct FileRemovexattrEvent {
     pub meta: EventMeta,
     pub path: [u8; MAX_PATH_LEN],
@@ -712,6 +896,7 @@ pub struct FileRemovexattrEvent {
 /// Outbound network connection (`syscalls:sys_enter_connect`, `AF_INET/AF_INET6` only).
 #[repr(C)]
 #[derive(Clone, Copy)]
+#[allow(missing_docs)] // #362
 pub struct ConnectEvent {
     pub meta: EventMeta,
     /// Raw bytes of `sin_addr` in memory order — not a native-endian integer, to
@@ -732,6 +917,7 @@ pub struct ConnectEvent {
 /// binds too).
 #[repr(C)]
 #[derive(Clone, Copy)]
+#[allow(missing_docs)] // #362
 pub struct SocketBindEvent {
     pub meta: EventMeta,
     pub laddr_v4: [u8; 4],
@@ -748,6 +934,7 @@ pub struct SocketBindEvent {
 /// not captured — see this file's `WIRE_VERSION` v9 changelog.
 #[repr(C)]
 #[derive(Clone, Copy)]
+#[allow(missing_docs)] // #362
 pub struct UdpSendEvent {
     pub meta: EventMeta,
     pub daddr_v4: [u8; 4],
@@ -763,6 +950,7 @@ pub struct UdpSendEvent {
 /// changelog for the entry/exit correlation.
 #[repr(C)]
 #[derive(Clone, Copy)]
+#[allow(missing_docs)] // #362
 pub struct UdpRecvEvent {
     pub meta: EventMeta,
     pub peer_addr_v4: [u8; 4],
@@ -779,6 +967,7 @@ pub struct UdpRecvEvent {
 /// bind-correlation and `addr_resolved` semantics.
 #[repr(C)]
 #[derive(Clone, Copy)]
+#[allow(missing_docs)] // #362
 pub struct SocketListenEvent {
     pub meta: EventMeta,
     pub laddr_v4: [u8; 4],
@@ -803,6 +992,7 @@ pub struct SocketListenEvent {
 /// `sys_enter`/`sys_exit` correlation mechanism. Only emitted on success.
 #[repr(C)]
 #[derive(Clone, Copy)]
+#[allow(missing_docs)] // #362
 pub struct SocketAcceptEvent {
     pub meta: EventMeta,
     /// The listening socket's fd (`accept`/`accept4`'s first argument).
@@ -821,6 +1011,7 @@ pub struct SocketAcceptEvent {
 /// the `sys_enter`/`sys_exit` correlation. Only emitted on success.
 #[repr(C)]
 #[derive(Clone, Copy)]
+#[allow(missing_docs)] // #362
 pub struct SocketCreateEvent {
     pub meta: EventMeta,
     /// `AF_INET`, `AF_INET6`, `AF_PACKET`, `AF_NETLINK`, ... — not filtered, unlike
@@ -842,6 +1033,7 @@ pub struct SocketCreateEvent {
 /// target path. `move_mount(2)` is not captured here.
 #[repr(C)]
 #[derive(Clone, Copy)]
+#[allow(missing_docs)] // #362
 pub struct MountEvent {
     pub meta: EventMeta,
     pub mount_point: [u8; MAX_PATH_LEN],
@@ -869,6 +1061,7 @@ pub struct MountEvent {
 /// same convention as macOS's `SignalToEsClient`.
 #[repr(C)]
 #[derive(Clone, Copy)]
+#[allow(missing_docs)] // #362
 pub struct SignalEvent {
     pub meta: EventMeta,
     /// Signal number, platform-native (`SIGKILL` = 9, `SIGTERM` = 15, ...).
@@ -881,6 +1074,7 @@ pub struct SignalEvent {
 /// SUID-binary-abuse and privilege-drop/escalation primitive.
 #[repr(C)]
 #[derive(Clone, Copy)]
+#[allow(missing_docs)] // #362
 pub struct IdentityChangeEvent {
     pub meta: EventMeta,
     /// 0=setuid, 1=setgid, 2=setresuid, 3=setresgid, 4=setfsuid, 5=setfsgid.
@@ -903,6 +1097,7 @@ pub struct IdentityChangeEvent {
 /// a `_LINUX_CAPABILITY_VERSION_1` header, which has no second element.
 #[repr(C)]
 #[derive(Clone, Copy)]
+#[allow(missing_docs)] // #362
 pub struct CapSetEvent {
     pub meta: EventMeta,
     /// `cap_user_header_t.pid` — the target process. `0` means "the calling
@@ -919,6 +1114,7 @@ pub struct CapSetEvent {
 /// `unshare(2)` (creating a new namespace).
 #[repr(C)]
 #[derive(Clone, Copy)]
+#[allow(missing_docs)] // #362
 pub struct NamespaceEvent {
     pub meta: EventMeta,
     /// 0 = setns, 1 = unshare.
@@ -936,6 +1132,7 @@ pub struct NamespaceEvent {
 /// `PR_SET_SECUREBITS` and `PR_CAPBSET_DROP` (see this file's v19 changelog).
 #[repr(C)]
 #[derive(Clone, Copy)]
+#[allow(missing_docs)] // #362
 pub struct PrctlEvent {
     pub meta: EventMeta,
     /// Raw `prctl` option — always 28 (`PR_SET_SECUREBITS`) or 24
@@ -952,6 +1149,7 @@ pub struct PrctlEvent {
 /// (`SSL_write`) or after decryption (`SSL_read`) for C2 beacon detection.
 #[repr(C)]
 #[derive(Clone, Copy)]
+#[allow(missing_docs)] // #362
 pub struct TlsCaptureEvent {
     pub meta: EventMeta,
     /// 0 = read (post-decryption), 1 = write (pre-encryption).
@@ -970,6 +1168,7 @@ pub struct TlsCaptureEvent {
 /// that never trigger execve (cd, export, alias, etc.).
 #[repr(C)]
 #[derive(Clone, Copy)]
+#[allow(missing_docs)] // #362
 pub struct ReadlineInputEvent {
     pub meta: EventMeta,
     /// 0 = bash, 1 = zsh. Identifies which shell was probed.
@@ -985,6 +1184,7 @@ pub struct ReadlineInputEvent {
 /// (unload by name). The classic rootkit-installation primitive.
 #[repr(C)]
 #[derive(Clone, Copy)]
+#[allow(missing_docs)] // #362
 pub struct KernelModuleEvent {
     pub meta: EventMeta,
     /// `delete_module(2)`'s `name` argument — the only one of the three
@@ -1010,6 +1210,7 @@ pub struct KernelModuleEvent {
 /// changelog) — eBPF-based defense evasion and kernel backdoor detection.
 #[repr(C)]
 #[derive(Clone, Copy)]
+#[allow(missing_docs)] // #362
 pub struct BpfEvent {
     pub meta: EventMeta,
     /// Raw `bpf_cmd` value (`<linux/bpf.h>`) — always one of the three
@@ -1026,6 +1227,7 @@ pub struct BpfEvent {
 /// the detection logic's own job into the sensor.
 #[repr(C)]
 #[derive(Clone, Copy)]
+#[allow(missing_docs)] // #362
 pub struct PtraceEvent {
     pub meta: EventMeta,
     /// The `request` argument (`PTRACE_ATTACH`, `PTRACE_PEEKDATA`, ... — see
@@ -1051,6 +1253,7 @@ pub struct PtraceEvent {
 /// for secrets — is the same).
 #[repr(C)]
 #[derive(Clone, Copy)]
+#[allow(missing_docs)] // #362
 pub struct ProcessVmReadEvent {
     pub meta: EventMeta,
     /// The `pid` argument — the process being read FROM.
@@ -1074,6 +1277,7 @@ pub struct ProcessVmReadEvent {
 /// word-at-a-time interface. Classic shellcode-injection primitive.
 #[repr(C)]
 #[derive(Clone, Copy)]
+#[allow(missing_docs)] // #362
 pub struct ProcessVmWriteEvent {
     pub meta: EventMeta,
     /// The `pid` argument — the process being written TO.
@@ -1092,6 +1296,7 @@ pub struct ProcessVmWriteEvent {
 /// touches a real path on disk.
 #[repr(C)]
 #[derive(Clone, Copy)]
+#[allow(missing_docs)] // #362
 pub struct MemfdCreateEvent {
     pub meta: EventMeta,
     /// The caller-supplied display name (`name` argument) — cosmetic only per
@@ -1123,6 +1328,7 @@ pub struct DnsAnswer {
 /// and bounded answer-list capture.
 #[repr(C)]
 #[derive(Clone, Copy)]
+#[allow(missing_docs)] // #362
 pub struct GetAddrInfoEvent {
     pub meta: EventMeta,
     pub query: [u8; MAX_DNS_QUERY_LEN],
@@ -1161,6 +1367,7 @@ pub struct GetAddrInfoEvent {
 /// message whose question already fits (a name is at most 255 bytes).
 #[repr(C)]
 #[derive(Clone, Copy)]
+#[allow(missing_docs)] // #362
 pub struct DnsUdpQueryEvent {
     pub meta: EventMeta,
     /// Destination of the datagram: the `sendto` address, or the address the socket was

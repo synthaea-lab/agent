@@ -32,6 +32,7 @@ pub struct TccJoiner {
 }
 
 impl TccJoiner {
+    /// Creates a joiner with no pending contexts and both counters at 0.
     #[must_use]
     pub fn new() -> Self {
         Self::default()

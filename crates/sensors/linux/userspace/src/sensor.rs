@@ -24,6 +24,7 @@ use crate::{
     normalize,
     parent_image::{ExecStamps, IMAGE_CACHE_CAP, ParentImageEvictions, ParentImages},
     proc::{exec_argv, read_proc_environ_security, read_proc_images},
+    ring_drops::{RingDropTotals, RingDrops},
     rings::{RingBuffers, drain_ready, drain_wire, readable_or_pending},
     unit_procs::{ToolProcs, ToolWatch, UnitResolver},
 };
@@ -57,6 +58,10 @@ const TAMPER_SWEEP_INTERVAL: Duration = Duration::from_secs(10);
 /// unseen in (a few seconds, stated in `docs/detection/security-tool-stop.md`); a scan is a few
 /// small reads of the cgroup tree.
 const TOOL_RESCAN_INTERVAL: Duration = Duration::from_secs(5);
+
+/// How often the per-ring drop counters are read and their growth logged (#304): one line per
+/// ring that lost events in the interval, whatever the drop rate.
+const RING_DROP_REPORT_INTERVAL: Duration = Duration::from_secs(10);
 
 /// Age past which a `SIGKILL` recorded against this very process is known not to
 /// have landed. Delivery happens within the sender's `kill(2)` call, microseconds
@@ -114,6 +119,7 @@ fn signal_target(
 pub struct LinuxSensor {
     stop: Arc<Notify>,
     evictions: Arc<ParentImageEvictions>,
+    ring_drops: Arc<RingDropTotals>,
     /// Whether the UDP/53 DNS capture program is attached (#458 part 3). Fixed for the life of the
     /// sensor.
     dns_udp: bool,
@@ -126,11 +132,13 @@ impl Default for LinuxSensor {
 }
 
 impl LinuxSensor {
+    /// A sensor with the UDP/53 DNS capture off; enable it with [`Self::with_dns_udp_capture`] before `run`.
     #[must_use]
     pub fn new() -> Self {
         Self {
             stop: Arc::new(Notify::new()),
             evictions: Arc::new(ParentImageEvictions::default()),
+            ring_drops: Arc::new(RingDropTotals::default()),
             dns_udp: false,
         }
     }
@@ -151,6 +159,13 @@ impl LinuxSensor {
     #[must_use]
     pub fn parent_image_evictions(&self) -> Arc<ParentImageEvictions> {
         Arc::clone(&self.evictions)
+    }
+
+    /// The running totals of events the probes lost to full ring buffers, for the agent's health
+    /// beacon (#335). Same handle for the life of the sensor, like [`Self::parent_image_evictions`].
+    #[must_use]
+    pub fn ring_drop_totals(&self) -> Arc<RingDropTotals> {
+        Arc::clone(&self.ring_drops)
     }
 
     async fn run_async(&mut self, sink: Box<dyn EventSink>) -> Result<(), SensorError> {
@@ -268,6 +283,8 @@ impl LinuxSensor {
         };
 
         let mut rings = RingBuffers::open(&mut ebpf, set_time_live)?;
+        let mut ring_drops = RingDrops::take(&mut ebpf, Arc::clone(&self.ring_drops))?;
+        let mut ring_drop_report = tokio::time::interval(RING_DROP_REPORT_INTERVAL);
 
         tracing::info!(
             "sensor-linux: listening for exec/open/connect/write/delete/rename/bind/chmod/chown/udp_send/udp_recv/dns_udp/listen/accept/socket_create/setxattr/removexattr/mount/signal/kernel_module/bpf/prctl/ptrace/process_vm_readv/process_vm_writev/memfd_create/identity_change/capset/namespace events"
@@ -304,6 +321,7 @@ impl LinuxSensor {
                 _ = tamper_sweep.tick() => {
                     sweep_survived_sigkill(&mut tamper_slot, own_pid, offset);
                 }
+                _ = ring_drop_report.tick() => ring_drops.report(),
                 _ = tool_rescan.tick() => {
                     tool_watch.refresh();
                     // Tool signals lost to a full ring: counted in the kernel, reported when it grows.

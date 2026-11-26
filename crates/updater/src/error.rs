@@ -8,6 +8,7 @@ use thiserror::Error;
 
 /// Everything that can go wrong staging, verifying, or promoting a release.
 #[derive(Debug, Error)]
+#[allow(missing_docs)] // #362
 pub enum UpdaterError {
     /// The manifest's `schema_version` is not one this build understands
     /// (ADR-0015 Decision 2: readers reject an unknown value outright).

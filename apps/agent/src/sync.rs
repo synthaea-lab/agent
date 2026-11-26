@@ -77,19 +77,10 @@ impl<T: ?Sized> RwLockExt<T> for RwLock<T> {
     }
 }
 
-/// [`Condvar::wait_while`] under the same policy: the guard comes back even if the
+/// [`Condvar::wait_timeout`] under the same policy: the guard comes back even if the
 /// mutex was poisoned while the caller waited. The poison itself is left for the next
 /// [`LockExt::lock_recovering`] to clear and log, since a guard cannot reach its mutex.
 pub(crate) trait CondvarExt {
-    /// Waits while `condition` holds, recovering a poisoned mutex instead of panicking.
-    // Only the Linux uprobes supervisor (`captures`) waits on a condition.
-    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-    fn wait_while_recovering<'a, T>(
-        &self,
-        guard: MutexGuard<'a, T>,
-        condition: impl FnMut(&mut T) -> bool,
-    ) -> MutexGuard<'a, T>;
-
     /// Waits for a notification or `timeout`, recovering a poisoned mutex instead of
     /// panicking. Returns the guard only: callers re-check their own deadline.
     fn wait_timeout_recovering<'a, T>(
@@ -100,15 +91,6 @@ pub(crate) trait CondvarExt {
 }
 
 impl CondvarExt for Condvar {
-    fn wait_while_recovering<'a, T>(
-        &self,
-        guard: MutexGuard<'a, T>,
-        condition: impl FnMut(&mut T) -> bool,
-    ) -> MutexGuard<'a, T> {
-        self.wait_while(guard, condition)
-            .unwrap_or_else(PoisonError::into_inner)
-    }
-
     fn wait_timeout_recovering<'a, T>(
         &self,
         guard: MutexGuard<'a, T>,
@@ -198,21 +180,6 @@ mod tests {
             cv.notify_all();
             panic!("poison the mutex the waiter sleeps on");
         })
-    }
-
-    #[test]
-    fn a_condvar_wait_survives_a_mutex_poisoned_while_waiting() {
-        let lock = Arc::new(Mutex::new(0u32));
-        let cv = Arc::new(Condvar::new());
-        let guard = lock.lock().unwrap();
-        let poisoner = poison_during_wait(&lock, &cv);
-        let guard = cv.wait_while_recovering(guard, |value| *value == 0);
-        // The wait returned through the poisoned branch: a plain `wait_while` would have
-        // handed back an `Err` here, and `.unwrap()` in the helper would panic.
-        assert!(lock.is_poisoned());
-        assert_eq!(*guard, 1);
-        drop(guard);
-        assert!(poisoner.join().is_err());
     }
 
     #[test]

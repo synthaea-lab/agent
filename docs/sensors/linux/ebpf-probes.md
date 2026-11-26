@@ -148,9 +148,10 @@ Every event starts with an `EventMeta` ([wire format](wire-format.md#eventmeta))
 | Ring buffer | Size | Notes |
 | --- | --- | --- |
 | `EXEC_EVENTS` | 512 KiB | Variable-length records (fixed part + argv bytes) |
+| `FILE_OPEN_EVENTS` | 1 MiB | systemd's device enumeration opens files under `/sys` in bursts of a few thousand, with relative paths the read filter cannot drop (#334); 256 KiB lost 64% of 2,000- and 3,000-open bursts |
 | `FILE_SET_TIME_EVENTS` | 1 MiB | `tar x` / `cp -a` emit one ~400-byte event per file; 256 KiB lost most of a 3000-file unpack |
 | `SIGNAL_EVENTS` | 64 KiB | Filtered to tamper-relevant targets |
-| every other ring (`FILE_OPEN_EVENTS`, `CONNECT_EVENTS`, ..., `NAMESPACE_EVENTS`, `TLS_CAPTURE_EVENTS`, `READLINE_EVENTS`, `DNS_QUERY_EVENTS`, `DNS_UDP_EVENTS`) | 256 KiB | One ring per event type |
+| every other ring (`CONNECT_EVENTS`, ..., `NAMESPACE_EVENTS`, `TLS_CAPTURE_EVENTS`, `READLINE_EVENTS`, `DNS_QUERY_EVENTS`, `DNS_UDP_EVENTS`) | 256 KiB | One ring per event type |
 
 One ring per event type means a burst of one type (writes during a `docker run`) cannot evict
 another type (execs). The userspace drain polls all of them fairly
@@ -168,6 +169,7 @@ another type (execs). The userspace drain polls all of them fairly
 | `SIGNAL_WATCH_PID` | array, 1 | userspace | the agent's own pid ([signals](signals.md)) |
 | `SIGNAL_WATCH_TOOLS` | hash, 8192 | userspace | tgids of listed security tools → their `SigCgt` |
 | `SIGNAL_TAMPER_LAST` | array, 1, pinned | kill/tgkill handlers | last `SIGKILL` aimed at the agent |
+| `RING_DROPS` | per-CPU array, one slot per ring (`sensor_linux_wire::ring`) | every probe that outputs to a ring | events lost to a full ring; read every 10 s ([userspace loader](userspace-loader.md#back-pressure-and-loss)) |
 | `LSM_FILE_OPEN_HITS`, `SIGNAL_TOOL_DROPS`, `PENDING_*_DROPPED` | per-CPU array | probes | counters |
 
 ## In-kernel filters
