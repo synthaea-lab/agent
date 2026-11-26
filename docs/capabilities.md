@@ -390,7 +390,7 @@ Totals: 273 capabilities, 153 built, 79 partial, 41 planned.
 
 | Capability | Status | Evidence | Tracking issue | Docs |
 | --- | --- | --- | --- | --- |
-| Cross-engine verdict fusion per entity: max severity/score, same-technique dedup window from first sighting, bounded evidence | built | crates/verdict/src/lib.rs VerdictEngine::record; unit tests in the same file; wired via apps/agent/src/sink/mod.rs record_detection and fuse_yara_match |  | [correlation.md#verdict-fusion](correlation.md#verdict-fusion) |
+| Cross-engine verdict fusion per entity: max severity/score, same-technique dedup window from first sighting, bounded evidence | built | crates/verdict/src/lib.rs VerdictEngine::record; unit tests in the same file; wired via apps/agent/src/sink/recording.rs record_detection and apps/agent/src/sink/yara.rs fuse_yara_match |  | [correlation.md#verdict-fusion](correlation.md#verdict-fusion) |
 | Operator suppression of a technique on an entity (cli suppress/unsuppress, bounded) | built | VerdictEngine::suppress/unsuppress/suppressions, DetectionSink::suppress_verdict, apps/agent/src/ipc_handler.rs, apps/cli/src/main.rs; tests the_suppression_list_is_bounded etc. in verdict/src/lib.rs (runtime only, cleared on restart) |  | [correlation.md#verdict-fusion](correlation.md#verdict-fusion) |
 
 ## Response and self-protection

@@ -364,7 +364,7 @@ with a 30 s dedup window (`VERDICT_DEDUP_WINDOW_NS` in
   Sigma, IOC and correlator findings from `record_detection`, YARA file matches keyed
   to the writing process through the scan context
   ([`fuse_yara_match`](../apps/agent/src/sink/yara.rs)), and memory-scan matches
-  ([`report_memory_matches`](../apps/agent/src/sink/mod.rs)). Each finding is redacted before
+  ([`report_memory_matches`](../apps/agent/src/sink/yara.rs)). Each finding is redacted before
   it enters the verdict, the alert log and the detection spool.
 - **Composition.** Severity is the max over everything recorded for the entity; score
   is the max over sources that carried one (no weighted blend until there is

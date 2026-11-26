@@ -222,7 +222,7 @@ pub(super) fn fuse_yara_match(
 /// `enable_response` was never called — same posture as `DetectionSink::maybe_kill`.
 pub(super) fn quarantine_matched_payload(
     response: &ResponseCell,
-    path: &std::path::Path,
+    path: &Path,
     alert_log: &AlertLog,
 ) {
     let Some(hooks) = response.get() else {
