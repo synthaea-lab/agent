@@ -7,6 +7,7 @@ pub type Result<T> = std::result::Result<T, TransportError>;
 
 /// Errors that can occur during transport operations.
 #[derive(Debug, Error)]
+#[allow(missing_docs)] // #362
 pub enum TransportError {
     /// Server returned an error status code.
     #[error("server error: {status} - {message}")]

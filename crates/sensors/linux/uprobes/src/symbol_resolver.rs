@@ -17,6 +17,7 @@ use goblin::elf::Elf;
 
 /// ELF symbol with its offset and source library.
 #[derive(Debug, Clone)]
+#[allow(missing_docs)] // #362
 pub struct SymbolInfo {
     pub name: String,
     pub offset: u64,
@@ -26,6 +27,7 @@ pub struct SymbolInfo {
 
 /// SSL/TLS library type identified from path.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(missing_docs)] // #362
 pub enum LibraryType {
     OpenSSL,
     BoringSSL,
@@ -49,6 +51,7 @@ impl LibraryType {
 
 /// Symbol resolution error.
 #[derive(Debug, thiserror::Error)]
+#[allow(missing_docs)] // #362
 pub enum ResolverError {
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),

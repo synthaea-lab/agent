@@ -109,6 +109,7 @@ const SCANNERS: &[(&str, &str)] = &[
 
 /// What a request matched.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(missing_docs)] // #362
 pub struct Match {
     pub signature: HttpSignature,
     /// The parameter and its raw value, for the signatures that live in a value.

@@ -18,6 +18,7 @@ use crate::scorer::ScorerError;
 /// avoid false rejections on legitimate edge cases. Loaded from
 /// `model_metadata.json` alongside the ONNX model.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[allow(missing_docs)] // #362
 pub struct FeatureBounds {
     pub feature_names: Vec<String>,
     pub min_values: Vec<f32>,

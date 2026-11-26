@@ -43,6 +43,7 @@ use onnx::{build_trees, find_graph, leaf_encoders, parse_graph, resolve_column_m
 
 /// Model files come from the update channel; parsing must fail closed and loudly.
 #[derive(Debug, thiserror::Error)]
+#[allow(missing_docs)] // #362
 pub enum ParseError {
     #[error("model file truncated")]
     Truncated,
@@ -151,6 +152,8 @@ impl Forest {
         self.n_features
     }
 
+    /// Number of trees in the ensemble. Never 0: construction fails when the graph has no
+    /// `TreeEnsembleRegressor` node.
     #[must_use]
     pub fn n_trees(&self) -> usize {
         self.trees.len()

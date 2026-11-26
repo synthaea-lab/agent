@@ -24,6 +24,7 @@ use crate::{ParseError, clamp};
 
 /// One failed authentication attempt.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(missing_docs)] // #362
 pub struct MysqlLoginFailure {
     /// The line's leading timestamp, as written.
     pub timestamp: String,

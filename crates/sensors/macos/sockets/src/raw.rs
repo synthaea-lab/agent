@@ -7,6 +7,7 @@ use std::net::SocketAddr;
 /// TCP state of a snapshotted socket, as the shim classified it (the raw
 /// `TCPS_*` values never cross into Rust).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(missing_docs)] // #362
 pub enum SocketState {
     Listen,
     Established,
@@ -22,6 +23,7 @@ pub enum SocketState {
 /// workers therefore appears once **per holding process**, which is the
 /// attribution consumers want anyway.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(missing_docs)] // #362
 pub struct SocketSnapshotEntry {
     pub pid: u32,
     pub ppid: u32,

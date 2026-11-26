@@ -51,6 +51,7 @@ pub struct Counters {
 
 /// What a message reports.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(missing_docs)] // #362
 pub enum Body {
     /// The queue has been empty for a while: the driver and its sender thread are alive.
     Heartbeat,
@@ -107,6 +108,7 @@ impl Body {
 
 /// One decoded message.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(missing_docs)] // #362
 pub struct Message {
     /// Per-connection sequence number, starting at 1: a gap means records were lost.
     pub seq: u64,
@@ -121,6 +123,7 @@ pub struct Message {
 /// Why a message was refused. Each one means the driver and the agent disagree on the format
 /// (or the bytes are not from the driver): the caller drops the message and counts it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[allow(missing_docs)] // #362
 pub enum WireError {
     #[error("message of {0} bytes is shorter than the {HEADER_LEN}-byte header")]
     TooShort(usize),

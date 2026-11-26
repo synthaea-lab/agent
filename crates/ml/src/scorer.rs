@@ -48,6 +48,7 @@ fn session_builder() -> Result<SessionBuilder, ort::Error> {
 /// Model artifacts arrive from the update channel; loading and inference must surface
 /// errors, never panic.
 #[derive(Debug, thiserror::Error)]
+#[allow(missing_docs)] // #362
 pub enum ScorerError {
     /// onnxruntime failed to load the model or run inference.
     #[error("onnxruntime error: {0}")]

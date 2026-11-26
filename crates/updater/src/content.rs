@@ -141,6 +141,7 @@ impl ContentEntry {
 /// Field order is alphabetical and fixed by declaration — canonicalization
 /// relies on it, exactly like [`crate::manifest::ReleaseManifest`].
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[allow(missing_docs)] // #362
 pub struct ContentManifest {
     pub entries: Vec<ContentEntry>,
     /// Monotone, strictly increasing per `ring`. See [`Self::check_release_version`].

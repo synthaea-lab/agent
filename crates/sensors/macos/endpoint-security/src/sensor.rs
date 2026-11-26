@@ -19,22 +19,30 @@ use crate::{ffi, normalize::normalize};
 /// has exactly three fixable causes, and "error 3" helps nobody.
 #[derive(Debug, thiserror::Error)]
 pub enum MacosSensorError {
+    /// `es_new_client` returned `ES_NEW_CLIENT_RESULT_ERR_NOT_ENTITLED`: the binary lacks the
+    /// ES client entitlement (fixed by signing the binary).
     #[error(
         "EndpointSecurity refused the client: this binary is not entitled \
          (com.apple.developer.endpoint-security.client). Sign it with the ES \
          entitlement — see docs/sensors/macos.md for the dev-signing path."
     )]
     NotEntitled,
+    /// `ES_NEW_CLIENT_RESULT_ERR_NOT_PERMITTED`: the binary has the entitlement but TCC has not
+    /// granted it Full Disk Access.
     #[error(
         "EndpointSecurity refused the client: not permitted. Grant the binary \
          Full Disk Access (System Settings → Privacy & Security) — TCC gates \
          ES clients behind it."
     )]
     NotPermitted,
+    /// `ES_NEW_CLIENT_RESULT_ERR_NOT_PRIVILEGED`: the process is not root.
     #[error("EndpointSecurity refused the client: not privileged. Run the agent as root.")]
     NotPrivileged,
+    /// Any other `es_new_client` failure; carries the raw `es_new_client_result_t`, which has no
+    /// operator fix to suggest.
     #[error("EndpointSecurity refused the client (es_new_client_result_t = {0})")]
     ClientCreation(i32),
+    /// The client was created but `es_subscribe` failed; carries the raw `es_return_t`.
     #[error("es_subscribe failed (es_return_t = {0})")]
     Subscribe(i32),
 }
@@ -54,6 +62,8 @@ pub struct StopHandle {
 }
 
 impl StopHandle {
+    /// Wakes the parked `run` so it destroys the ES client and returns. Idempotent, and safe to
+    /// call from a signal-handler thread.
     pub fn stop(&self) {
         // A poisoned lock means a waiter panicked mid-wait; stopping must
         // still work, so take the guard either way.
@@ -104,6 +114,8 @@ pub struct MacosSensor {
 }
 
 impl MacosSensor {
+    /// A sensor that is not running; `run` creates the ES client and subscribes. Nothing touches
+    /// `EndpointSecurity` until then.
     #[must_use]
     pub fn new() -> Self {
         MacosSensor {

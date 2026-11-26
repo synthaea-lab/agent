@@ -18,6 +18,7 @@ pub use receiver::socket::{accept_loop, listen};
 
 /// Errors from the receiver path.
 #[derive(Debug, thiserror::Error)]
+#[allow(missing_docs)] // #362
 pub enum NetworkExtensionError {
     #[error("I/O error on the extension socket: {0}")]
     Io(#[from] std::io::Error),

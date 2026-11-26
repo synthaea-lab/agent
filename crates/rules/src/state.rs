@@ -191,6 +191,8 @@ impl Default for RuleState {
 }
 
 impl RuleState {
+    /// Creates empty per-rule state. Every map is a `BoundedMap` with a fixed cap, so state
+    /// stays bounded under hostile event streams.
     #[must_use]
     pub fn new() -> Self {
         Self {

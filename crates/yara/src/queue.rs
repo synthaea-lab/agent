@@ -25,6 +25,7 @@ const SETTLE: Duration = Duration::from_millis(200);
 /// The fields mirror the correlator's entity join `(ppid, comm)` plus the parent's
 /// incarnation (issues #614, #592).
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(missing_docs)] // #362
 pub struct ScanContext {
     pub ppid: u32,
     pub comm: String,
@@ -44,6 +45,7 @@ pub struct ScanContext {
 
 /// One scan result delivered to the callback.
 #[derive(Debug, Clone)]
+#[allow(missing_docs)] // #362
 pub struct ScanOutcome {
     pub path: PathBuf,
     /// The process that wrote the file, when the request carried one
@@ -54,7 +56,10 @@ pub struct ScanOutcome {
     pub matches: Vec<YaraMatch>,
 }
 
+/// Cumulative scan counters for the queue. `dropped` counts requests that could not be queued
+/// (queue full or closed).
 #[derive(Debug, Clone, Copy, Default)]
+#[allow(missing_docs)] // #362
 pub struct ScanStats {
     /// Scans fully handled: the match callback, when there was a match, has returned.
     pub scanned: u64,
@@ -166,6 +171,8 @@ impl ScanQueue {
         }
     }
 
+    /// Snapshot of the cumulative `scanned` and `dropped` counters. Reads are `Relaxed`, so the
+    /// two values may be slightly out of step.
     #[must_use]
     pub fn stats(&self) -> ScanStats {
         ScanStats {

@@ -31,6 +31,7 @@ const SEGMENT_MAX_BYTES: u64 = 1024 * 1024; // 1 MiB
 /// itself — the caller (transport) decides when to give up.
 pub const MAX_DRAIN_ATTEMPTS: u32 = 5;
 
+/// Snapshot of a spool's size and loss counters, for health reporting.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct SpoolStats {
     /// Total bytes currently on disk across segments (including in-flight).
@@ -292,6 +293,9 @@ impl EventSpool {
         self.in_flight.is_some()
     }
 
+    /// Current on-disk size and drop count. `bytes` sums the sealed `.jsonl` segments and the
+    /// in-flight one; it is recomputed from the filesystem on each call, so it costs a
+    /// directory scan.
     #[must_use]
     pub fn stats(&self) -> SpoolStats {
         // Sum .jsonl segments

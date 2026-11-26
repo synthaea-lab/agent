@@ -16,6 +16,7 @@ use crate::record::{LogRecord, image_basename};
 /// category itself is the signal, and skipped where the field *is* the signal
 /// (documented per variant).
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(missing_docs)] // #362
 pub enum UnifiedLogEvent {
     /// A `sudo` invocation with its logged command line — same real-world
     /// format as Linux's (sudo is sudo): `"user : TTY=... ; PWD=... ;

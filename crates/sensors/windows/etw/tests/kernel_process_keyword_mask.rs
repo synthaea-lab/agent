@@ -1,3 +1,4 @@
+//! Real-session check of the Kernel-Process keyword mask. Windows-only; details below.
 #![cfg(windows)]
 
 //! Real-session check of the Kernel-Process keyword mask (#726, #727).

@@ -1224,6 +1224,7 @@ impl Default for EventLogConfig {
 /// readable from any thread through [`EventLogSensor::counters`] while `run`
 /// updates them.
 #[derive(Debug, Default)]
+#[allow(missing_docs)] // #362
 pub struct EventLogCounters {
     pub service_installs: AtomicU64,
     pub scheduled_tasks: AtomicU64,
@@ -1294,6 +1295,7 @@ impl EventLogSensor {
         Self::with_config(EventLogConfig::default())
     }
 
+    /// A sensor polling the targets `config` enables, with fresh counters and liveness stamps.
     #[must_use]
     pub fn with_config(config: EventLogConfig) -> Self {
         Self {

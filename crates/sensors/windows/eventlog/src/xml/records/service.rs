@@ -5,6 +5,7 @@ use crate::xml::scan::extract_between;
 /// Fields extracted from a 7045 ("A service was installed in the system") `<Event>`
 /// block — System log, no audit prerequisite.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(missing_docs)] // #362
 pub struct ServiceInstallEvent {
     pub record_id: u64,
     pub service_name: String,
