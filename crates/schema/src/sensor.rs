@@ -20,10 +20,12 @@ pub type SensorError = Box<dyn core::error::Error + Send + Sync + 'static>;
 /// reflect what `run` actually emits — never an optimistic static value; the
 /// conformance suite asserts it against observed behavior.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-#[allow(missing_docs)] // #362
 pub struct Capabilities {
+    /// Emits [`crate::Event::Exec`].
     pub exec_events: bool,
+    /// Emits file events (open, write, delete, rename and the like).
     pub file_events: bool,
+    /// Emits [`crate::Event::Connect`].
     pub connect_events: bool,
     /// True when this sensor can emit [`crate::Event::Auth`].
     pub auth_events: bool,

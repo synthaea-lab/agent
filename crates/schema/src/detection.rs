@@ -15,14 +15,22 @@ use serde::{Deserialize, Serialize};
 
 use crate::Event;
 
-/// Analyst-facing severity. Ordered: `Low < Medium < High < Critical`.
+/// Analyst-facing severity rank. Ordered: `Low < Medium < High < Critical`.
+///
+/// A rank says where a finding sits in the analyst's queue and how findings fuse; it carries no
+/// confidence. No severity, `Critical` included, gates a destructive action on its own (see
+/// `docs/response.md`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-#[allow(missing_docs)] // #362
 pub enum Severity {
+    /// The lowest rank; a Sigma `level` of `informational` or `low` maps here.
     Low,
+    /// Between `Low` and `High`; a Sigma `level: medium` maps here.
     Medium,
+    /// The lowest fused severity that writes a `RESPONSE-ESCALATE` alert
+    /// (`response::ESCALATION_THRESHOLD`).
     High,
+    /// The highest rank; a Sigma `level: critical` maps here.
     Critical,
 }
 
@@ -30,24 +38,38 @@ pub enum Severity {
 #[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "engine", rename_all = "snake_case")]
-#[allow(missing_docs)] // #362
 pub enum DetectionSource {
     /// Native rule engine (stateless or stateful).
-    Rule { rule_id: String },
+    Rule {
+        /// Identifier of the rule that fired.
+        rule_id: String,
+    },
     /// Compiled Sigma rule.
-    Sigma { rule_id: String },
+    Sigma {
+        /// Identifier of the Sigma rule that fired.
+        rule_id: String,
+    },
     /// An on-device ML tier (T0–T2). `model_id`/`model_version` name the registry
     /// entry (`ml/registry/`) so any score is traceable to a model card — rule 2 of
     /// `ml/README.md` depends on this being here.
     Ml {
+        /// Model tier, 0 to 2 (T0 to T2).
         tier: u8,
+        /// Registry id of the model that scored the activity.
         model_id: String,
+        /// Registry version of that model.
         model_version: String,
     },
     /// Correlator case scoring (Bayesian belief over accumulated evidence).
-    Correlator { case_id: String },
+    Correlator {
+        /// Identifier of the correlator case.
+        case_id: String,
+    },
     /// YARA-X scan hit.
-    Yara { rule_name: String },
+    Yara {
+        /// Name of the YARA-X rule that matched.
+        rule_name: String,
+    },
     /// On-device indicator-of-compromise match (#60): an observed hash, IP or domain
     /// found in a signed indicator set. Carries the matched indicator and where it
     /// came from, so an analyst can tell *which feed* flagged it and the server can
@@ -113,14 +135,15 @@ pub struct ScoreAttribution {
 /// sensors observe, detections are what engines conclude; sinks and transport handle
 /// the two as distinct streams.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[allow(missing_docs)] // #362
 pub struct Detection {
     /// Nanoseconds since the UNIX epoch, engine clock (when the judgment was made,
     /// not when the triggering activity happened — that lives on the events).
     pub timestamp_ns: u64,
+    /// Analyst-facing severity of the detection.
     pub severity: Severity,
     /// Analyst-facing one-line title (e.g. the rule title, or the ML scorer's name).
     pub title: String,
+    /// The engine that produced the detection, with its identity.
     pub source: DetectionSource,
     /// Calibrated score where the engine has one (ML tiers, correlator belief);
     /// `None` for binary hits (rules, Sigma, YARA). Calibration semantics — FP
