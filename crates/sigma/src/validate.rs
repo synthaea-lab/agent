@@ -39,23 +39,40 @@ const SUPPORTED_CATEGORY: &str = "process_creation";
 /// Why a Sigma rule file was rejected at load time. Every variant names the offending `path` so
 /// a bad rule in a large directory is easy to locate.
 #[derive(Debug, thiserror::Error)]
-#[allow(missing_docs)] // #362
 pub enum SigmaError {
+    /// The rule file could not be read.
     #[error("failed to read {path}: {source}")]
     Io {
+        /// File that could not be read.
         path: String,
+        /// The underlying I/O error.
         source: std::io::Error,
     },
+    /// The file is not valid YAML, or its shape does not match a Sigma rule.
     #[error("invalid YAML in {path}: {message}")]
     Yaml {
+        /// File that failed to parse.
         path: String,
         /// The parser's message on one line: see `engine::describe_yaml_error`.
         message: String,
     },
+    /// The rule uses a Sigma construct outside the supported subset.
     #[error("unsupported Sigma construct in {path}: {what}")]
-    Unsupported { path: String, what: String },
+    Unsupported {
+        /// Rule file that uses the construct.
+        path: String,
+        /// The construct that is refused, named precisely.
+        what: String,
+    },
+    /// A required metadata field is absent or invalid, or the rule sits outside a known
+    /// platform directory.
     #[error("missing or invalid rule metadata in {path}: {what}")]
-    MissingMetadata { path: String, what: String },
+    MissingMetadata {
+        /// Rule file lacking the metadata.
+        path: String,
+        /// Which metadata is missing or invalid (severity, technique, false positives, platform).
+        what: String,
+    },
 }
 
 /// Platforms `rules/sigma/` is organized by (issue #73: platform is derived from the

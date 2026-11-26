@@ -48,7 +48,6 @@ fn session_builder() -> Result<SessionBuilder, ort::Error> {
 /// Model artifacts arrive from the update channel; loading and inference must surface
 /// errors, never panic.
 #[derive(Debug, thiserror::Error)]
-#[allow(missing_docs)] // #362
 pub enum ScorerError {
     /// onnxruntime failed to load the model or run inference.
     #[error("onnxruntime error: {0}")]
@@ -59,7 +58,12 @@ pub enum ScorerError {
     /// The model's input width disagrees with the scorer's feature space — a sign the
     /// wrong model shipped to this scorer.
     #[error("model expects {model} features, the extractor produces {extractor}")]
-    FeatureArity { model: usize, extractor: usize },
+    FeatureArity {
+        /// Input width the model declares.
+        model: usize,
+        /// Number of features the extractor produces.
+        extractor: usize,
+    },
     /// The `scores` output was missing or empty.
     #[error("model produced no score")]
     NoScore,
@@ -71,9 +75,13 @@ pub enum ScorerError {
     /// the input is safe, just that the model cannot confidently score it.
     #[error("feature {feature} value {value:.3} outside bounds [{min:.3}, {max:.3}]")]
     FeatureOutOfBounds {
+        /// Name of the first feature found out of range.
         feature: String,
+        /// The offending input value.
         value: f32,
+        /// Lower bound of that feature: the training minimum minus the margin.
         min: f32,
+        /// Upper bound of that feature: the training maximum plus the margin.
         max: f32,
     },
 }
