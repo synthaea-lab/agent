@@ -79,6 +79,19 @@ impl StreamCounters {
     }
 }
 
+/// Adds the part of `count` not yet in `total` (`published` is what was already added, and is
+/// brought up to `count`). Returns the new total when it reaches a power of two, the moment to
+/// warn.
+fn add_new_losses(total: &AtomicU64, count: u64, published: &mut u64) -> Option<u64> {
+    let new = count.saturating_sub(*published);
+    if new == 0 {
+        return None;
+    }
+    *published = count;
+    let total = total.fetch_add(new, Ordering::Relaxed) + new;
+    total.is_power_of_two().then_some(total)
+}
+
 /// Reads normalized schema events out of any line-oriented
 /// `log stream --style ndjson` source. Generic over [`BufRead`] so tests feed
 /// canned captures; `process::spawn_stream`'s child stdout (macOS) feeds the
@@ -87,8 +100,10 @@ impl StreamCounters {
 pub struct NormalizedLogStream<R> {
     lines: std::io::Lines<R>,
     joiner: TccJoiner,
-    /// What of the joiner's counts was already added to `counters`.
-    published: (u64, u64),
+    /// What of the joiner's `shed_contexts` was already added to `counters`.
+    published_shed_contexts: u64,
+    /// What of the joiner's `unmatched_results` was already added to `counters`.
+    published_unmatched_results: u64,
     window: VecDeque<u64>,
     counters: Arc<StreamCounters>,
 }
@@ -106,7 +121,8 @@ impl<R: BufRead> NormalizedLogStream<R> {
         Self {
             lines: reader.lines(),
             joiner: TccJoiner::new(),
-            published: (0, 0),
+            published_shed_contexts: 0,
+            published_unmatched_results: 0,
             window: VecDeque::new(),
             counters,
         }
@@ -124,35 +140,25 @@ impl<R: BufRead> NormalizedLogStream<R> {
     /// while running). Adding the difference, not copying the count, keeps the totals whole when
     /// a later stream shares the handle.
     fn publish_tcc(&mut self) {
-        let shed = self.joiner.shed_contexts;
-        if shed > self.published.0 {
-            let total = self
-                .counters
-                .tcc_shed_contexts
-                .fetch_add(shed - self.published.0, Ordering::Relaxed)
-                + (shed - self.published.0);
-            self.published.0 = shed;
-            if total.is_power_of_two() {
-                tracing::warn!(
-                    tcc_shed_contexts = total,
-                    "unified-log tail: TCC context shed before its result arrived"
-                );
-            }
+        if let Some(total) = add_new_losses(
+            &self.counters.tcc_shed_contexts,
+            self.joiner.shed_contexts,
+            &mut self.published_shed_contexts,
+        ) {
+            tracing::warn!(
+                tcc_shed_contexts = total,
+                "unified-log tail: TCC context shed before its result arrived"
+            );
         }
-        let unmatched = self.joiner.unmatched_results;
-        if unmatched > self.published.1 {
-            let total = self
-                .counters
-                .tcc_unmatched_results
-                .fetch_add(unmatched - self.published.1, Ordering::Relaxed)
-                + (unmatched - self.published.1);
-            self.published.1 = unmatched;
-            if total.is_power_of_two() {
-                tracing::warn!(
-                    tcc_unmatched_results = total,
-                    "unified-log tail: TCC result with no pending context"
-                );
-            }
+        if let Some(total) = add_new_losses(
+            &self.counters.tcc_unmatched_results,
+            self.joiner.unmatched_results,
+            &mut self.published_unmatched_results,
+        ) {
+            tracing::warn!(
+                tcc_unmatched_results = total,
+                "unified-log tail: TCC result with no pending context"
+            );
         }
     }
 

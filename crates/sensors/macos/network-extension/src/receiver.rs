@@ -30,6 +30,25 @@ pub struct SkewCounters {
     unmapped: AtomicU64,
 }
 
+/// Why the receiver skipped a record.
+#[derive(Debug, Clone, Copy)]
+enum SkipCause {
+    Unparseable,
+    UnknownVersion,
+    Unmapped,
+}
+
+impl SkipCause {
+    /// The words the warning uses for this cause.
+    fn what(self) -> &'static str {
+        match self {
+            Self::Unparseable => "unparseable",
+            Self::UnknownVersion => "unknown wire version",
+            Self::Unmapped => "no schema event",
+        }
+    }
+}
+
 /// A reading of [`SkewCounters`] at one instant.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct SkewTotals {
@@ -61,6 +80,16 @@ impl SkewTotals {
 }
 
 impl SkewCounters {
+    /// Counts one skipped record; returns the new total for its cause.
+    fn count(&self, cause: SkipCause) -> u64 {
+        let counter = match cause {
+            SkipCause::Unparseable => &self.unparseable,
+            SkipCause::UnknownVersion => &self.unknown_version,
+            SkipCause::Unmapped => &self.unmapped,
+        };
+        counter.fetch_add(1, Ordering::Relaxed) + 1
+    }
+
     /// The totals now.
     #[must_use]
     pub fn totals(&self) -> SkewTotals {
@@ -105,12 +134,13 @@ impl<R: BufRead> NormalizedNeStream<R> {
     /// Counts one skipped record, warning when the total for its cause reaches a power of two:
     /// one connection can last the whole run, so a version-skewed extension must show while it
     /// lives, not only when the connection ends (no health beacon on macOS yet, #34).
-    fn count_skip(&self, cause: &AtomicU64, what: &'static str) {
-        let total = cause.fetch_add(1, Ordering::Relaxed) + 1;
+    fn count_skip(&self, cause: SkipCause) {
+        let total = self.counters.count(cause);
         if total.is_power_of_two() {
             tracing::warn!(
                 total,
-                "network-extension receiver: record skipped ({what}); extension version skew?"
+                "network-extension receiver: record skipped ({}); extension version skew?",
+                cause.what()
             );
         }
     }
@@ -133,16 +163,16 @@ impl<R: BufRead> Iterator for NormalizedNeStream<R> {
                 Err(_) => {
                     // A record kind or field shape this build doesn't know —
                     // a newer extension. Skip the line, never the stream.
-                    self.count_skip(&self.counters.unparseable, "unparseable");
+                    self.count_skip(SkipCause::Unparseable);
                     continue;
                 }
             };
             if record.version() != WIRE_VERSION {
-                self.count_skip(&self.counters.unknown_version, "unknown wire version");
+                self.count_skip(SkipCause::UnknownVersion);
                 continue;
             }
             let Some(event) = normalize(&record) else {
-                self.count_skip(&self.counters.unmapped, "no schema event");
+                self.count_skip(SkipCause::Unmapped);
                 continue;
             };
             return Some(Ok(event));
