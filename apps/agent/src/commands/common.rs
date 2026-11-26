@@ -481,7 +481,6 @@ mod tests {
             Arc::new(crate::host_counters::AgentHostCounters::new(
                 Arc::clone(&pipeline.sink),
                 crate::host_counters::WatchdogReport::default(),
-                None,
             )),
         );
         monitor

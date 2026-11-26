@@ -184,7 +184,7 @@ fn select_sensor(
 ) -> (
     Box<dyn schema::sensor::Sensor>,
     &'static str,
-    Option<crate::host_counters::SensorTotalsReader>,
+    Option<crate::host_counters::EbpfSensorTotalsReader>,
 ) {
     if can_use_ebpf() {
         tracing::info!("Using eBPF sensor (primary)");
@@ -197,7 +197,7 @@ fn select_sensor(
             "linux-ebpf",
             Some(Box::new(move || {
                 let (ring_dropped, exec_ring_dropped) = ring_drops.snapshot();
-                crate::host_counters::SensorTotals {
+                crate::host_counters::EbpfSensorTotals {
                     parent_image_evicted_live: evictions.live(),
                     parent_image_evicted_dead: evictions.dead(),
                     ring_dropped,
@@ -418,16 +418,21 @@ pub(crate) fn cmd_run(opts: super::RunOptions) -> anyhow::Result<()> {
     crate::inventory::spawn_monitor(storage.state_dir.clone(), sink.clone())?;
 
     // Health beacon (#134): periodic self-diagnostics to the control plane, over
-    // the silence monitor above.
+    // the silence monitor above. The eBPF sensor adds its loss totals; the audit fallback
+    // has none.
+    let counters = crate::host_counters::AgentHostCounters::new(
+        Arc::clone(&pipeline.sink),
+        crate::host_counters::WatchdogReport::from_env(),
+    );
+    let counters = match sensor_totals {
+        Some(read) => counters.with_ebpf_sensor_totals(read),
+        None => counters,
+    };
     let health = super::common::health_collector(
         &pipeline,
         silence_monitor,
         vec![avc_status.clone()],
-        Arc::new(crate::host_counters::AgentHostCounters::new(
-            Arc::clone(&pipeline.sink),
-            crate::host_counters::WatchdogReport::from_env(),
-            sensor_totals,
-        )),
+        Arc::new(counters),
     );
     // Workers wound down after `sensor.run` returns (#316).
     let mut shutdown = ShutdownPlan::default();
