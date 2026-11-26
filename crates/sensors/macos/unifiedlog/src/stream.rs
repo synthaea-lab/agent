@@ -7,7 +7,14 @@
 //! the exact-shape [`crate::classify`], and a counted sliding-window shed
 //! ([`MAX_EVENTS_PER_WINDOW`]).
 
-use std::{collections::VecDeque, io::BufRead};
+use std::{
+    collections::VecDeque,
+    io::BufRead,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
+};
 
 use crate::{
     UnifiedLogError, classify, normalize, parse_record, record::LogRecord, tcc::TccJoiner,
@@ -29,6 +36,62 @@ const MAX_EVENTS_PER_WINDOW: usize = 512;
 /// Sliding window (timestamp deque per the house rule — never reset buckets).
 const WINDOW_NS: u64 = 1_000_000_000;
 
+/// Cumulative loss counters, shared with whoever reports them: the stream moves into its reader
+/// thread, so the agent creates the counters, keeps a handle and injects it with
+/// [`NormalizedLogStream::with_counters`] (#178). One set belongs to one stream at a time: each
+/// stream adds its own losses, so a restarted stream may reuse the handle and the totals go on
+/// from where they were.
+#[derive(Debug, Default)]
+pub struct StreamCounters {
+    shed_events: AtomicU64,
+    tcc_shed_contexts: AtomicU64,
+    tcc_unmatched_results: AtomicU64,
+}
+
+/// A reading of [`StreamCounters`] at one instant.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct StreamTotals {
+    /// Events shed by the rate bound.
+    pub shed_events: u64,
+    /// TCC contexts shed by the pending-context cap before their result arrived.
+    pub tcc_shed_contexts: u64,
+    /// TCC results with no pending context.
+    pub tcc_unmatched_results: u64,
+}
+
+impl StreamTotals {
+    /// True when nothing was lost.
+    #[must_use]
+    pub fn is_clean(&self) -> bool {
+        *self == Self::default()
+    }
+}
+
+impl StreamCounters {
+    /// The totals now.
+    #[must_use]
+    pub fn totals(&self) -> StreamTotals {
+        StreamTotals {
+            shed_events: self.shed_events.load(Ordering::Relaxed),
+            tcc_shed_contexts: self.tcc_shed_contexts.load(Ordering::Relaxed),
+            tcc_unmatched_results: self.tcc_unmatched_results.load(Ordering::Relaxed),
+        }
+    }
+}
+
+/// Adds the part of `count` not yet in `total` (`published` is what was already added, and is
+/// brought up to `count`). Returns the new total when it reaches a power of two, the moment to
+/// warn.
+fn add_new_losses(total: &AtomicU64, count: u64, published: &mut u64) -> Option<u64> {
+    let new = count.saturating_sub(*published);
+    if new == 0 {
+        return None;
+    }
+    *published = count;
+    let total = total.fetch_add(new, Ordering::Relaxed) + new;
+    total.is_power_of_two().then_some(total)
+}
+
 /// Reads normalized schema events out of any line-oriented
 /// `log stream --style ndjson` source. Generic over [`BufRead`] so tests feed
 /// canned captures; `process::spawn_stream`'s child stdout (macOS) feeds the
@@ -37,28 +100,66 @@ const WINDOW_NS: u64 = 1_000_000_000;
 pub struct NormalizedLogStream<R> {
     lines: std::io::Lines<R>,
     joiner: TccJoiner,
+    /// What of the joiner's `shed_contexts` was already added to `counters`.
+    published_shed_contexts: u64,
+    /// What of the joiner's `unmatched_results` was already added to `counters`.
+    published_unmatched_results: u64,
     window: VecDeque<u64>,
-    /// Events shed by the rate bound, cumulative.
-    pub shed_events: u64,
+    counters: Arc<StreamCounters>,
 }
 
 impl<R: BufRead> NormalizedLogStream<R> {
-    /// Wraps `reader` (NDJSON from `log stream`). Starts with an empty TCC joiner, an empty
-    /// rate window and `shed_events` at 0.
-    pub fn new(reader: R) -> Self {
+    /// A stream with counters of its own, for tests: a caller outside them has no way to read the
+    /// counters, so it injects a handle with [`Self::with_counters`].
+    #[cfg(test)]
+    fn new(reader: R) -> Self {
+        Self::with_counters(reader, Arc::new(StreamCounters::default()))
+    }
+
+    /// A stream that adds to `counters`, which the caller keeps to read the totals.
+    pub fn with_counters(reader: R, counters: Arc<StreamCounters>) -> Self {
         Self {
             lines: reader.lines(),
             joiner: TccJoiner::new(),
+            published_shed_contexts: 0,
+            published_unmatched_results: 0,
             window: VecDeque::new(),
-            shed_events: 0,
+            counters,
         }
     }
 
-    /// TCC join counters (shed contexts / unmatched results), for health
-    /// reporting.
+    /// A handle on the stream's own counters, for tests that built it with [`Self::new`].
+    #[cfg(test)]
     #[must_use]
-    pub fn tcc_counters(&self) -> (u64, u64) {
-        (self.joiner.shed_contexts, self.joiner.unmatched_results)
+    pub fn counters(&self) -> Arc<StreamCounters> {
+        Arc::clone(&self.counters)
+    }
+
+    /// Adds what the TCC joiner lost since the last call to the shared counters, warning when a
+    /// total reaches a power of two (no health beacon on macOS yet, #34: this is how a loss shows
+    /// while running). Adding the difference, not copying the count, keeps the totals whole when
+    /// a later stream shares the handle.
+    fn publish_tcc(&mut self) {
+        if let Some(total) = add_new_losses(
+            &self.counters.tcc_shed_contexts,
+            self.joiner.shed_contexts,
+            &mut self.published_shed_contexts,
+        ) {
+            tracing::warn!(
+                tcc_shed_contexts = total,
+                "unified-log tail: TCC context shed before its result arrived"
+            );
+        }
+        if let Some(total) = add_new_losses(
+            &self.counters.tcc_unmatched_results,
+            self.joiner.unmatched_results,
+            &mut self.published_unmatched_results,
+        ) {
+            tracing::warn!(
+                tcc_unmatched_results = total,
+                "unified-log tail: TCC result with no pending context"
+            );
+        }
     }
 
     /// Sliding-window admission: true when the event at `now_ns` fits.
@@ -71,7 +172,14 @@ impl<R: BufRead> NormalizedLogStream<R> {
             }
         }
         if self.window.len() >= MAX_EVENTS_PER_WINDOW {
-            self.shed_events += 1;
+            let shed = self.counters.shed_events.fetch_add(1, Ordering::Relaxed) + 1;
+            // Powers of two only: a log storm must not flood the log.
+            if shed.is_power_of_two() {
+                tracing::warn!(
+                    shed_total = shed,
+                    "unified-log tail: event shed by the rate bound"
+                );
+            }
             return false;
         }
         self.window.push_back(now_ns);
@@ -102,7 +210,9 @@ impl<R: BufRead> Iterator for NormalizedLogStream<R> {
             let Some(classified) = classify(&record) else {
                 continue;
             };
-            let Some(event) = normalize(&record, &classified, &mut self.joiner) else {
+            let normalized = normalize(&record, &classified, &mut self.joiner);
+            self.publish_tcc();
+            let Some(event) = normalized else {
                 continue;
             };
             if !self.admit(record.timestamp_ns) {
@@ -124,7 +234,7 @@ pub mod process {
 
     /// Spawns `log stream --style ndjson --predicate` [`super::PREDICATE`],
     /// tailing from now. Returns the still-running [`Child`] with stdout
-    /// piped — feed it to [`super::NormalizedLogStream::new`] via
+    /// piped — feed it to [`super::NormalizedLogStream::with_counters`] via
     /// `BufReader::new(child.stdout.take()...)`. The caller owns the child
     /// and must kill it on shutdown (`agent::commands::macos::cmd_run`).
     ///
@@ -198,7 +308,39 @@ mod tests {
         let mut stream = NormalizedLogStream::new(Cursor::new(input));
         let yielded = stream.by_ref().filter(Result::is_ok).count();
         assert_eq!(yielded, 512);
-        assert_eq!(stream.shed_events, 88);
+        assert_eq!(stream.counters().totals().shed_events, 88);
+    }
+
+    #[test]
+    fn tcc_results_without_a_context_reach_the_shared_counters() {
+        let result = r#"{"eventType":"logEvent","subsystem":"com.apple.TCC","processID":427,"userID":0,"processImagePath":"/System/Library/PrivateFrameworks/TCC.framework/Support/tccd","timestamp":"2026-09-22 11:12:28.000000+0200","eventMessage":"AUTHREQ_RESULT: msgID=427.9, authValue=2, authReason=11, authVersion=1,"}"#;
+        let mut stream = NormalizedLogStream::new(Cursor::new(result.to_string()));
+        let counters = stream.counters();
+        assert_eq!(stream.by_ref().count(), 0);
+        let totals = counters.totals();
+        assert_eq!(totals.tcc_unmatched_results, 1);
+        assert_eq!(totals.tcc_shed_contexts, 0);
+        assert!(!totals.is_clean());
+    }
+
+    #[test]
+    fn two_streams_sharing_a_handle_add_their_tcc_losses() {
+        let result = |id: u32| {
+            format!(
+                r#"{{"eventType":"logEvent","subsystem":"com.apple.TCC","processID":427,"userID":0,"processImagePath":"/System/Library/PrivateFrameworks/TCC.framework/Support/tccd","timestamp":"2026-09-22 11:12:28.000000+0200","eventMessage":"AUTHREQ_RESULT: msgID=427.{id}, authValue=2, authReason=11, authVersion=1,"}}"#
+            )
+        };
+        let counters = Arc::new(StreamCounters::default());
+        for id in [1, 2] {
+            let mut stream =
+                NormalizedLogStream::with_counters(Cursor::new(result(id)), Arc::clone(&counters));
+            assert_eq!(stream.by_ref().count(), 0);
+        }
+        assert_eq!(
+            counters.totals().tcc_unmatched_results,
+            2,
+            "the second stream starts its own joiner at 0 and must not overwrite the first's count"
+        );
     }
 
     #[test]
@@ -210,7 +352,7 @@ mod tests {
         .join("\n");
         let mut stream = NormalizedLogStream::new(Cursor::new(input));
         assert_eq!(stream.by_ref().count(), 2);
-        assert_eq!(stream.shed_events, 0);
+        assert!(stream.counters().totals().is_clean());
     }
 
     #[test]

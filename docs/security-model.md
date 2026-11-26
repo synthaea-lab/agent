@@ -277,7 +277,7 @@ Implemented in [`crates/ipc`](../crates/ipc/src/lib.rs), served by
 
 The NE system extension connects to a Unix socket in the shared app-group container and
 writes NDJSON records ([`receiver.rs`](../crates/sensors/macos/network-extension/src/receiver.rs)).
-Unknown wire versions and lines that fail to parse are counted (`skew_skipped`) and
+Unknown wire versions and lines that fail to parse are counted (`SkewCounters`, by cause) and
 skipped, never treated as fatal. The receiver does **not** check the peer's identity and
 reads lines without a length cap. Access depends only on the app-group container's
 filesystem permissions. Follow-ups for this sensor are tracked in

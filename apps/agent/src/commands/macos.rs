@@ -107,7 +107,10 @@ fn spawn_socket_poller(
 /// Event Log sensor: its failure is logged, never fatal — `EndpointSecurity`
 /// is the sensor that must work. Returns the `log stream` child so shutdown
 /// can kill it (which ends the tail thread's stream and thus the thread).
-fn spawn_unifiedlog_tail(sink: Arc<dyn EventSink>) -> std::io::Result<Option<std::process::Child>> {
+fn spawn_unifiedlog_tail(
+    sink: Arc<dyn EventSink>,
+    counters: Arc<sensor_macos_unifiedlog::StreamCounters>,
+) -> std::io::Result<Option<std::process::Child>> {
     let mut child = match sensor_macos_unifiedlog::spawn_stream() {
         Ok(child) => child,
         Err(e) => {
@@ -120,8 +123,10 @@ fn spawn_unifiedlog_tail(sink: Arc<dyn EventSink>) -> std::io::Result<Option<std
         return Ok(None);
     };
     let spawned = crate::spawn::spawn_named("unifiedlog-tail", move || {
-        let stream =
-            sensor_macos_unifiedlog::NormalizedLogStream::new(std::io::BufReader::new(stdout));
+        let stream = sensor_macos_unifiedlog::NormalizedLogStream::with_counters(
+            std::io::BufReader::new(stdout),
+            Arc::clone(&counters),
+        );
         for item in stream {
             match item {
                 Ok((_, event)) => sink.on_event(event),
@@ -133,6 +138,7 @@ fn spawn_unifiedlog_tail(sink: Arc<dyn EventSink>) -> std::io::Result<Option<std
                 }
             }
         }
+        report_unified_log_losses(&counters.totals());
     });
     if let Err(e) = spawned {
         // No thread will read the child's pipe: do not leave `log stream` running.
@@ -141,6 +147,34 @@ fn spawn_unifiedlog_tail(sink: Arc<dyn EventSink>) -> std::io::Result<Option<std
         return Err(e);
     }
     Ok(Some(child))
+}
+
+/// Says what the unified-log tail shed or could not join, as a closing summary when its stream
+/// ends (#178). While the agent runs, the stream itself warns at power-of-two totals. macOS has no
+/// health beacon yet (#34), so these lines are where the counts are read.
+fn report_unified_log_losses(totals: &sensor_macos_unifiedlog::StreamTotals) {
+    if !totals.is_clean() {
+        tracing::warn!(
+            shed_events = totals.shed_events,
+            tcc_shed_contexts = totals.tcc_shed_contexts,
+            tcc_unmatched_results = totals.tcc_unmatched_results,
+            "unified-log tail: events were shed or TCC records could not be joined"
+        );
+    }
+}
+
+/// The same for the `NetworkExtension` receiver, once per ended connection: what the agent skipped
+/// on that connection because the extension speaks another version, by cause (#178). `skipped` is
+/// the difference across the connection, not the cumulative totals.
+fn report_network_extension_skew(skipped: &sensor_macos_network_extension::SkewTotals) {
+    if !skipped.is_clean() {
+        tracing::warn!(
+            unparseable = skipped.unparseable,
+            unknown_version = skipped.unknown_version,
+            unmapped = skipped.unmapped,
+            "network-extension connection: records were skipped on this connection (extension version skew?)"
+        );
+    }
 }
 
 /// Where the `NetworkExtension` providers' event pipe lives (issue #33). The
@@ -170,10 +204,14 @@ fn spawn_network_extension_receiver(sink: Arc<dyn EventSink>) -> std::io::Result
                 return Ok(());
             }
         };
+    // One handle for every connection: the extension reconnects whenever the OS restarts it.
+    let skew = Arc::new(sensor_macos_network_extension::SkewCounters::default());
     crate::spawn::spawn_named("ne-receiver", move || {
         let result = sensor_macos_network_extension::accept_loop(&listener, |conn| {
-            let stream = sensor_macos_network_extension::NormalizedNeStream::new(
+            let before = skew.totals();
+            let stream = sensor_macos_network_extension::NormalizedNeStream::with_counters(
                 std::io::BufReader::new(conn),
+                Arc::clone(&skew),
             );
             for item in stream {
                 match item {
@@ -186,6 +224,7 @@ fn spawn_network_extension_receiver(sink: Arc<dyn EventSink>) -> std::io::Result
                     }
                 }
             }
+            report_network_extension_skew(&skew.totals().since(&before));
         });
         if let Err(e) = result {
             tracing::warn!(error = %e, "network-extension receiver stopped");
@@ -208,7 +247,10 @@ fn run_macos_sensors(sink: Box<dyn EventSink>, redact_commands: bool) -> anyhow:
     spawn_network_extension_receiver(Arc::clone(&sink))?;
     let poll_stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
     spawn_socket_poller(Arc::clone(&sink), Arc::clone(&poll_stop))?;
-    let log_child = spawn_unifiedlog_tail(Arc::clone(&sink))?;
+    // Created here, not in the tail thread, so the agent holds the handle the macOS health
+    // beacon (#34) will read, as `skew` is held on the network-extension side.
+    let log_counters = Arc::new(sensor_macos_unifiedlog::StreamCounters::default());
+    let log_child = spawn_unifiedlog_tail(Arc::clone(&sink), Arc::clone(&log_counters))?;
     let log_child = std::sync::Mutex::new(log_child);
 
     ctrlc::set_handler(move || {
