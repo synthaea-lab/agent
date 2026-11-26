@@ -13,7 +13,11 @@ sensor tracks forks itself in the `PROC_LINEAGE` map
 [`LineageEntry`](../../../crates/sensors/linux/wire/src/lib.rs)):
 
 - [`raw_sched_process_fork`](../../../crates/sensors/linux/ebpf/src/raw.rs) inserts the child with
-  the parent's tgid and comm, a fresh `generation`, the parent's generation, and `execd = 0`.
+  the parent's tgid and comm, a fresh `generation`, the parent's generation, and `execd = 0`. The
+  tracepoint fires for every `clone`: a new thread gets no entry, and a fork by a secondary thread
+  records the parent's tgid, not that thread's id
+  ([`forked_process`](../../../crates/sensors/linux/wire/src/lineage.rs), #372). The comm is the
+  forking thread's, which a thread renamed with `prctl(PR_SET_NAME)` may not share with its process.
 - [`raw_sched_process_exit`](../../../crates/sensors/linux/ebpf/src/raw.rs) removes it.
 - [`record_sched_process_exec`](../../../crates/sensors/linux/ebpf/src/exec.rs) sets `execd = 1` on
   the process's own entry, after reading the entries it reports.

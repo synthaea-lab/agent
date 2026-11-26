@@ -19,7 +19,9 @@
 extern crate std;
 
 mod layout;
+mod lineage;
 mod path_filter;
+pub use lineage::{ForkedProcess, TaskIds, forked_process};
 pub use path_filter::is_filtered_path;
 
 /// Packs the handler tag and syscall number for a pending raw `sys_exit` event.
