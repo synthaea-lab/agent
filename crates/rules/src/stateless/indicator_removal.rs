@@ -135,7 +135,8 @@ pub fn evaluate_log_cleared(event: &schema::LogClearedEvent) -> Vec<Alert> {
 /// Linux (#1036): the BPF-LSM `inode_setattr` hook does know the process, so `comm` is printed.
 /// The package managers (`rpm`/`dpkg`/`pacman` and their frontends set the archive's stored mtime
 /// on every file they unpack) are skipped by `RuleState::on_file_set_time`, not here: the skip
-/// needs the exec-time image, because `comm` alone is attacker-controlled. Everything else stays
+/// needs the exec-time image, because `comm` alone is attacker-controlled. So is systemd (pid 1)
+/// stamping a persistent timer under `/var/lib/systemd/timers/` (#353). Everything else stays
 /// Low for the reason above (`touch -d`, `cp -p`, `tar x`, `rsync -t` are ordinary too). Telling a build tool's
 /// `touch` from a targeted stomp needs the parent or a per-process count, which the event does
 /// not carry: not guessed here.

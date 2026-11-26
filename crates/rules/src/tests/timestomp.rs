@@ -241,3 +241,75 @@ fn the_alert_after_a_window_says_how_many_requests_it_folded() {
         next[0].message
     );
 }
+
+/// systemd (pid 1) stamping a `Persistent=true` timer's last trigger (#353), through the same
+/// per-process path as every other Linux request.
+fn set_time_by_init(path: &str) -> Vec<crate::Alert> {
+    let mut event = linux_event("systemd");
+    event.meta.pid = 1;
+    event.path = path.into();
+    crate::RuleState::new().on_file_set_time(&event)
+}
+
+#[test]
+fn systemd_stamping_a_persistent_timer_does_not_alert() {
+    for path in [
+        "/var/lib/systemd/timers/stamp-logrotate.timer",
+        "/var/lib/systemd/timers/stamp-dnf-makecache.timer",
+    ] {
+        assert!(set_time_by_init(path).is_empty(), "{path}");
+    }
+}
+
+#[test]
+fn a_timer_stamp_on_a_separate_var_mount_does_not_alert() {
+    // The hook's path stops at the mount root: `/var` mounted apart gives `/lib/systemd/...`.
+    for path in [
+        "/lib/systemd/timers/stamp-fstrim.timer",
+        "/systemd/timers/stamp-fstrim.timer",
+    ] {
+        assert!(set_time_by_init(path).is_empty(), "{path}");
+    }
+}
+
+#[test]
+fn a_long_timer_stamp_name_cut_by_the_probe_does_not_alert() {
+    // `stamp-dnf-automatic-install.timer` is over the probe's 31 bytes, so it loses `.timer`.
+    let path = "/.../var/lib/systemd/timers/stamp-dnf-automatic-install.tim";
+    assert!(set_time_by_init(path).is_empty(), "{path}");
+}
+
+#[test]
+fn a_stamp_name_without_timer_still_alerts_unless_the_probe_cut_it() {
+    for path in [
+        // 31 bytes, but the sensor did not mark the path as cut: the name is complete.
+        "/var/lib/systemd/timers/stamp-dnf-automatic-install.tim",
+        // Marked as cut, but shorter than the probe's limit: this name was not the one cut.
+        "/.../var/lib/systemd/timers/stamp-short.tim",
+        // Cut to the limit, but not a stamp.
+        "/.../var/lib/systemd/timers/other-dnf-automatic-install.tim",
+    ] {
+        assert_eq!(set_time_by_init(path).len(), 1, "{path}");
+    }
+}
+
+#[test]
+fn pid_1_setting_a_time_anywhere_else_still_alerts() {
+    for path in [
+        "/etc/passwd",
+        "/var/lib/systemd/timers/other.timer",
+        "/var/lib/systemd/timers/stamp-x.timer.bak",
+        "/var/lib/systemd/timers/sub/stamp-x.timer",
+        "/var/lib/systemd/timers-evil/stamp-x.timer",
+        "/var/lib/other/timers/stamp-x.timer",
+    ] {
+        assert_eq!(set_time_by_init(path).len(), 1, "{path}");
+    }
+}
+
+#[test]
+fn a_process_named_systemd_stamping_a_timer_still_alerts() {
+    let mut event = linux_event("systemd");
+    event.path = "/var/lib/systemd/timers/stamp-logrotate.timer".into();
+    assert_eq!(crate::RuleState::new().on_file_set_time(&event).len(), 1);
+}
