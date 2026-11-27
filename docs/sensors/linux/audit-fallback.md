@@ -168,7 +168,10 @@ is still emitted with the head that arrived and `cmdline_truncated` set. `classi
 
 `AuditSensor` runs a current-thread tokio runtime with the socket in an `AsyncFd`. Readiness is
 edge-triggered, so each wake-up drains up to `DRAIN_BUDGET` (256) records, about 36 execs at seven
-records each, and leaves readiness set if the budget ran out. The socket asks for an 8 MiB receive
+records each, and leaves readiness set if the budget ran out. The pass is `SocketDrain::drain` in
+`sensor.rs`, which takes the `recv` as a closure so tests script the socket; its three loss counts
+(cut records, unparseable records, `ENOBUFS` overruns) are `ThrottledCount`s, which hand back the total
+only on powers of two, the moments the sensor warns. The socket asks for an 8 MiB receive
 buffer and logs what the kernel granted. `SO_RCVBUFFORCE` needs `CAP_NET_ADMIN`, which the packaged
 unit grants as an ambient capability; without it, `SO_RCVBUF` is capped at `net.core.rmem_max` and the
 agent warns. The default held fewer
