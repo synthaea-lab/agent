@@ -14,7 +14,7 @@ runtime, enriches each record from `/proc` and cgroupfs, and hands a `schema::Ev
 | [`sensor.rs`](../../../crates/sensors/linux/userspace/src/sensor.rs) | `LinuxSensor`, the drain loop |
 | [`rings.rs`](../../../crates/sensors/linux/userspace/src/rings.rs) | The ring buffer table, a ready ring to one drain |
 | [`drain.rs`](../../../crates/sensors/linux/userspace/src/drain.rs) | One drain: cap, self-exclusion, wire record reads; container attribution of drained events |
-| [`normalize.rs`](../../../crates/sensors/linux/userspace/src/normalize.rs) | Pure wire → schema mapping, tested on every OS |
+| [`normalize/`](../../../crates/sensors/linux/userspace/src/normalize) | Pure wire → schema mapping, tested on every OS |
 | [`proc.rs`](../../../crates/sensors/linux/userspace/src/proc.rs) | `/proc` parsing: cmdline, environ, stat |
 | [`parent_image.rs`](../../../crates/sensors/linux/userspace/src/parent_image.rs) | Parent image cache |
 | [`unit_procs.rs`](../../../crates/sensors/linux/userspace/src/unit_procs.rs) | Security-tool processes for the signal probe |
@@ -125,13 +125,13 @@ guessed one. The details per field are in [process context](process-context.md).
 
 ## Normalization
 
-[`normalize.rs`](../../../crates/sensors/linux/userspace/src/normalize.rs) is pure and
+[`normalize/`](../../../crates/sensors/linux/userspace/src/normalize) is pure and
 platform-independent; its unit tests run on every CI leg. Invariants it enforces:
 
 - **Timestamps** are `timestamp_ns + boot_epoch_offset_ns`, saturating.
 - **Zero means unknown.** A wire generation of 0 becomes `None` in the schema, never
   `Some(0)`. An empty `pcomm` becomes `parent_comm: None`.
-- **Open flags are masked.** [`OPEN_FLAGS_MASK`](../../../crates/sensors/linux/userspace/src/normalize.rs)
+- **Open flags are masked.** [`OPEN_FLAGS_MASK`](../../../crates/sensors/linux/userspace/src/normalize/file.rs)
   (`0x007F_FFFF`) keeps only the bits the kernel's open flags can carry. The kernel ignores unknown
   bits, so without the mask an unprivileged process could set the synthetic `schema::FLAG_*` bits
   other sensors use to mark persistence facts on a `FileOpenEvent`, and raise those alerts at will.
