@@ -12,7 +12,9 @@ use crate::xml::{
 /// missing field means.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LogClearedRecord {
+    /// `<EventRecordID>`: the record's id in its channel, the poller's resume cursor.
     pub record_id: u64,
+    /// `<EventID>`: 1102 (Security) or 104 (System).
     pub event_id: u32,
     /// `<Execution ProcessID>`: the Event Log service, not the clearer.
     pub pid: u32,
@@ -24,10 +26,12 @@ pub struct LogClearedRecord {
     /// header's, which is always `System`). 1102 does not carry one: it is
     /// always about the Security log it is written into.
     pub cleared_channel: Option<String>,
-    /// 1102: `SubjectUserSid`. 104 has no such field; its header's
-    /// `<Security UserID>` names the same account and is read instead.
+    /// `SubjectUserSid`, else the header's `<Security UserID>` (104 has no such field; the
+    /// header names the same account).
     pub subject_sid: Option<String>,
+    /// `SubjectUserName` of the account that cleared the log.
     pub subject_user_name: Option<String>,
+    /// `SubjectDomainName`: the domain of [`Self::subject_user_name`].
     pub subject_domain_name: Option<String>,
     /// 1102 only.
     pub subject_logon_id: Option<String>,

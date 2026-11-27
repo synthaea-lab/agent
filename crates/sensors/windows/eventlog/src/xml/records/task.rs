@@ -6,15 +6,17 @@ use crate::xml::scan::{extract_between, opt_data, unescape_xml_entities};
 /// Security log, requires the "Other Object Access Events" audit subcategory.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ScheduledTaskEvent {
+    /// `<EventRecordID>`: the record's id in its channel, the poller's resume cursor.
     pub record_id: u64,
     /// e.g. `\TestTask` — the Task Scheduler path, not just the leaf name.
     pub task_name: String,
-    /// The full task definition XML, already unescaped (`unescape_xml_entities`
-    /// applied by `parse_scheduled_task_block`) — pass to
+    /// The full task definition XML (`TaskContent` on 4698, `TaskContentNew` on 4702), already
+    /// unescaped (`unescape_xml_entities` applied by `parse_scheduled_task_block`) — pass to
     /// [`task_actions`](crate::xml::task_actions) to pull out every action it runs.
     pub task_content: String,
-    /// PID of the process that created the task (e.g. `schtasks.exe`) — not a
-    /// future execution of the task itself, which is only registered here, not run.
+    /// `ClientProcessId`: PID of the process that created the task (e.g. `schtasks.exe`), 0 if
+    /// missing — not a future execution of the task itself, which is only registered here, not
+    /// run.
     pub pid: u32,
 }
 
@@ -67,6 +69,7 @@ fn parse_task_block_with_content_field(
 /// content, so no action path.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TaskSchedulerOpRegisteredEvent {
+    /// `<EventRecordID>`: the record's id in its channel, the poller's resume cursor.
     pub record_id: u64,
     /// PID of the reporting process (`<Execution ProcessID='...'>`) — the
     /// Task Scheduler service host. 0 if missing.

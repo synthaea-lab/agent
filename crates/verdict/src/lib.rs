@@ -43,8 +43,12 @@ use store::BoundedMap;
 /// incarnations, and a `None` on either side cannot disprove identity.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct EntityKey {
+    /// Parent process id of the process the findings are about.
     pub ppid: u32,
+    /// Command name (`comm`) of the process.
     pub comm: String,
+    /// Incarnation stamp of the parent `ppid`, when the sensor gave one; tells a recycled
+    /// parent pid apart from the original.
     pub parent_generation: Option<u64>,
 }
 
@@ -131,7 +135,9 @@ impl EntityState {
 /// so far.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Verdict {
+    /// The entity this snapshot is about.
     pub entity: EntityKey,
+    /// The highest severity among the folded findings.
     pub severity: Severity,
     /// The highest-confidence score seen across every contributing source, when
     /// any source carried one. Simple max composition, not a weighted blend: a
@@ -189,6 +195,9 @@ pub struct VerdictEngine {
 }
 
 impl VerdictEngine {
+    /// Creates an engine with no tracked entities and no suppression marks. `dedup_window_ns`
+    /// is the fixed window, in nanoseconds, from a technique's first sighting within which a
+    /// repeat is a duplicate (see `TechniqueRecord`).
     #[must_use]
     pub fn new(dedup_window_ns: u64) -> Self {
         Self {

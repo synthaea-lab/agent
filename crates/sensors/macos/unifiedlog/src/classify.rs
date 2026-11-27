@@ -21,33 +21,51 @@ pub enum UnifiedLogEvent {
     /// format as Linux's (sudo is sudo): `"user : TTY=... ; PWD=... ;
     /// USER=root ; COMMAND=/usr/bin/true"`.
     SudoCommand {
+        /// The account before the first ` :` of the message.
         invoking_user: Option<String>,
+        /// The `USER=` field; `None` when absent.
         target_user: Option<String>,
+        /// Everything after `COMMAND=`, to the end of the message.
         command: Option<String>,
     },
     /// A failed `sudo` authentication: `"user : N incorrect password attempts ;
     /// TTY=... ; USER=root ; COMMAND=..."`.
     SudoFailure {
+        /// See [`UnifiedLogEvent::SudoCommand`].
         invoking_user: Option<String>,
+        /// See [`UnifiedLogEvent::SudoCommand`].
         target_user: Option<String>,
     },
     /// tccd's `AUTHREQ_CTX` — carries the requested service for a message id;
     /// joined with the matching [`UnifiedLogEvent::TccResult`] by
     /// [`crate::tcc::TccJoiner`].
-    TccContext { msg_id: String, service: String },
+    TccContext {
+        /// The `msgID=` value (for example `988.7025`), the join key with the result.
+        msg_id: String,
+        /// The `service=` value, for example `kTCCServiceAddressBook`.
+        service: String,
+    },
     /// tccd's `AUTHREQ_RESULT` — carries the verdict for a message id.
     TccResult {
+        /// The `msgID=` value; matches the [`UnifiedLogEvent::TccContext`] it answers.
         msg_id: String,
+        /// The `authValue=` verdict. Normalization treats 2 (allowed) and 3 (limited) as grants.
         auth_value: u32,
+        /// The `authReason=` code; `None` when absent or not a number.
         auth_reason: Option<u32>,
     },
     /// syspolicyd's `GK evaluateScanResult` — a Gatekeeper scan verdict.
     /// `target` is the bundle id when logged, else syspolicyd's opaque path
     /// token (paths are hash-redacted without the private-data profile).
     GatekeeperScan {
+        /// Bundle id if logged, else the signing id, else syspolicyd's opaque path token, else
+        /// `"unknown"`.
         target: String,
+        /// The `(team: ...)` field; `None` for `(null)`.
         team_id: Option<String>,
+        /// The `(id: ...)` field; `None` for `(null)`.
         signing_id: Option<String>,
+        /// The number after `GK evaluateScanResult:`.
         result_code: u32,
     },
 }

@@ -37,8 +37,11 @@ use crate::{RuleSet, ScanContext, YaraError, YaraMatch};
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[allow(clippy::struct_excessive_bools)] // r/w/x/p are four independent mapping flags
 pub struct RegionPerms {
+    /// The `r` flag: the region is readable.
     pub read: bool,
+    /// The `w` flag: the region is writable.
     pub write: bool,
+    /// The `x` flag: the region is executable.
     pub exec: bool,
 }
 
@@ -73,10 +76,13 @@ pub enum RegionKind {
 /// One mapped region of a process.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MemoryRegion {
+    /// Start address (inclusive).
     pub start: u64,
     /// Exclusive end.
     pub end: u64,
+    /// Read/write/execute flags of the mapping.
     pub perms: RegionPerms,
+    /// What backs the mapping.
     pub kind: RegionKind,
 }
 
@@ -168,6 +174,7 @@ impl Default for MemoryBudget {
 pub struct MemoryScanReport {
     /// Distinct matching rules across all scanned regions.
     pub matches: Vec<YaraMatch>,
+    /// Regions read and scanned.
     pub regions_scanned: usize,
     /// Candidate regions left unread because a budget was spent.
     pub regions_skipped: usize,
@@ -175,6 +182,7 @@ pub struct MemoryScanReport {
     pub regions_unreadable: usize,
     /// Regions read only in part because of `max_region_bytes` or `max_total_bytes`.
     pub regions_truncated: usize,
+    /// Total bytes handed to the scanner across all regions.
     pub bytes_scanned: u64,
 }
 
@@ -237,12 +245,15 @@ pub fn scan_memory(
 /// One scan's result, delivered when it found something.
 #[derive(Debug, Clone)]
 pub struct MemoryScanOutcome {
+    /// Process id that was scanned.
     pub pid: u32,
+    /// Incarnation stamp of `pid`, when known; tells a recycled pid apart from the original.
     pub generation: Option<u64>,
     /// Who the scan was about, as the trigger described them (`(ppid, comm)` and the
     /// triggering event's time), so a match can be keyed to the same entity as the
     /// finding that caused the scan.
     pub context: Option<ScanContext>,
+    /// What the scan read, matched and skipped.
     pub report: MemoryScanReport,
 }
 
@@ -423,6 +434,9 @@ impl MemoryScanQueue {
         true
     }
 
+    /// Snapshot of the memory-scan counters: completed scans, requests shed (queue full,
+    /// cooldown, rate limit) and unreadable targets. Counters are cumulative and read
+    /// `Relaxed`.
     #[must_use]
     pub fn stats(&self) -> MemoryScanStats {
         MemoryScanStats {

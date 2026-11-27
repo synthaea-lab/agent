@@ -10,6 +10,7 @@ use crate::wire::{NLMSG_HDR_LEN, NlMsgHeader};
 
 /// A message whose header cannot be trusted. The rest of the buffer is not walked after one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[allow(missing_docs)] // #362
 pub enum FrameError {
     /// The header's length field is smaller than the header itself.
     #[error("netlink message length {len} is shorter than its {NLMSG_HDR_LEN}-byte header")]

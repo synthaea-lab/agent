@@ -1,0 +1,12 @@
+{
+  "type": "wmi_activity",
+  "meta": {
+    "pid": 4242,
+    "ppid": 1337,
+    "user": { "os": "windows", "sid": "S-1-5-18", "integrity_level": 16384 },
+    "timestamp_ns": 1756900050000000000,
+    "comm": "wmic.exe"
+  },
+  "namespace": "ROOT\\CIMv2",
+  "method": "Win32_Process.Create"
+}

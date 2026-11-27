@@ -132,28 +132,70 @@ mod imp {
     }
 }
 
+/// `TZ` is process-wide, and `tzset`/`localtime_r` read it. A test that sets it, or that runs
+/// code reaching [`utc_offset_minutes_at`] (`common::apply_detection`, so every `start_pipeline`
+/// test), holds a `TzGuard` for its whole body. The guard puts the previous `TZ` back when it
+/// drops, so no test leaves its zone to the next one. The lock orders only the Rust-side access to
+/// `TZ`: it does not stop a `set_var` from racing a libc `getenv` of another variable.
+#[cfg(all(test, unix))]
+pub(super) struct TzGuard {
+    _lock: std::sync::MutexGuard<'static, ()>,
+    previous: Option<std::ffi::OsString>,
+}
+
+#[cfg(all(test, unix))]
+static TZ_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+#[cfg(all(test, unix))]
+impl TzGuard {
+    pub(super) fn new() -> Self {
+        let lock = TZ_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        Self {
+            _lock: lock,
+            previous: std::env::var_os("TZ"),
+        }
+    }
+
+    /// Sets `TZ` to a POSIX rule such as `JST-9`.
+    pub(super) fn set(&self, rule: &str) {
+        // SAFETY: the guard holds `TZ_LOCK`, which every test that sets `TZ` or reaches
+        // `localzone` takes, so nothing in a test reads or writes the variable concurrently.
+        unsafe { std::env::set_var("TZ", rule) };
+    }
+}
+
+#[cfg(all(test, unix))]
+impl Drop for TzGuard {
+    fn drop(&mut self) {
+        // SAFETY: still under `TZ_LOCK` (the field drops after this body).
+        unsafe {
+            match &self.previous {
+                Some(value) => std::env::set_var("TZ", value),
+                None => std::env::remove_var("TZ"),
+            }
+        }
+    }
+}
+
 #[cfg(all(test, unix))]
 mod tests {
-    use super::{configured, utc_offset_minutes_at};
+    use super::{TzGuard, configured, utc_offset_minutes_at};
 
     // POSIX `TZ` rules are used instead of zoneinfo names so the result does not depend on the
     // host's tzdata. Windows reads the machine's zone setting, which a test cannot change.
-    // `TZ` is process-wide: this is the only test in the agent that reads or sets it.
+    // `TZ` is process-wide: every test that sets it or reaches `localzone` holds a `TzGuard`.
     // 2026 transitions. Europe (CET/CEST): UTC 01:00 on 29 March and on 25 October.
     // US Eastern: 07:00 UTC on 8 March (02:00 local), 06:00 UTC on 1 November.
     const EU_SPRING: i64 = 1_774_746_000;
     const EU_AUTUMN: i64 = 1_792_890_000;
     const US_SPRING: i64 = 1_772_953_200;
 
-    fn set_tz(rule: &str) {
-        // SAFETY: the only test in this binary that touches `TZ`, and no other test converts
-        // local time, so nothing reads or writes it concurrently.
-        unsafe { std::env::set_var("TZ", rule) };
-    }
-
     #[test]
     fn the_offset_follows_the_zones_daylight_saving_rules_at_each_instant() {
-        set_tz("CET-1CEST,M3.5.0,M10.5.0/3");
+        let tz = TzGuard::new();
+        tz.set("CET-1CEST,M3.5.0,M10.5.0/3");
         assert!(configured());
         assert_eq!(
             utc_offset_minutes_at(EU_SPRING - 1),
@@ -179,15 +221,35 @@ mod tests {
         assert_eq!(utc_offset_minutes_at(0), Some(60));
 
         // The platform is re-read on every call: the zone changes under a running agent.
-        set_tz("EST5EDT,M3.2.0,M11.1.0");
+        tz.set("EST5EDT,M3.2.0,M11.1.0");
         assert_eq!(utc_offset_minutes_at(US_SPRING - 1), Some(-300));
         assert_eq!(utc_offset_minutes_at(US_SPRING), Some(-240));
 
         // A zone with no daylight saving and a half-hour offset (India).
-        set_tz("IST-5:30");
+        tz.set("IST-5:30");
         assert_eq!(utc_offset_minutes_at(EU_SPRING), Some(330));
 
-        set_tz("UTC0");
+        tz.set("UTC0");
         assert_eq!(utc_offset_minutes_at(EU_SPRING), Some(0));
+    }
+
+    #[test]
+    fn the_guard_puts_the_previous_zone_back() {
+        let guard = TzGuard::new();
+        let outside = std::env::var_os("TZ");
+        assert_ne!(
+            outside.as_deref(),
+            Some(std::ffi::OsStr::new("JST-9")),
+            "the test needs an outer zone different from the one it sets"
+        );
+        guard.set("JST-9");
+        assert_eq!(
+            std::env::var_os("TZ").as_deref(),
+            Some(std::ffi::OsStr::new("JST-9"))
+        );
+        drop(guard);
+        let guard = TzGuard::new();
+        assert_eq!(std::env::var_os("TZ"), outside, "restored on drop");
+        drop(guard);
     }
 }

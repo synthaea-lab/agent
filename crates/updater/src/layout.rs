@@ -43,6 +43,7 @@ pub struct Layout {
 }
 
 impl Layout {
+    /// Creates a layout rooted at `base_dir`. Does no I/O; the directories need not exist yet.
     #[must_use]
     pub fn new(base_dir: impl Into<PathBuf>) -> Self {
         Self {

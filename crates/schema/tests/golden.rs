@@ -1980,6 +1980,7 @@ fn signal_golden() {
             target_pid: 400,
             target_image_path: Some("/usr/local/bin/synthaea-agent".into()),
             target_unit: None,
+            sender_is_watchdog: false,
             sender_unreliable: false,
             signals_lost: 0,
         }),
@@ -2002,6 +2003,7 @@ fn signal_golden() {
             target_pid: 612,
             target_image_path: Some("/usr/sbin/auditd".into()),
             target_unit: Some("auditd".into()),
+            sender_is_watchdog: false,
             sender_unreliable: false,
             signals_lost: 0,
         }),
@@ -2024,10 +2026,34 @@ fn signal_golden() {
             target_pid: 612,
             target_image_path: Some("/usr/sbin/auditd".into()),
             target_unit: Some("auditd".into()),
+            sender_is_watchdog: false,
             sender_unreliable: true,
             signals_lost: 0,
         }),
         "signal_unreliable",
+    );
+    // v69 (#322): the sender is the agent's own watchdog.
+    assert_golden(
+        &Event::Signal(SignalEvent {
+            meta: EventMeta {
+                pid: 5000,
+                ppid: 1,
+                user: User::Unix { uid: 0, gid: 0 },
+                timestamp_ns: 1_756_900_000_123_456_789,
+                comm: "watchdog".into(),
+                container: None,
+                process_generation: None,
+                parent_process_generation: None,
+            },
+            signal: 9,
+            target_pid: 400,
+            target_image_path: Some("/usr/local/bin/synthaea-agent".into()),
+            target_unit: None,
+            sender_is_watchdog: true,
+            sender_unreliable: false,
+            signals_lost: 0,
+        }),
+        "signal_sender_watchdog",
     );
 }
 
@@ -2050,6 +2076,7 @@ fn signal_events_lost_golden() {
             target_pid: 0,
             target_image_path: None,
             target_unit: None,
+            sender_is_watchdog: false,
             sender_unreliable: false,
             signals_lost: 19_182,
         }),
@@ -3064,6 +3091,7 @@ fn meta_accessor_covers_all_variants() {
             target_pid: 0,
             target_image_path: None,
             target_unit: None,
+            sender_is_watchdog: false,
             sender_unreliable: false,
             signals_lost: 0,
         }),

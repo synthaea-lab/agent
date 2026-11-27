@@ -34,6 +34,7 @@ pub struct UnitPersistenceTracker {
 }
 
 impl UnitPersistenceTracker {
+    /// A tracker that has seen no unit yet, so the first start of every unit is reported.
     #[must_use]
     pub fn new() -> Self {
         Self::default()

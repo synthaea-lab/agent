@@ -142,6 +142,7 @@ impl ContentEntry {
 /// relies on it, exactly like [`crate::manifest::ReleaseManifest`].
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ContentManifest {
+    /// The content files this release lists, each with its path and hash.
     pub entries: Vec<ContentEntry>,
     /// Monotone, strictly increasing per `ring`. See [`Self::check_release_version`].
     pub release_version: u64,

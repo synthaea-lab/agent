@@ -95,6 +95,7 @@ pub use unitstop::to_unit_stop_event;
 
 /// Errors from parsing a journal record or driving `journalctl`.
 #[derive(Debug, thiserror::Error)]
+#[allow(missing_docs)] // #362
 pub enum JournalError {
     #[error("failed to parse journal line as JSON: {0}")]
     Json(#[from] serde_json::Error),

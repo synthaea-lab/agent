@@ -1,0 +1,11 @@
+{
+  "type": "unit_stop",
+  "meta": {
+    "pid": 1,
+    "ppid": 0,
+    "user": { "os": "unknown" },
+    "timestamp_ns": 1756900000123456789,
+    "comm": "auditd.service"
+  },
+  "unit": "auditd.service"
+}

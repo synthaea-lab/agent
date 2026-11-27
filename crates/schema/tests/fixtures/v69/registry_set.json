@@ -7,7 +7,7 @@
     "timestamp_ns": 1756900020000000000,
     "comm": "chrome-update.exe"
   },
-  "key": { "state": "resolved", "path": "HKLM\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Run" },
+  "key": "HKLM\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Run",
   "value_name": "ChromeUpdate",
   "data_type": 1,
   "data": "C:\\Users\\Public\\chrome-update.exe"

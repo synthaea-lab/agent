@@ -136,6 +136,7 @@ pub struct CgroupIdCache {
 const CGROUP_ID_CACHE_CAP: usize = 4096;
 
 impl CgroupIdCache {
+    /// An empty cache. It holds at most `CGROUP_ID_CACHE_CAP` ids and evicts the oldest first.
     #[must_use]
     pub fn new() -> Self {
         Self {
@@ -182,6 +183,7 @@ impl CgroupIdCache {
 /// One entry in [`DockerInfoCache`]: either a lookup is already running for this
 /// container id (don't start a second one), or it finished with whatever it found
 /// (`DockerContainerInfo`'s fields are already `Option` for "asked, got nothing").
+#[allow(missing_docs)] // #362
 pub enum DockerLookupState {
     Pending,
     Done(DockerContainerInfo),
@@ -262,6 +264,7 @@ pub struct ContainerResolver {
 }
 
 impl ContainerResolver {
+    /// A resolver with empty cgroup-id and Docker caches; the first lookup of each id walks cgroupfs.
     #[must_use]
     pub fn new() -> Self {
         Self {

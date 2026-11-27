@@ -1,0 +1,14 @@
+{
+  "type": "process_vm_write",
+  "meta": {
+    "pid": 9003,
+    "ppid": 1,
+    "user": { "os": "unix", "uid": 0, "gid": 0 },
+    "timestamp_ns": 1756900021000000000,
+    "comm": "injector"
+  },
+  "target_pid": 4242,
+  "local_iov_count": 1,
+  "remote_iov_count": 1,
+  "remote_iov_len": 256
+}

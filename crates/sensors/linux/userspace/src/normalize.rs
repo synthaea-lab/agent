@@ -245,6 +245,9 @@ const _: () = {
     }
 };
 
+/// Maps a `wire::FileOpenEvent` to `Event::FileOpen`. The path is the raw argument (not resolved), and `flags`
+/// is masked with `OPEN_FLAGS_MASK` so a process cannot forge the synthetic `schema::FLAG_*` bits (#1129).
+/// `boot_epoch_offset_ns` converts the boot-relative timestamp to wall-clock; `container` is caller-resolved.
 #[must_use]
 pub fn file_open(
     event: &wire::FileOpenEvent,
@@ -260,6 +263,8 @@ pub fn file_open(
     })
 }
 
+/// Maps a `wire::FileWriteEvent` to `Event::FileWrite`. `bytes_requested` is the `count` passed to
+/// `write(2)`, not the bytes actually written. `boot_epoch_offset_ns` and `container` as in [`file_open`].
 #[must_use]
 pub fn file_write(
     event: &wire::FileWriteEvent,
@@ -273,6 +278,8 @@ pub fn file_write(
     })
 }
 
+/// Maps a `wire::FileDeleteEvent` to `Event::FileDelete`. The path is the raw NUL-terminated argument, not resolved.
+/// `boot_epoch_offset_ns` and `container` as in [`file_open`].
 #[must_use]
 pub fn file_delete(
     event: &wire::FileDeleteEvent,
@@ -287,6 +294,9 @@ pub fn file_delete(
     })
 }
 
+/// Maps a `wire::FileRenameEvent` to `Event::FileRename`. Both paths are made absolute against the caller's
+/// dirfd or cwd (#515) and `executable_path` is read from `/proc`, so this is not pure. `boot_epoch_offset_ns`
+/// and `container` as in [`file_open`].
 #[must_use]
 pub fn file_rename(
     event: &wire::FileRenameEvent,
@@ -385,6 +395,8 @@ fn exe_path_for_pid(pid: u32) -> Option<String> {
         .ok()
 }
 
+/// Maps a `wire::FileChmodEvent` to `Event::FileChmod`. The path is the raw NUL-terminated argument, not resolved. `mode` is passed through unmasked.
+/// `boot_epoch_offset_ns` and `container` as in [`file_open`].
 #[must_use]
 pub fn file_chmod(
     event: &wire::FileChmodEvent,
@@ -453,6 +465,8 @@ pub fn file_set_time(
     })
 }
 
+/// Maps a `wire::FileChownEvent` to `Event::FileChown`. The path is the raw NUL-terminated argument, not resolved. `uid`/`gid` of `u32::MAX` mean "unchanged" and are passed through.
+/// `boot_epoch_offset_ns` and `container` as in [`file_open`].
 #[must_use]
 pub fn file_chown(
     event: &wire::FileChownEvent,
@@ -469,6 +483,8 @@ pub fn file_chown(
     })
 }
 
+/// Maps a `wire::FileSetxattrEvent` to `Event::FileSetxattr`: the target path and the attribute name,
+/// both truncated to their buffer sizes. `boot_epoch_offset_ns` and `container` as in [`file_open`].
 #[must_use]
 pub fn file_setxattr(
     event: &wire::FileSetxattrEvent,
@@ -492,6 +508,8 @@ pub fn file_setxattr(
     })
 }
 
+/// Maps a `wire::FileRemovexattrEvent` to `Event::FileRemovexattr`: the target path and the attribute name,
+/// both truncated to their buffer sizes. `boot_epoch_offset_ns` and `container` as in [`file_open`].
 #[must_use]
 pub fn file_removexattr(
     event: &wire::FileRemovexattrEvent,
@@ -515,6 +533,8 @@ pub fn file_removexattr(
     })
 }
 
+/// Maps a `wire::ConnectEvent` to `Event::Connect`. The destination is read as IPv6 or IPv4 according to `is_ipv6`.
+/// `boot_epoch_offset_ns` and `container` as in [`file_open`].
 #[must_use]
 pub fn connect(
     event: &wire::ConnectEvent,
@@ -533,6 +553,8 @@ pub fn connect(
     })
 }
 
+/// Maps a `wire::SocketBindEvent` to `Event::SocketBind`. The local address is read as IPv6 or IPv4 according to `is_ipv6`.
+/// `boot_epoch_offset_ns` and `container` as in [`file_open`].
 #[must_use]
 pub fn socket_bind(
     event: &wire::SocketBindEvent,
@@ -551,6 +573,8 @@ pub fn socket_bind(
     })
 }
 
+/// Maps a `wire::UdpSendEvent` to `Event::UdpSend`. `size` is the datagram length; the destination follows `is_ipv6`.
+/// `boot_epoch_offset_ns` and `container` as in [`file_open`].
 #[must_use]
 pub fn udp_send(
     event: &wire::UdpSendEvent,
@@ -597,6 +621,8 @@ pub fn dns_udp_query(
     }))
 }
 
+/// Maps a `wire::UdpRecvEvent` to `Event::UdpRecv`. `peer_addr`/`peer_port` are the sender's; `size` is the datagram length.
+/// `boot_epoch_offset_ns` and `container` as in [`file_open`].
 #[must_use]
 pub fn udp_recv(
     event: &wire::UdpRecvEvent,
@@ -616,6 +642,8 @@ pub fn udp_recv(
     })
 }
 
+/// Maps a `wire::SocketListenEvent` to `Event::SocketListen`. `local_addr`/`local_port` are `None` when the probe could not correlate a prior `bind` (`addr_resolved` false).
+/// `boot_epoch_offset_ns` and `container` as in [`file_open`].
 #[must_use]
 pub fn socket_listen(
     event: &wire::SocketListenEvent,
@@ -640,6 +668,8 @@ pub fn socket_listen(
     })
 }
 
+/// Maps a `wire::SocketAcceptEvent` to `Event::SocketAccept`. Carries the listening and accepted fds and the peer address; emitted only on success.
+/// `boot_epoch_offset_ns` and `container` as in [`file_open`].
 #[must_use]
 pub fn socket_accept(
     event: &wire::SocketAcceptEvent,
@@ -660,6 +690,8 @@ pub fn socket_accept(
     })
 }
 
+/// Maps a `wire::SocketCreateEvent` to `Event::SocketCreate`. `domain`, `socket_type` and `protocol` are the raw `socket(2)` arguments; `fd` is the one returned.
+/// `boot_epoch_offset_ns` and `container` as in [`file_open`].
 #[must_use]
 pub fn socket_create(
     event: &wire::SocketCreateEvent,
@@ -675,6 +707,8 @@ pub fn socket_create(
     })
 }
 
+/// Maps a `wire::MountEvent` to `Event::Mount`. `source` and `fs_type` are `None` when the probe captured none
+/// (length 0). `boot_epoch_offset_ns` and `container` as in [`file_open`].
 #[must_use]
 pub fn mount(
     event: &wire::MountEvent,
@@ -703,24 +737,36 @@ pub fn mount(
     })
 }
 
-/// `target_image_path` is the caller's, not the wire event's — see this module's
-/// `WIRE_VERSION` v12 changelog for why. So is `target_unit` (#1103): the wire event carries
-/// only the pid, and the unit is what the sensor resolved from the cgroup when it put the
-/// target on the watch list.
+/// What the sensor resolved about a signal's two processes, which the wire event carries only as
+/// pids. `target_image_path` is the caller's, not the wire event's — see this module's
+/// `WIRE_VERSION` v12 changelog for why. So is `target_unit` (#1103): the unit the sensor
+/// resolved from the cgroup when it put the target on the watch list. `sender_is_watchdog` is
+/// the sensor's check of the sender against the agent's watchdog (#322).
+#[derive(Debug, Default)]
+pub struct SignalParties {
+    /// The target's executable.
+    pub target_image_path: Option<String>,
+    /// The listed security unit the target belongs to.
+    pub target_unit: Option<String>,
+    /// The sender is the agent's own watchdog.
+    pub sender_is_watchdog: bool,
+}
+
+/// A wire signal event, with what the sensor resolved about its sender and target.
 #[must_use]
 pub fn signal(
     event: &wire::SignalEvent,
     boot_epoch_offset_ns: u64,
-    target_image_path: Option<String>,
-    target_unit: Option<String>,
+    parties: SignalParties,
     container: Option<ContainerContext>,
 ) -> Event {
     Event::Signal(SignalEvent {
         meta: meta(&event.meta, boot_epoch_offset_ns, container),
         signal: event.signal & !wire::SIGNAL_SENDER_UNRELIABLE,
         target_pid: event.target_pid,
-        target_image_path,
-        target_unit,
+        target_image_path: parties.target_image_path,
+        target_unit: parties.target_unit,
+        sender_is_watchdog: parties.sender_is_watchdog,
         sender_unreliable: event.signal & wire::SIGNAL_SENDER_UNRELIABLE != 0,
         signals_lost: 0,
     })
@@ -748,6 +794,7 @@ pub fn signals_lost(lost: u64, agent_pid: u32, timestamp_ns: u64) -> Event {
         target_pid: 0,
         target_image_path: None,
         target_unit: None,
+        sender_is_watchdog: false,
         sender_unreliable: false,
         signals_lost: lost,
     })
@@ -784,6 +831,8 @@ pub fn kernel_module(
     })
 }
 
+/// Maps a `wire::BpfEvent` to `Event::BpfOperation`; `cmd` is the raw `bpf(2)` command
+/// (map create, program load or attach). `boot_epoch_offset_ns` and `container` as in [`file_open`].
 #[must_use]
 pub fn bpf_operation(
     event: &wire::BpfEvent,
@@ -796,6 +845,8 @@ pub fn bpf_operation(
     })
 }
 
+/// Maps a `wire::PrctlEvent` to `Event::Prctl`. The probe only reports `PR_SET_SECUREBITS` and
+/// `PR_CAPBSET_DROP`. `boot_epoch_offset_ns` and `container` as in [`file_open`].
 #[must_use]
 pub fn prctl(
     event: &wire::PrctlEvent,
@@ -809,6 +860,8 @@ pub fn prctl(
     })
 }
 
+/// Maps a `wire::PtraceEvent` to `Event::Ptrace`. `request`, `addr` and `data` are the raw `ptrace(2)`
+/// arguments, unfiltered. `boot_epoch_offset_ns` and `container` as in [`file_open`].
 #[must_use]
 pub fn ptrace(
     event: &wire::PtraceEvent,
@@ -824,6 +877,8 @@ pub fn ptrace(
     })
 }
 
+/// Maps a `wire::ProcessVmReadEvent` to `Event::ProcessVmRead`: the target pid and the local and remote
+/// iovec counts. `boot_epoch_offset_ns` and `container` as in [`file_open`].
 #[must_use]
 pub fn process_vm_read(
     event: &wire::ProcessVmReadEvent,
@@ -839,6 +894,8 @@ pub fn process_vm_read(
     })
 }
 
+/// Maps a `wire::ProcessVmWriteEvent` to `Event::ProcessVmWrite`: the target pid and the local and remote
+/// iovec counts. `boot_epoch_offset_ns` and `container` as in [`file_open`].
 #[must_use]
 pub fn process_vm_write(
     event: &wire::ProcessVmWriteEvent,
@@ -854,6 +911,8 @@ pub fn process_vm_write(
     })
 }
 
+/// Maps a `wire::MemfdCreateEvent` to `Event::MemfdCreate`; `name` is the label passed to `memfd_create(2)`,
+/// not a path. `boot_epoch_offset_ns` and `container` as in [`file_open`].
 #[must_use]
 pub fn memfd_create(
     event: &wire::MemfdCreateEvent,
@@ -870,6 +929,8 @@ pub fn memfd_create(
     })
 }
 
+/// Maps a `wire::IdentityChangeEvent` to `Event::IdentityChange`. An unknown `kind` code is read as `SetUid`.
+/// `effective` and `saved` are set only for the `setres*` calls. `boot_epoch_offset_ns` and `container` as in [`file_open`].
 #[must_use]
 pub fn identity_change(
     event: &wire::IdentityChangeEvent,
@@ -893,6 +954,8 @@ pub fn identity_change(
     })
 }
 
+/// Maps a `wire::CapSetEvent` to `Event::CapSet`: the target pid and the effective, permitted and inheritable
+/// capability sets as bitmasks. `boot_epoch_offset_ns` and `container` as in [`file_open`].
 #[must_use]
 pub fn cap_set(
     event: &wire::CapSetEvent,
@@ -908,6 +971,8 @@ pub fn cap_set(
     })
 }
 
+/// Maps a `wire::NamespaceEvent` to `Event::Namespace`: `syscall` 0 is `setns(2)` (with its `fd`),
+/// anything else `unshare(2)` (`fd` is `None`). `boot_epoch_offset_ns` and `container` as in [`file_open`].
 #[must_use]
 pub fn namespace(
     event: &wire::NamespaceEvent,
@@ -1773,13 +1838,11 @@ mod tests {
             signal: 9,
             target_pid: 400,
         };
-        let Event::Signal(e) = signal(
-            &event,
-            0,
-            Some("/usr/local/bin/synthaea-agent".to_string()),
-            None,
-            None,
-        ) else {
+        let parties = SignalParties {
+            target_image_path: Some("/usr/local/bin/synthaea-agent".to_string()),
+            ..SignalParties::default()
+        };
+        let Event::Signal(e) = signal(&event, 0, parties, None) else {
             panic!("wrong variant")
         };
         assert_eq!(e.signal, 9);
@@ -1799,13 +1862,17 @@ mod tests {
             signal: 9 | wire::SIGNAL_SENDER_UNRELIABLE,
             target_pid: 612,
         };
-        let Event::Signal(e) = signal(&event, 0, None, Some("auditd".to_string()), None) else {
+        let parties = SignalParties {
+            target_unit: Some("auditd".to_string()),
+            ..SignalParties::default()
+        };
+        let Event::Signal(e) = signal(&event, 0, parties, None) else {
             panic!("wrong variant")
         };
         assert_eq!(e.signal, 9);
         assert!(e.sender_unreliable);
         let plain = wire::SignalEvent { signal: 9, ..event };
-        let Event::Signal(e) = signal(&plain, 0, None, None, None) else {
+        let Event::Signal(e) = signal(&plain, 0, SignalParties::default(), None) else {
             panic!("wrong variant")
         };
         assert!(!e.sender_unreliable);
@@ -1827,19 +1894,36 @@ mod tests {
             signal: 9,
             target_pid: 612,
         };
-        let Event::Signal(e) = signal(
-            &event,
-            0,
-            Some("/usr/sbin/auditd".to_string()),
-            Some("auditd".to_string()),
-            None,
-        ) else {
+        let parties = SignalParties {
+            target_image_path: Some("/usr/sbin/auditd".to_string()),
+            target_unit: Some("auditd".to_string()),
+            ..SignalParties::default()
+        };
+        let Event::Signal(e) = signal(&event, 0, parties, None) else {
             panic!("wrong variant")
         };
         assert_eq!(e.target_pid, 612);
         assert_eq!(e.target_unit.as_deref(), Some("auditd"));
         assert_eq!(e.target_image_path.as_deref(), Some("/usr/sbin/auditd"));
         assert_eq!(e.meta.comm, "pkill", "meta must stay the sender");
+    }
+
+    #[test]
+    fn a_signal_says_whether_its_sender_is_the_watchdog() {
+        let event = wire::SignalEvent {
+            meta: wire_meta(b"watchdog"),
+            signal: 9,
+            target_pid: 400,
+        };
+        let parties = SignalParties {
+            sender_is_watchdog: true,
+            ..SignalParties::default()
+        };
+        let Event::Signal(e) = signal(&event, 0, parties, None) else {
+            panic!("wrong variant")
+        };
+        assert!(e.sender_is_watchdog);
+        assert_eq!(e.target_unit, None);
     }
 
     fn wire_kernel_module(name: &[u8]) -> wire::KernelModuleEvent {

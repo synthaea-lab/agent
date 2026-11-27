@@ -27,6 +27,7 @@ use crate::xml::scan::{extract_between, opt_data};
 /// the fixture in this module's tests is faithful to that capture.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct AccountCreatedEvent {
+    /// `<EventRecordID>`: the record's id in its channel, the poller's resume cursor.
     pub record_id: u64,
     /// PID of the reporting process (`<Execution ProcessID='...'>`) — LSASS, same
     /// as [`LogonEvent`](crate::xml::LogonEvent). Not the caller's PID; that is not

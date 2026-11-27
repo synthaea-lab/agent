@@ -17,8 +17,12 @@ use crate::{
 /// what keeps a host from loading the rules of the others.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Platform {
+    /// Linux hosts: the `linux/` rule directory.
     Linux,
+    /// Windows hosts: the `windows/` rule directory.
     Windows,
+    /// macOS hosts: the `macos/` rule directory plus the shared `linux/` one (see
+    /// [`Platform::rule_dirs`]).
     MacOs,
 }
 
@@ -194,6 +198,7 @@ impl SigmaEngine {
             .collect()
     }
 
+    /// Number of rules currently loaded.
     #[must_use]
     pub fn rule_count(&self) -> usize {
         self.rules.len()

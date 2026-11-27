@@ -1,0 +1,12 @@
+{
+  "type": "prctl",
+  "meta": {
+    "pid": 9010,
+    "ppid": 1,
+    "user": { "os": "unix", "uid": 0, "gid": 0 },
+    "timestamp_ns": 1756900028000000000,
+    "comm": "sandbox_init"
+  },
+  "option": 28,
+  "arg": 3
+}

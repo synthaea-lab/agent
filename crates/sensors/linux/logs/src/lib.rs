@@ -51,6 +51,7 @@ pub const MAX_LINE_BYTES: usize = 8 * 1024;
 
 /// Why a line did not match its preset.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[allow(missing_docs)] // #362
 pub enum ParseError {
     #[error("line ended before the field {0:?}")]
     MissingField(&'static str),

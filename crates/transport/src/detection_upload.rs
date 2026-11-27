@@ -30,7 +30,9 @@ const SERVER_INVALID_PAYLOAD: &str = "Invalid payload";
 /// Reopening an in-flight segment therefore reuses the exact same key.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct QueuedDetection {
+    /// Idempotency key sent with every attempt, so a retry is recognised as the same upload.
     pub key: String,
+    /// The detection to upload.
     pub detection: Detection,
 }
 

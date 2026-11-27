@@ -44,12 +44,19 @@ use onnx::{build_trees, find_graph, leaf_encoders, parse_graph, resolve_column_m
 /// Model files come from the update channel; parsing must fail closed and loudly.
 #[derive(Debug, thiserror::Error)]
 pub enum ParseError {
+    /// The file ends in the middle of a protobuf field.
     #[error("model file truncated")]
     Truncated,
+    /// The bytes are not valid protobuf, or a field the parser needs is invalid; the payload
+    /// names what was wrong.
     #[error("malformed protobuf: {0}")]
     Malformed(&'static str),
+    /// Valid ONNX, but not a tree-ensemble shape this parser attributes (for example
+    /// `nodes_missing_value_tracks_true` set); the payload names the unsupported feature.
     #[error("unsupported model shape: {0}")]
     Unsupported(&'static str),
+    /// The tree arrays contradict each other (bad child ids, missing root, length mismatch);
+    /// the payload names the check that failed.
     #[error("inconsistent tree structure: {0}")]
     Inconsistent(&'static str),
 }
@@ -151,6 +158,8 @@ impl Forest {
         self.n_features
     }
 
+    /// Number of trees in the ensemble. Never 0: construction fails when the graph has no
+    /// `TreeEnsembleRegressor` node.
     #[must_use]
     pub fn n_trees(&self) -> usize {
         self.trees.len()

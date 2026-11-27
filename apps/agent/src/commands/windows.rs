@@ -494,7 +494,6 @@ pub(crate) fn cmd_run(opts: super::RunOptions) -> anyhow::Result<()> {
             crate::host_counters::AgentHostCounters::new(
                 Arc::clone(&pipeline.sink),
                 crate::host_counters::WatchdogReport::from_env(),
-                None,
             )
             .with_etw_shedding(shedding.clone()),
         ),

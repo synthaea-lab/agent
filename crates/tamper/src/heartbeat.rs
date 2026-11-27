@@ -76,6 +76,7 @@ impl SensorHeartbeat {
         self.counter.fetch_add(n, Ordering::Relaxed);
     }
 
+    /// The stable sensor name given at construction, used to identify it in a `SilenceVerdict`.
     #[must_use]
     pub fn name(&self) -> &'static str {
         self.name
@@ -144,6 +145,7 @@ pub struct SilenceMonitor {
 }
 
 impl SilenceMonitor {
+    /// Creates a monitor watching no heartbeats.
     #[must_use]
     pub fn new() -> Self {
         Self {

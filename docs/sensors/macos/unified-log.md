@@ -32,7 +32,7 @@ flowchart LR
 2. **Parse.** [`parse_record`](../../../crates/sensors/macos/unifiedlog/src/record.rs) extracts fields one by one from a `serde_json::Value`. Records without a message (timesync, activity transitions) and `log`'s own banner line are skipped, never ending the stream. Timestamps are parsed from `log`'s fixed `YYYY-MM-DD hh:mm:ss.ffffff+zzzz` format; any deviation fails the record rather than guessing a time.
 3. **Classify.** [`classify`](../../../crates/sensors/macos/unifiedlog/src/classify.rs) matches exact message shapes and returns `None` for everything else. Fields are optional where the category is the signal and required where a field is the signal.
 4. **Normalize.** [`normalize`](../../../crates/sensors/macos/unifiedlog/src/normalize.rs) builds the schema event; provenance (logging process, time) rides in `meta`.
-5. **Rate bound.** A timestamp deque admits at most 512 events per sliding second ([`MAX_EVENTS_PER_WINDOW`](../../../crates/sensors/macos/unifiedlog/src/stream.rs)). Legitimate traffic is a few events per minute; anything beyond is a log storm or a generator. Shed events are counted in `shed_events`.
+5. **Rate bound.** A timestamp deque admits at most 512 events per sliding second ([`MAX_EVENTS_PER_WINDOW`](../../../crates/sensors/macos/unifiedlog/src/stream.rs)). Legitimate traffic is a few events per minute; anything beyond is a log storm or a generator. Shed events are counted in `shed_events` of [`StreamCounters`](../../../crates/sensors/macos/unifiedlog/src/stream.rs), a handle the agent creates and injects. The stream warns when the shed total reaches a power of two (1, 2, 4, 8, …), and the agent logs the totals when the stream ends. A line over 1 MiB is read to its end and dropped unparsed, counted as `oversize_lines` with the same power-of-two warning (count and cap, never the line): a `log` that writes without a newline cannot grow the agent's memory without limit (#189). The total is never reset, so the warnings thin out as it grows (after about a thousand sheds, a storm of 500 logs nothing); the macOS health beacon (#34) is the real answer.
 
 ## sudo mapping
 
@@ -40,7 +40,7 @@ Same semantics as the Linux journal sensor: a root target is a privileged sessio
 
 ## TCC join
 
-tccd logs a decision as two records: `AUTHREQ_CTX` (the service, keyed by tccd's message id) and later `AUTHREQ_RESULT` (the verdict, same key). Only the pair is an event. [`TccJoiner`](../../../crates/sensors/macos/unifiedlog/src/tcc.rs) holds pending contexts in a bounded map (512 entries, FIFO shedding). Message ids are namespaced by tccd's pid, so one joiner serves both the system and per-user daemons. Shed contexts and results with no context are counted (`shed_contexts`, `unmatched_results`, exposed by `tcc_counters`).
+tccd logs a decision as two records: `AUTHREQ_CTX` (the service, keyed by tccd's message id) and later `AUTHREQ_RESULT` (the verdict, same key). Only the pair is an event. [`TccJoiner`](../../../crates/sensors/macos/unifiedlog/src/tcc.rs) holds pending contexts in a bounded map (512 entries, FIFO shedding). Message ids are namespaced by tccd's pid, so one joiner serves both the system and per-user daemons. Shed contexts and results with no context are counted (`shed_contexts`, `unmatched_results`, added to the same `StreamCounters` as `tcc_shed_contexts` and `tcc_unmatched_results`, with the same power-of-two warning).
 
 ## Gatekeeper
 

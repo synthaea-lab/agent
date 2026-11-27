@@ -8,7 +8,9 @@ use std::{collections::HashSet, path::PathBuf};
 
 use thiserror::Error;
 
+/// Rejected probe configuration. Returned by the budget setters on `UprobesConfig` when a rate is 0.
 #[derive(Debug, Error)]
+#[allow(missing_docs)] // #362
 pub enum ConfigError {
     #[error("invalid budget value: {0}")]
     InvalidBudget(String),

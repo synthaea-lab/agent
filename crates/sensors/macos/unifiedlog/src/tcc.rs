@@ -25,13 +25,14 @@ pub struct TccJoiner {
     pending: HashMap<String, String>,
     order: VecDeque<String>,
     /// Contexts shed by the cap before their result arrived.
-    pub shed_contexts: u64,
+    pub(crate) shed_contexts: u64,
     /// Results with no pending context (context filtered/predates the tail —
     /// e.g. the stream attached between the two records).
-    pub unmatched_results: u64,
+    pub(crate) unmatched_results: u64,
 }
 
 impl TccJoiner {
+    /// Creates a joiner with no pending contexts and both counters at 0.
     #[must_use]
     pub fn new() -> Self {
         Self::default()

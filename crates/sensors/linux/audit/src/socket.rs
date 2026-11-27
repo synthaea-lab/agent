@@ -29,7 +29,9 @@ pub struct Received {
     pub truncated: bool,
 }
 
+/// Failure to open, read or parse the audit netlink socket.
 #[derive(Debug, thiserror::Error)]
+#[allow(missing_docs)] // #362
 pub enum AuditError {
     #[error("netlink socket error: {0}")]
     Netlink(i32), // errno
@@ -37,6 +39,8 @@ pub enum AuditError {
     Parse(String),
 }
 
+/// Owned `NETLINK_AUDIT` socket fd, closed on drop. `AsRawFd` lets the sensor wait for readiness
+/// before calling [`AuditSocket::recv`].
 pub struct AuditSocket {
     fd: RawFd,
 }
