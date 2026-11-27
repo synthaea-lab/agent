@@ -15,7 +15,8 @@ use aya_log_ebpf::{info, warn};
 use sensor_linux_wire::syscall_nr_from_i32;
 use sensor_linux_wire::{
     DISPATCH_CONNECT, DISPATCH_SENDTO, DISPATCH_WRITE, LineageEntry, SIGNAL_SENDER_UNRELIABLE,
-    TASK_COMM_LEN, encode_pending_syscall_exit, matching_pending_syscall_exit,
+    TASK_COMM_LEN, TaskIds, encode_pending_syscall_exit, forked_process,
+    matching_pending_syscall_exit,
 };
 
 use crate::{
@@ -124,7 +125,8 @@ static SYSCALL_ARG_OFFSETS: Global<[u32; 6]> = Global::new([0; 6]);
 #[unsafe(no_mangle)]
 static SYSCALL_NR_OFFSET: Global<u32> = Global::new(0);
 /// `task_struct.tgid`, from the kernel's BTF (#1103): `signal_generate` hands over the target
-/// task, and a signal to a thread of a tool names the thread, not the process.
+/// task, and a signal to a thread of a tool names the thread, not the process. The fork probe
+/// reads it too (#372): a fork by a secondary thread must record the parent process.
 #[unsafe(no_mangle)]
 static TASK_TGID_OFFSET: Global<u32> = Global::new(0);
 
@@ -295,18 +297,17 @@ static SYSCALL_EXIT_SCRATCH: PerCpuArray<SysExitRecord> = PerCpuArray::with_max_
 pub fn raw_sched_process_fork(ctx: RawTracePointContext) -> u32 {
     let parent = ctx.arg::<*const u8>(0);
     let child = ctx.arg::<*const u8>(1);
-    // SAFETY (the two pid reads and the `comm` read below): `parent` and `child` are the
-    // kernel's `task_struct` pointers from the tracepoint, read only through
-    // `bpf_probe_read_kernel` at loader-set offsets; a failed read is handled, not a fault.
-    let parent_pid =
-        unsafe { bpf_probe_read_kernel(parent.add(TASK_PID_OFFSET.load() as usize).cast::<i32>()) };
-    let child_pid =
-        unsafe { bpf_probe_read_kernel(child.add(TASK_PID_OFFSET.load() as usize).cast::<i32>()) };
-    let (Ok(parent_pid), Ok(child_pid)) = (parent_pid, child_pid) else {
+    let (Some(parent_ids), Some(child_ids)) = (task_ids(parent), task_ids(child)) else {
         warn!(&ctx, "sensor-linux-ebpf: raw fork could not read task pids");
         return 0;
     };
+    // A new thread joins a process that has its entry already (#372).
+    let Some(forked) = forked_process(parent_ids, child_ids) else {
+        return 0;
+    };
 
+    // SAFETY: `parent` is the kernel's `task_struct` pointer from the tracepoint, read only
+    // through `bpf_probe_read_kernel` at the loader-set offset; a failed read is handled.
     let comm = unsafe {
         bpf_probe_read_kernel(
             parent
@@ -316,26 +317,42 @@ pub fn raw_sched_process_fork(ctx: RawTracePointContext) -> u32 {
     }
     .unwrap_or([0; TASK_COMM_LEN]);
     let entry = LineageEntry {
-        ppid: parent_pid as u32,
+        ppid: forked.ppid,
         comm,
         execd: 0,
         generation: unsafe { aya_ebpf::helpers::bpf_ktime_get_ns() },
-        parent_generation: match unsafe { PROC_LINEAGE.get(&(parent_pid as u32)) } {
+        parent_generation: match unsafe { PROC_LINEAGE.get(&forked.ppid) } {
             Some(parent) => parent.generation,
             None => 0,
         },
     };
-    match PROC_LINEAGE.insert(&(child_pid as u32), &entry, 0) {
+    match PROC_LINEAGE.insert(&forked.pid, &entry, 0) {
         Ok(_) => info!(
             &ctx,
-            "sensor-linux-ebpf: fork child={} parent={} inserted=1", child_pid, parent_pid
+            "sensor-linux-ebpf: fork child={} parent={} inserted=1", forked.pid, forked.ppid
         ),
         Err(_) => info!(
             &ctx,
-            "sensor-linux-ebpf: fork child={} parent={} inserted=0", child_pid, parent_pid
+            "sensor-linux-ebpf: fork child={} parent={} inserted=0", forked.pid, forked.ppid
         ),
     }
     0
+}
+
+/// A task's thread id and process id, `None` when either read fails.
+#[inline(always)]
+fn task_ids(task: *const u8) -> Option<TaskIds> {
+    // SAFETY: `task` is a kernel `task_struct` pointer from a tracepoint, read only through
+    // `bpf_probe_read_kernel` at loader-set offsets; a failed read is handled, not a fault.
+    let pid =
+        unsafe { bpf_probe_read_kernel(task.add(TASK_PID_OFFSET.load() as usize).cast::<u32>()) };
+    // SAFETY: as above, at the tgid offset.
+    let tgid =
+        unsafe { bpf_probe_read_kernel(task.add(TASK_TGID_OFFSET.load() as usize).cast::<u32>()) };
+    match (pid, tgid) {
+        (Ok(pid), Ok(tgid)) => Some(TaskIds { pid, tgid }),
+        _ => None,
+    }
 }
 
 #[raw_tracepoint(tracepoint = "sched_process_exit")]
