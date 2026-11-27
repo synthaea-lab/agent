@@ -235,7 +235,7 @@ fn write_capable_volume_open_reaches_t1006_through_the_real_sink() {
 
 #[test]
 fn a_metadata_only_volume_open_does_not_enter_the_raw_volume_route() {
-    // `alerts.ndjson` (`AlertRecord` in `apps/agent/src/alerts.rs`) carries only
+    // `alerts.ndjson` (`sinks::AlertRecord`) carries only
     // timestamp/technique/message — no severity field — so this sink-level test
     // can only prove "produces no alert at all", not "produces Low rather than
     // Medium". That distinction is already proven directly against the rule:
@@ -347,7 +347,9 @@ fn sigma_sees_raw_exec_but_alert_and_event_outputs_are_redacted() {
     let alerts = alerts_in(&dir);
     assert!(alerts.contains("REDACTED"), "{alerts}");
     assert!(!alerts.contains("S3cret"), "{alerts}");
-    let recent = sink.alert_log.latest(crate::alerts::RECENT_ALERTS_CAPACITY);
+    let recent = sink
+        .alert_log
+        .latest(sinks::alert_log::RECENT_ALERTS_CAPACITY);
     assert!(
         recent
             .iter()
@@ -358,7 +360,8 @@ fn sigma_sees_raw_exec_but_alert_and_event_outputs_are_redacted() {
         recent.iter().all(|alert| !alert.message.contains("S3cret")),
         "{recent:?}"
     );
-    let terminal_alert = crate::alerts::format_alert_line(&recent[0].technique, &recent[0].message);
+    let terminal_alert =
+        sinks::alert_log::format_alert_line(&recent[0].technique, &recent[0].message);
     assert!(
         terminal_alert.contains("[ALERT]") && terminal_alert.contains("REDACTED"),
         "{terminal_alert}"
@@ -509,7 +512,7 @@ fn quarantine_fixture(
 ) -> (
     std::path::PathBuf,
     super::response::ResponseCell,
-    crate::alerts::AlertLog,
+    sinks::alert_log::AlertLog,
     std::path::PathBuf,
 ) {
     let dir = tmp(name);
@@ -525,7 +528,7 @@ fn quarantine_fixture(
         quarantine_dir: dir.join("quarantine"),
         own_pid: std::process::id(),
     };
-    let log = crate::alerts::AlertLog::open(&dir.join("alerts.ndjson"), 8).unwrap();
+    let log = sinks::alert_log::AlertLog::open(&dir.join("alerts.ndjson"), 8).unwrap();
     (
         dir,
         super::response::ResponseCell::from(hooks),
@@ -4368,4 +4371,39 @@ fn a_dns_query_under_a_listed_domain_names_the_listed_domain_not_the_subdomain()
     );
     drop(sink);
     std::fs::remove_dir_all(&dir).ok();
+}
+
+/// A real rule message, so the summary is pinned to the format rules
+/// actually produce, not to a hand-written copy of it.
+fn base64_alert_message() -> String {
+    let mut exec = schema::fixtures::exec();
+    exec.meta.pid = 4242;
+    exec.meta.comm = "bash".into();
+    exec.cmdline = "base64 -d payload.b64 --token=S3cret".into();
+    let alerts = rules::evaluate_exec(&exec);
+    let alert = alerts
+        .iter()
+        .find(|a| a.technique == "T1059.004")
+        .expect("the base64 rule fires on this command line");
+    alert.message.clone()
+}
+
+#[test]
+fn the_default_stderr_line_names_the_process_but_not_the_command_line() {
+    let message = base64_alert_message();
+    let line = sinks::alert_log::stderr_alert_line("T1059.004", &message, false);
+    assert_eq!(
+        line,
+        "[ALERT] T1059.004 — pid=4242 comm=bash (details in alerts.ndjson)"
+    );
+}
+
+#[test]
+fn alert_details_prints_the_whole_message() {
+    let message = base64_alert_message();
+    assert_eq!(
+        sinks::alert_log::stderr_alert_line("T1059.004", &message, true),
+        sinks::alert_log::format_alert_line("T1059.004", &message)
+    );
+    assert!(sinks::alert_log::stderr_alert_line("T1059.004", &message, true).contains("base64 -d"));
 }

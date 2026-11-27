@@ -6,10 +6,10 @@
 use std::sync::Mutex;
 
 use schema::Event;
+use sinks::alert_log::AlertLog;
 use workers::sync::LockExt as _;
 
 use super::{DetectionSink, entity_key, escalate_if_warranted, techniques_from};
-use crate::alerts::AlertLog;
 
 /// One engine's finding, as [`record_detection`] takes it.
 pub(super) struct Finding<'a> {

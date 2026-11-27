@@ -14,13 +14,13 @@ use std::{
 };
 
 use schema::{Event, sensor::EventSink};
-use sinks::JsonlWriter;
+use sinks::{
+    JsonlWriter,
+    alert_log::{AlertLog, RECENT_ALERTS_CAPACITY},
+};
 use workers::sync::LockExt as _;
 
-use crate::{
-    alerts::{AlertLog, RECENT_ALERTS_CAPACITY},
-    enrich_queue::EnrichQueue,
-};
+use crate::enrich_queue::EnrichQueue;
 
 mod baseline;
 mod canary;

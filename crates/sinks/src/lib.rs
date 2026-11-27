@@ -161,5 +161,7 @@ impl EventSink for JsonlEventSink {
     }
 }
 
+pub mod alert_log;
+
 #[cfg(test)]
 mod tests;

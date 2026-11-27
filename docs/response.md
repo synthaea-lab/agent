@@ -22,7 +22,7 @@ These hold for every action and explain most of the code's shape:
   result, not a separate code path, and the functions never return `Err`: a caller
   audits every outcome through one path.
 - **Every outcome is audited** into the alert log (`alerts.ndjson`) as a `RESPONSE-*`
-  line, through the sink's single alert funnel ([`AlertLog`](../apps/agent/src/alerts.rs)).
+  line, through the sink's single alert funnel ([`AlertLog`](../crates/sinks/src/alert_log.rs)).
 - **The library is platform-neutral.** `response` depends only on `schema` and
   `policy`. The OS call that acts (the `SIGKILL`, the firewall) is injected by the
   agent binary, which already holds the per-platform code in

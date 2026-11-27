@@ -13,6 +13,7 @@ workspace = true
 schema = { path = "../schema" }
 serde = { workspace = true }
 serde_json = { workspace = true }
+workers = { path = "../workers" }
 
 [dev-dependencies]
 schema = { path = "../schema", features = ["test-fixtures"] }

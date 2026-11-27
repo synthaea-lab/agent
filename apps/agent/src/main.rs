@@ -25,7 +25,6 @@
     not(any(target_os = "linux", target_os = "macos", windows)),
     allow(dead_code)
 )]
-mod alerts;
 mod commands;
 mod content;
 mod deception;
