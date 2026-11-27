@@ -10,7 +10,7 @@ use std::{
     time::Duration,
 };
 
-use schema::sensor::{EventSink as _, Sensor as _};
+use schema::sensor::Sensor as _;
 use tamper::heartbeat::{SensorHeartbeat, SilenceMonitor};
 
 use crate::{
@@ -888,36 +888,55 @@ fn spawn_journal_tail(
             // sensor silent.
             tracing::warn!(error = %e, "journal canary not started");
         }
-        let mut unit_persistence = sensor_linux_journal::UnitPersistenceTracker::new();
-        for item in journal {
-            // The heartbeat is pulsed per line by the hook above, not here: this
-            // loop only sees the allowlisted records.
-            match item {
-                Ok((record, event)) => {
-                    crate::journal_cursor::write(&cursor_path, &record.cursor);
-                    if let Some(auth) = sensor_linux_journal::to_auth_event(&record, &event) {
-                        sink.on_event(schema::Event::Auth(auth));
-                    }
-                    if let Some(persistence_event) = unit_persistence.observe(&record, &event) {
-                        sink.on_event(persistence_event);
-                    }
-                    if let Some(stop_event) =
-                        sensor_linux_journal::to_unit_stop_event(&record, &event)
-                    {
-                        sink.on_event(stop_event);
-                    }
-                }
-                Err(e) => {
-                    // A hard I/O error ends `ClassifiedJournal`'s stream (see its
-                    // doc) — nothing left to iterate, so this thread exits. No
-                    // reconnect logic yet (matches the crate doc's Status section).
-                    tracing::warn!(error = %e, "journal tail: stream ended");
-                    break;
-                }
-            }
-        }
+        forward_journal(journal, sink.as_ref(), &cursor_path);
     })?;
     Ok(())
+}
+
+/// Forwards what the journal tail yields to `sink` until the stream ends: the auth event of
+/// each record, the first start of a unit as a persistence event, the stop of a security
+/// service as a unit-stop event. Each record's cursor is persisted at `cursor_path` first, so a
+/// restart resumes after it.
+///
+/// A hard I/O error ends `ClassifiedJournal`'s stream (see its doc): nothing is left to
+/// iterate, so this returns and the tail thread exits. No reconnect logic yet (matches the
+/// crate doc's Status section).
+///
+/// The heartbeat is pulsed per line by the hook on the journal, not here: this only sees the
+/// allowlisted records.
+fn forward_journal(
+    journal: impl Iterator<
+        Item = Result<
+            (
+                sensor_linux_journal::JournalRecord,
+                sensor_linux_journal::JournalEvent,
+            ),
+            sensor_linux_journal::JournalError,
+        >,
+    >,
+    sink: &impl schema::sensor::EventSink,
+    cursor_path: &std::path::Path,
+) {
+    let mut unit_persistence = sensor_linux_journal::UnitPersistenceTracker::new();
+    for item in journal {
+        let (record, event) = match item {
+            Ok(pair) => pair,
+            Err(e) => {
+                tracing::warn!(error = %e, "journal tail: stream ended");
+                break;
+            }
+        };
+        crate::journal_cursor::write(cursor_path, &record.cursor);
+        if let Some(auth) = sensor_linux_journal::to_auth_event(&record, &event) {
+            sink.on_event(schema::Event::Auth(auth));
+        }
+        if let Some(persistence_event) = unit_persistence.observe(&record, &event) {
+            sink.on_event(persistence_event);
+        }
+        if let Some(stop_event) = sensor_linux_journal::to_unit_stop_event(&record, &event) {
+            sink.on_event(stop_event);
+        }
+    }
 }
 
 /// How often the agent writes its liveness line into journald. Four of these fit in
@@ -1438,5 +1457,53 @@ mod tests {
         // Sensor::run loop — a second reader here would double up PolicyDenial
         // events, not add coverage.
         assert!(!starts_avc_reader("linux-audit"));
+    }
+
+    /// Collects every event it is given.
+    #[derive(Default)]
+    struct CollectingSink(std::sync::Mutex<Vec<schema::Event>>);
+
+    impl schema::sensor::EventSink for CollectingSink {
+        fn on_event(&self, event: schema::Event) {
+            self.0.lock().unwrap().push(event);
+        }
+    }
+
+    const KERNEL_LINE: &str = r#"{"__CURSOR":"c1","__REALTIME_TIMESTAMP":"1","SYSLOG_IDENTIFIER":"kernel","MESSAGE":"eth0 up"}"#;
+    const SUDO_LINE: &str = r#"{"__CURSOR":"c2","__REALTIME_TIMESTAMP":"2","SYSLOG_IDENTIFIER":"sudo","_COMM":"sudo","_PID":"100","_UID":"0","_GID":"0","MESSAGE":"     lab : TTY=pts/0 ; USER=root ; COMMAND=/bin/true"}"#;
+    const UNIT_START_LINE: &str = r#"{"__CURSOR":"c3","__REALTIME_TIMESTAMP":"3","_PID":"1","JOB_TYPE":"start","JOB_RESULT":"done","UNIT":"cron.service","MESSAGE":"Started cron.service."}"#;
+
+    fn forwarded(input: &[&str]) -> (Vec<schema::Event>, Option<String>) {
+        let dir = tempfile::tempdir().unwrap();
+        let cursor_path = dir.path().join("agent.journal-cursor");
+        let journal =
+            sensor_linux_journal::ClassifiedJournal::new(std::io::Cursor::new(input.join("\n")));
+        let sink = CollectingSink::default();
+        super::forward_journal(journal, &sink, &cursor_path);
+        (
+            sink.0.into_inner().unwrap(),
+            crate::journal_cursor::read(&cursor_path),
+        )
+    }
+
+    #[test]
+    fn the_journal_tail_forwards_an_auth_event_and_a_units_first_start() {
+        let (events, _) = forwarded(&[KERNEL_LINE, SUDO_LINE, UNIT_START_LINE]);
+        assert_eq!(events.len(), 2, "{events:?}");
+        assert!(matches!(events[0], schema::Event::Auth(_)));
+        assert!(matches!(events[1], schema::Event::FileOpen(_)));
+    }
+
+    #[test]
+    fn the_journal_tail_persists_the_cursor_of_the_last_record_it_yielded() {
+        let (_, cursor) = forwarded(&[KERNEL_LINE, SUDO_LINE, UNIT_START_LINE]);
+        assert_eq!(cursor.as_deref(), Some("c3"));
+    }
+
+    #[test]
+    fn the_journal_tail_persists_no_cursor_when_nothing_was_yielded() {
+        let (events, cursor) = forwarded(&[KERNEL_LINE]);
+        assert!(events.is_empty());
+        assert_eq!(cursor, None);
     }
 }
