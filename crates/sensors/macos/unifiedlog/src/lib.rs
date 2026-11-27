@@ -11,6 +11,7 @@
 //! is no [`schema::sensor::Sensor`] implementation: the agent runs this as a
 //! supplementary tail. See `docs/sensors/macos/unified-log.md`.
 
+mod bounded_lines;
 mod classify;
 mod normalize;
 mod record;
@@ -22,18 +23,22 @@ pub use normalize::normalize;
 pub use record::{LogRecord, parse_record};
 #[cfg(target_os = "macos")]
 pub use stream::process::spawn_stream;
-pub use stream::{NormalizedLogStream, PREDICATE};
+pub use stream::{NormalizedLogStream, PREDICATE, StreamCounters, StreamTotals};
 pub use tcc::TccJoiner;
 
 /// Errors from parsing a unified-log record or driving `log stream`.
 #[derive(Debug, thiserror::Error)]
 pub enum UnifiedLogError {
+    /// The line is not JSON.
     #[error("failed to parse log line as JSON: {0}")]
     Json(#[from] serde_json::Error),
+    /// A required field is absent or has the wrong shape; the stream skips such lines.
     #[error("log record is missing expected field {0:?}")]
     MissingField(&'static str),
+    /// Reading a line from the stream failed.
     #[error("I/O error reading the log stream: {0}")]
     Io(#[from] std::io::Error),
+    /// `/usr/bin/log` could not be spawned.
     #[error("failed to spawn or read from `log stream`: {0}")]
     Spawn(std::io::Error),
 }

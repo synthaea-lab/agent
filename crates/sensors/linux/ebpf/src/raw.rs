@@ -15,7 +15,8 @@ use aya_log_ebpf::{info, warn};
 use sensor_linux_wire::syscall_nr_from_i32;
 use sensor_linux_wire::{
     DISPATCH_CONNECT, DISPATCH_SENDTO, DISPATCH_WRITE, LineageEntry, SIGNAL_SENDER_UNRELIABLE,
-    TASK_COMM_LEN, encode_pending_syscall_exit, matching_pending_syscall_exit,
+    TASK_COMM_LEN, TaskIds, encode_pending_syscall_exit, forked_process,
+    matching_pending_syscall_exit,
 };
 
 use crate::{
@@ -124,7 +125,8 @@ static SYSCALL_ARG_OFFSETS: Global<[u32; 6]> = Global::new([0; 6]);
 #[unsafe(no_mangle)]
 static SYSCALL_NR_OFFSET: Global<u32> = Global::new(0);
 /// `task_struct.tgid`, from the kernel's BTF (#1103): `signal_generate` hands over the target
-/// task, and a signal to a thread of a tool names the thread, not the process.
+/// task, and a signal to a thread of a tool names the thread, not the process. The fork probe
+/// reads it too (#372): a fork by a secondary thread must record the parent process.
 #[unsafe(no_mangle)]
 static TASK_TGID_OFFSET: Global<u32> = Global::new(0);
 
@@ -295,18 +297,17 @@ static SYSCALL_EXIT_SCRATCH: PerCpuArray<SysExitRecord> = PerCpuArray::with_max_
 pub fn raw_sched_process_fork(ctx: RawTracePointContext) -> u32 {
     let parent = ctx.arg::<*const u8>(0);
     let child = ctx.arg::<*const u8>(1);
-    // SAFETY (the two pid reads and the `comm` read below): `parent` and `child` are the
-    // kernel's `task_struct` pointers from the tracepoint, read only through
-    // `bpf_probe_read_kernel` at loader-set offsets; a failed read is handled, not a fault.
-    let parent_pid =
-        unsafe { bpf_probe_read_kernel(parent.add(TASK_PID_OFFSET.load() as usize).cast::<i32>()) };
-    let child_pid =
-        unsafe { bpf_probe_read_kernel(child.add(TASK_PID_OFFSET.load() as usize).cast::<i32>()) };
-    let (Ok(parent_pid), Ok(child_pid)) = (parent_pid, child_pid) else {
+    let (Some(parent_ids), Some(child_ids)) = (task_ids(parent), task_ids(child)) else {
         warn!(&ctx, "sensor-linux-ebpf: raw fork could not read task pids");
         return 0;
     };
+    // A new thread joins a process that has its entry already (#372).
+    let Some(forked) = forked_process(parent_ids, child_ids) else {
+        return 0;
+    };
 
+    // SAFETY: `parent` is the kernel's `task_struct` pointer from the tracepoint, read only
+    // through `bpf_probe_read_kernel` at the loader-set offset; a failed read is handled.
     let comm = unsafe {
         bpf_probe_read_kernel(
             parent
@@ -316,26 +317,42 @@ pub fn raw_sched_process_fork(ctx: RawTracePointContext) -> u32 {
     }
     .unwrap_or([0; TASK_COMM_LEN]);
     let entry = LineageEntry {
-        ppid: parent_pid as u32,
+        ppid: forked.ppid,
         comm,
         execd: 0,
         generation: unsafe { aya_ebpf::helpers::bpf_ktime_get_ns() },
-        parent_generation: match unsafe { PROC_LINEAGE.get(&(parent_pid as u32)) } {
+        parent_generation: match unsafe { PROC_LINEAGE.get(&forked.ppid) } {
             Some(parent) => parent.generation,
             None => 0,
         },
     };
-    match PROC_LINEAGE.insert(&(child_pid as u32), &entry, 0) {
+    match PROC_LINEAGE.insert(&forked.pid, &entry, 0) {
         Ok(_) => info!(
             &ctx,
-            "sensor-linux-ebpf: fork child={} parent={} inserted=1", child_pid, parent_pid
+            "sensor-linux-ebpf: fork child={} parent={} inserted=1", forked.pid, forked.ppid
         ),
         Err(_) => info!(
             &ctx,
-            "sensor-linux-ebpf: fork child={} parent={} inserted=0", child_pid, parent_pid
+            "sensor-linux-ebpf: fork child={} parent={} inserted=0", forked.pid, forked.ppid
         ),
     }
     0
+}
+
+/// A task's thread id and process id, `None` when either read fails.
+#[inline(always)]
+fn task_ids(task: *const u8) -> Option<TaskIds> {
+    // SAFETY: `task` is a kernel `task_struct` pointer from a tracepoint, read only through
+    // `bpf_probe_read_kernel` at loader-set offsets; a failed read is handled, not a fault.
+    let pid =
+        unsafe { bpf_probe_read_kernel(task.add(TASK_PID_OFFSET.load() as usize).cast::<u32>()) };
+    // SAFETY: as above, at the tgid offset.
+    let tgid =
+        unsafe { bpf_probe_read_kernel(task.add(TASK_TGID_OFFSET.load() as usize).cast::<u32>()) };
+    match (pid, tgid) {
+        (Ok(pid), Ok(tgid)) => Some(TaskIds { pid, tgid }),
+        _ => None,
+    }
 }
 
 #[raw_tracepoint(tracepoint = "sched_process_exit")]
@@ -379,8 +396,30 @@ pub fn raw_sched_process_exec(ctx: RawTracePointContext) -> u32 {
     0
 }
 
+/// The syscall-entry router with the file path filters inline, as before #351: the fallback the
+/// sensor attaches when the kernel refuses [`raw_sys_enter_tc`] (a JIT that cannot mix tail calls
+/// with BPF-to-BPF calls: i686, arm64 before 6.0, no JIT).
 #[raw_tracepoint(tracepoint = "sys_enter")]
 pub fn raw_sys_enter(ctx: RawTracePointContext) -> u32 {
+    sys_enter_dispatch::<false>(ctx)
+}
+
+/// The syscall-entry router whose file handlers tail-call their filter programs
+/// (`FILE_FILTER_PROGS`, #351), so the path scan is verified once per kind, not once per state
+/// reaching each handler here. The sensor attaches it in place of [`raw_sys_enter`] when the
+/// kernel loads it.
+#[raw_tracepoint(tracepoint = "sys_enter")]
+// Inlined into the entry the macro generates: the verifier allows a tail call only in a
+// subprogram whose BTF returns `int`, which the outlined body does not (6.1 refused it once the
+// body grew past LLVM's inlining).
+#[inline(always)]
+pub fn raw_sys_enter_tc(ctx: RawTracePointContext) -> u32 {
+    sys_enter_dispatch::<true>(ctx)
+}
+
+/// Both routers' body; `TC` picks how the file handlers filter (#351).
+#[inline(always)]
+fn sys_enter_dispatch<const TC: bool>(ctx: RawTracePointContext) -> u32 {
     let syscall_id = ctx.arg::<i64>(1);
     if syscall_id < 0 || syscall_id >= MAX_SYSCALL_ID as i64 {
         return 0;
@@ -419,21 +458,21 @@ pub fn raw_sys_enter(ctx: RawTracePointContext) -> u32 {
 
     let trace_ctx = TracePointContext::new(record.cast());
     match *action {
-        1 => sys_enter_openat(trace_ctx),
-        2 => sys_enter_open(trace_ctx),
+        1 => sys_enter_openat::<TC>(&ctx, trace_ctx),
+        2 => sys_enter_open::<TC>(&ctx, trace_ctx),
         DISPATCH_CONNECT => sys_enter_connect(trace_ctx),
         DISPATCH_WRITE => sys_enter_write(trace_ctx),
-        5 => sys_enter_unlink(trace_ctx),
-        6 => sys_enter_unlinkat(trace_ctx),
-        7 => sys_enter_rename(trace_ctx),
-        8 => sys_enter_renameat(trace_ctx),
-        9 => sys_enter_renameat2(trace_ctx),
+        5 => sys_enter_unlink::<TC>(&ctx, trace_ctx),
+        6 => sys_enter_unlinkat::<TC>(&ctx, trace_ctx),
+        7 => sys_enter_rename::<TC>(&ctx, trace_ctx),
+        8 => sys_enter_renameat::<TC>(&ctx, trace_ctx),
+        9 => sys_enter_renameat2::<TC>(&ctx, trace_ctx),
         10 => sys_enter_bind(trace_ctx),
-        11 => sys_enter_chmod(trace_ctx),
-        12 => sys_enter_fchmodat(trace_ctx),
-        13 => sys_enter_chown(trace_ctx),
-        14 => sys_enter_lchown(trace_ctx),
-        15 => sys_enter_fchownat(trace_ctx),
+        11 => sys_enter_chmod::<TC>(&ctx, trace_ctx),
+        12 => sys_enter_fchmodat::<TC>(&ctx, trace_ctx),
+        13 => sys_enter_chown::<TC>(&ctx, trace_ctx),
+        14 => sys_enter_lchown::<TC>(&ctx, trace_ctx),
+        15 => sys_enter_fchownat::<TC>(&ctx, trace_ctx),
         DISPATCH_SENDTO => sys_enter_sendto(trace_ctx),
         17 => sys_enter_listen(trace_ctx),
         18 => {
@@ -444,8 +483,8 @@ pub fn raw_sys_enter(ctx: RawTracePointContext) -> u32 {
             stash_pending_syscall_exit(pid_tgid, EXIT_ACCEPT4, syscall_id as u32);
             sys_enter_accept4(trace_ctx)
         }
-        20 => sys_enter_setxattr(trace_ctx),
-        21 => sys_enter_removexattr(trace_ctx),
+        20 => sys_enter_setxattr::<TC>(&ctx, trace_ctx),
+        21 => sys_enter_removexattr::<TC>(&ctx, trace_ctx),
         22 => sys_enter_mount(trace_ctx),
         23 => sys_enter_umount(trace_ctx),
         24 => sys_enter_kill(trace_ctx),

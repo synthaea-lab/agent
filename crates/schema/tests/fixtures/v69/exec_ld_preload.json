@@ -1,0 +1,14 @@
+{
+  "type": "exec",
+  "meta": {
+    "pid": 9001,
+    "ppid": 1,
+    "user": { "os": "unix", "uid": 0, "gid": 0 },
+    "timestamp_ns": 1756900007000000000,
+    "comm": "ls"
+  },
+  "image_path": "/usr/bin/ls",
+  "cmdline": "ls -la",
+  "argv": ["ls", "-la"],
+  "env_security": [["LD_PRELOAD", "/tmp/evil.so"]]
+}

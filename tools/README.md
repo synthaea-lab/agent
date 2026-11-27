@@ -11,6 +11,7 @@ the same on Linux, macOS and Windows; the shell scripts need a POSIX shell.
 | [`check-docs.py`](check-docs.py) | Checks links and anchors in `README.md` and `docs/`. |
 | [`attack-coverage.py`](attack-coverage.py) | Generates `docs/attack-coverage.md` from this repository and a `rules` checkout; `--check` fails when it is stale. |
 | [`gen-roadmap.py`](gen-roadmap.py) | Generates `docs/roadmap.md` from `docs/capabilities.md` and the tracking issues (needs `gh`). |
+| [`check-platform-cfg.py`](check-platform-cfg.py) | Fails on a `cfg(target_os/windows/unix/...)` outside the places CLAUDE.md allows; the core-crate exceptions are listed in the script with their reasons and may not grow. |
 | [`check-exec-bits.py`](check-exec-bits.py), [`check-ps1-ascii.py`](check-ps1-ascii.py) | Keep shell scripts executable in git and PowerShell scripts ASCII-only. |
 | [`check-pe-imports.py`](check-pe-imports.py), [`check-macho-imports.py`](check-macho-imports.py) | Fail when a Windows or macOS agent binary loads ONNX Runtime or another non-system library. Tests in [`tests/`](tests). |
 | [`check-ebpf-symbols.py`](check-ebpf-symbols.py) | Fails when the built eBPF object's program or map names differ from [`crates/sensors/linux/ebpf/symbols.txt`](../crates/sensors/linux/ebpf/symbols.txt), the names the loader looks up. `--sizes` prints per-program instruction counts to compare before and after a change. Tests in [`tests/`](tests). |

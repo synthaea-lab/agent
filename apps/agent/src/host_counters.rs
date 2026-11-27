@@ -1,7 +1,7 @@
 //! The health-beacon counters that come from outside the sink's rarity statistics, the spool and
 //! the silence monitor (#863): how many times the watchdog restarted the agent, how many
-//! tamper-class alerts there were, what the Linux parent-image cache's cap dropped, and how many
-//! alerts `alerts.ndjson` did not get.
+//! tamper-class alerts there were, what the Linux parent-image cache's cap dropped, what the Linux
+//! eBPF probes lost to full ring buffers, and how many alerts `alerts.ndjson` did not get.
 //!
 //! What counts as a tamper event, stated plainly: an alert the agent's own monitors raise through
 //! [`crate::sink::DetectionSink::emit_tamper`] (a sensor confirmed silent, a shipped binary or its
@@ -48,8 +48,22 @@ impl WatchdogReport {
     }
 }
 
-/// Reads the parent-image cache totals as `(live, dead)`. Linux only: other platforms pass none.
-pub(crate) type EvictionReader = Box<dyn Fn() -> (u64, u64) + Send + Sync>;
+/// The Linux eBPF sensor's own loss totals, cumulative since it started.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct EbpfSensorTotals {
+    /// Parent-image cache entries the cap dropped while their process was alive (#863).
+    pub(crate) parent_image_evicted_live: u64,
+    /// Entries the cap dropped whose process had already exited.
+    pub(crate) parent_image_evicted_dead: u64,
+    /// Events lost to full ring buffers, every ring (#335).
+    pub(crate) ring_dropped: u64,
+    /// The part of it lost from the exec ring.
+    pub(crate) exec_ring_dropped: u64,
+}
+
+/// Reads the [`EbpfSensorTotals`]. Linux eBPF only: the audit fallback and other platforms give
+/// none, and their totals read zero.
+pub(crate) type EbpfSensorTotalsReader = Box<dyn Fn() -> EbpfSensorTotals + Send + Sync>;
 
 /// What the Windows ETW sensor's caches and queues shed (#178). Zero where there is no such
 /// sensor.
@@ -65,26 +79,32 @@ pub(crate) struct EtwShedCounts {
 pub(crate) type EtwShedReader = Box<dyn Fn() -> EtwShedCounts + Send + Sync>;
 
 /// The agent's [`HostCountersSource`]: the sink's tamper count, what the watchdog reported, and
-/// the eviction totals when the platform has them.
+/// the sensor's loss totals when the platform has them.
 pub(crate) struct AgentHostCounters {
     sink: Arc<DetectionSink>,
     watchdog: WatchdogReport,
-    evictions: Option<EvictionReader>,
+    ebpf_totals: Option<EbpfSensorTotalsReader>,
     etw_shed: Option<EtwShedReader>,
 }
 
 impl AgentHostCounters {
-    pub(crate) fn new(
-        sink: Arc<DetectionSink>,
-        watchdog: WatchdogReport,
-        evictions: Option<EvictionReader>,
-    ) -> Self {
+    /// The counters every platform has. A platform sensor's own totals are added with
+    /// `with_ebpf_sensor_totals` (Linux) or `with_etw_shed_reader` (Windows). Plain text, not
+    /// links: each builder exists only on its platform, so a link would break the other's docs.
+    pub(crate) fn new(sink: Arc<DetectionSink>, watchdog: WatchdogReport) -> Self {
         Self {
             sink,
             watchdog,
-            evictions,
+            ebpf_totals: None,
             etw_shed: None,
         }
+    }
+
+    /// Reports what `read` says the Linux eBPF sensor lost.
+    #[cfg(any(target_os = "linux", test))]
+    pub(crate) fn with_ebpf_sensor_totals(mut self, read: EbpfSensorTotalsReader) -> Self {
+        self.ebpf_totals = Some(read);
+        self
     }
 
     /// Reports what `read` says the Windows ETW sensor shed.
@@ -108,7 +128,10 @@ impl AgentHostCounters {
 
 impl HostCountersSource for AgentHostCounters {
     fn host_counters(&self) -> HostCounters {
-        let (live, dead) = self.evictions.as_ref().map_or((0, 0), |read| read());
+        let sensor = self
+            .ebpf_totals
+            .as_ref()
+            .map_or_else(EbpfSensorTotals::default, |read| read());
         let etw_shed = self
             .etw_shed
             .as_ref()
@@ -122,14 +145,16 @@ impl HostCountersSource for AgentHostCounters {
                 .sink
                 .tamper_events()
                 .saturating_add(self.watchdog.tamper_events),
-            parent_image_evicted_live: live,
-            parent_image_evicted_dead: dead,
+            parent_image_evicted_live: sensor.parent_image_evicted_live,
+            parent_image_evicted_dead: sensor.parent_image_evicted_dead,
             ioc_indicators,
             ioc_findings,
             ioc_cooled_down,
             ioc_own_skipped,
             ioc_sibling_skipped,
             alerts_dropped: self.sink.alert_log().dropped_writes(),
+            ring_dropped: sensor.ring_dropped,
+            exec_ring_dropped: sensor.exec_ring_dropped,
             etw_pid_cache_evicted: etw_shed.pid_cache_evicted,
             etw_silo_evicted: etw_shed.silo_evicted,
             etw_marks_dropped: etw_shed.marks_dropped,
@@ -223,7 +248,6 @@ mod tests {
                 restarts: 2,
                 tamper_events: 5,
             },
-            None,
         )
         .host_counters();
 
@@ -254,7 +278,7 @@ mod tests {
             .unwrap(),
         );
         use schema::sensor::EventSink as _;
-        let counters = AgentHostCounters::new(Arc::clone(&sink), WatchdogReport::default(), None);
+        let counters = AgentHostCounters::new(Arc::clone(&sink), WatchdogReport::default());
         let ioc = |c: HostCounters| (c.ioc_indicators, c.ioc_findings, c.ioc_cooled_down);
         assert_eq!(ioc(counters.host_counters()), (2, 0, 0));
 
@@ -273,29 +297,35 @@ mod tests {
     }
 
     #[test]
-    fn the_eviction_totals_are_live_then_dead_and_zero_where_the_platform_has_none() {
-        let with = AgentHostCounters::new(
-            sink("evict"),
-            WatchdogReport::default(),
-            Some(Box::new(|| (13, 209_000))),
-        )
-        .host_counters();
+    fn the_sensor_totals_reach_their_own_fields_and_are_zero_where_the_platform_has_none() {
+        let with = AgentHostCounters::new(sink("evict"), WatchdogReport::default())
+            .with_ebpf_sensor_totals(Box::new(|| EbpfSensorTotals {
+                parent_image_evicted_live: 13,
+                parent_image_evicted_dead: 209_000,
+                ring_dropped: 51_064_213,
+                exec_ring_dropped: 7,
+            }))
+            .host_counters();
         assert_eq!(
             (
                 with.parent_image_evicted_live,
-                with.parent_image_evicted_dead
+                with.parent_image_evicted_dead,
+                with.ring_dropped,
+                with.exec_ring_dropped
             ),
-            (13, 209_000)
+            (13, 209_000, 51_064_213, 7)
         );
 
         let without =
-            AgentHostCounters::new(sink("none"), WatchdogReport::default(), None).host_counters();
+            AgentHostCounters::new(sink("none"), WatchdogReport::default()).host_counters();
         assert_eq!(
             (
                 without.parent_image_evicted_live,
-                without.parent_image_evicted_dead
+                without.parent_image_evicted_dead,
+                without.ring_dropped,
+                without.exec_ring_dropped
             ),
-            (0, 0)
+            (0, 0, 0, 0)
         );
     }
 
@@ -303,8 +333,7 @@ mod tests {
     fn an_alert_log_that_writes_every_alert_reports_none_dropped() {
         let sink = sink("alerts-dropped");
         sink.emit("T1059", "an ordinary alert");
-        let counters =
-            AgentHostCounters::new(sink, WatchdogReport::default(), None).host_counters();
+        let counters = AgentHostCounters::new(sink, WatchdogReport::default()).host_counters();
         assert_eq!(counters.alerts_dropped, 0);
     }
 
@@ -320,15 +349,14 @@ mod tests {
 
     #[test]
     fn without_an_etw_shed_reader_the_etw_counters_read_zero() {
-        let counters =
-            AgentHostCounters::new(sink("etw-shed-none"), WatchdogReport::default(), None)
-                .host_counters();
+        let counters = AgentHostCounters::new(sink("etw-shed-none"), WatchdogReport::default())
+            .host_counters();
         assert_eq!(etw_shed(&counters), (0, 0, 0, 0));
     }
 
     #[test]
     fn the_etw_shed_reader_feeds_the_counters() {
-        let counters = AgentHostCounters::new(sink("etw-shed"), WatchdogReport::default(), None)
+        let counters = AgentHostCounters::new(sink("etw-shed"), WatchdogReport::default())
             .with_etw_shed_reader(Box::new(|| EtwShedCounts {
                 pid_cache_evicted: 1,
                 silo_evicted: 2,
@@ -349,7 +377,6 @@ mod tests {
                 restarts: 0,
                 tamper_events: u64::MAX,
             },
-            None,
         )
         .host_counters();
         assert_eq!(counters.tamper_events, u64::MAX);

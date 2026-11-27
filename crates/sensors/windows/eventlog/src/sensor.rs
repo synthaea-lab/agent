@@ -1225,16 +1225,29 @@ impl Default for EventLogConfig {
 /// updates them.
 #[derive(Debug, Default)]
 pub struct EventLogCounters {
+    /// System 7045.
     pub service_installs: AtomicU64,
+    /// Security 4698.
     pub scheduled_tasks: AtomicU64,
+    /// Security 4702, counted apart from 4698 because it is much noisier.
     pub scheduled_task_updates: AtomicU64,
+    /// Security 4720.
     pub account_creations: AtomicU64,
+    /// Security 4624, 4625, 4648 and 4672 together.
     pub logon_events: AtomicU64,
+    /// `AppLocker` decisions from its four channels together: EXE and DLL (8003, 8004), MSI and
+    /// Script (8006, 8007), Packaged app-Execution (8021, 8022) and Packaged app-Deployment
+    /// (8024, 8025).
     pub applocker_blocks: AtomicU64,
+    /// `Microsoft-Windows-TaskScheduler/Operational` 106.
     pub task_scheduler_op: AtomicU64,
+    /// Defender Operational 1116, 1117, 5001, 5007, 5010 and 5012 together.
     pub defender: AtomicU64,
+    /// `Microsoft-Windows-CodeIntegrity/Operational` 3076 and 3077 together.
     pub wdac: AtomicU64,
+    /// `LocalSessionManager` 21, 23, 24 and 25 together.
     pub session_lifecycle: AtomicU64,
+    /// `RemoteConnectionManager` 1149.
     pub rdp_connections: AtomicU64,
     /// Security 1102 and System 104 together.
     pub log_clears: AtomicU64,
@@ -1294,6 +1307,7 @@ impl EventLogSensor {
         Self::with_config(EventLogConfig::default())
     }
 
+    /// A sensor polling the targets `config` enables, with fresh counters and liveness stamps.
     #[must_use]
     pub fn with_config(config: EventLogConfig) -> Self {
         Self {

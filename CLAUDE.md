@@ -70,6 +70,27 @@ New crate? Add it to the rules in `tools/check-deps.py` in the same change.
   source by descriptor at the privileged response boundary; see ADR-0021.
   Platform deps must be target-gated: `[target.'cfg(windows)'.dependencies]`, never
   unconditional.
+- `tools/check-platform-cfg.py` enforces this in CI (`lint` job). It counts source lines with a
+  platform `cfg` (`target_os`, `target_family`, `target_vendor`, `target_env`, `windows`, `unix`,
+  `macos`, `linux`; an attribute split over several lines counts once), leaving out comments
+  and the items a column-0 `#[cfg(test)]` opens (a `use`, `const`, `mod tests;`, a test
+  module, found by bracket depth). It does not look at `Cargo.toml`: that platform
+  dependencies are target-gated is not enforced by it. Not counted at all: the places above,
+  `apps/` (each binary owns its OS entry point), `tools/` and test code. Everywhere else the
+  count is zero, except the core-crate files in the script's `EXCEPTIONS` table, which hold a ceiling
+  that may go down, never up: the check fails when a count drops below its ceiling, until the
+  number is lowered in the same change. The exceptions, each with its reason:
+  - `config`: default config path per OS (`discovery.rs`), the shape of `ipc.endpoint`
+    (named pipe or socket path, `load.rs`), the Linux default template (`template.rs`).
+  - `ipc` (`stream.rs`): the one place that picks a Unix socket or a Windows named pipe, with
+    peer credentials.
+  - `yara` (`access.rs`): opens a file as the requesting user, which only Unix has.
+  - `sigma` (`engine.rs`): picks the content directory of the OS the binary is built for.
+  - `rules` (`stateless/impair_defenses.rs`): signal numbers differ between Linux and macOS,
+    and events carry the sending host's own.
+  - `enrich` (`lib.rs`, `pe_info.rs`, `sig.rs`): code-signature and PE enrichment through
+    OS APIs. A drift, not a decision: moving it to a sensor is #151.
+  A new exception needs a line in `EXCEPTIONS` with its reason and a line here.
 - `crates/sensors/linux/ebpf` (`sensor-linux-ebpf`) is a workspace member but not a default member
   (bpfel target, special toolchain, dual-licensed GPL-2.0-only OR MIT); it is built by `sensor-linux`'s
   `build.rs` on Linux, and `--workspace` commands must `--exclude sensor-linux-ebpf`.

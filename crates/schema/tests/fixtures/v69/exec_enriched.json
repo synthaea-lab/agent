@@ -1,0 +1,15 @@
+{
+  "type": "exec",
+  "meta": {
+    "pid": 6001,
+    "ppid": 700,
+    "user": { "os": "unix", "uid": 0, "gid": 0 },
+    "timestamp_ns": 1756900005000000000,
+    "comm": "payload"
+  },
+  "image_path": "/tmp/payload",
+  "cmdline": "/tmp/payload",
+  "argv": ["/tmp/payload"],
+  "sha256": "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
+  "signature": "unsigned"
+}

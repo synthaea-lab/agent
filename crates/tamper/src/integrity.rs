@@ -47,6 +47,7 @@ pub struct Manifest {
 }
 
 impl Manifest {
+    /// Creates an empty manifest. An empty manifest verifies clean, so it protects nothing.
     #[must_use]
     pub fn new() -> Self {
         Self::default()
@@ -69,11 +70,13 @@ impl Manifest {
             .insert(path.into(), expected_sha256.into().to_ascii_lowercase());
     }
 
+    /// Number of protected paths.
     #[must_use]
     pub fn len(&self) -> usize {
         self.entries.len()
     }
 
+    /// True when no path is protected.
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
@@ -102,20 +105,30 @@ impl Manifest {
 pub enum ViolationKind {
     /// The file exists and was hashed, but the hash does not match the manifest —
     /// the artifact was replaced or edited.
-    Modified { expected: String, actual: String },
+    Modified {
+        /// Hash the manifest records for the path.
+        expected: String,
+        /// Hash computed from the file on disk.
+        actual: String,
+    },
     /// The protected path is gone — an uninstall or a move as a prelude to a swap.
     Missing,
     /// The path exists but could not be read as a regular file (a FIFO/device
     /// planted at the path, a permissions change, an I/O error).
     Unreadable,
     /// The file grew past [`MAX_VERIFY_BYTES`] — suspicious in its own right.
-    Oversized { size: u64 },
+    Oversized {
+        /// Size of the file in bytes.
+        size: u64,
+    },
 }
 
 /// One protected path that failed verification.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IntegrityViolation {
+    /// The protected path that failed its check.
     pub path: PathBuf,
+    /// Which check failed.
     pub kind: ViolationKind,
 }
 

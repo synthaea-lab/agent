@@ -46,6 +46,7 @@ use crate::JournalRecord;
 /// match with a field we couldn't extract is still reported (the category itself is
 /// the useful signal), just with that field empty.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(missing_docs)] // #362
 pub enum JournalEvent {
     /// Successful SSH login (`sshd`, "Accepted ..." — password or pubkey).
     SshAccepted {

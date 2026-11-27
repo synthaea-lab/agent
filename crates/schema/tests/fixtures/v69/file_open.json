@@ -1,0 +1,12 @@
+{
+  "type": "file_open",
+  "meta": {
+    "pid": 4242,
+    "ppid": 1337,
+    "user": { "os": "unix", "uid": 0, "gid": 0 },
+    "timestamp_ns": 1756900002000000000,
+    "comm": "cron"
+  },
+  "path": "/etc/cron.d/backdoor",
+  "flags": 577
+}

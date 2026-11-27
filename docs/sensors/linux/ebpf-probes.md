@@ -178,7 +178,7 @@ Filtering happens before the ring buffer wherever volume would otherwise be unbo
 
 | Filter | Where | Effect |
 | --- | --- | --- |
-| Path prefix and write intent | [`is_filtered_path`](../../../crates/sensors/linux/wire/src/path_filter.rs), all 14 file programs | Drops `/dev/` (except `/dev/shm/`) always; drops `/sys/` except three tamper routes (a write-intent open of a cgroup limit file or of the `AppArmor` `.remove` file, any mutation under `/sys/fs/bpf/`, #356); drops `/proc/`, `/tmp/`, `/var/tmp/`, `/dev/shm/` only for read-only opens; never drops `/proc/<pid>/root/...` |
+| Path prefix and write intent | [`is_filtered_path`](../../../crates/sensors/linux/wire/src/path_filter.rs), all 14 file programs | Drops `/dev/` (except `/dev/shm/`) always; drops `/sys/` except three tamper routes (a write-intent open of a cgroup limit file or of the `AppArmor` `.remove` file, any mutation under `/sys/fs/bpf/`, #356); drops `/proc/`, `/tmp/`, `/var/tmp/`, `/dev/shm/` only for read-only opens; never drops `/proc/<pid>/root/...`, nor a path that can leave its prefix (a `.` or `..` segment, a repeated `/`, or a path below `/dev/fd/<n>` or `/dev/std*`, or one that fills the probe buffer, #350); never drops a write or mutation of `/dev/fd/<n>` or `/dev/std*` |
 | Agent's own pid | [`is_agent_own_pid`](../../../crates/sensors/linux/ebpf/src/mount_signal/signal.rs) in `open`, `write` and the DNS capture | The agent's spool writes would otherwise double write-ring pressure during bursts; userspace drops the rest |
 | Address family | `connect`, `bind`, `sendto`, `recvfrom`, `accept` | Only `AF_INET`/`AF_INET6`; a null address (`send`, `recv`) is skipped |
 | `bpf(2)` command | `sys_enter_bpf` | Only `BPF_MAP_CREATE`, `BPF_PROG_LOAD`, `BPF_PROG_ATTACH` |
@@ -190,8 +190,23 @@ The path filter is conditioned on intent because `/tmp/`, `/var/tmp/` and `/dev/
 payload staging areas: a read-only open there is noise, but a write-intent open
 (`O_WRONLY|O_RDWR|O_CREAT|O_TRUNC`) or any delete, rename, chmod, chown or xattr change is the
 payload lifecycle. `/proc/` follows the same rule because `/proc/self/root/...` and
-`/proc/self/cwd/...` reach real files; a write through any procfs alias passes. The filter takes
-two primitives `(flags: i64, is_mutation: bool)` rather than an enum, because an enum variant
+`/proc/self/cwd/...` reach real files; a write through any procfs alias passes. A prefix is a
+spelling, not a place: `/dev/../etc/cron.d/x` is `/etc/cron.d/x`, and with a directory open as
+fd 3, so is `/dev/fd/3/cron.d/x`. Before #350 such paths were dropped, writes and mutations
+included. A path the prefixes would drop now passes when its spelling can leave the prefix, or
+when it fills the probe's 255-byte buffer: the kernel walks the bytes the probe never read. A
+write-intent open or a mutation of `/dev/fd/<n>` or `/dev/std*` itself also passes, because it
+reaches the descriptor's target; reading one stays dropped. Only a segment that is exactly `.`
+or `..` counts: hidden names such as `/tmp/.X11-unix/X0` stay filtered.
+
+What the filter still cannot see:
+- a symlink under a filtered prefix. Any user can plant one under `/tmp`, `/var/tmp` or
+  `/dev/shm`, and a read through it is dropped.
+- a read through a procfs alias named by `self` or a pid (`/proc/self/root/etc/shadow`,
+  `/proc/<pid>/fd/3/x`). Telling these from `/proc/self/status` needs more verifier budget
+  than the scan leaves (#357, #351).
+
+The filter takes two primitives `(flags: i64, is_mutation: bool)` rather than an enum, because an enum variant
 without payload leaves its payload slot uninitialised and the verifier rejects reading it.
 
 ## Verifier constraints
@@ -203,7 +218,28 @@ These rules are not style; each one was a verifier rejection on a supported kern
 - **No new loops in code inlined into the file programs.** `is_filtered_path` is inlined into 14
   programs; two small slash-skipping loops pushed every one past the 1M-instruction limit on 5.15.
   Prefer a fail-open early return. Bounded loops with a constant bound are fine where needed
-  (`MAX_DNS_ANSWERS`, `SET_TIME_COMPONENTS`, `TASK_COMM_LEN` copies).
+  (`MAX_DNS_ANSWERS`, `SET_TIME_COMPONENTS`, `TASK_COMM_LEN` copies). The one loop in the filter,
+  `may_leave_its_prefix` (#350), runs only on paths the prefixes would drop, and its body has no
+  branch on the bytes. A first version with an `if` per byte took `raw_sys_enter` past the limit on
+  6.1 (`E2BIG`). The verifier walks what follows the loop once per way out of it, and a branch
+  before the loop sends a second state through all of it, so every other test is computed
+  before the loop without a branch. `raw_sys_enter`, verified instructions (`loads` where the
+  kernel reports no count; the ceiling is `verify_probes`' 700k):
+
+  | shape | 7.2 | 6.1 | 5.14 (RHEL 9.9) | 5.14 (RHEL 9.0) |
+  | --- | --- | --- | --- | --- |
+  | no scan (before #350) | 244,498 | 254,839 | 242,708 | loads |
+  | an `if` per byte, early return | | `E2BIG` | | |
+  | branchless, any segment starting with `.`, tests after the loop | 666,141 | 469,697 | 664,321 | loads |
+  | the same, plus the length and alias-write tests after the loop | 695,505 | | | |
+  | the same, those tests before the loop with a branch each | 688,939 | | | |
+  | the same, every test before the loop and branchless | 489,405 | 579,663 | 487,591 | loads |
+  | the same, exact `.` and `..` segments (current) | 520,088 | 465,995 | 518,282 | loads |
+  | eight bytes per step, one `u64` load | 379,054 | refused | 373,752 | refused |
+  | eight bytes per step, from byte loads | 496,702 | 558,655 | | loads |
+  | any of the above run before the prefix rules | `E2BIG` | `E2BIG` | | |
+
+  The `u64` load is refused where the path buffer is not 8-aligned on older verifiers.
 - **Clamp before a variable-length helper call.** User buffers (argv, TLS, DNS payloads) are read
   with one `bpf_probe_read_user_buf` into a slice whose length was clamped against the buffer size
   first, so the verifier sees an upper bound. A byte loop is never used.

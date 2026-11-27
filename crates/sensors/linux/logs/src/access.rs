@@ -20,6 +20,7 @@ use crate::{ParseError, clamp, tokenizer::Cursor};
 
 /// Which preset a source is declared as.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(missing_docs)] // #362
 pub enum AccessFormat {
     Common,
     Combined,
@@ -28,6 +29,7 @@ pub enum AccessFormat {
 /// One access-log line. Strings are as logged: the request line, referer and user
 /// agent are attacker-controlled and unredacted at this layer.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(missing_docs)] // #362
 pub struct AccessRecord {
     pub client: String,
     pub user: Option<String>,

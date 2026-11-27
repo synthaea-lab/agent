@@ -177,7 +177,7 @@ The packaged unit grants `CAP_KILL`
 The YARA file worker scans files opened with write intent (budgeted, off the capture
 thread). On a match it writes one `YARA` line per rule, fuses the match into the
 writing process's verdict, escalates if warranted, then calls
-[`quarantine_matched_payload`](../apps/agent/src/sink/tests.rs). Any matching rule triggers it;
+[`quarantine_matched_payload`](../apps/agent/src/sink/yara.rs). Any matching rule triggers it;
 the rule's severity is not consulted. A path already under the quarantine directory is
 skipped: writing a payload there is itself a file event the sensor sees, and
 re-quarantining it would overwrite its own origin record with the wrong path.
@@ -342,7 +342,7 @@ The Windows enforcement primitive (WFP) is tracked in
 | Technique | Written by | Messages |
 | --- | --- | --- |
 | `RESPONSE-KILL` | [`kill_for`](../apps/agent/src/sink/response.rs) | `killed pid N on <reason>`, `pid N would have been killed on <reason> (observe-only)`, `failed to kill pid N on <reason>: <error>`, `refused to kill pid N on <reason>: <why>` |
-| `RESPONSE-QUARANTINE` | [`quarantine_matched_payload`](../apps/agent/src/sink/tests.rs) | `quarantined <path> (<sha256>) to <dir> ...`, `... would have been quarantined ... (observe-only)`, `failed to quarantine <path> ...: <error>` |
+| `RESPONSE-QUARANTINE` | [`quarantine_matched_payload`](../apps/agent/src/sink/yara.rs) | `quarantined <path> (<sha256>) to <dir> ...`, `... would have been quarantined ... (observe-only)`, `failed to quarantine <path> ...: <error>` |
 | `RESPONSE-UNQUARANTINE` | [`cmd_quarantine_restore`](../apps/agent/src/quarantine_cmd.rs) | restored, or failed with the error |
 | `RESPONSE-ESCALATE` | [`escalate_if_warranted`](../apps/agent/src/sink/mod.rs) | `escalated <ppid>:<comm> at <severity> severity across N source(s): <techniques>` |
 

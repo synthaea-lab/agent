@@ -48,7 +48,11 @@
 //! `while`-skip-the-slashes loops (d2f48bc) were enough to push every file program
 //! past the 1M-instruction limit on 5.15 (12/26 programs loaded, #429 review). The
 //! one existing loop, the pid-digit scan in [`is_proc_pid_root`], was already there
-//! and verified; prefer a fail-open early return over another loop.
+//! and verified; prefer a fail-open early return over another loop. The single
+//! exception is [`may_leave_its_prefix`] (#350): a prefix filter that drops
+//! `/dev/../etc/x` is an evasion, and telling a path that leaves its prefix from one
+//! that stays takes reading every byte. It runs only on paths the prefixes would drop,
+//! and its cost was measured with `verify_probes` before it landed.
 
 const O_WRONLY: i64 = 0o1;
 const O_RDWR: i64 = 0o2;
@@ -185,6 +189,144 @@ fn is_bpffs_mutation(path: &[u8], is_mutation: bool) -> bool {
 /// the mutation.
 #[must_use]
 pub fn is_filtered_path(path: &[u8], flags: i64, is_mutation: bool) -> bool {
+    drops_by_prefix(path, flags, is_mutation)
+        && !may_leave_its_prefix(path, u64::from(is_mutation || is_write_intent(flags)))
+}
+
+/// Whether the kernel can resolve `path` (already known to start with a filtered prefix)
+/// somewhere outside that prefix, judged on its spelling (#350). The prefix rules read the
+/// path as the caller wrote it, and the kernel walks it:
+///
+/// - **`.` and `..` segments.** `/dev/../etc/cron.d/x` is `/etc/cron.d/x`. Reproduced live
+///   before this check (Debian 12, 6.1): an open with `O_CREAT`, an `unlink`, a `chmod` and
+///   a `rename` through `/dev/..` or `/sys/..` left no event, though each one took effect.
+///   Only a segment that is exactly `.` or `..` counts, the end of the path included as a
+///   separator (`/dev/..`): a hidden name like `/tmp/.X11-unix/X0` or an `AppImage`'s
+///   `/tmp/.mount_x/...` is read all the time, and stays filtered (agent#352 review).
+/// - **Repeated `/`.** The kernel collapses them, so `/dev//fd/3/x` must not slip past the
+///   alias test below by spelling.
+/// - **A path the probe truncated.** The probe reads at most `MAX_PATH_LEN - 1` bytes and the
+///   kernel walks the whole string, so a `..` past that point is never seen (agent#352
+///   review: repeated sysfs `subsystem` links put the first `..` at byte 265, no privilege
+///   needed). A path that fills the buffer passes whatever it holds.
+/// - **Descriptor aliases.** `/dev/fd` links to `/proc/self/fd`, and `/dev/stdin`,
+///   `/dev/stdout` and `/dev/stderr` to its first three entries. Each entry is a link to
+///   whatever that descriptor holds, a directory included. So with `/etc` open as fd 3,
+///   `/dev/fd/3/cron.d/x` is `/etc/cron.d/x`, and no `..` is needed. The alias itself
+///   (`/dev/fd/63` for a bash process substitution, `/dev/stdin`) stays filtered for a
+///   read; a path that continues below it passes for every access.
+///
+/// Write-intent opens and mutations of the alias itself pass too (`writes` is 1 for them):
+/// they reach the descriptor's target.
+///
+/// Not covered:
+/// - a symlink under a filtered prefix. Any user can plant one under `/tmp`, `/var/tmp` or
+///   `/dev/shm` and read through it; only root can under `/dev` or `/sys`. Reads through it
+///   are dropped. Writes and mutations under the tmp family pass by intent anyway.
+/// - a read through a procfs alias that `self` or a pid names: `/proc/self/root/etc/shadow`,
+///   `/proc/self/cwd/x`, `/proc/<pid>/fd/3/x`. Telling these from `/proc/self/status` takes
+///   more bytes of state per step than the verifier budget left by this scan allows
+///   (agent#357; agent#351 is the way to buy it back).
+///
+/// Telling either apart would take a lookup the probe cannot make, or a budget it does not
+/// have: that is the residual risk of a prefix filter.
+///
+/// This is the one loop the filter adds. It runs only when the prefix rules would drop the
+/// path (the `&&` in [`is_filtered_path`]), at most [`crate::MAX_PATH_LEN`] steps over
+/// bytes the probe already read, with no nested loop: what `verify_probes` has to fit on
+/// 5.14 and 5.15 (see the module comment on #429).
+///
+/// The body has no branch on the bytes, only arithmetic, and the one branch per step is the
+/// bounds check. Every handler in `raw_sys_enter` inlines this, and the verifier walks what
+/// follows the loop once per way out of it, while a branch before the loop sends a second
+/// state through all of it. So every other test is computed before the loop, without a
+/// branch, and combined after it with plain arithmetic. The shapes measured with
+/// `verify_probes` before this one was kept are in `docs/sensors/linux/ebpf-probes.md`.
+fn may_leave_its_prefix(path: &[u8], writes: u64) -> bool {
+    // Computed before the loop and without a branch: the verifier walks what follows the loop
+    // once per way out of it, and a branch before it sends a second state through all of it.
+    let truncated = at_least(path.len() as u64, crate::MAX_PATH_LEN as u64 - 1);
+    let below_fd = starts_with_8(path, *b"/dev/fd/");
+    let below_std = starts_with_8(path, *b"/dev/std");
+    let mut slashes = 0u64;
+    let mut previous_is_slash = 0u64;
+    // The segment read so far is exactly `.` / exactly `..`.
+    let mut segment_is_dot = 0u64;
+    let mut segment_is_dot_dot = 0u64;
+    let mut leaves = 0u64;
+    let mut i = 0usize;
+    while i < crate::MAX_PATH_LEN {
+        let Some(&byte) = path.get(i) else {
+            break;
+        };
+        let is_slash = equality_bit(byte, b'/');
+        let is_dot = equality_bit(byte, b'.');
+        // A `/` closes the segment before it: `.`, `..`, or empty (`//`).
+        leaves |= is_slash & (segment_is_dot | segment_is_dot_dot | previous_is_slash);
+        segment_is_dot_dot = segment_is_dot & is_dot;
+        segment_is_dot = previous_is_slash & is_dot;
+        slashes += is_slash;
+        previous_is_slash = is_slash;
+        i += 1;
+    }
+    // The end of the path closes the last segment too: `/dev/..` is `/`.
+    leaves |= segment_is_dot | segment_is_dot_dot;
+    let below_alias = continues_below_a_descriptor_alias(below_fd, below_std, slashes, writes);
+    (leaves | truncated | below_alias) != 0
+}
+
+/// `/dev/fd/<n>/...` has this many `/`: one more than the alias itself.
+const SLASHES_BELOW_FD_ALIAS: u64 = 4;
+/// `/dev/stdin/...` (and `stdout`, `stderr`) has this many `/`.
+const SLASHES_BELOW_STD_ALIAS: u64 = 3;
+
+/// 1 when a path under a descriptor alias (`below_fd`: `/dev/fd/`, `below_std`: `/dev/std`)
+/// reaches the descriptor's target, else 0, without a branch.
+///
+/// A path that continues below the alias names a file inside the directory the descriptor
+/// holds. A write-intent open or a mutation (`writes`) of the alias itself reopens what the
+/// descriptor holds: `chmod("/dev/fd/3")` changes the target's mode, and an `O_TRUNC` open
+/// rewrites it, even when fd 3 was opened read-only (agent#352 review). Only a read of the
+/// alias stays dropped: `cat /dev/stdin` and bash's `/dev/fd/63` are the noise, and a reopened
+/// read names a file whose own open was seen or was inherited.
+fn continues_below_a_descriptor_alias(
+    below_fd: u64,
+    below_std: u64,
+    slashes: u64,
+    writes: u64,
+) -> u64 {
+    (below_fd & (at_least(slashes, SLASHES_BELOW_FD_ALIAS) | writes))
+        | (below_std & (at_least(slashes, SLASHES_BELOW_STD_ALIAS) | writes))
+}
+
+/// 1 when `path` starts with the 8 bytes of `prefix`, else 0, with one bounds branch and no
+/// branch on the bytes.
+fn starts_with_8(path: &[u8], prefix: [u8; 8]) -> u64 {
+    let Some(head) = path.get(..8) else {
+        return 0;
+    };
+    let mut differs = 0u64;
+    for (byte, wanted) in head.iter().zip(prefix) {
+        differs |= u64::from(byte ^ wanted);
+    }
+    differs.wrapping_sub(1) >> 63
+}
+
+/// 1 when `count >= floor`, else 0, without a branch. `count` is at most `MAX_PATH_LEN`, far
+/// below the top bit, so `floor - 1 - count` wraps (setting the top bit) exactly when
+/// `count >= floor`.
+fn at_least(count: u64, floor: u64) -> u64 {
+    (floor - 1).wrapping_sub(count) >> 63
+}
+
+/// 1 when `byte == wanted`, else 0, without a branch: `byte ^ wanted` is 0 only on a match,
+/// and only 0 wraps below zero, which sets the top bit.
+fn equality_bit(byte: u8, wanted: u8) -> u64 {
+    (u64::from(byte ^ wanted)).wrapping_sub(1) >> 63
+}
+
+/// The prefix rules alone, on the path as the caller spelled it.
+fn drops_by_prefix(path: &[u8], flags: i64, is_mutation: bool) -> bool {
     if is_proc_pid_root(path) {
         return false;
     }
@@ -400,8 +542,14 @@ mod tests {
             b"/sys/fs/cgroup/system.slice/osqueryd.service/cgroup.freeze",
         ] {
             assert!(!is_filtered_path(path, O_WRONLY, false), "{path:?}");
-            assert!(is_filtered_path(path, 0, false), "{path:?}");
         }
+        // A read of the plain spelling stays filtered. The other spellings pass even as reads,
+        // since a `.`, `..` or empty segment can leave `/sys` (#350).
+        assert!(is_filtered_path(
+            b"/sys/fs/cgroup/system.slice/osqueryd.service/cgroup.freeze",
+            0,
+            false
+        ));
     }
 
     #[test]
@@ -480,6 +628,285 @@ mod tests {
             b"/home/user/.ssh/authorized_keys",
             0,
             true
+        ));
+    }
+
+    /// Every way a call can name a path, as `(flags, is_mutation)`: a read, a write-intent
+    /// open, and a mutation syscall.
+    const EVERY_ACCESS: [(i64, bool); 3] = [(0, false), (O_WRONLY | O_CREAT, false), (0, true)];
+
+    #[test]
+    fn a_path_that_climbs_out_of_a_filtered_prefix_is_never_filtered() {
+        // #350, reproduced live on Debian 12 (6.1): each of these took effect with no event.
+        for path in [
+            &b"/dev/../etc/cron.d/job"[..],
+            b"/sys/../etc/shadow",
+            b"/proc/../etc/shadow",
+            b"/tmp/../etc/shadow",
+            b"/var/tmp/../../etc/shadow",
+            b"/dev/shm/../../etc/shadow",
+            b"/dev/x/../../var/log/auth.log",
+            b"/sys/kernel/../../usr/bin/tool",
+        ] {
+            for (flags, is_mutation) in EVERY_ACCESS {
+                assert!(
+                    !is_filtered_path(path, flags, is_mutation),
+                    "{path:?} flags={flags:o} mutation={is_mutation}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_dot_or_empty_segment_under_a_filtered_prefix_is_never_filtered() {
+        // `.` and `//` keep the path where it is, but they defeat the alias test below by
+        // spelling, so they pass like `..`.
+        for path in [
+            &b"/dev/./fd/3/cron.d/job"[..],
+            b"/dev//fd/3/cron.d/job",
+            b"/sys/./kernel/x",
+            b"/dev/.",
+            b"/dev/..",
+            b"/tmp/x/..",
+        ] {
+            for (flags, is_mutation) in EVERY_ACCESS {
+                assert!(!is_filtered_path(path, flags, is_mutation), "{path:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_hidden_name_under_a_filtered_prefix_stays_filtered() {
+        // agent#352 review: X11's socket directory and an AppImage's mount are read all the
+        // time. Only a segment that is exactly `.` or `..` moves the path.
+        for path in [
+            &b"/tmp/.X11-unix/X0"[..],
+            b"/tmp/.mount_abc/usr/lib/libx.so",
+            b"/dev/.hidden",
+            b"/tmp/..x",
+            b"/tmp/.../x",
+            b"/tmp/x.",
+        ] {
+            assert!(is_filtered_path(path, 0, false), "{path:?}");
+        }
+    }
+
+    #[test]
+    fn a_path_below_a_descriptor_alias_is_never_filtered() {
+        // With a directory open as fd 3 (or as stdin), these name a file inside it.
+        for path in [
+            &b"/dev/fd/3/cron.d/job"[..],
+            b"/dev/fd/3/",
+            b"/dev/stdin/shadow",
+            b"/dev/stdout/x",
+            b"/dev/stderr/x",
+        ] {
+            for (flags, is_mutation) in EVERY_ACCESS {
+                assert!(!is_filtered_path(path, flags, is_mutation), "{path:?}");
+            }
+        }
+    }
+
+    const DESCRIPTOR_ALIASES: [&[u8]; 4] =
+        [b"/dev/fd/63", b"/dev/stdin", b"/dev/stdout", b"/dev/stderr"];
+
+    #[test]
+    fn a_read_of_a_descriptor_alias_itself_stays_filtered() {
+        // bash's process substitution opens `/dev/fd/63`; reading stdin through its name is
+        // common.
+        for path in DESCRIPTOR_ALIASES {
+            assert!(is_filtered_path(path, 0, false), "{path:?}");
+        }
+    }
+
+    #[test]
+    fn a_write_or_mutation_of_a_descriptor_alias_itself_is_never_filtered() {
+        // agent#352 review: `chmod("/dev/fd/N")` set the target's mode, and an `O_WRONLY|O_TRUNC`
+        // open of it rewrote the target, fd N having been opened read-only.
+        for path in DESCRIPTOR_ALIASES {
+            assert!(
+                !is_filtered_path(path, O_WRONLY | O_TRUNC, false),
+                "{path:?}"
+            );
+            assert!(!is_filtered_path(path, 0, true), "{path:?}");
+        }
+    }
+
+    #[test]
+    fn the_plain_noise_the_filter_exists_for_stays_filtered() {
+        for path in [
+            &b"/dev/null"[..],
+            b"/dev/pts/3",
+            b"/dev/urandom",
+            b"/sys/class/net/lo/uevent",
+            b"/sys/devices/system/cpu/online",
+        ] {
+            for (flags, is_mutation) in EVERY_ACCESS {
+                assert!(is_filtered_path(path, flags, is_mutation), "{path:?}");
+            }
+        }
+        for path in [
+            &b"/proc/1/status"[..],
+            b"/tmp/cache",
+            b"/var/tmp/x",
+            b"/dev/shm/x",
+        ] {
+            assert!(is_filtered_path(path, 0, false), "{path:?}");
+        }
+    }
+
+    #[test]
+    fn a_dot_inside_a_name_is_not_a_dot_segment() {
+        // Only a `.` right after a `/` counts: `libc.so.6` and `cpu0.1` keep their noise
+        // filtered.
+        assert!(is_filtered_path(b"/sys/devices/cpu0.1/uevent", 0, false));
+        assert!(is_filtered_path(b"/tmp/lib.so.6", 0, false));
+    }
+
+    /// The rule `may_leave_its_prefix` implements, with plain comparisons: what the
+    /// branchless version is checked against.
+    fn leaves_by_bytes(path: &[u8]) -> bool {
+        let slash_at = |i: usize| path.get(i) == Some(&b'/');
+        // Every segment that follows a `/`, up to the next `/` or the end; a trailing `/`
+        // closes no segment.
+        let dot_or_empty_segment = (1..path.len()).filter(|&i| slash_at(i - 1)).any(|start| {
+            let end = (start..path.len())
+                .find(|&i| slash_at(i))
+                .unwrap_or(path.len());
+            matches!(&path[start..end], b"." | b"..") || (end == start && end < path.len())
+        });
+        let slash_from = |start: usize| (start..path.len()).any(slash_at);
+        dot_or_empty_segment
+            || path.len() >= crate::MAX_PATH_LEN - 1
+            || (path.starts_with(b"/dev/fd/") && slash_from(8))
+            || (path.starts_with(b"/dev/std") && slash_from(5))
+    }
+
+    #[test]
+    fn the_branchless_scan_agrees_with_the_plain_rule_on_every_short_path() {
+        // Every string of up to 9 bytes over `/`, `.` and `a`, after each prefix that matters:
+        // every segment of up to three dots, a `//` at every offset, and every count of
+        // slashes past an alias.
+        let alphabet = *b"/.a";
+        for prefix in [
+            &b""[..],
+            b"/dev/",
+            b"/dev/fd/",
+            b"/dev/std",
+            b"/sys/kernel/",
+        ] {
+            for len in 0..=9u32 {
+                for n in 0..3usize.pow(len) {
+                    let mut path = prefix.to_vec();
+                    let mut rest = n;
+                    for _ in 0..len {
+                        path.push(alphabet[rest % 3]);
+                        rest /= 3;
+                    }
+                    assert_eq!(
+                        may_leave_its_prefix(&path, 0),
+                        leaves_by_bytes(&path),
+                        "{path:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn the_branchless_prefix_test_matches_starts_with() {
+        for path in [
+            &b""[..],
+            b"/dev/fd",
+            b"/dev/fd/",
+            b"/dev/fd/3",
+            b"/dev/fe/3",
+            b"/dev/stdin",
+            b"/dev/st",
+            b"_dev/fd/",
+        ] {
+            for prefix in [*b"/dev/fd/", *b"/dev/std"] {
+                assert_eq!(
+                    starts_with_8(path, prefix),
+                    u64::from(path.starts_with(&prefix)),
+                    "{path:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_branchless_threshold_matches_the_comparison_for_every_probe_count() {
+        for count in 0..=crate::MAX_PATH_LEN as u64 {
+            for floor in [3, 4] {
+                assert_eq!(at_least(count, floor), u64::from(count >= floor), "{count}");
+            }
+        }
+    }
+
+    #[test]
+    fn the_branchless_byte_test_matches_equality_for_every_byte() {
+        for byte in 0..=u8::MAX {
+            for wanted in *b"/." {
+                assert_eq!(
+                    equality_bit(byte, wanted),
+                    u64::from(byte == wanted),
+                    "{byte}"
+                );
+            }
+        }
+    }
+
+    /// The longest path the probe hands the filter: `bpf_probe_read_user_str_bytes` into a
+    /// `MAX_PATH_LEN` buffer keeps one byte for the terminating NUL.
+    const PROBE_PATH_MAX: usize = crate::MAX_PATH_LEN - 1;
+
+    /// `/dev/` + filler + `tail`, `len` bytes in all.
+    fn path_under_dev(len: usize, tail: &[u8]) -> std::vec::Vec<u8> {
+        let mut path = b"/dev/".to_vec();
+        path.resize(len - tail.len(), b'a');
+        path.extend_from_slice(tail);
+        path
+    }
+
+    #[test]
+    fn a_dot_dot_ending_the_longest_unfilled_path_is_seen() {
+        let path = path_under_dev(PROBE_PATH_MAX - 1, b"/..");
+        assert!(!is_filtered_path(&path, 0, true));
+    }
+
+    #[test]
+    fn a_plain_path_one_byte_short_of_the_probe_buffer_stays_filtered() {
+        let path = path_under_dev(PROBE_PATH_MAX - 1, b"");
+        assert!(is_filtered_path(&path, 0, true));
+        assert!(is_filtered_path(&path, 0, false));
+    }
+
+    #[test]
+    fn a_path_that_fills_the_probe_buffer_is_never_filtered() {
+        // agent#352 review: repeated sysfs `subsystem` links reach a `..` past byte 255, which
+        // the probe never reads, and the kernel resolves it out of `/sys`. Unprivileged; an
+        // append through that spelling landed under `/var/tmp`.
+        let mut spelled = b"/sys/bus/cpu".to_vec();
+        for _ in 0..11 {
+            spelled.extend_from_slice(b"/devices/cpu0/subsystem");
+        }
+        spelled.extend_from_slice(b"/../../../var/tmp/x");
+        let seen = &spelled[..PROBE_PATH_MAX];
+        assert!(
+            !seen.windows(2).any(|pair| pair == b"/."),
+            "the probe sees no dot segment"
+        );
+        for (flags, is_mutation) in EVERY_ACCESS {
+            assert!(
+                !is_filtered_path(seen, flags, is_mutation),
+                "flags={flags:o}"
+            );
+        }
+        assert!(!is_filtered_path(
+            &path_under_dev(PROBE_PATH_MAX, b""),
+            0,
+            false
         ));
     }
 }

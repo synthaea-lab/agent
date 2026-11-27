@@ -132,6 +132,7 @@ fn read_be64(value: &[u8]) -> Option<u64> {
 /// beacon detection; a protocol without ports, e.g. ICMP, still decodes with
 /// `src_port`/`dst_port` left `None`, not rejected).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(missing_docs)] // #362
 pub struct FlowTuple {
     pub src: IpAddr,
     pub dst: IpAddr,
@@ -226,6 +227,7 @@ impl FlowTuple {
 /// counter is therefore an environment fact, not a parse failure — see
 /// [`ConntrackFlow::counters_orig`]/[`counters_reply`](ConntrackFlow::counters_reply).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(missing_docs)] // #362
 pub struct FlowCounters {
     pub packets: u64,
     pub bytes: u64,
@@ -263,6 +265,7 @@ impl FlowCounters {
 /// (simultaneous-open detection); the ambiguity is the kernel's, not a gap in
 /// this decode.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(missing_docs)] // #362
 pub enum TcpState {
     None,
     SynSent,
@@ -317,6 +320,7 @@ fn parse_tcp_state(protoinfo_value: &[u8]) -> Option<TcpState> {
 /// One conntrack table entry, decoded to the fields this crate's beacon
 /// cross-check needs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(missing_docs)] // #362
 pub struct ConntrackFlow {
     pub orig: FlowTuple,
     pub reply: FlowTuple,

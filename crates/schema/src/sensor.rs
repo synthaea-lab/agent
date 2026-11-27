@@ -21,8 +21,11 @@ pub type SensorError = Box<dyn core::error::Error + Send + Sync + 'static>;
 /// conformance suite asserts it against observed behavior.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Capabilities {
+    /// Emits [`crate::Event::Exec`].
     pub exec_events: bool,
+    /// Emits file events (open, write, delete, rename and the like).
     pub file_events: bool,
+    /// Emits [`crate::Event::Connect`].
     pub connect_events: bool,
     /// True when this sensor can emit [`crate::Event::Auth`].
     pub auth_events: bool,
@@ -41,6 +44,8 @@ pub struct Capabilities {
 /// so new telemetry categories reach existing sinks without a breaking trait change —
 /// sinks match on the variants they understand and ignore the rest.
 pub trait EventSink: Send + Sync {
+    /// Handles one normalized event. `Event` is `#[non_exhaustive]`: match the variants the sink
+    /// understands and ignore the rest.
     fn on_event(&self, event: Event);
 }
 

@@ -1,0 +1,14 @@
+{
+  "type": "session",
+  "meta": {
+    "pid": 2312,
+    "ppid": 0,
+    "user": { "os": "unknown" },
+    "timestamp_ns": 1759600000000000000,
+    "comm": ""
+  },
+  "state": "logoff",
+  "session_id": 1,
+  "target_user": "LAB\\alice",
+  "console": false
+}

@@ -20,7 +20,9 @@ use std::{fs::File, io, path::Path};
 /// The user behind a scan request, as the sensor saw them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Requester {
+    /// Numeric user id of the requesting process; 0 (root) is never restricted.
     pub uid: u32,
+    /// Numeric primary group id of the requesting process, matched against the file's group.
     pub gid: u32,
 }
 

@@ -83,7 +83,7 @@ went to, the watchdog's, with no `target_image_path` (the rule prints `?`); the 
 it. A `tkill` or `tgkill` of a thread of the watchdog (not its pid) is not attributed, as the watchdog's thread ids are
 not in the marker. Unit-tested on the marker, the replay, the real `prctl` read and the line captured below. Run under the packaged unit on Debian 13.7 (kernel 6.12.107, systemd 257, auditd 4.0.2, 2026-11-24): the marker's ninth field was the watchdog's pid, and `/usr/bin/kill -KILL <watchdog>` was reported by the restarted agent (`the previous agent instance's watchdog was sent SIGKILL, which ended the agent too`, T1562.001 `pid=<sender> comm=kill … security process pid=<watchdog> (?)`), with no "did not stop cleanly" warning; a `kill -KILL` of the agent was still reported as before. The agent was built from the head of the change; the watchdog and `cli` are those of `e1567838`, unchanged in `apps/watchdog`, `apps/cli` and `packaging/` up to it. Not run: another distribution or kernel, an agent with eBPF probes under the watchdog.
 
-**Limits.** No rule, no attribution. The agent's own watchdog also sends SIGKILL (a heartbeat stall, a probation rollback): the restarted agent reports it like any other kill (High, T1562.001, `exe=…/watchdog`), so read the `exe` before taking a watchdog restart for tampering (the eBPF path has the same gap, #1103). Ways to SIGKILL the agent that these rules do not record, so are not
+**Limits.** No rule, no attribution. The agent's own watchdog also sends SIGKILL (a heartbeat stall, a probation rollback): the restarted agent reports it like any other kill (High, T1562.001, `exe=…/watchdog`), so read the `exe` before taking a watchdog restart for tampering. The eBPF path reads the heartbeat kill as Low, but this replay does not identify the watchdog ([signals.md](signals.md#a-signal-from-the-agents-watchdog), #322). Ways to SIGKILL the agent that these rules do not record, so are not
 attributed: `systemctl kill` (no record, as captured), `rt_sigqueueinfo`, `rt_tgsigqueueinfo` and
 `pidfd_send_signal`. A kill of a thread started less than 5 s earlier, not yet in the marker, is not
 attributed. A default Fedora ships `-a never,task`, which removes syscall auditing from every task:
@@ -168,7 +168,10 @@ is still emitted with the head that arrived and `cmdline_truncated` set. `classi
 
 `AuditSensor` runs a current-thread tokio runtime with the socket in an `AsyncFd`. Readiness is
 edge-triggered, so each wake-up drains up to `DRAIN_BUDGET` (256) records, about 36 execs at seven
-records each, and leaves readiness set if the budget ran out. The socket asks for an 8 MiB receive
+records each, and leaves readiness set if the budget ran out. The pass is `SocketDrain::drain` in
+`sensor.rs`, which takes the `recv` as a closure so tests script the socket; its three loss counts
+(cut records, unparseable records, `ENOBUFS` overruns) are `ThrottledCount`s, which hand back the total
+only on powers of two, the moments the sensor warns. The socket asks for an 8 MiB receive
 buffer and logs what the kernel granted. `SO_RCVBUFFORCE` needs `CAP_NET_ADMIN`, which the packaged
 unit grants as an ambient capability; without it, `SO_RCVBUF` is capped at `net.core.rmem_max` and the
 agent warns. The default held fewer
