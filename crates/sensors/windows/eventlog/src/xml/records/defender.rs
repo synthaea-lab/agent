@@ -11,24 +11,31 @@ use crate::xml::scan::{data_field, data_u32, extract_between};
 /// "Élevée", `Action Name` as "Supprimer"): only the numeric ids and the
 /// untranslated `Threat Name` / `Path` are read, never the `* Name` texts.
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[allow(missing_docs)] // #362
 pub struct DefenderLogEvent {
+    /// `<EventRecordID>`: the record's id in its channel, the poller's resume cursor.
     pub record_id: u64,
+    /// `<EventID>`: 1116, 1117, 5001, 5007, 5010 or 5012. 0 if the block has none.
     pub event_id: u32,
     /// `Detection ID`: the GUID a 1116 and its 1117 share.
     pub detection_id: Option<String>,
+    /// `Threat Name`, as Defender writes it (not localized).
     pub threat_name: Option<String>,
+    /// `Severity ID`, Defender's numeric severity.
     pub severity_id: Option<u32>,
+    /// `Category ID`, Defender's numeric threat category.
     pub category_id: Option<u32>,
+    /// `Action ID`, Defender's numeric action taken.
     pub action_id: Option<u32>,
     /// `Path`: the resource as Defender writes it (`file:_C:\x.exe`,
     /// `CmdLine:_...`). Not cut here.
     pub path: Option<String>,
     /// `Process Name`, without Defender's literal `Unknown` placeholder.
     pub process_name: Option<String>,
+    /// `Detection User`: the account Defender names for the detection, as written.
     pub detection_user: Option<String>,
     /// 5007 only: `<registry value path> = <data>` before and after.
     pub old_value: Option<String>,
+    /// 5007 only: the setting after the change, see [`Self::old_value`].
     pub new_value: Option<String>,
 }
 

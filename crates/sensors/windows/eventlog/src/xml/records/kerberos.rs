@@ -9,10 +9,12 @@ use crate::xml::{
 /// delegation denied) or 202 (TGT session key export denied), same nine-field
 /// template (`#364`).
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[allow(missing_docs)] // #362
 pub struct KerberosDelegationFailureRecord {
+    /// `<EventRecordID>`: the record's id in its channel, the poller's resume cursor.
     pub record_id: u64,
+    /// `<EventID>`: 201 or 202.
     pub event_id: u32,
+    /// When the event happened (`<TimeCreated SystemTime>`), in nanoseconds since the UNIX epoch.
     pub time_created_ns: Option<u64>,
     /// `TargetName`/`Server` — the server named in the local process's request.
     pub target_server: Option<String>,

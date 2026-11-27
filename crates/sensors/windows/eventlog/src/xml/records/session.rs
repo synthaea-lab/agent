@@ -19,15 +19,17 @@ use crate::xml::{
 /// in these fields. The 21/23 shapes were checked on a Windows 11 26200 host
 /// (2026-10-05): the console session logs them too, with `Address` `LOCAL`.
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[allow(missing_docs)] // #362
 pub struct TerminalSessionEvent {
+    /// `<EventRecordID>`: the record's id in its channel, the poller's resume cursor.
     pub record_id: u64,
+    /// `<EventID>`: 21, 23, 24, 25 or 1149. 0 if the block has none.
     pub event_id: u32,
     /// `<Execution ProcessID>`: the Terminal Services svchost, not an actor.
     pub pid: u32,
     /// `DOMAIN\user` as the event writes it (1149: `Param2\Param1`, or
     /// `Param1` alone when the domain is empty).
     pub user: Option<String>,
+    /// `SessionID`. Always `None` for 1149, which fires before a session exists.
     pub session_id: Option<u32>,
     /// The client as written: an IP address, `LOCAL` for the console, or
     /// whatever else Windows put there. Interpreted by `sensor.rs`.
