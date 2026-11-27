@@ -8,7 +8,7 @@ catch (#150).
 
 Three kinds of path:
 
-- **Allowed**: `crates/sensors/`, `crates/updater/`, `crates/response/src/quarantine.rs`
+- **Allowed**: `crates/sensors/`, `crates/updater/`, `crates/response/src/quarantine/`
   (CLAUDE.md), `apps/` (each binary owns its OS entry point), `tools/` (the release tool is
   an operator binary) and test code (any `tests` directory, `tests.rs`, and the items a
   `#[cfg(test)]` at column 0 opens). No limit.
@@ -46,7 +46,7 @@ from pathlib import Path
 ALLOWED_PREFIXES = (
     "crates/sensors/",
     "crates/updater/",
-    "crates/response/src/quarantine.rs",
+    "crates/response/src/quarantine/",
     "apps/",
     "tools/",
 )

@@ -61,7 +61,7 @@ New crate? Add it to the rules in `tools/check-deps.py` in the same change.
   with `-D warnings`.
 - Platform-specific code (`#[cfg(target_os = ...)]`, platform-only deps) is allowed
   **only inside `crates/sensors/*`, `crates/updater`, and the narrow filesystem
-  permission and descriptor helpers in `crates/response/src/quarantine.rs`**. Sensors and updater compile to empty
+  permission and descriptor helpers in `crates/response/src/quarantine/`**. Sensors and updater compile to empty
   stubs elsewhere. `updater`'s exception is scoped narrowly: ADR-0015 is a
   Linux-first slice (the `bootstrap`/`current`/`versions` layout and its atomic
   symlink swap are POSIX-shaped by nature); ADR-0039 (proposed) is the

@@ -16,7 +16,7 @@ These hold for every action and explain most of the code's shape:
   With a flag off, the same trigger still produces an audit line saying what *would*
   have happened, so a policy can be trialled before it acts.
 - **One outcome type per action, acted or not.** [`KillOutcome`](../crates/response/src/kill.rs),
-  [`QuarantineOutcome`](../crates/response/src/quarantine.rs) and
+  [`QuarantineOutcome`](../crates/response/src/quarantine/mod.rs) and
   [`IsolateOutcome`](../crates/response/src/isolation.rs) each cover "acted",
   "observe-only", "failed" (and for kill, "refused"). Observing is a variant of the
   result, not a separate code path, and the functions never return `Err`: a caller
@@ -189,8 +189,8 @@ no file to move.
 
 ### What `quarantine_file` does
 
-[`response::quarantine_file`](../crates/response/src/quarantine.rs) checks the policy,
-then [`try_quarantine`](../crates/response/src/quarantine.rs):
+[`response::quarantine_file`](../crates/response/src/quarantine/mod.rs) checks the policy,
+then [`try_quarantine`](../crates/response/src/quarantine/mod.rs):
 
 1. **Open once.** The source is opened a single time (`O_NOFOLLOW` on Unix, checked as
    a regular file with `fstat`). Hashing, linking or copying, and the final `chmod` all
@@ -210,7 +210,7 @@ then [`try_quarantine`](../crates/response/src/quarantine.rs):
    `/proc/self/fd` (`linkat` with `AT_SYMLINK_FOLLOW`) and the original name removed.
    When linking is not possible (another filesystem, no hard links, protected hard
    links) it copies from the descriptor instead
-   ([`can_fall_back_to_copy`](../crates/response/src/quarantine.rs)).
+   ([`can_fall_back_to_copy`](../crates/response/src/quarantine/source.rs)).
 6. **Secure the payload** to `0400` (`set_readonly` alone would keep the execute
    bits). If securing fails, the move is rolled back; if the rollback also fails, the
    payload stays in quarantine and the error says so.
@@ -220,7 +220,7 @@ busy) is noticed from a size or mtime change since the open. Refusing would let 
 writer defeat quarantine, so the agent instead copies the descriptor's bytes into a
 private snapshot, hashing as it copies, and files the snapshot under that digest, so
 the stored bytes and the digest always agree
-([`quarantine_snapshot`](../crates/response/src/quarantine.rs)). The copy is bounded to
+([`quarantine_snapshot`](../crates/response/src/quarantine/snapshot.rs)). The copy is bounded to
 the length at open. Snapshots left by a killed agent are swept at the next quarantine
 after a grace period; an in-flight one is protected by an advisory lock, or, on a
 filesystem without `flock`, only one untouched for an hour is taken.
@@ -254,16 +254,16 @@ payload stays in place.
 `agent quarantine list|restore --alerts <same path as run>`
 ([`quarantine_cmd.rs`](../apps/agent/src/quarantine_cmd.rs)):
 
-- [`list_quarantined`](../crates/response/src/quarantine.rs) prints digest and
+- [`list_quarantined`](../crates/response/src/quarantine/restore.rs) prints digest and
   original path, skipping (with a warning) a malformed sidecar so one bad entry cannot
   hide the others.
-- [`unquarantine`](../crates/response/src/quarantine.rs) refuses anything that is not a
+- [`unquarantine`](../crates/response/src/quarantine/restore.rs) refuses anything that is not a
   lowercase SHA-256 (it becomes a file name), re-hashes each slot before giving it
   back (a tampered slot is reported, the next slot is still tried), never overwrites
   an occupied original path (`AlreadyExists`), and restores the original mode (legacy
   path-only sidecars restore as `0400`). Once the file is back the restore has
   succeeded; failing to remove the stored copy afterwards is reported through
-  [`is_still_quarantined`](../crates/response/src/quarantine.rs), not as an error.
+  [`is_still_quarantined`](../crates/response/src/quarantine/restore.rs), not as an error.
 - The restore is audited as `RESPONSE-UNQUARANTINE`, on success and failure. It is not
   policy-gated: it needs only host access.
 
@@ -373,7 +373,7 @@ event capture.
   [`kill.rs`](../crates/response/src/kill.rs).
 - Quarantine: symlink swaps, writers during quarantine, duplicates, rollback, sidecar
   formats, restore refusals — unit tests in
-  [`quarantine.rs`](../crates/response/src/quarantine.rs).
+  [`quarantine/`](../crates/response/src/quarantine).
 - Isolation: plan validation, intent persistence, lock discipline, lift, reconcile —
   unit tests in [`isolation.rs`](../crates/response/src/isolation.rs).
 - Gate and wiring: `bayes_crossing_with_kill_enabled_calls_terminate_on_the_verdict_pid`,

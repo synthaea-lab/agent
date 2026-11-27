@@ -300,7 +300,7 @@ class Violations(unittest.TestCase):
         counts = {
             "crates/sensors/linux/lsm/src/lib.rs": 50,
             "crates/updater/src/lib.rs": 9,
-            "crates/response/src/quarantine.rs": 4,
+            "crates/response/src/quarantine/source.rs": 4,
             "apps/agent/src/main.rs": 14,
             "tools/release/src/keyfile.rs": 2,
             "crates/ipc/tests/e2e.rs": 6,
