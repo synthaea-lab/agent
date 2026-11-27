@@ -19,8 +19,8 @@ pub use receiver::{NormalizedNeStream, SkewCounters, SkewTotals};
 
 /// Errors from the receiver path.
 #[derive(Debug, thiserror::Error)]
-#[allow(missing_docs)] // #362
 pub enum NetworkExtensionError {
+    /// Reading from or accepting on the extension socket failed.
     #[error("I/O error on the extension socket: {0}")]
     Io(#[from] std::io::Error),
 }
