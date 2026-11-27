@@ -4,12 +4,14 @@ use schema::{
 };
 use sensor_linux_wire as wire;
 
-use super::file::{
-    AT_FDCWD, FILETIME_UNIX_EPOCH, OPEN_FLAGS_MASK, join_resolved, resolve_dirfd_path,
-    set_time_path, unix_to_filetime,
+use super::{
+    file::{
+        AT_FDCWD, FILETIME_UNIX_EPOCH, OPEN_FLAGS_MASK, join_resolved, resolve_dirfd_path,
+        set_time_path, unix_to_filetime,
+    },
+    process::exe_path_for_pid,
+    *,
 };
-use super::process::exe_path_for_pid;
-use super::*;
 
 fn wire_meta(comm: &[u8]) -> wire::EventMeta {
     let mut c = [0u8; wire::TASK_COMM_LEN];

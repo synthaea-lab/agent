@@ -1,12 +1,13 @@
 //! Socket records: connect, bind, listen, accept, and UDP in both directions.
 
-use super::meta;
-use crate::dns_udp;
 use schema::{
     ConnectEvent, ContainerContext, DnsQueryEvent, Event, SocketAcceptEvent, SocketBindEvent,
     SocketCreateEvent, SocketListenEvent, UdpRecvEvent, UdpSendEvent,
 };
 use sensor_linux_wire as wire;
+
+use super::meta;
+use crate::dns_udp;
 
 /// Maps a `wire::ConnectEvent` to `Event::Connect`. The destination is read as IPv6 or IPv4 according to `is_ipv6`.
 /// `boot_epoch_offset_ns` and `container` as in [`file_open`](super::file_open).

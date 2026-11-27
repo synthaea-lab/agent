@@ -1,12 +1,12 @@
 //! File records: opens, writes, renames, metadata changes and mounts.
 
-use super::meta;
-use super::process::exe_path_for_pid;
 use schema::{
     ContainerContext, Event, FileChmodEvent, FileChownEvent, FileDeleteEvent, FileOpenEvent,
     FileRemovexattrEvent, FileRenameEvent, FileSetxattrEvent, FileWriteEvent, MountEvent,
 };
 use sensor_linux_wire as wire;
+
+use super::{meta, process::exe_path_for_pid};
 
 /// The bits a Linux `open(2)` flag word can carry. Every `O_*` flag of the kernel's
 /// `VALID_OPEN_FLAGS` sits below `0x0080_0000` (the highest, `__O_TMPFILE`, is `0x0040_0000` in

@@ -1,11 +1,12 @@
 //! Records of a process changing what it, or the kernel, may do.
 
-use super::meta;
 use schema::{
     BpfEvent, CapSetEvent, ContainerContext, Event, IdentityChangeEvent, IdentityChangeKind,
     KernelModuleAction, KernelModuleEvent, NamespaceEvent, NamespaceSyscall, PrctlEvent,
 };
 use sensor_linux_wire as wire;
+
+use super::meta;
 
 /// `fd_path` is what `event.fd` pointed at when the event was drained (see
 /// [`KernelModuleEvent::path`]); the caller resolves it, this stays pure.

@@ -13,20 +13,20 @@ mod network;
 mod privilege;
 mod process;
 
-pub use self::file::{
-    file_chmod, file_chown, file_delete, file_open, file_removexattr, file_rename, file_set_time,
-    file_setxattr, file_write, mount,
-};
-pub use self::network::{
-    connect, dns_udp_query, socket_accept, socket_bind, socket_create, socket_listen, udp_recv,
-    udp_send,
-};
-pub use self::privilege::{
-    bpf_operation, cap_set, identity_change, kernel_module, namespace, prctl,
-};
-pub use self::process::{
-    SignalParties, exec, memfd_create, process_vm_read, process_vm_write, ptrace, signal,
-    signals_lost,
+pub use self::{
+    file::{
+        file_chmod, file_chown, file_delete, file_open, file_removexattr, file_rename,
+        file_set_time, file_setxattr, file_write, mount,
+    },
+    network::{
+        connect, dns_udp_query, socket_accept, socket_bind, socket_create, socket_listen, udp_recv,
+        udp_send,
+    },
+    privilege::{bpf_operation, cap_set, identity_change, kernel_module, namespace, prctl},
+    process::{
+        SignalParties, exec, memfd_create, process_vm_read, process_vm_write, ptrace, signal,
+        signals_lost,
+    },
 };
 
 /// Tripwire: bumping the wire ABI must come here to revisit the mappings below.

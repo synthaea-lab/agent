@@ -1,11 +1,12 @@
 //! Process records: exec, signals, and one process reaching into another.
 
-use super::{comm_opt, meta};
 use schema::{
     ContainerContext, Event, ExecEvent, MemfdCreateEvent, ProcessVmReadEvent, ProcessVmWriteEvent,
     PtraceEvent, SignalEvent,
 };
 use sensor_linux_wire as wire;
+
+use super::{comm_opt, meta};
 
 /// `image_path` is the authoritative image the kernel loaded (`ExecEvent::image`, from
 /// the `sched_process_exec` tracepoint), never `argv[0]`. `argv` is passed in by the
