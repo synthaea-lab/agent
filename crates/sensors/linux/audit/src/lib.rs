@@ -31,6 +31,8 @@ mod avc;
 mod sensor;
 #[cfg(target_os = "linux")]
 mod socket;
+#[cfg(target_os = "linux")]
+mod throttle;
 
 #[cfg(target_os = "linux")]
 pub use avc::AvcReader;

@@ -36,7 +36,7 @@ pub struct AvcReader {
     /// and logged at powers of two, same convention as `AuditSensor` (#504's
     /// lesson, #780 review): without this, a change in the AVC wire format would
     /// look exactly like "no denials happened" instead of a parser gap.
-    unparsed: u64,
+    unparsed: crate::throttle::ThrottledCount,
 }
 
 impl AvcReader {
@@ -49,7 +49,7 @@ impl AvcReader {
     pub fn open() -> Result<Self, AuditError> {
         Ok(Self {
             socket: AuditSocket::open()?,
-            unparsed: 0,
+            unparsed: crate::throttle::ThrottledCount::default(),
         })
     }
 
@@ -59,7 +59,7 @@ impl AvcReader {
     fn from_socket_for_test(socket: AuditSocket) -> Self {
         Self {
             socket,
-            unparsed: 0,
+            unparsed: crate::throttle::ThrottledCount::default(),
         }
     }
 
@@ -101,11 +101,9 @@ impl AvcReader {
                     ForwardOutcome::Forwarded => forwarded += 1,
                     ForwardOutcome::NotPolicyDenial => {}
                     ForwardOutcome::Unparseable => {
-                        self.unparsed += 1;
-                        // Powers of two only: a stream of bad records must not flood the log.
-                        if self.unparsed.is_power_of_two() {
+                        if let Some(unparsed_total) = self.unparsed.bump() {
                             tracing::warn!(
-                                unparsed_total = self.unparsed,
+                                unparsed_total,
                                 "avc-reader: unparseable record skipped"
                             );
                         }
@@ -152,7 +150,7 @@ impl AvcReader {
 /// out as its own pure function (#780 review) so `EAGAIN`/`EWOULDBLOCK` vs `ENOBUFS`
 /// vs a genuine, propagate-worthy error are each directly testable, rather than only
 /// reachable through a real socket error `cargo-mutants` found nothing exercised.
-enum RecvOutcome {
+pub(crate) enum RecvOutcome {
     /// Nothing queued right now — not an error, the caller just stops this pass.
     WouldBlock,
     /// The kernel dropped records before this socket could read them — reported
@@ -162,7 +160,7 @@ enum RecvOutcome {
     Fatal(AuditError),
 }
 
-fn classify_recv_error(error: AuditError) -> RecvOutcome {
+pub(crate) fn classify_recv_error(error: AuditError) -> RecvOutcome {
     match error {
         AuditError::Netlink(errno) if errno == libc::EAGAIN || errno == libc::EWOULDBLOCK => {
             RecvOutcome::WouldBlock
@@ -440,7 +438,7 @@ mod tests {
         let (forwarded, overran) = reader.drain(&sink, 1000).unwrap();
         assert_eq!(forwarded, 0);
         assert!(!overran);
-        assert_eq!(reader.unparsed, 1);
+        assert_eq!(reader.unparsed.total(), 1);
         assert!(sink.0.lock().unwrap().is_empty());
         // SAFETY: peer_fd is owned by this test and not used again after this.
         unsafe { libc::close(peer_fd) };

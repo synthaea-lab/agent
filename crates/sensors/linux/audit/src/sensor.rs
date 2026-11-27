@@ -6,9 +6,13 @@ use schema::sensor::{Capabilities, EventSink, Sensor, SensorError};
 use tokio::sync::Notify;
 
 use crate::{
-    AuditSocket, classify,
+    AuditSocket,
+    avc::{RecvOutcome, classify_recv_error},
+    classify,
     execve::{AssembledExec, ExecveAssembler},
     normalize, parse,
+    socket::Received,
+    throttle::ThrottledCount,
 };
 
 /// Records read per readiness wakeup before yielding back to `select!`. One
@@ -225,14 +229,7 @@ impl AuditSensor {
         let ctrl_c = tokio::signal::ctrl_c();
         tokio::pin!(ctrl_c);
 
-        let mut buf = vec![0u8; crate::socket::RECV_BUFFER_LEN];
-        // A record this parser can't read is skipped and counted, never fatal:
-        // returning the parse error here once stopped the sensor on the first
-        // record it received (#504).
-        let mut unparsed: u64 = 0;
-        let mut overruns: u64 = 0;
-        let mut execve = ExecveAssembler::default();
-        let mut truncated: u64 = 0;
+        let mut drain = SocketDrain::new();
         let mut threads = tokio::time::interval(THREAD_REFRESH);
         loop {
             tokio::select! {
@@ -241,68 +238,17 @@ impl AuditSensor {
                 _ = self.stop.notified() => break,
                 guard = async_socket.readable_mut() => {
                     let mut guard = guard.map_err(|e| format!("poll: {e}"))?;
-                    // Drain what is queued before re-arming: readiness is edge-
-                    // triggered, and clearing it after a single recv left the rest
-                    // queued until the next record arrived, so the sensor fell
-                    // further behind with every burst and lost the tail on exit
-                    // (#504). Bounded per wakeup so a flood can't starve `stop`;
-                    // readiness stays set when the budget runs out.
-                    for _ in 0..DRAIN_BUDGET {
-                        match guard.get_inner_mut().recv(&mut buf) {
-                            Ok(received) => {
-                                if received.truncated {
-                                    truncated += 1;
-                                    if truncated.is_power_of_two() {
-                                        tracing::warn!(
-                                            truncated_total = truncated,
-                                            "sensor-linux-audit: record longer than the receive buffer, parsed cut"
-                                        );
-                                    }
-                                }
-                                match parse::parse_audit_message(&buf[..received.len]) {
-                                    Ok(record) => forward(&record, &mut execve, sink.as_ref()),
-                                    Err(e) => {
-                                        unparsed += 1;
-                                        // Powers of two only: a stream of bad records must not flood the log.
-                                        if unparsed.is_power_of_two() {
-                                            tracing::warn!(
-                                                error = %e,
-                                                unparsed_total = unparsed,
-                                                "sensor-linux-audit: unparseable record skipped"
-                                            );
-                                        }
-                                    }
-                                }
-                            }
-                            Err(crate::AuditError::Netlink(errno))
-                                if errno == libc::EAGAIN || errno == libc::EWOULDBLOCK =>
-                            {
-                                guard.clear_ready();
-                                break;
-                            }
-                            // The kernel dropped records because the socket buffer
-                            // overflowed; the socket itself is still usable.
-                            Err(crate::AuditError::Netlink(libc::ENOBUFS)) => {
-                                overruns += 1;
-                                if overruns.is_power_of_two() {
-                                    tracing::warn!(
-                                        overruns_total = overruns,
-                                        "sensor-linux-audit: kernel dropped records (socket buffer overrun)"
-                                    );
-                                }
-                            }
-                            Err(e) => {
-                                return Err(format!("recv: {e}").into());
-                            }
-                        }
+                    let end = drain
+                        .drain(|buf| guard.get_inner_mut().recv(buf), sink.as_ref())
+                        .map_err(|e| format!("recv: {e}"))?;
+                    if end == DrainEnd::Empty {
+                        guard.clear_ready();
                     }
                 }
             }
         }
 
-        for exec in execve.finish() {
-            emit_exec(exec, sink.as_ref());
-        }
+        drain.finish(sink.as_ref());
         // A clean stop: nothing killed this instance, so the next one has nothing to attribute.
         if let Some(dir) = &self.state_dir {
             crate::killrec::remove_marker(dir);
@@ -352,6 +298,108 @@ impl Sensor for AuditSensor {
 
     fn stop(&mut self) {
         self.stop.notify_one();
+    }
+}
+
+/// How one pass of [`SocketDrain::drain`] ended.
+#[derive(Debug, PartialEq, Eq)]
+enum DrainEnd {
+    /// The socket has nothing queued: the caller clears its readiness and waits for the next.
+    Empty,
+    /// [`DRAIN_BUDGET`] records were read and more may be queued: readiness stays set.
+    BudgetSpent,
+}
+
+/// What the sensor loop keeps between passes over the audit socket: the receive buffer, the
+/// `EXECVE` assembler and the counts of what the loop skipped or lost.
+struct SocketDrain {
+    buf: Vec<u8>,
+    execve: ExecveAssembler,
+    /// Records longer than the receive buffer, parsed cut.
+    truncated: ThrottledCount,
+    /// A record this parser can't read is skipped and counted, never fatal: returning the parse
+    /// error here once stopped the sensor on the first record it received (#504).
+    unparsed: ThrottledCount,
+    /// Times the kernel dropped records because the socket buffer overflowed.
+    overruns: ThrottledCount,
+}
+
+impl SocketDrain {
+    fn new() -> Self {
+        Self {
+            buf: vec![0u8; crate::socket::RECV_BUFFER_LEN],
+            execve: ExecveAssembler::default(),
+            truncated: ThrottledCount::default(),
+            unparsed: ThrottledCount::default(),
+            overruns: ThrottledCount::default(),
+        }
+    }
+
+    /// Reads records with `recv` and forwards them to `sink`, up to [`DRAIN_BUDGET`] of them.
+    ///
+    /// Drains what is queued before the caller re-arms: readiness is edge-triggered, and clearing
+    /// it after a single recv left the rest queued until the next record arrived, so the sensor
+    /// fell further behind with every burst and lost the tail on exit (#504). Bounded per wakeup
+    /// so a flood can't starve `stop`; readiness stays set when the budget runs out.
+    ///
+    /// # Errors
+    ///
+    /// A socket error other than "nothing queued" and "the kernel dropped records".
+    fn drain(
+        &mut self,
+        mut recv: impl FnMut(&mut [u8]) -> Result<Received, crate::AuditError>,
+        sink: &dyn EventSink,
+    ) -> Result<DrainEnd, crate::AuditError> {
+        for _ in 0..DRAIN_BUDGET {
+            match recv(&mut self.buf) {
+                Ok(received) => self.take(received, sink),
+                Err(e) => match classify_recv_error(e) {
+                    RecvOutcome::WouldBlock => return Ok(DrainEnd::Empty),
+                    // The socket itself is still usable.
+                    RecvOutcome::Overrun => {
+                        if let Some(overruns_total) = self.overruns.bump() {
+                            tracing::warn!(
+                                overruns_total,
+                                "sensor-linux-audit: kernel dropped records (socket buffer overrun)"
+                            );
+                        }
+                    }
+                    RecvOutcome::Fatal(e) => return Err(e),
+                },
+            }
+        }
+        Ok(DrainEnd::BudgetSpent)
+    }
+
+    /// Parses the record `received` into the buffer and forwards it.
+    fn take(&mut self, received: Received, sink: &dyn EventSink) {
+        if received.truncated
+            && let Some(truncated_total) = self.truncated.bump()
+        {
+            tracing::warn!(
+                truncated_total,
+                "sensor-linux-audit: record longer than the receive buffer, parsed cut"
+            );
+        }
+        match parse::parse_audit_message(&self.buf[..received.len]) {
+            Ok(record) => forward(&record, &mut self.execve, sink),
+            Err(e) => {
+                if let Some(unparsed_total) = self.unparsed.bump() {
+                    tracing::warn!(
+                        error = %e,
+                        unparsed_total,
+                        "sensor-linux-audit: unparseable record skipped"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Emits the execs still being assembled when the loop ends.
+    fn finish(mut self, sink: &dyn EventSink) {
+        for exec in self.execve.finish() {
+            emit_exec(exec, sink);
+        }
     }
 }
 
@@ -730,5 +778,130 @@ mod tests {
         assert!(crate::killrec::read_marker(dir.path()).is_none());
         let next = replayed_with_outcome(&sensor_in(dir.path(), log));
         assert!(next.0.is_empty(), "{:?}", next.0);
+    }
+
+    /// What the scripted socket serves next: a datagram (cut or whole) or an errno.
+    enum Step {
+        Datagram { raw: Vec<u8>, truncated: bool },
+        Errno(i32),
+    }
+
+    fn datagram(record_type: u16, seq: u64, fields: &str) -> Step {
+        Step::Datagram {
+            raw: parse::build_wire_message(record_type, &format!("audit(1000.5:{seq}): {fields}")),
+            truncated: false,
+        }
+    }
+
+    /// A `recv` that serves `steps` in order and then reports nothing queued; `calls` counts it.
+    fn scripted(
+        steps: Vec<Step>,
+        calls: &std::cell::Cell<usize>,
+    ) -> impl FnMut(&mut [u8]) -> Result<Received, crate::AuditError> + '_ {
+        let mut steps = steps.into_iter();
+        move |buf| {
+            calls.set(calls.get() + 1);
+            match steps.next() {
+                Some(Step::Datagram { raw, truncated }) => {
+                    buf[..raw.len()].copy_from_slice(&raw);
+                    Ok(Received {
+                        len: raw.len(),
+                        truncated,
+                    })
+                }
+                Some(Step::Errno(errno)) => Err(crate::AuditError::Netlink(errno)),
+                None => Err(crate::AuditError::Netlink(libc::EAGAIN)),
+            }
+        }
+    }
+
+    #[test]
+    fn a_drain_forwards_what_is_queued_and_ends_empty() {
+        let sink = Collect::default();
+        let mut drain = SocketDrain::new();
+        let calls = std::cell::Cell::new(0);
+        let steps = vec![
+            datagram(1300, 10, "syscall=59"),
+            datagram(1309, 10, "argc=1 a0=\"/bin/id\""),
+            datagram(1307, 10, "cwd=\"/\""),
+        ];
+        let end = drain.drain(scripted(steps, &calls), &sink).unwrap();
+        assert_eq!(end, DrainEnd::Empty);
+        assert_eq!(calls.get(), 4, "three records, then the EAGAIN");
+        drain.finish(&sink);
+        let events = sink.0.into_inner().unwrap();
+        assert_eq!(events.len(), 1, "{events:?}");
+        assert!(matches!(events[0], schema::Event::Exec(_)));
+    }
+
+    #[test]
+    fn a_drain_stops_at_its_budget_and_leaves_the_socket_marked_readable() {
+        let sink = Collect::default();
+        let mut drain = SocketDrain::new();
+        let calls = std::cell::Cell::new(0);
+        let steps = (0..DRAIN_BUDGET * 2)
+            .map(|seq| datagram(1307, seq as u64, "cwd=\"/\""))
+            .collect();
+        let end = drain.drain(scripted(steps, &calls), &sink).unwrap();
+        assert_eq!(end, DrainEnd::BudgetSpent);
+        assert_eq!(calls.get(), DRAIN_BUDGET);
+    }
+
+    #[test]
+    fn a_drain_counts_an_unparseable_record_and_goes_on() {
+        let sink = Collect::default();
+        let mut drain = SocketDrain::new();
+        let calls = std::cell::Cell::new(0);
+        let steps = vec![
+            Step::Datagram {
+                raw: b"short".to_vec(),
+                truncated: false,
+            },
+            datagram(1300, 10, "syscall=59"),
+        ];
+        let end = drain.drain(scripted(steps, &calls), &sink).unwrap();
+        assert_eq!(end, DrainEnd::Empty);
+        assert_eq!(drain.unparsed.total(), 1);
+        assert_eq!(calls.get(), 3, "the record after the bad one was read");
+    }
+
+    #[test]
+    fn a_drain_counts_a_cut_record_and_still_parses_its_head() {
+        let sink = Collect::default();
+        let mut drain = SocketDrain::new();
+        let calls = std::cell::Cell::new(0);
+        let Step::Datagram { raw, .. } = datagram(1300, 10, "syscall=59") else {
+            unreachable!()
+        };
+        let steps = vec![Step::Datagram {
+            raw,
+            truncated: true,
+        }];
+        drain.drain(scripted(steps, &calls), &sink).unwrap();
+        assert_eq!(drain.truncated.total(), 1);
+        assert_eq!(drain.unparsed.total(), 0);
+    }
+
+    #[test]
+    fn a_drain_counts_a_kernel_overrun_and_goes_on() {
+        let sink = Collect::default();
+        let mut drain = SocketDrain::new();
+        let calls = std::cell::Cell::new(0);
+        let steps = vec![Step::Errno(libc::ENOBUFS), Step::Errno(libc::ENOBUFS)];
+        let end = drain.drain(scripted(steps, &calls), &sink).unwrap();
+        assert_eq!(end, DrainEnd::Empty);
+        assert_eq!(drain.overruns.total(), 2);
+        assert_eq!(calls.get(), 3);
+    }
+
+    #[test]
+    fn a_drain_fails_on_any_other_socket_error() {
+        let sink = Collect::default();
+        let mut drain = SocketDrain::new();
+        let calls = std::cell::Cell::new(0);
+        let steps = vec![Step::Errno(libc::EBADF), datagram(1300, 10, "syscall=59")];
+        let error = drain.drain(scripted(steps, &calls), &sink).unwrap_err();
+        assert!(matches!(error, crate::AuditError::Netlink(libc::EBADF)));
+        assert_eq!(calls.get(), 1, "nothing is read after a fatal error");
     }
 }
