@@ -8,7 +8,7 @@
 
 use std::time::Duration;
 
-use correlator::EventBus;
+use event_window::EventBus;
 use ml::{
     BehaviorScorer, FeatureBounds, ScorerError,
     features::t1::{FEATURE_COUNT, FEATURE_NAMES},

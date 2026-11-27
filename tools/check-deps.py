@@ -7,7 +7,9 @@ Rules (see CLAUDE.md):
   - Sensor crates (`sensor-*`) depend only on `schema`, plus their own platform's
     shared crates (`sensor-linux-wire`, `sensor-linux-container`).
   - Detection crates (rules, sigma, correlator, verdict, ml, yara, enrich) depend on
-    the base tier, each other, and `store` — never on a sensor crate.
+    the base tier, each other, `store` and `event-window` — never on a sensor crate.
+  - Within detection, the engines never depend on the stages that consume their output
+    (`correlator`, `verdict`): what both sides share lives in `event-window`.
   - Leaf crates (response, transport, ipc, sinks, updater, config, store, conformance)
     depend only on the base tier.
   - Only the binaries (`agent`, `watchdog`, `cli`) may depend on anything.
@@ -27,7 +29,11 @@ SCHEMA = "schema"
 BASE = {"schema", "policy"}
 DETECTION = {"rules", "sigma", "correlator", "verdict", "ml", "yara", "enrich",
              "intel", "deception"}
-LEAF = {"response", "transport", "ipc", "sinks", "updater", "config", "store",
+# The stages fed by the engines' output; an engine depending on one would close a loop.
+DETECTION_CONSUMERS = {"correlator", "verdict"}
+# Leaf crates every detection crate may build on: bounded state, and the event window.
+DETECTION_SHARED = {"store", "event-window"}
+LEAF = {"response", "transport", "ipc", "sinks", "updater", "config", "store", "event-window",
         "conformance", "tamper", "mesh", "device-control", "inventory", "redact"}
 BINARIES = {"agent", "watchdog", "cli", "release-tool"}
 # Crates shared by one platform's sensors, keyed to that platform's package prefix:
@@ -53,8 +59,10 @@ def allowed(crate: str) -> set[str] | None:
         if crate in PLATFORM_SHARED:
             return {SCHEMA}
         return {SCHEMA} | {c for c, prefix in PLATFORM_SHARED.items() if crate.startswith(prefix)}
+    if crate in DETECTION_CONSUMERS:
+        return BASE | DETECTION | DETECTION_SHARED
     if crate in DETECTION:
-        return BASE | DETECTION | {"store"}
+        return BASE | (DETECTION - DETECTION_CONSUMERS) | DETECTION_SHARED
     if crate in LEAF:
         return set(BASE)
     print(f"error: crate `{crate}` is not covered by the dependency rules — "

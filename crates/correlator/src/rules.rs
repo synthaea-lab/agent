@@ -3,9 +3,10 @@
 
 use std::collections::{HashMap, HashSet};
 
+use event_window::EventBus;
 use schema::{Event, EventMeta, ExecEvent, HttpRequestEvent, detection::Severity};
 
-use crate::{bus::EventBus, event::is_file_write};
+use crate::event::is_file_write;
 
 /// A co-occurrence finding emitted by the correlator. Same shape as `rules::Alert`, plus
 /// `trigger_event` for findings a timer emits after the fact.

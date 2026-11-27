@@ -1,8 +1,11 @@
-//! Sliding queue of recent events — the correlator's short-term memory.
+//! Sliding queue of recent events: the correlator's short-term memory, which the ML
+//! feature extractors read too.
 //!
-//! Deliberately unbounded beyond time-based eviction for now; the bounded entity
-//! store (`crates/store`, issue #15) takes over long-lived state. Per-datagram UDP
-//! volume is kept off it by `udp_flows`.
+//! Bounded by time only; `store::BoundedMap` holds the long-lived state. Per-datagram
+//! UDP volume is kept off it by the correlator's `udp_flows`.
+//!
+//! A crate of its own so that both sides depend on it, and `ml` does not depend on the
+//! correlator that consumes its scores.
 
 use std::{collections::VecDeque, time::Duration};
 
@@ -10,7 +13,8 @@ use schema::Event;
 
 /// An unstamped event cannot disprove identity. This preserves the existing
 /// Windows/macOS behavior and Linux fallback when a stamp could not be read.
-pub(crate) fn same_generation(recorded: Option<u64>, wanted: Option<u64>) -> bool {
+#[must_use]
+pub fn same_generation(recorded: Option<u64>, wanted: Option<u64>) -> bool {
     !matches!((recorded, wanted), (Some(a), Some(b)) if a != b)
 }
 
@@ -59,7 +63,7 @@ impl EventBus {
 
     /// Filters events by (ppid, comm) — the logical identity of a respawned process
     /// (repeated fork+exec by the same parent), whose pid changes on every iteration.
-    pub(crate) fn events_for_ppid_comm<'a>(
+    pub fn events_for_ppid_comm<'a>(
         &'a self,
         ppid: u32,
         parent_generation: Option<u64>,

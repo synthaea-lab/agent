@@ -21,6 +21,7 @@ described in [docs/architecture.md](../docs/architecture.md).
 | | `deception` | Per-host canary files and decoy credentials |
 | Services | `config` | `agent.toml` discovery, loading and validation |
 | | `store` | Bounded in-memory state and the durable upload spool |
+| | `event-window` | The sliding window of recent events the correlator and the ML features read |
 | | `transport` | mTLS client and store-and-forward upload to the control plane |
 | | `sinks` | Local JSON Lines outputs |
 | | `ipc` | Local control channel between the agent and `cli` |

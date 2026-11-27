@@ -17,7 +17,7 @@
 //! produced by Python (`gen_t1_golden.py`) and checked from both sides. A T1 model
 //! trained on the Python vectors only scores consistently here if they match.
 
-use correlator::EventBus;
+use event_window::EventBus;
 use schema::{Event, ExecEvent};
 
 use super::{cmdline, correlation};

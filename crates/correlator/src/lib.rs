@@ -14,7 +14,8 @@
 //! One module per responsibility:
 //! - `event` — helpers over the shared [`schema::Event`] envelope (the old
 //!   crate-local `TimedEvent` duplicate is gone);
-//! - `bus` — the sliding window ([`EventBus`]);
+//! - the sliding window ([`EventBus`]) lives in `event-window`, below this crate and `ml`, which
+//!   reads the same window for its features;
 //! - `rules` — the co-occurrence rules (one function per scenario);
 //! - `behavior` — the per-pid behavioral vector ([`BehaviorVector`]);
 //! - `bayes` — the naive Bayes filter ([`BeliefState`], calibrated LLRs);
@@ -23,7 +24,6 @@
 
 mod bayes;
 mod behavior;
-mod bus;
 mod engine;
 mod event;
 mod rules;
@@ -31,8 +31,8 @@ mod udp_flows;
 
 pub use bayes::BeliefState;
 pub use behavior::BehaviorVector;
-pub use bus::EventBus;
 pub use engine::{CorrelationEngine, KillShield, MlUpdateError};
+pub use event_window::EventBus;
 pub use rules::CorrelationAlert;
 pub use udp_flows::UdpSendShedding;
 

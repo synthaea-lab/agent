@@ -12,7 +12,7 @@
 
 use std::time::Duration;
 
-use correlator::EventBus;
+use event_window::EventBus;
 use ml::features::t1::{FEATURE_COUNT, FEATURE_NAMES, extract_features};
 use schema::Event;
 

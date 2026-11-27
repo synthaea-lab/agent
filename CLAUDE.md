@@ -43,7 +43,9 @@ and build-machine toolchain scripts live here under `packaging/toolchain/`.
 - Sensor crates (`crates/sensors/*`) depend **only** on `schema`, plus their own
   platform's shared crates (`sensor-linux-wire`, `sensor-linux-container`).
 - Detection crates (`rules`, `sigma`, `correlator`, `verdict`, `ml`, `yara`, `enrich`)
-  depend on the base tier, each other, and `store` — **never on a sensor**.
+  depend on the base tier, each other, and `store` — **never on a sensor**. The engines never
+  depend on `correlator` or `verdict`, which consume their output; what both sides share
+  (the event window) lives in `event-window`, a leaf crate.
 - Leaf crates (`response`, `transport`, `ipc`, `sinks`, `updater`, `config`, `store`,
   `conformance`) depend only on the base tier.
 - Only the binaries (`apps/agent/`, `apps/watchdog/`, `apps/cli/`, and the offline `tools/release/`) may depend on everything.

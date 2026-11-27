@@ -688,6 +688,7 @@ checksum = "7f8f80099a98041a3d1622845c271458a2d73e688351bf3cb999266764b81d48"
 name = "correlator"
 version = "0.0.1"
 dependencies = [
+ "event-window",
  "policy",
  "proptest",
  "schema",
@@ -1143,6 +1144,13 @@ checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
  "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "event-window"
+version = "0.0.1"
+dependencies = [
+ "schema",
 ]
 
 [[package]]
@@ -1863,7 +1871,7 @@ dependencies = [
 name = "ml"
 version = "0.0.1"
 dependencies = [
- "correlator",
+ "event-window",
  "ort",
  "schema",
  "serde",
