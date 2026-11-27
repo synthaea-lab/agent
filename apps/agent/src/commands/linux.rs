@@ -872,7 +872,7 @@ impl<'a, I: AvcIo> AvcWorker<'a, I> {
 /// posture as [`seeded_rule_state`]'s netlink snapshot.
 ///
 /// Cursor persistence (issue #321): the tail resumes from the last cursor this
-/// process saw (`crate::journal_cursor`, a file derived from `alerts` — same
+/// process saw (`sensor_linux_journal::cursor`, a file derived from `alerts` — same
 /// convention as `heartbeat_path_for`) when one exists, falling back to
 /// `journalctl`'s own "now" snapshot on a fresh install or a missing/corrupt
 /// cursor file — either way the honest "no prior state" case, not an error.
@@ -883,9 +883,9 @@ fn spawn_journal_tail(
     heartbeat: SensorHeartbeat,
     alerts: &std::path::Path,
 ) -> std::io::Result<()> {
-    let cursor_path = crate::journal_cursor::cursor_path_for(alerts);
+    let cursor_path = sensor_linux_journal::cursor::cursor_path_for(alerts);
     workers::spawn::spawn_named("journal-tail", move || {
-        let cursor = crate::journal_cursor::read(&cursor_path)
+        let cursor = sensor_linux_journal::cursor::read(&cursor_path)
             .or_else(|| sensor_linux_journal::current_cursor().ok());
         let mut child = match sensor_linux_journal::spawn_follow(cursor.as_deref()) {
             Ok(child) => child,
@@ -952,7 +952,7 @@ fn forward_journal(
                 break;
             }
         };
-        crate::journal_cursor::write(cursor_path, &record.cursor);
+        sensor_linux_journal::cursor::write(cursor_path, &record.cursor);
         if let Some(auth) = sensor_linux_journal::to_auth_event(&record, &event) {
             sink.on_event(schema::Event::Auth(auth));
         }
@@ -1508,7 +1508,7 @@ mod tests {
         super::forward_journal(journal, &sink, &cursor_path);
         (
             sink.0.into_inner().unwrap(),
-            crate::journal_cursor::read(&cursor_path),
+            sensor_linux_journal::cursor::read(&cursor_path),
         )
     }
 

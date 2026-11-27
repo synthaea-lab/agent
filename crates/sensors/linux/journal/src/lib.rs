@@ -60,13 +60,12 @@
 //!   (issue #92), this is a supplementary poll/tail source wired directly into
 //!   `agent::commands::linux::cmd_run` alongside the main sensor, not a
 //!   standalone `Sensor`.
-//! - No cursor persistence *in this crate* — `process::current_cursor`/
-//!   `process::spawn_follow(after_cursor)` are the mechanism, but reading a prior
-//!   run's cursor back and writing the current one as records arrive is
-//!   `agent::journal_cursor`'s job (issue #321: a restart now resumes from the
-//!   last persisted cursor via a small file next to the alerts output, no
-//!   `crates/store` integration needed — first start still begins at "now", same
-//!   as before). [`persistence::UnitPersistenceTracker`]'s seen-set is still
+//! - Cursor persistence is a file, not a store — `process::current_cursor`/
+//!   `process::spawn_follow(after_cursor)` are the mechanism, and [`cursor`] reads a
+//!   prior run's cursor back and writes the current one; the agent calls it as records
+//!   arrive (issue #321: a restart resumes from the last persisted cursor via a small
+//!   file next to the alerts output — first start still begins at "now", same as
+//!   before). [`persistence::UnitPersistenceTracker`]'s seen-set is still
 //!   agent-process-local and still resets on restart — a known limitation of that
 //!   tracker (see its own doc), unrelated to and not closed by the journal
 //!   cursor now being persisted.
@@ -74,6 +73,7 @@
 mod auth;
 mod canary;
 mod classify;
+pub mod cursor;
 mod pam_filter;
 mod persistence;
 mod record;

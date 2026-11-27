@@ -95,7 +95,7 @@ line (a dropped oversize line included), and writes its own canary line every 30
 stored and returned it through `journalctl -f`. It never matches the allowlist.
 
 The last cursor is persisted next to the alerts file by the agent
-([`journal_cursor.rs`](../../../apps/agent/src/journal_cursor.rs)) and passed as `--after-cursor` on
+([`cursor.rs`](../../../crates/sensors/linux/journal/src/cursor.rs)) and passed as `--after-cursor` on
 restart. The first start begins at "now".
 
 ## Limits

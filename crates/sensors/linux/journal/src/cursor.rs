@@ -1,21 +1,21 @@
 //! Persists the journal tail's last-seen cursor across agent restarts (issue #321).
 //!
-//! Without this, `commands::linux::spawn_journal_tail` (Linux-gated) always started its
-//! `journalctl -f` from "now" (`sensor_linux_journal::process::current_cursor`) —
+//! Without this, the agent's journal tail always started its `journalctl -f` from "now"
+//! (`current_cursor`) —
 //! the crate's own doc named this an accepted gap, not a decision: a
 //! watchdog-triggered restart drops whatever auth/persistence events landed in the
 //! restart gap. The journal has stable cursors (`__CURSOR`, `JournalRecord::cursor`)
 //! already threaded through every classified record, so persisting the last one seen
-//! closes the gap cheaply — no new crate, no `crates/store` integration, just a small
-//! file next to the alerts output, same derived-path convention `heartbeat_path_for`
-//! uses for #102.
+//! closes the gap cheaply: a small file next to the alerts output, the same derived-path
+//! convention the agent's heartbeat file uses (#102).
 
 use std::path::{Path, PathBuf};
 
 /// Derives the cursor file's path from the alerts output path — same reasoning as
-/// `crate::heartbeat::heartbeat_path_for`: the two paths always travel together, so
+/// the agent's heartbeat file: the two paths always travel together, so
 /// no separate CLI flag or install-time wiring is needed.
-pub(crate) fn cursor_path_for(alerts: &Path) -> PathBuf {
+#[must_use]
+pub fn cursor_path_for(alerts: &Path) -> PathBuf {
     alerts.with_extension("journal-cursor")
 }
 
@@ -23,7 +23,8 @@ pub(crate) fn cursor_path_for(alerts: &Path) -> PathBuf {
 /// unreadable — every one of those is the honest "no prior state" case (first start,
 /// a fresh install, a deleted state dir), not an error worth failing startup over.
 /// The caller falls back to `journalctl`'s own "now" snapshot in that case.
-pub(crate) fn read(path: &Path) -> Option<String> {
+#[must_use]
+pub fn read(path: &Path) -> Option<String> {
     let cursor = std::fs::read_to_string(path).ok()?;
     let cursor = cursor.trim();
     if cursor.is_empty() {
@@ -35,11 +36,11 @@ pub(crate) fn read(path: &Path) -> Option<String> {
 
 /// Writes `cursor` to `path` via a same-directory temp file + rename, so a process
 /// killed mid-write (the exact moment a restart's resume point matters most) never
-/// leaves a torn cursor behind — same pattern `heartbeat::write_once` uses. Silently
+/// leaves a torn cursor behind. Silently
 /// ignores I/O failures: same posture as the heartbeat writer, a missed persist just
 /// means the next restart falls a little further back (or, worst case, to "now"
 /// again), never a reason to bring down the journal tail thread over a disk hiccup.
-pub(crate) fn write(path: &Path, cursor: &str) {
+pub fn write(path: &Path, cursor: &str) {
     let mut tmp = path.as_os_str().to_os_string();
     tmp.push(".tmp");
     let tmp = PathBuf::from(tmp);
