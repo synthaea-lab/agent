@@ -158,7 +158,8 @@ fn report_unified_log_losses(totals: &sensor_macos_unifiedlog::StreamTotals) {
             shed_events = totals.shed_events,
             tcc_shed_contexts = totals.tcc_shed_contexts,
             tcc_unmatched_results = totals.tcc_unmatched_results,
-            "unified-log tail: events were shed or TCC records could not be joined"
+            oversize_lines = totals.oversize_lines,
+            "unified-log tail: events were shed, lines dropped, or TCC records could not be joined"
         );
     }
 }
@@ -172,7 +173,8 @@ fn report_network_extension_skew(skipped: &sensor_macos_network_extension::SkewT
             unparseable = skipped.unparseable,
             unknown_version = skipped.unknown_version,
             unmapped = skipped.unmapped,
-            "network-extension connection: records were skipped on this connection (extension version skew?)"
+            oversize_lines = skipped.oversize_lines,
+            "network-extension connection: records were skipped on this connection (extension version skew or oversize lines?)"
         );
     }
 }

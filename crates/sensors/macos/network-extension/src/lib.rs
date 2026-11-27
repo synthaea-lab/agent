@@ -7,6 +7,7 @@
 //! and [`normalize()`] into the existing `Connect`, `NetworkFlow` and
 //! `DnsQuery` shapes. See `docs/sensors/macos/network-extension.md`.
 
+mod bounded_lines;
 pub mod normalize;
 pub mod receiver;
 pub mod wire;
