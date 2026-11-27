@@ -48,7 +48,7 @@ Before an event reaches `DetectionSink`, it passes through these wrappers:
 | --- | --- | --- |
 | [`PulsingSink`](../apps/agent/src/silence.rs) | Linux primary and uprobes. Windows ETW. | Pulses the sensor's `SensorHeartbeat` on every event, so the silence monitor can tell a silent sensor apart. Pollers pulse on each successful poll instead, whether or not it returned events. |
 | [`ProtectedResourceGuard`](../apps/agent/src/protected.rs) | Linux primary only | Raises an alert when a foreign process writes to the agent's own files: config, alerts file, events file. |
-| [`RedactingSink`](../apps/agent/src/redact.rs) | Windows and macOS, all commands. Linux capture commands. | Redacts URL secrets and similar fields at the boundary. In `run` mode (`redact_commands = false`), events that carry command text (`Exec`, `ReadlineInput`, `ScriptBlock`, `AmsiContent`, `WmiActivity`) pass through unredacted, because the rules must read the raw command line. The capture commands redact everything. |
+| [`RedactingSink`](../crates/redact/src/event.rs) | Windows and macOS, all commands. Linux capture commands. | Redacts URL secrets and similar fields at the boundary. In `run` mode (`redact_commands = false`), events that carry command text (`Exec`, `ReadlineInput`, `ScriptBlock`, `AmsiContent`, `WmiActivity`) pass through unredacted, because the rules must read the raw command line. The capture commands redact everything. |
 
 The Linux `run` path does not put a `RedactingSink` in front of the detection sink. Redaction there happens only on the output copies (step 6).
 

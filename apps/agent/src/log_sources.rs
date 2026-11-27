@@ -284,7 +284,7 @@ pub(crate) fn spawn(
 /// The one place an event leaves this module for the sink. ADR-0018's credential
 /// redaction of an `HttpRequest`'s evidence value is applied here and nowhere else.
 fn deliver(sink: &DetectionSink, mut event: schema::Event) {
-    crate::redact::redact_event(&mut event);
+    redact::event::redact_event(&mut event);
     sink.on_event(event);
 }
 

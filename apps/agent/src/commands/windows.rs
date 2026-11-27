@@ -252,7 +252,7 @@ fn run_windows_sensors(
 ) -> anyhow::Result<()> {
     // Run and both capture commands funnel through here, so this is the one
     // place credential redaction has to sit in front of (#440).
-    let sink = crate::redact::redacting(sink, redact_commands);
+    let sink = redact::event::redacting(sink, redact_commands);
 
     let mut etw_sensor = sensor_windows::WindowsSensor::with_shedding(
         sensor_windows::EtwNames {

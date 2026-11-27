@@ -130,7 +130,7 @@ fn record_detection(
     let safe_message = safe_detection_message(event, &evidence, finding.message);
     let mut safe_events: Vec<Event> = std::iter::once(event.clone()).chain(evidence).collect();
     for event in &mut safe_events {
-        crate::redact::redact_event(event);
+        redact::event::redact_event(event);
     }
     let detection = schema::detection::Detection {
         timestamp_ns: now_ns,
@@ -167,7 +167,7 @@ fn safe_detection_message(event: &Event, evidence: &[Event], message: &str) -> S
         return message.to_owned();
     };
     let mut safe = source.clone();
-    crate::redact::redact_event(&mut safe);
+    redact::event::redact_event(&mut safe);
     match (source, &safe) {
         (Event::Exec(raw), Event::Exec(safe)) => {
             redact_detection_message(&raw.cmdline, &safe.cmdline, message)

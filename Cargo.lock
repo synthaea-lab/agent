@@ -2355,6 +2355,8 @@ name = "redact"
 version = "0.0.1"
 dependencies = [
  "proptest",
+ "schema",
+ "serde_json",
 ]
 
 [[package]]

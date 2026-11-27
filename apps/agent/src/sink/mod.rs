@@ -286,7 +286,7 @@ impl DetectionSink {
                     );
                 }
                 let mut safe_event = event.clone();
-                crate::redact::redact_event(&mut safe_event);
+                redact::event::redact_event(&mut safe_event);
                 if let Some(events_log) = &events_log {
                     events_log.write(&safe_event);
                 }

@@ -64,7 +64,7 @@ impl EventSink for BaselineSink {
                 // Baselines leave the process and are used as a training corpus;
                 // store the same redacted canonical argv that inference can derive.
                 let mut safe = e.clone();
-                crate::redact::redact_exec(&mut safe);
+                redact::event::redact_exec(&mut safe);
                 self.out.write(&BaselineRecord {
                     argv: &safe.argv,
                     cmdline: &safe.cmdline,

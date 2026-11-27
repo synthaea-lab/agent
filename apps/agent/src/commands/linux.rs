@@ -1099,9 +1099,9 @@ pub(crate) fn cmd_capture_baseline(output: &std::path::Path) -> anyhow::Result<(
     eprintln!("Output: {}", output.display());
     eprintln!("Perform normal activity on a CLEAN host for ~10 minutes.");
     let mut sensor = sensor_linux::LinuxSensor::new();
-    let sink = crate::redact::redacting(Box::new(sink), true);
+    let sink = redact::event::redacting(Box::new(sink), true);
     sensor
-        .run(Box::new(crate::redact::SharedSink(sink)))
+        .run(Box::new(SharedSink(sink)))
         .map_err(|e| anyhow::anyhow!("sensor failed: {e}"))
 }
 
@@ -1112,9 +1112,9 @@ pub(crate) fn cmd_capture_events(output: &std::path::Path) -> anyhow::Result<()>
     eprintln!("Output: {}", output.display());
     eprintln!("Perform normal activity for ~10-15 minutes.");
     let mut sensor = sensor_linux::LinuxSensor::new();
-    let sink = crate::redact::redacting(Box::new(sink), true);
+    let sink = redact::event::redacting(Box::new(sink), true);
     sensor
-        .run(Box::new(crate::redact::SharedSink(sink)))
+        .run(Box::new(SharedSink(sink)))
         .map_err(|e| anyhow::anyhow!("sensor failed: {e}"))
 }
 
@@ -1210,6 +1210,15 @@ mod sudo_join_tests {
         let mut forged_success = five_failures("sudo");
         forged_success.push(line(10, "logger", SUCCESS));
         assert_eq!(escalations(&techniques(&forged_success)), 0);
+    }
+}
+
+/// Lets two sensors share one sink: each takes a `Box<dyn EventSink>` of its own.
+struct SharedSink(std::sync::Arc<dyn schema::sensor::EventSink>);
+
+impl schema::sensor::EventSink for SharedSink {
+    fn on_event(&self, event: schema::Event) {
+        self.0.on_event(event);
     }
 }
 
