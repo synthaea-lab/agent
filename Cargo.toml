@@ -53,11 +53,8 @@ members = [
     "crates/transport",
     "crates/sinks",
     "crates/updater",
-    "crates/conformance",
     "crates/tamper",
-    "crates/mesh",
     "crates/deception",
-    "crates/device-control",
     "crates/inventory",
     "crates/siblings",
 ]
@@ -101,11 +98,8 @@ default-members = [
     "crates/transport",
     "crates/sinks",
     "crates/updater",
-    "crates/conformance",
     "crates/tamper",
-    "crates/mesh",
     "crates/deception",
-    "crates/device-control",
     "crates/inventory",
     "crates/siblings",
 ]
