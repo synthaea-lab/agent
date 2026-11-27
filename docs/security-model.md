@@ -400,7 +400,7 @@ They must fail closed when the target is wrong.
   kill, the outcome is `ObserveOnly`. Separately, the correlator refuses to kill a system
   service's main process. That refusal currently misses services started before the agent
   ([#52](https://github.com/synthaea-lab/agent/issues/52)).
-- **Quarantine.** [`quarantine_file`](../crates/response/src/quarantine.rs) opens the
+- **Quarantine.** [`quarantine_file`](../crates/response/src/quarantine/mod.rs) opens the
   source once with `O_NOFOLLOW`, checks it with `fstat`, and hashes and moves it through
   that descriptor, so a swap to a symlink is not followed. The copy is bounded by the
   file's size at open time. The module documents its limits: a symlinked parent
