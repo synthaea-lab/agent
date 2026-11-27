@@ -10,8 +10,7 @@ use std::{
 
 use schema::{Event, sensor::EventSink};
 use sinks::JsonlWriter;
-
-use crate::sync::LockExt as _;
+use workers::sync::LockExt as _;
 
 /// Minimal sink for ML baseline capture: records the exec events that trigger NO
 /// deterministic rule — the "known benign under current rules" corpus consumed by

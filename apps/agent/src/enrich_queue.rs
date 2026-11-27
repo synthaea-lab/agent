@@ -93,7 +93,7 @@ impl EnrichQueue {
     ) -> std::io::Result<Self> {
         let (tx, rx) = mpsc::sync_channel::<QueueItem>(QUEUE_CAP);
         let dropped = Arc::new(AtomicU64::new(0));
-        crate::spawn::spawn_named("enrich", move || {
+        workers::spawn::spawn_named("enrich", move || {
             while let Ok(item) = rx.recv() {
                 match item {
                     QueueItem::Event(mut event, gated) => {

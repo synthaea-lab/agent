@@ -12,8 +12,9 @@ use schema::{
     sensor::{EventSink, Sensor as _},
 };
 use tamper::heartbeat::{SensorHeartbeat, SilenceMonitor};
+use workers::{shutdown::ShutdownPlan, sync::LockExt};
 
-use crate::{shutdown::ShutdownPlan, silence::PulsingSink, sync::LockExt};
+use crate::silence::PulsingSink;
 
 /// Silence deadline (#71/#388) for the ETW sensor, pulsed on every event it
 /// forwards. ETW is the high-volume sensor (process, file, registry, DNS...),

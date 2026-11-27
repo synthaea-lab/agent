@@ -46,7 +46,7 @@ const SNAPSHOT_FILE: &str = "packages.json";
 /// every later diff is computed against, so delaying it only delays the point
 /// where the feature starts working, for no benefit.
 pub(crate) fn spawn_monitor(state_dir: PathBuf, sink: Arc<DetectionSink>) -> std::io::Result<()> {
-    crate::spawn::spawn_named("inventory", move || {
+    workers::spawn::spawn_named("inventory", move || {
         let snapshot_path = snapshot_path_for(&state_dir);
         loop {
             check_once(Path::new(DPKG_STATUS_PATH), &snapshot_path, &sink);

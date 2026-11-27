@@ -47,7 +47,7 @@ All crates live under `crates/`. Platform sensors live under `crates/sensors/<pl
 | Sensors | `sensor-linux` (eBPF userspace), `sensor-linux-ebpf` (kernel probes, own target), `sensor-linux-wire` (ring-buffer ABI), `sensor-linux-container` (container attribution), `sensor-linux-audit`, `-netlink`, `-journal`, `-uprobes`, `-lsm`, `-logs`, `-procmem`; `sensor-windows` (ETW), `-eventlog`, `-sockets`, `-minifilter`; `sensor-macos` (EndpointSecurity), `-unifiedlog`, `-sockets`, `-network-extension` | Turn one OS facility into `schema::Event`s. Each crate either implements `Sensor` or exposes poll/stream functions that a caller drives. |
 | Detection | `rules`, `sigma`, `correlator`, `verdict`, `ml`, `yara`, `enrich`, `intel`, `deception` | Detection engines and the work they need. `rules` holds the stateless and stateful rules. `correlator` holds co-occurrence and Bayesian belief per process. `verdict` fuses findings per entity. `ml` does ONNX scoring. `yara` holds the budgeted file and memory scan queues. `enrich` handles hashing and signature verdicts. `deception` handles canary tripwires. |
 | Leaf | `store`, `transport`, `sinks`, `ipc`, `response`, `updater`, `config`, `tamper`, `redact`, `inventory` | Self-contained services. `store` holds bounded maps and the on-disk spool. `transport` holds the mTLS client and upload loops. `sinks` holds the JSONL writers. `ipc` holds the local control-channel protocol. `response` holds the kill/quarantine/escalate decisions. `updater` handles manifest verification and the release layout. `tamper` handles heartbeats, the silence monitor and integrity checks. `redact` holds pure redaction functions. |
-| Utility | `file-hash` | One implementation of file hashing for the tiers that may not depend on each other. |
+| Utility | `file-hash`, `workers` | Code several tiers need and may not take from each other: file hashing, and the worker-thread policies (named spawn, poisoned-lock recovery, bounded shutdown). |
 | Test support | `siblings` | Dev-only helper. Any crate may use it as a dev-dependency, never as a normal one. |
 | Binaries | `agent`, `watchdog`, `cli`, `release-tool` | Composition points. Only binaries may depend on anything. |
 
@@ -75,7 +75,7 @@ The rules:
 - `schema` depends on no workspace crate. `policy` depends only on `schema`.
 - A `sensor-*` crate depends on `schema`, plus its own platform's shared crates and `bounded-lines`, a line reader with a byte cap that sensors on any platform may use and that depends on no workspace crate. For example, `sensor-linux` and `sensor-linux-uprobes` may use `sensor-linux-wire` and `sensor-linux-container`. A shared crate depends only on `schema`.
 - Detection crates may use the base tier, each other, and `store`. They may never use a sensor crate. The engines may not use `correlator` or `verdict`, the two stages that consume their output; the event window both sides read is in the leaf crate `event-window`.
-- Utility crates (`file-hash`, the streaming SHA-256 every hashing crate uses) depend on no workspace crate. Detection and leaf crates may use them; that is where code two tiers both need goes, instead of a copy in each.
+- Utility crates (`file-hash`, the streaming SHA-256 every hashing crate uses, and `workers`, the worker-thread policies) depend on no workspace crate. Detection and leaf crates may use them; that is where code two tiers both need goes, instead of a copy in each.
 - Leaf crates may use only the base tier and the utility crates. In particular, `transport` and `store` do not know each other, `updater` does not know `transport`, and `response` does not call the OS.
 - Only binaries may depend on anything. No crate depends on a binary.
 - A crate that the script does not know makes it exit with code 2. A new crate must be added to the script.
@@ -118,8 +118,8 @@ The detection sink ([`sink/mod.rs`](../apps/agent/src/sink/mod.rs)) has no platf
 | [`health`](../apps/agent/src/health.rs) | Health-beacon collector, sent every 30 s by default. |
 | [`heartbeat`](../apps/agent/src/heartbeat.rs) | Progress-counter file for the watchdog. |
 | [`ipc_handler`](../apps/agent/src/ipc_handler.rs) | IPC server thread answering `cli` requests and content reloads. |
-| [`spawn`](../apps/agent/src/spawn.rs) | `spawn_named`, which starts a named background thread and returns the OS error, with the thread's name, instead of panicking. |
-| [`shutdown`](../apps/agent/src/shutdown.rs) | `ShutdownPlan`, a bounded join of the registered workers. |
+| [`spawn`](../crates/workers/src/spawn.rs) | `spawn_named`, which starts a named background thread and returns the OS error, with the thread's name, instead of panicking. |
+| [`shutdown`](../crates/workers/src/shutdown.rs) | `ShutdownPlan`, a bounded join of the registered workers. |
 | [`kill_loudness`](../apps/agent/src/kill_loudness.rs) | Attributes SIGTERM/SIGHUP/SIGQUIT to their sender before exiting (Linux). |
 | [`redact`](../apps/agent/src/redact.rs) | `RedactingSink` and `redact_event`, which redact data at the point where events leave the process. |
 | [`content`](../apps/agent/src/content.rs), [`release`](../apps/agent/src/release.rs), [`rotation`](../apps/agent/src/rotation.rs), [`trust`](../apps/agent/src/trust.rs) | Signed content, release and key-rotation commands. |

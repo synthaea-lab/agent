@@ -7,6 +7,7 @@
 use std::sync::{Arc, Mutex};
 
 use tamper::heartbeat::SilenceMonitor;
+use workers::shutdown::{SHUTDOWN_BUDGET, ShutdownPlan};
 
 use super::{RunOptions, localzone};
 use crate::{
@@ -15,7 +16,6 @@ use crate::{
         RarityStatsSource, SensorHealthSource, SpoolStatsSource,
     },
     ipc_handler::{AgentHandler, SensorHealthSlot},
-    shutdown::{SHUTDOWN_BUDGET, ShutdownPlan},
     silence::{SilenceHealthSource, SourceStatus},
     sink::DetectionSink,
 };
@@ -533,7 +533,10 @@ mod tests {
         let drained = Arc::new(AtomicBool::new(false));
         let (worker_stop, worker_drained) = (Arc::clone(&stop), Arc::clone(&drained));
         let handle = std::thread::spawn(move || {
-            crate::shutdown::sleep_unless_stopped(&worker_stop, std::time::Duration::from_secs(60));
+            workers::shutdown::sleep_unless_stopped(
+                &worker_stop,
+                std::time::Duration::from_secs(60),
+            );
             // The final drain an upload loop makes once it sees the stop.
             worker_drained.store(true, Ordering::SeqCst);
         });

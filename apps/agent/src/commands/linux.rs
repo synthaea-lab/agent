@@ -12,13 +12,15 @@ use std::{
 
 use schema::sensor::Sensor as _;
 use tamper::heartbeat::{SensorHeartbeat, SilenceMonitor};
+use workers::{
+    shutdown::{ShutdownPlan, sleep_unless_stopped},
+    sync::LockExt,
+};
 
 use crate::{
     protected::ProtectedResourceGuard,
-    shutdown::{ShutdownPlan, sleep_unless_stopped},
     silence::{PulsingSink, SourceStatus},
     sink::DetectionSink,
-    sync::LockExt,
 };
 
 /// Silence deadlines (#71) fed to `SilenceMonitor::register`. The eBPF sensor and
@@ -532,7 +534,7 @@ fn spawn_netlink_poller(
 ) -> std::io::Result<()> {
     let mut sensor = sensor_linux_netlink::NetlinkPollSensor::new(move || heartbeat.pulse());
     let stop = sensor.stop_handle();
-    let handle = crate::spawn::spawn_named("netlink-poll", move || {
+    let handle = workers::spawn::spawn_named("netlink-poll", move || {
         if let Err(e) = sensor.run(Box::new(sink)) {
             tracing::warn!(error = %e, "netlink poller stopped");
         }
@@ -595,7 +597,7 @@ struct AvcSource {
 fn spawn_avc_reader(source: AvcSource, shutdown: &mut ShutdownPlan) -> std::io::Result<()> {
     let stop = Arc::new(AtomicBool::new(false));
     let worker_stop = Arc::clone(&stop);
-    let handle = crate::spawn::spawn_named("avc-reader", move || {
+    let handle = workers::spawn::spawn_named("avc-reader", move || {
         let AvcSource {
             sink,
             heartbeat,
@@ -882,7 +884,7 @@ fn spawn_journal_tail(
     alerts: &std::path::Path,
 ) -> std::io::Result<()> {
     let cursor_path = crate::journal_cursor::cursor_path_for(alerts);
-    crate::spawn::spawn_named("journal-tail", move || {
+    workers::spawn::spawn_named("journal-tail", move || {
         let cursor = crate::journal_cursor::read(&cursor_path)
             .or_else(|| sensor_linux_journal::current_cursor().ok());
         let mut child = match sensor_linux_journal::spawn_follow(cursor.as_deref()) {
@@ -973,7 +975,7 @@ const JOURNAL_CANARY_INTERVAL: std::time::Duration = std::time::Duration::from_s
 /// A failed write is logged once per failure streak and retried; it is the
 /// signal itself when journald is down, so it never stops the thread.
 fn spawn_journal_canary() -> std::io::Result<()> {
-    crate::spawn::spawn_named("journal-canary", || {
+    workers::spawn::spawn_named("journal-canary", || {
         let socket = std::path::Path::new(sensor_linux_journal::JOURNAL_SOCKET);
         let mut warned = false;
         loop {
@@ -1024,7 +1026,7 @@ fn spawn_uprobes_sensor(
     enable_readline_capture: bool,
     enable_dns_capture: bool,
 ) -> std::io::Result<()> {
-    crate::spawn::spawn_named("uprobes", move || {
+    workers::spawn::spawn_named("uprobes", move || {
         let mut config = sensor_linux_uprobes::UprobesConfig::new();
         if enable_tls_capture {
             config = config.with_tls_enabled();

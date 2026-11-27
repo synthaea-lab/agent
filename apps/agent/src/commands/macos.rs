@@ -7,8 +7,7 @@
 use std::sync::Arc;
 
 use schema::sensor::{EventSink, Sensor as _};
-
-use crate::{shutdown::ShutdownPlan, sync::LockExt as _};
+use workers::{shutdown::ShutdownPlan, sync::LockExt as _};
 
 /// Forwards to a shared `Arc<dyn EventSink>` — ownership plumbing to satisfy
 /// `Sensor::run`'s `Box<dyn EventSink>` signature (same shape as Windows).
@@ -76,7 +75,7 @@ fn spawn_socket_poller(
     sink: Arc<dyn EventSink>,
     stop: Arc<std::sync::atomic::AtomicBool>,
 ) -> std::io::Result<()> {
-    crate::spawn::spawn_named("socket-poller", move || {
+    workers::spawn::spawn_named("socket-poller", move || {
         while !stop.load(std::sync::atomic::Ordering::SeqCst) {
             let now_ns = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -122,7 +121,7 @@ fn spawn_unifiedlog_tail(
         tracing::warn!("unified-log tail: `log stream` spawned without a piped stdout");
         return Ok(None);
     };
-    let spawned = crate::spawn::spawn_named("unifiedlog-tail", move || {
+    let spawned = workers::spawn::spawn_named("unifiedlog-tail", move || {
         let stream = sensor_macos_unifiedlog::NormalizedLogStream::with_counters(
             std::io::BufReader::new(stdout),
             Arc::clone(&counters),
@@ -208,7 +207,7 @@ fn spawn_network_extension_receiver(sink: Arc<dyn EventSink>) -> std::io::Result
         };
     // One handle for every connection: the extension reconnects whenever the OS restarts it.
     let skew = Arc::new(sensor_macos_network_extension::SkewCounters::default());
-    crate::spawn::spawn_named("ne-receiver", move || {
+    workers::spawn::spawn_named("ne-receiver", move || {
         let result = sensor_macos_network_extension::accept_loop(&listener, |conn| {
             let before = skew.totals();
             let stream = sensor_macos_network_extension::NormalizedNeStream::with_counters(

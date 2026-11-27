@@ -31,6 +31,7 @@ const SLEEP_SLICE: Duration = Duration::from_millis(50);
 /// (and was joined), `false` if it was still running — the handle is dropped,
 /// which detaches the thread. A panicked worker counts as finished: shutdown
 /// has nothing left to wait for.
+#[must_use]
 pub fn join_bounded(handle: JoinHandle<()>, deadline: Instant) -> bool {
     while !handle.is_finished() {
         if Instant::now() >= deadline {
@@ -44,7 +45,6 @@ pub fn join_bounded(handle: JoinHandle<()>, deadline: Instant) -> bool {
 
 /// `thread::sleep` that returns early (within [`SLEEP_SLICE`]) once `stop` is
 /// set — for poll loops whose only shutdown signal is a flag.
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))] // only Linux workers poll on a flag
 pub fn sleep_unless_stopped(stop: &AtomicBool, total: Duration) {
     let deadline = Instant::now() + total;
     while !stop.load(Ordering::SeqCst) {
@@ -85,7 +85,7 @@ impl ShutdownPlan {
     }
 
     /// The registered workers' names, in registration order.
-    #[cfg(test)]
+    #[must_use]
     pub fn names(&self) -> Vec<&'static str> {
         self.workers.iter().map(|w| w.name).collect()
     }

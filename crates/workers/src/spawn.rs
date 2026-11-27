@@ -17,7 +17,7 @@ use std::{
 /// # Errors
 ///
 /// The OS refused the thread; the error keeps the OS error's kind and names the thread.
-pub(crate) fn spawn_named<F, T>(name: &str, body: F) -> io::Result<JoinHandle<T>>
+pub fn spawn_named<F, T>(name: &str, body: F) -> io::Result<JoinHandle<T>>
 where
     F: FnOnce() -> T + Send + 'static,
     T: Send + 'static,

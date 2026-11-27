@@ -7,9 +7,9 @@ use std::{path::PathBuf, sync::OnceLock};
 use ::response::KillOutcome;
 use policy::ResponsePolicy;
 use schema::Event;
+use workers::sync::LockExt as _;
 
 use super::DetectionSink;
-use crate::sync::LockExt as _;
 
 /// What `enable_response` installs: the policy, the injected kill call and the quarantine
 /// directory.

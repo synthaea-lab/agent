@@ -50,7 +50,7 @@ pub(crate) fn start(
     counter: Arc<AtomicU64>,
     interval: Duration,
 ) -> std::io::Result<()> {
-    crate::spawn::spawn_named("heartbeat", move || {
+    workers::spawn::spawn_named("heartbeat", move || {
         loop {
             write_once(&path, counter.load(Ordering::Relaxed));
             std::thread::sleep(interval);

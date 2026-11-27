@@ -27,7 +27,7 @@ use std::{
     time::Duration,
 };
 
-use crate::sync::{LockExt, RwLockExt};
+use workers::sync::{LockExt, RwLockExt};
 
 /// Addresses of the control-plane host kept at once. A host behind a CDN resolves to a handful.
 const MAX_CONTROL_PLANE_ADDRS: usize = 32;

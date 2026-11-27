@@ -37,6 +37,7 @@ tamper = { path = "../../crates/tamper" }
 inventory = { path = "../../crates/inventory" }
 response = { path = "../../crates/response" }
 store = { path = "../../crates/store" }
+workers = { path = "../../crates/workers" }
 transport = { path = "../../crates/transport" }
 # Content-manifest fetch/verify (ADR-0016, issue #30/#73): cross-platform, unlike
 # `updater::layout`'s Linux-only bootstrap/current/versions binary-update layout —

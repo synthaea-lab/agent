@@ -14,11 +14,9 @@ use std::{
 };
 
 use schema::Event;
+use workers::sync::LockExt as _;
 
-use crate::{
-    deception::{CanaryAllow, ExecImage, ExecImages},
-    sync::LockExt as _,
-};
+use crate::deception::{CanaryAllow, ExecImage, ExecImages};
 
 /// The ATT&CK technique a canary hit reports: someone looked through files nothing
 /// legitimate reads (T1083 file and directory discovery). The rule id names the provenance.
