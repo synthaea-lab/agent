@@ -31,8 +31,6 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use sha2::{Digest, Sha256};
-
 /// Upper bound on a protected file's size (256 MiB). Larger is treated as a
 /// violation rather than read — protected artifacts (binaries, config) are small,
 /// and an oversized file at a protected path is tampering, not telemetry.
@@ -183,31 +181,16 @@ fn verify_one(path: &Path, expected: &str) -> Option<ViolationKind> {
 /// Streaming SHA-256 of a regular file, bounded by [`MAX_VERIFY_BYTES`] via
 /// `Read::take` so a file that grows under us cannot exceed the budget.
 fn hash_file(path: &Path) -> Option<String> {
-    let file = std::fs::File::open(path).ok()?;
-    let mut reader = file.take(MAX_VERIFY_BYTES);
-    let mut hasher = Sha256::new();
-    // `sha2` 0.11 dropped `impl Write for Sha256` (it never guaranteed the
-    // infallible-write contract `io::Write` implies), so `io::copy` no longer
-    // applies here — read into a buffer and feed `Digest::update` by hand.
-    let mut buf = [0u8; 64 * 1024];
-    loop {
-        let n = reader.read(&mut buf).ok()?;
-        if n == 0 {
-            break;
-        }
-        hasher.update(&buf[..n]);
-    }
-    let digest = hasher.finalize();
-    let mut out = String::with_capacity(64);
-    for byte in digest {
-        use std::fmt::Write as _;
-        let _ = write!(out, "{byte:02x}");
-    }
-    Some(out)
+    let mut reader = std::fs::File::open(path).ok()?.take(MAX_VERIFY_BYTES);
+    file_hash::sha256_reader(&mut reader)
+        .ok()
+        .map(|digest| file_hash::hex(&digest))
 }
 
 #[cfg(test)]
 mod tests {
+    use sha2::{Digest, Sha256};
+
     use super::*;
 
     fn tmp(name: &str, content: &[u8]) -> PathBuf {

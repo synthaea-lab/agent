@@ -1120,8 +1120,8 @@ dependencies = [
 name = "enrich"
 version = "0.0.1"
 dependencies = [
+ "file-hash",
  "schema",
- "sha2 0.11.1",
  "store",
  "tracing",
 ]
@@ -1178,6 +1178,13 @@ dependencies = [
  "widestring",
  "windows",
  "zerocopy 0.7.35",
+]
+
+[[package]]
+name = "file-hash"
+version = "0.0.1"
+dependencies = [
+ "sha2 0.11.1",
 ]
 
 [[package]]
@@ -2410,12 +2417,12 @@ dependencies = [
 name = "response"
 version = "0.0.1"
 dependencies = [
+ "file-hash",
  "libc",
  "policy",
  "schema",
  "serde",
  "serde_json",
- "sha2 0.11.1",
  "thiserror 2.0.21",
  "tracing",
 ]
@@ -3109,6 +3116,7 @@ dependencies = [
 name = "tamper"
 version = "0.0.1"
 dependencies = [
+ "file-hash",
  "schema",
  "sha2 0.11.1",
 ]
@@ -3436,6 +3444,7 @@ checksum = "6d49784317cd0d1ee7ec5c716dd598ec5b4483ea832a2dced265471cc0f690ae"
 name = "updater"
 version = "0.0.1"
 dependencies = [
+ "file-hash",
  "ring",
  "rustix",
  "serde",
@@ -3865,9 +3874,9 @@ dependencies = [
  "anyhow",
  "clap",
  "config",
+ "file-hash",
  "libc",
  "serde_json",
- "sha2 0.11.1",
  "signal-hook",
  "sinks",
  "tempfile",

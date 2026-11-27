@@ -14,6 +14,9 @@ Rules (see CLAUDE.md):
   - Leaf crates (response, transport, ipc, sinks, updater, config, store)
     depend only on the base tier.
   - Only the binaries (`agent`, `watchdog`, `cli`) may depend on anything.
+  - Utility crates (`file-hash`) depend on no workspace crate; any detection or leaf crate
+    may use them. They exist so two tiers that may not depend on each other need not
+    each keep a copy of the same code.
   - Test-support crates (`siblings`) depend on no workspace crate and may be a
     dev-dependency of anything — never a normal or build dependency.
   - No crate depends on a binary.
@@ -43,6 +46,8 @@ PLATFORM_SHARED = {
     "sensor-linux-wire": "sensor-linux",
     "sensor-linux-container": "sensor-linux",
 }
+# Helpers the detection and leaf tiers share instead of copying: no workspace deps.
+UTILITY = {"file-hash"}
 # Helpers sensors on different platforms share instead of copying: no workspace deps.
 SENSOR_SHARED = {"bounded-lines"}
 # Dev-only helpers: leaves with no workspace deps, usable as a dev-dependency anywhere.
@@ -53,7 +58,7 @@ def allowed(crate: str) -> set[str] | None:
     """Workspace crates `crate` may depend on; None means unrestricted."""
     if crate in BINARIES:
         return None
-    if crate == SCHEMA or crate in TEST_SUPPORT or crate in SENSOR_SHARED:
+    if crate == SCHEMA or crate in TEST_SUPPORT | SENSOR_SHARED | UTILITY:
         return set()
     if crate == "policy":
         return {SCHEMA}
@@ -64,11 +69,11 @@ def allowed(crate: str) -> set[str] | None:
         own_platform = {c for c, prefix in PLATFORM_SHARED.items() if crate.startswith(prefix)}
         return {SCHEMA} | SENSOR_SHARED | own_platform
     if crate in DETECTION_CONSUMERS:
-        return BASE | DETECTION | DETECTION_SHARED
+        return BASE | DETECTION | DETECTION_SHARED | UTILITY
     if crate in DETECTION:
-        return BASE | (DETECTION - DETECTION_CONSUMERS) | DETECTION_SHARED
+        return BASE | (DETECTION - DETECTION_CONSUMERS) | DETECTION_SHARED | UTILITY
     if crate in LEAF:
-        return set(BASE)
+        return BASE | UTILITY
     print(f"error: crate `{crate}` is not covered by the dependency rules — "
           f"add it to tools/check-deps.py")
     sys.exit(2)

@@ -10,11 +10,11 @@ publish.workspace = true
 workspace = true
 
 [dependencies]
+file-hash = { path = "../file-hash" }
 policy = { path = "../policy" }
 schema = { path = "../schema" }
 serde = { workspace = true }
 serde_json = { workspace = true }
-sha2 = "0.11"
 thiserror = { workspace = true }
 tracing = { workspace = true }
 

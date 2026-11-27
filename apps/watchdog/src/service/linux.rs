@@ -89,7 +89,7 @@ pub(crate) fn snapshot_definition() -> anyhow::Result<DefinitionSnapshot> {
             PathBuf::from(openrc_enable_link()),
         ),
     };
-    let digest = crate::tamper::sha256_file(&definition_path).ok();
+    let digest = file_hash::sha256_file(&definition_path).ok();
     let enabled = enable_link.exists();
     Ok(DefinitionSnapshot {
         definition_path,

@@ -32,13 +32,30 @@ class DetectionTier(unittest.TestCase):
         self.assertIn("event-window", tool.allowed("ml"))
         self.assertIn("event-window", tool.allowed("correlator"))
 
-    def test_the_event_window_depends_on_the_base_tier_only(self) -> None:
-        self.assertEqual(tool.allowed("event-window"), tool.BASE)
+    def test_the_event_window_depends_on_no_detection_crate(self) -> None:
+        self.assertFalse(tool.allowed("event-window") & (tool.DETECTION | {"store"}))
 
     def test_no_detection_crate_may_depend_on_a_sensor(self) -> None:
         for crate in sorted(tool.DETECTION):
             with self.subTest(crate=crate):
                 self.assertFalse(any(dep.startswith("sensor-") for dep in tool.allowed(crate)))
+
+
+class UtilityCrates(unittest.TestCase):
+    def test_leaf_and_detection_crates_may_use_the_shared_file_hash(self) -> None:
+        for crate in ("updater", "tamper", "response", "enrich"):
+            with self.subTest(crate=crate):
+                self.assertIn("file-hash", tool.allowed(crate))
+
+    def test_a_utility_crate_depends_on_no_workspace_crate(self) -> None:
+        self.assertEqual(tool.allowed("file-hash"), set())
+
+    def test_leaf_crates_still_may_not_depend_on_each_other(self) -> None:
+        self.assertNotIn("tamper", tool.allowed("updater"))
+        self.assertNotIn("updater", tool.allowed("tamper"))
+
+    def test_a_sensor_may_not_use_a_utility_crate(self) -> None:
+        self.assertNotIn("file-hash", tool.allowed("sensor-linux"))
 
 
 class SensorTier(unittest.TestCase):
