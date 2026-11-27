@@ -50,7 +50,7 @@ thousands of entries), the amortized cost is small.
   shows up as a number rather than as missing detections. For example, the
   Linux parent-image cache splits its evictions into live and dead processes in
   the health beacon (`parent_image_evicted_live` and `parent_image_evicted_dead`
-  in [`HealthBeacon`](../crates/schema/src/lib.rs)).
+  in [`HealthBeacon`](../crates/schema/src/health.rs)).
   The Windows ETW sensor does the same for what its bounded caches and queues
   shed: `etw_pid_cache_evicted`, `etw_silo_evicted`, `etw_marks_dropped` and
   `etw_quarantine_unremembered` (#178), and for its registry key table
