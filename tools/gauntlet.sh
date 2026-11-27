@@ -23,6 +23,9 @@ cargo +nightly fmt --all --check
 step "dependency direction"
 python3 tools/check-deps.py
 
+step "module layering inside the agent binary"
+python3 tools/check-agent-layers.py
+
 # Needs the `rules` sibling; CI's `content` job makes its absence fatal.
 if [[ -d "${SYNTHAEA_ROOT:-..}/rules/sigma" ]]; then
     step "ATT&CK coverage matrix up to date"

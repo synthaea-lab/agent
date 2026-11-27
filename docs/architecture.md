@@ -85,6 +85,13 @@ Some consequences show up in the agent's code:
 - **The binary bridges types that two crates may not share.** [`upload.rs`](../apps/agent/src/upload.rs) adapts `store::EventSpool` to `transport::EventDrain`. [`content.rs`](../apps/agent/src/content.rs) composes `updater` verification with `transport` downloads. [`eventlog_config`](../apps/agent/src/commands/windows.rs) maps `policy::EventLogPolicy` to `sensor-windows-eventlog`'s own config type field by field.
 - **The binary injects OS calls.** `response::kill_process` takes the actual kill as a closure. On Linux that closure is [`terminate_process`](../apps/agent/src/commands/linux.rs), which sends `SIGKILL`.
 
+### Layers inside the agent binary
+
+The crate rules stop at the binary's edge, so [`tools/check-agent-layers.py`](../tools/check-agent-layers.py) carries them inside [`apps/agent/src`](../apps/agent/src/main.rs). CI runs it on every push. It reads the `crate::` paths of each top-level module, test code excepted, and fails on two things:
+
+- **A module that names the wiring.** [`main.rs`](../apps/agent/src/main.rs) and [`commands/`](../apps/agent/src/commands/mod.rs) start the sensors and hand events to everything else. No other module imports `crate::commands` or an item `main.rs` defines.
+- **An import cycle between modules.** Two modules in a cycle cannot be tested, or moved to a crate, one without the other.
+
 ## Where platform code lives
 
 All `cfg(target_os)` dispatch in the agent sits in [`apps/agent/src/commands/`](../apps/agent/src/commands/mod.rs):
