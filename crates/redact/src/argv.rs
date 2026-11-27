@@ -1,13 +1,15 @@
 //! Redacting a command line held as an argument vector.
 
-use super::REDACTED;
-use super::cmdline::redact_command_line;
-use super::form::redact_form_data;
-use super::headers::header_secret_value;
-use super::net::{NetMode, net_password_argv_index, net_subcommand_argv};
-use super::options::{credential_option, should_redact_next};
-use super::tokens::{image_name, token_ranges};
-use super::url::{redact_url_secrets, url_range};
+use super::{
+    REDACTED,
+    cmdline::redact_command_line,
+    form::redact_form_data,
+    headers::header_secret_value,
+    net::{NetMode, net_password_argv_index, net_subcommand_argv},
+    options::{credential_option, should_redact_next},
+    tokens::{image_name, token_ranges},
+    url::{redact_url_secrets, url_range},
+};
 
 /// Redacts recognized secrets in argv in place while retaining its number and order
 /// of arguments.

@@ -1,7 +1,6 @@
 //! Secrets in form-encoded request bodies.
 
-use super::secrets::is_secret_key;
-use super::url::redacted_keeping_quotes;
+use super::{secrets::is_secret_key, url::redacted_keeping_quotes};
 
 pub(super) fn add_form_edits(
     input: &str,

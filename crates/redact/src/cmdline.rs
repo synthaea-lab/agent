@@ -1,13 +1,16 @@
 //! Redacting a command line held as one string.
 
-use super::REDACTED;
-use super::form::add_form_edits;
-use super::headers::{add_header_edits, header_secret_value};
-use super::net::{NetMode, net_password_index, net_subcommand};
-use super::options::{credential_option, push_value_edit, should_redact_next};
-use super::tokens::{image_name, token_ranges, trim_quotes, uses_windows_quotes};
-use super::url::{redact_url_secrets, redacted_keeping_quotes, url_range};
 use std::borrow::Cow;
+
+use super::{
+    REDACTED,
+    form::add_form_edits,
+    headers::{add_header_edits, header_secret_value},
+    net::{NetMode, net_password_index, net_subcommand},
+    options::{credential_option, push_value_edit, should_redact_next},
+    tokens::{image_name, token_ranges, trim_quotes, uses_windows_quotes},
+    url::{redact_url_secrets, redacted_keeping_quotes, url_range},
+};
 
 /// Redacts well-known command-line credential forms without reformatting the line.
 /// Detection must consume the original event; call this only on copies at output

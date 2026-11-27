@@ -1,7 +1,6 @@
 //! Secrets inside a URL: the userinfo part and secret query parameters.
 
-use super::REDACTED;
-use super::secrets::is_secret_key;
+use super::{REDACTED, secrets::is_secret_key};
 
 pub(super) fn url_range(token: &str, offset: usize) -> Option<(usize, usize)> {
     let scheme = token.find("://")?;

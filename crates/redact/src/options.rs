@@ -1,8 +1,6 @@
 //! Command-line options that take a credential, per tool.
 
-use super::REDACTED;
-use super::secrets::is_secret_key;
-use super::tokens::trim_quotes;
+use super::{REDACTED, secrets::is_secret_key, tokens::trim_quotes};
 
 pub(super) fn push_value_edit(
     input: &str,

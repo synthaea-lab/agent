@@ -1,8 +1,10 @@
 //! Secrets in HTTP headers given on a command line.
 
-use super::options::push_value_edit;
-use super::secrets::is_secret_key;
-use super::tokens::{token_ranges, trim_quotes};
+use super::{
+    options::push_value_edit,
+    secrets::is_secret_key,
+    tokens::{token_ranges, trim_quotes},
+};
 
 pub(super) fn header_secret_value(token: &str, offset: usize) -> Option<(usize, usize)> {
     let (base, end) = trim_quotes(token, 0, token.len());
