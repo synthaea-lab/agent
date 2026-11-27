@@ -42,6 +42,8 @@ jobs:
           cargo +nightly fmt --all --check
       - name: dependency direction
         run: python3 tools/check-deps.py
+      - name: module layering inside the agent binary
+        run: python3 tools/check-agent-layers.py
       - name: platform branches only where CLAUDE.md allows them
         run: python3 tools/check-platform-cfg.py
       - name: docs links, anchors and capability tracking issues

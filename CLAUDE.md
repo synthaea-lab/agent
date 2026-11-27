@@ -168,6 +168,7 @@ New crate? Add it to the rules in `tools/check-deps.py` in the same change.
 - `tools/clippy-ebpf.sh` — clippy for the excluded eBPF crate (pinned nightly, once per
   `bpf_target_arch`: x86_64, aarch64); CI and the gauntlet run it.
 - `python3 tools/check-deps.py` — dependency direction check.
+- `python3 tools/check-agent-layers.py` — module layering inside the agent binary (wiring on top, no import cycle).
 - `python3 tools/check-docs.py` — docs links, anchors, and tracking issues on capability rows; `python3 tools/gen-roadmap.py` regenerates `docs/roadmap.md` (needs `gh`).
 - `python3 tools/attack-coverage.py [--check]` — regenerate / verify `docs/attack-coverage.md` (needs the `rules/` sibling).
 - `cargo +nightly fuzz run --fuzz-dir tests/fuzz audit_parse` / `netlink_parse` — coverage-guided parser
