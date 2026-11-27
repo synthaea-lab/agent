@@ -309,7 +309,7 @@ cause a panic.
   operator places the cert and key on the host by hand. See
   [#56](https://github.com/synthaea-lab/agent/issues/56) (operator guide) and
   [#79](https://github.com/synthaea-lab/agent/issues/79) (install-to-enroll acceptance run).
-- **Peer-to-peer mesh.** The [`mesh`](../crates/mesh/src/lib.rs) crate is a design stub
+- **Peer-to-peer mesh.** The mesh is a [design](planned.md#peer-mesh)
   with no code ([#29](https://github.com/synthaea-lab/agent/issues/29)).
 
 ### Parsers of untrusted bytes
