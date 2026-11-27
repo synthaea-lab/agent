@@ -104,7 +104,7 @@ All `cfg(target_os)` dispatch in the agent sits in [`apps/agent/src/commands/`](
 | [`commands/windows.rs`](../apps/agent/src/commands/windows.rs) | ETW plus the Event Log, socket-table and minifilter sources. |
 | [`commands/macos.rs`](../apps/agent/src/commands/macos.rs) | EndpointSecurity plus the unified log, socket-table and NetworkExtension sources. |
 
-The detection sink ([`sink/mod.rs`](../apps/agent/src/sink/mod.rs)) has no platform dispatch of its own. A few agent modules are compiled only on Linux because the mechanism exists only there: `integrity`, `inventory`, `kill_loudness`, `journal_cursor`, `log_sources`, `memscan`, `captures`. See the `mod` declarations in [`main.rs`](../apps/agent/src/main.rs).
+The detection sink ([`sink/mod.rs`](../apps/agent/src/sink/mod.rs)) has no platform dispatch of its own. A few agent modules are compiled only on Linux because the mechanism exists only there: `integrity`, `inventory`, `kill_loudness`, `log_sources`, `memscan`, `captures`. See the `mod` declarations in [`main.rs`](../apps/agent/src/main.rs).
 
 ## Agent modules at a glance
 

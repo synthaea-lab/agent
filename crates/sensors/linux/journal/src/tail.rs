@@ -165,7 +165,7 @@ pub mod process {
 
     /// Runs `journalctl --show-cursor -n0` to get journald's current position
     /// without reading any history. Call once at startup — as the fallback when no
-    /// prior cursor was persisted (fresh install, or `agent::journal_cursor` found
+    /// prior cursor was persisted (fresh install, or [`crate::cursor::read`] found
     /// nothing to read, issue #321). When one was persisted, use it instead so a
     /// restart resumes with [`spawn_follow`] rather than either replaying the whole
     /// journal or silently missing what was written while the sensor was down.

@@ -3,7 +3,7 @@
 //!
 //! One thread polls every source once a second. Each source keeps a persisted
 //! [`Position`] in a file derived from the alerts path (same convention as
-//! `crate::journal_cursor`), so a restart resumes where it stopped.
+//! `sensor_linux_journal::cursor`), so a restart resumes where it stopped.
 //!
 //! Two kinds of source:
 //!
@@ -67,7 +67,7 @@ pub(crate) fn read_position(path: &Path) -> Option<Position> {
     Position::decode(&std::fs::read_to_string(path).ok()?)
 }
 
-/// Same-directory temp file plus rename, like `journal_cursor::write`: a kill mid-write
+/// Same-directory temp file plus rename, like `sensor_linux_journal::cursor::write`: a kill mid-write
 /// never leaves a torn position. I/O failures are ignored; a missed persist only means
 /// the next restart re-reads a little more.
 pub(crate) fn write_position(path: &Path, position: &Position) {

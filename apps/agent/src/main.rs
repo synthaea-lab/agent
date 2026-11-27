@@ -58,8 +58,6 @@ mod ioc;
 )]
 mod ipc_handler;
 #[cfg(target_os = "linux")]
-mod journal_cursor;
-#[cfg(target_os = "linux")]
 mod kill_loudness;
 #[cfg(target_os = "linux")]
 mod log_sources;

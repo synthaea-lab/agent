@@ -184,7 +184,7 @@ Totals: 272 capabilities, 152 built, 81 partial, 39 planned.
 | --- | --- | --- | --- | --- |
 | Authentication events from journald (sshd accept/fail, sudo, su, PAM sessions and auth failures) | built | journal classify.rs (37 tests), auth.rs to_auth_event (14 tests), tail.rs ClassifiedJournal dedup tests; sshd accept and sudo lab-verified, failure paths unit-tested only |  | [sensors/linux/journal.md#mappings](sensors/linux/journal.md#mappings) |
 | systemd unit lifecycle: first-start persistence flag and security-unit stop events | built | journal persistence.rs UnitPersistenceTracker tests, unitstop.rs to_unit_stop_event tests; system-manager stop record not captured on a real host; unit failures not mapped |  | [sensors/linux/journal.md#mappings](sensors/linux/journal.md#mappings) |
-| Journal tail liveness canary and cursor resume | built | journal canary.rs send_canary tests, tail.rs with_line_hook, agent journal_cursor.rs |  | [sensors/linux/journal.md#liveness-and-resume](sensors/linux/journal.md#liveness-and-resume) |
+| Journal tail liveness canary and cursor resume | built | journal canary.rs send_canary tests, tail.rs with_line_hook, journal cursor.rs |  | [sensors/linux/journal.md#liveness-and-resume](sensors/linux/journal.md#liveness-and-resume) |
 
 ### Service logs
 
