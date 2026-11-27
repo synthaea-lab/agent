@@ -10,11 +10,15 @@ use std::net::SocketAddr;
 /// not found there (exited mid-poll, or the snapshot failed).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ListenerEntry {
+    /// The owning process id from the IP Helper table.
     pub pid: u32,
+    /// Parent of [`Self::pid`], from the process snapshot.
     pub ppid: Option<u32>,
     /// Executable file name (`svchost.exe`) — `Toolhelp32` gives the name, not
     /// the full path.
     pub process_name: Option<String>,
+    /// The local address and port. A wildcard bind appears as the unspecified address (`0.0.0.0`
+    /// or `::`).
     pub local: SocketAddr,
     /// `IPPROTO_TCP` (6) or `IPPROTO_UDP` (17) — which IP Helper table this
     /// entry came from.

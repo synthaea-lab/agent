@@ -1,0 +1,18 @@
+{
+  "type": "signal",
+  "meta": {
+    "pid": 7001,
+    "ppid": 1,
+    "user": {
+      "os": "unix",
+      "uid": 0,
+      "gid": 0
+    },
+    "timestamp_ns": 1756900000123456789,
+    "comm": "pkill"
+  },
+  "signal": 9,
+  "target_pid": 612,
+  "target_image_path": "/usr/sbin/auditd",
+  "target_unit": "auditd"
+}

@@ -35,6 +35,8 @@ impl<K: Eq + Hash + Clone, V> BoundedMap<K, V> {
         self.tick
     }
 
+    /// Inserts or replaces `key` and marks it most recently used. When the cap is exceeded,
+    /// evicts a batch of the least recently used entries (counted by the eviction counter).
     pub fn insert(&mut self, key: K, value: V) {
         let tick = self.next_tick();
         self.entries.insert(key, (value, tick));
@@ -51,6 +53,7 @@ impl<K: Eq + Hash + Clone, V> BoundedMap<K, V> {
         Some(&entry.0)
     }
 
+    /// Mutable lookup that refreshes recency like `get`. Returns `None` when `key` is absent.
     pub fn get_mut(&mut self, key: &K) -> Option<&mut V> {
         let tick = self.next_tick();
         let entry = self.entries.get_mut(key)?;
@@ -91,17 +94,20 @@ impl<K: Eq + Hash + Clone, V> BoundedMap<K, V> {
         &mut entry.0
     }
 
+    /// Inserts every pair, one `insert` at a time, so eviction can happen mid-iteration.
     pub fn extend(&mut self, iter: impl IntoIterator<Item = (K, V)>) {
         for (k, v) in iter {
             self.insert(k, v);
         }
     }
 
+    /// Number of entries currently held; never exceeds the cap after an `insert` returns.
     #[must_use]
     pub fn len(&self) -> usize {
         self.entries.len()
     }
 
+    /// True when the map holds no entries.
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()

@@ -18,7 +18,7 @@
 //! - `rules` — the co-occurrence rules (one function per scenario);
 //! - `behavior` — the per-pid behavioral vector ([`BehaviorVector`]);
 //! - `bayes` — the naive Bayes filter ([`BeliefState`], calibrated LLRs);
-//! - `udp_flows` — the gate that lets one `UdpSend` per flow per window onto the bus;
+//! - `udp_flows` — the gate that lets one `UdpSend` per flow per second onto the bus;
 //! - `engine` — the entry point ([`CorrelationEngine`]) that orchestrates it all.
 
 mod bayes;

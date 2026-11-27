@@ -8,9 +8,13 @@ use serde::{Deserialize, Deserializer};
 /// Sigma rule as loaded from the YAML.
 #[derive(Debug, Deserialize)]
 pub struct SigmaRule {
+    /// Human-readable rule name; copied into [`SigmaAlert::title`].
     pub title: String,
+    /// Free-text explanation of what the rule detects; empty when the YAML omits it.
     #[serde(default)]
     pub description: String,
+    /// Sigma tags, such as `attack.execution` or `attack.t1059.001`; the ATT&CK technique ids
+    /// of an alert are derived from them.
     #[serde(default)]
     pub tags: Vec<String>,
     /// Required by `validate()` for any rule shipped through
@@ -37,6 +41,7 @@ pub struct SigmaRule {
     /// `validate()` refuses anything this engine would evaluate against the wrong events.
     #[serde(default)]
     pub logsource: Option<LogSource>,
+    /// Selections and the condition that combines them.
     pub detection: Detection,
     /// The condition, parsed once (at validation, or on first evaluation of a rule that was
     /// never validated): what evaluation runs, so the text is never re-parsed per event.
@@ -143,11 +148,15 @@ pub enum Selection {
 #[derive(Debug, Deserialize)]
 #[serde(untagged)]
 pub enum ValueList {
+    /// One scalar value.
     Single(String),
+    /// A YAML list of values: a match on any of them is a match (implicit OR).
     Many(Vec<String>),
 }
 
 impl ValueList {
+    /// Borrows the values as a vector of `&str`, whether the YAML held a single scalar or a
+    /// list. Allocates; the order is the YAML order.
     #[must_use]
     pub fn as_slice(&self) -> Vec<&str> {
         match self {
@@ -160,9 +169,14 @@ impl ValueList {
 /// Alert emitted when a Sigma rule matches.
 #[derive(Debug, Clone)]
 pub struct SigmaAlert {
+    /// Title of the rule that matched.
     pub title: String,
+    /// Raw tag list of the rule, tactic tags included.
     pub tags: Vec<String>,
+    /// Description of the rule that matched; empty if the rule has none.
     pub description: String,
+    /// Mapped from the rule's `level` (`informational` and `low` both give `Low`); `Low` for a rule
+    /// that never went through `validate()` and so has no `level`.
     pub severity: Severity,
     /// ATT&CK technique ids (`T1234`, `T1234.001`) extracted from `tags`, normalized
     /// to bare uppercase form — issue #74. `tags` keeps the full raw list (tactic

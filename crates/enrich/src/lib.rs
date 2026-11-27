@@ -45,6 +45,7 @@ const CACHE_CAP: usize = 16_384;
 pub struct FileEnrichment {
     /// Lowercase hex SHA-256; `None` when the file was unreadable or over budget.
     pub sha256: Option<String>,
+    /// Code-signature verdict for the file, read from the same handle as the hash.
     pub signature: Signature,
     /// PE version-resource metadata (issue #983): empty (every field `None`) on
     /// every platform but Windows, and on Windows too when the image has none,
@@ -118,6 +119,8 @@ impl Default for Enricher {
 }
 
 impl Enricher {
+    /// Creates an enricher with an empty verdict cache, bounded to `CACHE_CAP` entries (LRU
+    /// eviction).
     #[must_use]
     pub fn new() -> Self {
         Self {

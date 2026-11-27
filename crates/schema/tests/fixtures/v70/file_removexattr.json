@@ -1,0 +1,12 @@
+{
+  "type": "file_removexattr",
+  "meta": {
+    "pid": 9004,
+    "ppid": 9000,
+    "user": { "os": "unix", "uid": 0, "gid": 0 },
+    "timestamp_ns": 1756900017000000000,
+    "comm": "evade"
+  },
+  "path": "/tmp/backdoor",
+  "name": "security.selinux"
+}

@@ -37,8 +37,11 @@ pub type PackageSnapshot = BTreeMap<String, String>;
 /// What happened to one package between two snapshots.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PackageChangeKind {
+    /// The package is in the new snapshot but not in the old one.
     Added,
+    /// The package was in the old snapshot and is gone from the new one.
     Removed,
+    /// The package is in both snapshots with a different version.
     Upgraded,
 }
 
@@ -46,9 +49,13 @@ pub enum PackageChangeKind {
 /// `schema::PackageChangeEvent` the agent emits for it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PackageChange {
+    /// Package name, the key of the [`PackageSnapshot`] entry.
     pub package: String,
+    /// Whether the package was added, removed or upgraded.
     pub kind: PackageChangeKind,
+    /// Version in the old snapshot; `None` for an added package.
     pub previous_version: Option<String>,
+    /// Version in the new snapshot; `None` for a removed package.
     pub version: Option<String>,
 }
 

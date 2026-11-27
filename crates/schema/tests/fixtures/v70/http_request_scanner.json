@@ -1,0 +1,15 @@
+{
+  "type": "http_request",
+  "meta": {
+    "pid": 0,
+    "ppid": 0,
+    "user": { "os": "unknown" },
+    "timestamp_ns": 1756900030000000000,
+    "comm": "http-access-log"
+  },
+  "path": "/",
+  "status": 400,
+  "signature": "scanner_user_agent",
+  "scanner": "nikto",
+  "truncated": true
+}

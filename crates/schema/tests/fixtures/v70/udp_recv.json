@@ -1,0 +1,13 @@
+{
+  "type": "udp_recv",
+  "meta": {
+    "pid": 4242,
+    "ppid": 1337,
+    "user": { "os": "unix", "uid": 0, "gid": 0 },
+    "timestamp_ns": 1756900090000000000,
+    "comm": "dnsd"
+  },
+  "peer_addr": "203.0.113.42",
+  "peer_port": 53,
+  "size": 120
+}

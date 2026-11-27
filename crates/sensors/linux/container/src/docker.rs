@@ -26,6 +26,7 @@ const REQUEST_TIMEOUT: Duration = Duration::from_millis(500);
 
 /// What the Docker daemon reported for one container. `None` means it did not say.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[allow(missing_docs)] // #362
 pub struct DockerContainerInfo {
     pub image: Option<String>,
     pub name: Option<String>,

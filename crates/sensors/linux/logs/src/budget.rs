@@ -39,6 +39,7 @@ impl PerSignature {
 
 /// Events shed in the window that just ended, per signature, for the log line.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(missing_docs)] // #362
 pub struct Dropped {
     pub path_traversal: u32,
     pub sql_injection: u32,
@@ -66,6 +67,7 @@ pub struct SignatureBudget {
 }
 
 impl SignatureBudget {
+    /// A budget with nothing emitted or dropped; the window starts at the first [`Self::allow`] call.
     #[must_use]
     pub fn new() -> Self {
         Self::default()

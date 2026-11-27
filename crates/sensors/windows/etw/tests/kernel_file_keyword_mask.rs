@@ -1,3 +1,4 @@
+//! Real-session check that the Kernel-File provider only delivers the requested event IDs (mask `0x1480` by default, override with `SYNTHAEA_KERNEL_FILE_MASK`). Windows-only, `#[ignore]`d, needs an elevated process.
 #![cfg(windows)]
 
 use std::{

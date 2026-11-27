@@ -145,6 +145,29 @@ fn the_alert_log_loss_counter_round_trips() {
     assert_eq!(back, beacon);
 }
 
+// The eBPF ring loss counters (#335) are additive in the same way.
+
+#[test]
+fn a_beacon_from_an_agent_without_the_ring_loss_counters_parses_with_zero() {
+    let beacon: HealthBeacon = serde_json::from_str(&beacon_json("")).unwrap();
+    assert_eq!((beacon.ring_dropped, beacon.exec_ring_dropped), (0, 0));
+}
+
+#[test]
+fn the_ring_loss_counters_round_trip() {
+    let beacon: HealthBeacon = serde_json::from_str(&beacon_json(
+        r#","ring_dropped":51064213,"exec_ring_dropped":7"#,
+    ))
+    .unwrap();
+    assert_eq!(
+        (beacon.ring_dropped, beacon.exec_ring_dropped),
+        (51_064_213, 7)
+    );
+    let back: HealthBeacon =
+        serde_json::from_str(&serde_json::to_string(&beacon).unwrap()).unwrap();
+    assert_eq!(back, beacon);
+}
+
 // The Windows ETW shedding counters (issue #178) are additive in the same way.
 
 /// The ETW shedding counts, in beacon order.

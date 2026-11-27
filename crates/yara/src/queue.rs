@@ -26,7 +26,9 @@ const SETTLE: Duration = Duration::from_millis(200);
 /// incarnation (issues #614, #592).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ScanContext {
+    /// Parent process id of the process that triggered the scan.
     pub ppid: u32,
+    /// Command name (`comm`) of the process that triggered the scan.
     pub comm: String,
     /// The incarnation of the parent `ppid` names, when the sensor stamped one
     /// (`EventMeta::parent_process_generation`): without it a recycled parent pid
@@ -45,6 +47,7 @@ pub struct ScanContext {
 /// One scan result delivered to the callback.
 #[derive(Debug, Clone)]
 pub struct ScanOutcome {
+    /// The file that was scanned.
     pub path: PathBuf,
     /// The process that wrote the file, when the request carried one
     /// ([`ScanQueue::enqueue_for`]).
@@ -54,10 +57,12 @@ pub struct ScanOutcome {
     pub matches: Vec<YaraMatch>,
 }
 
+/// Cumulative scan counters for the queue.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct ScanStats {
     /// Scans fully handled: the match callback, when there was a match, has returned.
     pub scanned: u64,
+    /// Requests that could not be queued because the queue was full or closed.
     pub dropped: u64,
 }
 
@@ -166,6 +171,8 @@ impl ScanQueue {
         }
     }
 
+    /// Snapshot of the cumulative `scanned` and `dropped` counters. Reads are `Relaxed`, so the
+    /// two values may be slightly out of step.
     #[must_use]
     pub fn stats(&self) -> ScanStats {
         ScanStats {

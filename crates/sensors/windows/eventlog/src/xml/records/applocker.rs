@@ -8,6 +8,7 @@ use crate::xml::scan::{attribute_value, element_text, event_field, unescape_xml_
 /// `<EventData><Data Name=...>` shape the Security channel uses.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AppLockerEvent {
+    /// `<EventRecordID>`: the record's id in its channel, the poller's resume cursor.
     pub record_id: u64,
     /// `System/EventID`, one of the channel's audited or enforced decision ids.
     pub event_id: u32,

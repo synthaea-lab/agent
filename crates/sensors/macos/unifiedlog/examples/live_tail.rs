@@ -17,7 +17,12 @@ fn main() {
         "tailing the unified log (predicate: {})",
         sensor_macos_unifiedlog::PREDICATE
     );
-    for item in sensor_macos_unifiedlog::NormalizedLogStream::new(BufReader::new(stdout)) {
+    let counters = std::sync::Arc::new(sensor_macos_unifiedlog::StreamCounters::default());
+    let stream = sensor_macos_unifiedlog::NormalizedLogStream::with_counters(
+        BufReader::new(stdout),
+        std::sync::Arc::clone(&counters),
+    );
+    for item in stream {
         match item {
             Ok((record, event)) => {
                 println!(
@@ -32,7 +37,8 @@ fn main() {
             Err(e) => eprintln!("stream error: {e}"),
         }
     }
-    // Reached only when `log stream` exits (killed externally) — reap it.
+    // Reached only when `log stream` exits (killed externally) — report the losses and reap it.
+    eprintln!("losses: {:?}", counters.totals());
     let _ = child.wait();
 }
 

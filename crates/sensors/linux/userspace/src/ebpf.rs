@@ -20,7 +20,7 @@ pub const RAW_TRACEPOINTS: &[(&str, &str)] = &[
     ("raw_sched_process_fork", "sched_process_fork"),
     ("raw_sched_process_exit", "sched_process_exit"),
     ("raw_sched_process_exec", "sched_process_exec"),
-    ("raw_sys_enter", "sys_enter"),
+    (SYS_ENTER_PROGRAM, "sys_enter"),
     ("raw_sys_exit", "sys_exit"),
     (DNS_UDP_PROGRAM, "sys_enter"),
     // Signals to the processes of the listed security units (#1103), through `SIGNAL_WATCH_TOOLS`.
@@ -31,6 +31,46 @@ pub const RAW_TRACEPOINTS: &[(&str, &str)] = &[
 /// sensor is built with [`crate::LinuxSensor::with_dns_udp_capture`]. It is in [`RAW_TRACEPOINTS`] so
 /// the preflight loads it through the verifier like the others, and the sensor skips it otherwise.
 pub const DNS_UDP_PROGRAM: &str = "raw_dns_udp_enter";
+
+/// The syscall-entry router with the file path filters inline (`RAW_TRACEPOINTS` lists it).
+pub const SYS_ENTER_PROGRAM: &str = "raw_sys_enter";
+
+/// The same router whose file handlers tail-call the [`FILE_FILTER_PROGRAMS`] (#351): the path
+/// scan is verified once per kind instead of inside the router, which leaves the router far under
+/// the verifier's budget. Attached in place of [`SYS_ENTER_PROGRAM`] when the kernel loads it; a
+/// JIT that cannot mix tail calls with BPF-to-BPF calls (i686, arm64 before 6.0, no JIT) refuses
+/// it, and the sensor keeps the inline router.
+pub const SYS_ENTER_TAIL_CALL_PROGRAM: &str = "raw_sys_enter_tc";
+
+/// The file handlers' filter-and-output programs (#351), each with its
+/// `sensor_linux_wire::file_filter` slot in `FILE_FILTER_PROGS`. Loaded, never attached:
+/// `raw_sys_enter` tail-calls them. The agent's preflight loads them through the verifier like
+/// [`RAW_TRACEPOINTS`].
+pub const FILE_FILTER_PROGRAMS: &[(&str, u32)] = {
+    use sensor_linux_wire::file_filter::{
+        CHMOD, CHOWN, COUNT, DELETE, OPEN, REMOVEXATTR, RENAME, SETXATTR,
+    };
+    const PROGRAMS: &[(&str, u32)] = &[
+        ("raw_file_open_filter", OPEN),
+        ("raw_file_delete_filter", DELETE),
+        ("raw_file_rename_filter", RENAME),
+        ("raw_file_chmod_filter", CHMOD),
+        ("raw_file_chown_filter", CHOWN),
+        ("raw_file_setxattr_filter", SETXATTR),
+        ("raw_file_removexattr_filter", REMOVEXATTR),
+    ];
+    // Every slot filled, each once: an empty slot would leave its events unfiltered.
+    assert!(PROGRAMS.len() == COUNT as usize);
+    let mut seen = [false; COUNT as usize];
+    let mut i = 0;
+    while i < PROGRAMS.len() {
+        let slot = PROGRAMS[i].1 as usize;
+        assert!(slot < COUNT as usize && !seen[slot]);
+        seen[slot] = true;
+        i += 1;
+    }
+    PROGRAMS
+};
 
 /// `sensor_linux_wire::LineageEntry` is `repr(C)` over two `u32`, a `[u8; 16]` and a `u64`,
 /// laid out with no implicit padding (`execd` is explicit) — every bit pattern is
@@ -347,6 +387,82 @@ pub fn load_program(ebpf: &mut aya::Ebpf, program_name: &str) -> Result<(), Sens
         .load()
         .map_err(|e| err(format!("kernel verifier rejected `{program_name}`: {e}")))?;
     Ok(())
+}
+
+/// Loads each [`FILE_FILTER_PROGRAMS`] program and puts it in its `FILE_FILTER_PROGS` slot
+/// (#351), so the file handlers filter their events. Slot by slot: a program the kernel refuses
+/// leaves only its own slot empty, and only that kind's events go out unfiltered. `ebpf` must
+/// outlive the sensor: the kernel empties a program array when its last userspace handle closes.
+///
+/// Returns the programs that could not be put in their slot, each with why; the caller logs them
+/// and runs on.
+///
+/// # Errors
+///
+/// Returns [`SensorError`] when the map itself is missing or not a program array: then no slot
+/// can be filled, and every file event kind goes out unfiltered.
+pub(crate) fn populate_file_filters(
+    ebpf: &mut aya::Ebpf,
+) -> Result<Vec<(&'static str, SensorError)>, SensorError> {
+    let mut failed = Vec::new();
+    let mut fds = Vec::with_capacity(FILE_FILTER_PROGRAMS.len());
+    for &(name, slot) in FILE_FILTER_PROGRAMS {
+        match load_program(ebpf, name).and_then(|()| program_fd(ebpf, name)) {
+            Ok(fd) => fds.push((name, slot, fd)),
+            Err(e) => failed.push((name, e)),
+        }
+    }
+    let map = ebpf
+        .map_mut("FILE_FILTER_PROGS")
+        .ok_or_else(|| err("eBPF map FILE_FILTER_PROGS is missing".to_owned()))?;
+    let mut progs = aya::maps::ProgramArray::try_from(map)
+        .map_err(|e| err(format!("FILE_FILTER_PROGS is not a program array: {e}")))?;
+    for (name, slot, fd) in &fds {
+        if let Err(e) = progs.set(*slot, fd, 0) {
+            failed.push((
+                name,
+                err(format!("populate FILE_FILTER_PROGS[{slot}]: {e}")),
+            ));
+        }
+    }
+    Ok(failed)
+}
+
+/// An owned copy of a loaded program's fd, so the map can be borrowed while it is set.
+fn program_fd(ebpf: &aya::Ebpf, name: &str) -> Result<aya::programs::ProgramFd, SensorError> {
+    ebpf.program(name)
+        .ok_or_else(|| err(format!("program `{name}` not found in eBPF object")))?
+        .fd()
+        .map_err(|e| e.to_string())
+        .and_then(|fd| fd.try_clone().map_err(|e| e.to_string()))
+        .map_err(|e| err(format!("`{name}` has no usable fd: {e}")))
+}
+
+/// Attaches `sys_enter`'s router: [`SYS_ENTER_TAIL_CALL_PROGRAM`] when `filters_ready` (every
+/// filter slot filled) and the kernel loads it, [`SYS_ENTER_PROGRAM`] otherwise (#351).
+///
+/// # Errors
+///
+/// Returns [`SensorError`] when the inline router cannot be attached either.
+pub(crate) fn attach_sys_enter(
+    ebpf: &mut aya::Ebpf,
+    filters_ready: bool,
+) -> Result<(), SensorError> {
+    if filters_ready {
+        match attach_raw_tracepoint(ebpf, SYS_ENTER_TAIL_CALL_PROGRAM, "sys_enter") {
+            Ok(()) => {
+                tracing::info!(
+                    "sensor-linux: sys_enter router filters file events through tail calls"
+                );
+                return Ok(());
+            }
+            Err(e) => tracing::warn!(
+                error = %e,
+                "sensor-linux: tail-call sys_enter router refused: keeping the inline filters"
+            ),
+        }
+    }
+    attach_raw_tracepoint(ebpf, SYS_ENTER_PROGRAM, "sys_enter")
 }
 
 pub(crate) fn attach_raw_tracepoint(

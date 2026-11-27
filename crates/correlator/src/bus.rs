@@ -27,6 +27,8 @@ pub struct EventBus {
 }
 
 impl EventBus {
+    /// Creates an empty bus that keeps events within `window` of the newest timestamp seen (see
+    /// `push`).
     #[must_use]
     pub fn new(window: Duration) -> Self {
         Self {

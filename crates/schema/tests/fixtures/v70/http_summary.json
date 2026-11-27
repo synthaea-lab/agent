@@ -1,0 +1,20 @@
+{
+  "type": "http_summary",
+  "meta": {
+    "pid": 0,
+    "ppid": 0,
+    "user": { "os": "unknown" },
+    "timestamp_ns": 1756900031000000000,
+    "comm": "http-access-log"
+  },
+  "source": "/var/log/nginx/access.log",
+  "window_secs": 60,
+  "requests": 412,
+  "status_4xx": 37,
+  "status_5xx": 2,
+  "distinct_clients": 19,
+  "top_clients": [
+    { "client": "198.51.100.7", "failures": 31 },
+    { "client": "2001:db8::5", "failures": 4 }
+  ]
+}

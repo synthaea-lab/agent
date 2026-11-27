@@ -135,7 +135,7 @@ pub struct CorrelationEngine {
     recent_web_requests: VecDeque<HttpRequestEvent>,
     /// What the bounded web-shell state had to drop (CLAUDE.md: bounded and observable).
     web_shell_shedding: WebShellShedding,
-    /// One `UdpSend` per flow per window reaches the bus: a datagram is an event.
+    /// One `UdpSend` per flow per second reaches the bus: a datagram is an event.
     udp_flows: UdpFlowGate,
     /// Bayesian beliefs per entity (ppid, comm), LRU-bounded (`store::BoundedMap`) —
     /// the old iteration's unbounded `HashMap` was a documented known limitation.

@@ -54,6 +54,8 @@ pub struct ClassifiedJournal<R> {
 }
 
 impl<R: BufRead> ClassifiedJournal<R> {
+    /// Wraps `reader`, one `journalctl -o json` record per line. Lines over the length cap are
+    /// dropped and counted rather than ending the stream.
     pub fn new(reader: R) -> Self {
         Self::from_lines(BoundedLines::new(reader))
     }

@@ -7,18 +7,20 @@
 //! and [`normalize()`] into the existing `Connect`, `NetworkFlow` and
 //! `DnsQuery` shapes. See `docs/sensors/macos/network-extension.md`.
 
+mod bounded_lines;
 pub mod normalize;
 pub mod receiver;
 pub mod wire;
 
 pub use normalize::normalize;
-pub use receiver::NormalizedNeStream;
 #[cfg(unix)]
 pub use receiver::socket::{accept_loop, listen};
+pub use receiver::{NormalizedNeStream, SkewCounters, SkewTotals};
 
 /// Errors from the receiver path.
 #[derive(Debug, thiserror::Error)]
 pub enum NetworkExtensionError {
+    /// Reading from or accepting on the extension socket failed.
     #[error("I/O error on the extension socket: {0}")]
     Io(#[from] std::io::Error),
 }

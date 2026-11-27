@@ -7,12 +7,16 @@ use schema::{Event, EventMeta, ExecEvent, HttpRequestEvent, detection::Severity}
 
 use crate::{bus::EventBus, event::is_file_write};
 
+/// A co-occurrence finding emitted by the correlator. Same shape as `rules::Alert`, plus
+/// `trigger_event` for findings a timer emits after the fact.
 #[derive(Debug, Clone)]
 pub struct CorrelationAlert {
+    /// ATT&CK identifier(s) of the co-occurrence pattern, e.g. `"T1059/T1071"`.
     pub technique: &'static str,
     /// Analyst-facing severity of this co-occurrence pattern (issue #615). Ranks
     /// and fuses the finding; never a response trigger (see `rules::Alert`).
     pub severity: Severity,
+    /// Analyst-facing description of what co-occurred.
     pub message: String,
     /// Event that owns the finding when it is emitted later by a timer.
     pub trigger_event: Option<Box<Event>>,
@@ -22,7 +26,7 @@ pub struct CorrelationAlert {
 /// except sshd's address-selection probe (`connect()` to `0.0.0.0:65535` / `:::65535`),
 /// which reaches no remote peer. A datagram is a C2 channel as much as a TCP connect
 /// (custom UDP C2, DNS to a chosen resolver): before #253, Windows read every UDP send as
-/// a `Connect`, and the bus holds one `UdpSend` per flow per window (`udp_flows`).
+/// a `Connect`, and the bus holds one `UdpSend` per flow per second (`udp_flows`).
 ///
 /// Without the probe exclusion, every SSH login (`sshd-auth` and `sshd-session` exec,
 /// then probe) raised `rule_spawn_connect` twice and, after a few logins,
