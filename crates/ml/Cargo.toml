@@ -21,7 +21,7 @@ dynamic-onnx = ["ort/download-binaries", "ort/tls-rustls"]
 
 [dependencies]
 schema = { path = "../schema" }
-correlator = { path = "../correlator" }
+event-window = { path = "../event-window" }
 thiserror = { workspace = true }
 # Workspace ort is configured with default-features = false.
 # The dynamic-onnx feature (enabled by default) re-enables download-binaries for dev builds.

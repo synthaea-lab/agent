@@ -3,13 +3,13 @@
 
 use std::{collections::VecDeque, time::Duration};
 
+use event_window::{EventBus, same_generation};
 use schema::{Event, EventMeta, ExecEvent, HttpRequestEvent, detection::Severity};
 use store::BoundedMap;
 
 use crate::{
     bayes::{BAYES_THRESHOLD, BeliefState, apply_ml_llr, apply_rarity_llr, update_belief},
     behavior::BehaviorVector,
-    bus::{EventBus, same_generation},
     event::is_correlated,
     rules::{
         CorrelationAlert, WEB_SHELL_GRACE_NS, WEB_SHELL_LATE_REQUEST_NS, rule_assembly_connect,

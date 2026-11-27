@@ -11,6 +11,7 @@ workspace = true
 
 [dependencies]
 policy = { path = "../policy" }
+event-window = { path = "../event-window" }
 schema = { path = "../schema" }
 store = { path = "../store" }
 thiserror = { workspace = true }

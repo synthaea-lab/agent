@@ -8,7 +8,7 @@
 //! rules/Sigma/YARA. This crate is the seam that turns "N engines each raising a
 //! hand" into one scored verdict per entity, keyed by the same `(ppid, comm)`
 //! join `correlator` already uses (the logical identity of a respawned
-//! process — see `crates/correlator/src/bus.rs`).
+//! process — see `crates/event-window/src/lib.rs`).
 //!
 //! Findings are folded in as real [`schema::detection::Detection`] values, not
 //! bare strings — the schema's own severity/score/source/evidence fields are

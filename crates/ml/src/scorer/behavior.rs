@@ -13,7 +13,7 @@
 //! decides what to do with the number. Nothing wires it into the agent yet; that waits
 //! for a model trained on a real capture (#617).
 
-use correlator::EventBus;
+use event_window::EventBus;
 use ort::{session::Session, value::Tensor};
 
 use super::{ModelMetadata, Score, ScorerError};

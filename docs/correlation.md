@@ -42,7 +42,7 @@ Two outputs of the correlator matter downstream:
 
 ## The event bus: the correlator's short-term memory
 
-[`EventBus`](../crates/correlator/src/bus.rs) is a `VecDeque` of recent events,
+[`EventBus`](../crates/event-window/src/lib.rs) is a `VecDeque` of recent events,
 evicted by time. The engine uses a 60 s window
 ([`CorrelationEngine::new`](../crates/correlator/src/engine.rs)).
 
@@ -58,13 +58,13 @@ evicted by time. The engine uses a 60 s window
   [`BehaviorVector::from_window`](../crates/correlator/src/behavior.rs) and in every
   exhaustive match of `rules.rs`.
 - **Eviction cuts against the greatest timestamp ever seen**, not the last insert
-  ([`EventBus::push`](../crates/correlator/src/bus.rs)). Sensors drain several ring
+  ([`EventBus::push`](../crates/event-window/src/lib.rs)). Sensors drain several ring
   buffers independently, so an older event delivered late must not move the cutoff
   back and resurrect history.
 - **Process identity.** Lookups go through
-  [`EventBus::events_for_pid`](../crates/correlator/src/bus.rs), which filters on pid
+  [`EventBus::events_for_pid`](../crates/event-window/src/lib.rs), which filters on pid
   *and* process incarnation (`process_generation`) with
-  [`same_generation`](../crates/correlator/src/bus.rs): two known, different stamps
+  [`same_generation`](../crates/event-window/src/lib.rs): two known, different stamps
   are two processes; a missing stamp on either side cannot disprove identity (the
   behavior on platforms or paths that do not stamp). The same rule is applied by
   every pid-keyed map in the correlator, by the verdict engine, and by the

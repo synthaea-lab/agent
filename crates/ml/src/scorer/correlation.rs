@@ -21,7 +21,7 @@
 //! through `CorrelationEngine::update_belief_with_ml` — see
 //! `docs/detection/correlation.md`.
 
-use correlator::EventBus;
+use event_window::EventBus;
 use ort::{session::Session, value::Tensor};
 
 use super::{ModelMetadata, Score, ScorerError};

@@ -15,7 +15,7 @@
 
 use std::collections::HashSet;
 
-use correlator::EventBus;
+use event_window::EventBus;
 use schema::Event;
 
 /// Write intent on a `FileOpen` — same shape as `correlator`'s crate-private

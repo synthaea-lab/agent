@@ -95,7 +95,7 @@
 //!   alone.
 //! - `crates/correlator` wiring: [`listen_port_events`]/[`conntrack_flow_events`]
 //!   produce `schema::Event`s, but nothing in this crate hands them to
-//!   `correlator::EventBus` — that's the caller's job (the same one that would own
+//!   `event_window::EventBus` — that's the caller's job (the same one that would own
 //!   the polling cadence above), and no such caller exists yet for this crate's
 //!   data.
 //! - UDP in the agent: [`snapshot_udp`]/[`listen_port_events_udp`] exist (a bound,

@@ -1,0 +1,13 @@
+[package]
+name = "event-window"
+version.workspace = true
+description = "The sliding window of recent events the correlator joins over and the ML features read"
+license.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+schema = { path = "../schema" }

@@ -11,7 +11,7 @@
 
 use std::{net::Ipv4Addr, time::Duration};
 
-use correlator::EventBus;
+use event_window::EventBus;
 use ml::CorrelationScorer;
 use schema::{ConnectEvent, Event, EventMeta, ExecEvent, FileOpenEvent, User};
 use serde_json::Value;
