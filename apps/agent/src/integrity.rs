@@ -89,7 +89,7 @@ fn check_once(layout: &updater::layout::Layout, sink: &DetectionSink) {
     // The manifest was verified under the `release` key in force when it was promoted, which a
     // rotation since then may have replaced: accept any key this install has trusted. That is a
     // re-check of a manifest already on disk, never an approval of anything new.
-    let keys = match crate::trust::load(&state_dir(layout)) {
+    let keys = match updater::trust_state::keys_in_force(&state_dir(layout)) {
         Ok(keys) => keys,
         Err(e) => {
             tracing::warn!(error = %e, "self-integrity: the record of key rotations is not trustworthy");
@@ -339,7 +339,7 @@ mod tests {
         std::fs::create_dir_all(layout.versions_dir()).unwrap();
         std::os::unix::fs::symlink(layout.bootstrap_dir(), layout.current_link()).unwrap();
         promote_signed_release(&layout, b"the real agent binary");
-        std::fs::write(crate::trust::record_path(&dir), b"{ truncated").unwrap();
+        std::fs::write(updater::trust_state::record_path(&dir), b"{ truncated").unwrap();
 
         let sink = sink_in(&dir);
         check_once(&layout, &sink);

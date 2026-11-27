@@ -117,7 +117,7 @@ pub(crate) fn apply(
     installed_release: Option<u64>,
     now: u64,
 ) -> anyhow::Result<Outcome> {
-    let path = crate::trust::record_path(state_dir);
+    let path = updater::trust_state::record_path(state_dir);
     let mut record = TrustState::load(&path)?;
     match record.adopt(rotation, installed_release, now) {
         Ok(_) => {}
@@ -218,7 +218,7 @@ mod tests {
     #[test]
     fn a_fresh_install_trusts_the_embedded_keys() {
         let state = dir("fresh");
-        let keys = crate::trust::load(&state).unwrap();
+        let keys = updater::trust_state::keys_in_force(&state).unwrap();
         assert_eq!(keys.release, *RELEASE_PUBLIC_KEY);
         assert_eq!(keys.content, *CONTENT_PUBLIC_KEY);
         assert_eq!(keys.applied_release_version, None);
@@ -242,7 +242,7 @@ mod tests {
             }
         );
         // A different process: nothing is cached, the record is read again.
-        let keys = crate::trust::load(&state).unwrap();
+        let keys = updater::trust_state::keys_in_force(&state).unwrap();
         assert_eq!(keys.release, Some(new_key(0x51)));
         assert_eq!(
             keys.content, *CONTENT_PUBLIC_KEY,
@@ -262,7 +262,7 @@ mod tests {
             NOW,
         )
         .unwrap();
-        let keys = crate::trust::load(&state).unwrap();
+        let keys = updater::trust_state::keys_in_force(&state).unwrap();
 
         let mut by_old = updater::ReleaseManifest::new(6, std::collections::BTreeMap::new());
         by_old.sign(&test_key_pair());
@@ -282,7 +282,7 @@ mod tests {
         let state = dir("replay");
         let first = rotation(5, embedded_release(), new_key(0x51));
         apply(&first, &state, None, NOW).unwrap();
-        let before = std::fs::read(crate::trust::record_path(&state)).unwrap();
+        let before = std::fs::read(updater::trust_state::record_path(&state)).unwrap();
 
         assert_eq!(
             apply(&first, &state, None, NOW).unwrap(),
@@ -301,7 +301,7 @@ mod tests {
             }
         ));
         assert_eq!(
-            std::fs::read(crate::trust::record_path(&state)).unwrap(),
+            std::fs::read(updater::trust_state::record_path(&state)).unwrap(),
             before
         );
     }
@@ -322,7 +322,7 @@ mod tests {
                 current: 5
             }
         ));
-        assert!(!crate::trust::record_path(&state).exists());
+        assert!(!updater::trust_state::record_path(&state).exists());
     }
 
     #[test]
@@ -333,7 +333,7 @@ mod tests {
         assert!(apply(&forged, &state, None, NOW).is_err());
         let expired = rotation(5, embedded_release(), new_key(0x51));
         assert!(apply(&expired, &state, None, ISSUED + 7200).is_err());
-        assert!(!crate::trust::record_path(&state).exists());
+        assert!(!updater::trust_state::record_path(&state).exists());
     }
 
     #[test]
@@ -346,11 +346,11 @@ mod tests {
             NOW,
         )
         .unwrap();
-        let path = crate::trust::record_path(&state);
+        let path = updater::trust_state::record_path(&state);
 
         std::fs::write(&path, b"{ truncated").unwrap();
         assert!(
-            crate::trust::load(&state).is_err(),
+            updater::trust_state::keys_in_force(&state).is_err(),
             "never a silent fallback"
         );
         assert!(
@@ -361,7 +361,7 @@ mod tests {
 
         std::fs::remove_file(&path).unwrap();
         assert_eq!(
-            crate::trust::load(&state).unwrap().release,
+            updater::trust_state::keys_in_force(&state).unwrap().release,
             *RELEASE_PUBLIC_KEY,
             "an absent file is a fresh install; deleting it needs the state directory's owner"
         );
@@ -396,7 +396,7 @@ mod tests {
         .unwrap();
         // The real clock is past the test rotation's window: refused, nothing recorded.
         assert!(cmd_apply_key_rotation(&Source::File(&file), &state, true).is_err());
-        assert!(!crate::trust::record_path(&state).exists());
+        assert!(!updater::trust_state::record_path(&state).exists());
         // Not a manifest at all.
         std::fs::write(&file, b"{}").unwrap();
         assert!(cmd_apply_key_rotation(&Source::File(&file), &state, true).is_err());

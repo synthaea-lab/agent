@@ -74,7 +74,7 @@ for (see [Packaging](packaging.md#test-key-exclusion)).
 network or disk work: a test-key build acts only with `--allow-test-key` (a flag that exists only
 in such a build), and a build with no key says that nothing can be verified instead of failing
 later at the signature. The keys in force are loaded fresh from the state directory for every
-command ([`trust::load`](../apps/agent/src/trust.rs)), so a rotation applied by another process is in
+command ([`keys_in_force`](../crates/updater/src/trust_state.rs)), so a rotation applied by another process is in
 force at the next check.
 
 ## Manifest signing
@@ -114,7 +114,7 @@ sequenceDiagram
   participant FS as /var/lib/synthaea
   Op->>A: run
   A->>A: ensure_release_key_trusted (no network yet)
-  A->>FS: trust::load (keys in force, rotation counter)
+  A->>FS: keys_in_force (keys in force, rotation counter)
   A->>CP: GET /api/release/manifest
   A->>A: verify signature, entry paths, ban list,<br/>release_version > max(current, last rotation)
   loop each entry

@@ -196,7 +196,7 @@ pub(crate) fn cmd_check_content_manifest(
     state_dir: &Path,
     state_path: &Path,
 ) -> anyhow::Result<()> {
-    let keys = crate::trust::load(state_dir)?;
+    let keys = updater::trust_state::keys_in_force(state_dir)?;
     let client = build_client(server, cert, key, ca_cert)?;
     let url = client.config().content_manifest_url(ring);
     let manifest: ContentManifest = client.get_json(&url)?;
@@ -749,7 +749,7 @@ fn apply_content_manifest(
     state_path: &Path,
     ipc_endpoint: &str,
 ) -> anyhow::Result<ApplyOutcome> {
-    let keys = crate::trust::load(state_dir)?;
+    let keys = updater::trust_state::keys_in_force(state_dir)?;
     let client = build_client(
         &endpoint.server,
         endpoint.cert.as_deref(),
