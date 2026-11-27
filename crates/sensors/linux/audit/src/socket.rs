@@ -31,11 +31,12 @@ pub struct Received {
 
 /// Failure to open, read or parse the audit netlink socket.
 #[derive(Debug, thiserror::Error)]
-#[allow(missing_docs)] // #362
 pub enum AuditError {
     #[error("netlink socket error: {0}")]
+    /// The `netlink` call failed; the payload is the `errno`.
     Netlink(i32), // errno
     #[error("failed to parse audit message: {0}")]
+    /// A received message did not have the expected layout; the payload says what was wrong.
     Parse(String),
 }
 

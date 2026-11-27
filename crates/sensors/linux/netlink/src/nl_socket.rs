@@ -19,12 +19,12 @@ use crate::{
 
 /// Errors from driving the real netlink socket.
 #[derive(Debug, thiserror::Error)]
-#[allow(missing_docs)] // #362
 pub enum NetlinkError {
     // Not `#[from]`: that would also make the I/O error this error's `source()`, and the message
     // already prints it, so a reporter walking the chain would print it twice. The `From` impl
     // below is written by hand for that reason.
     #[error("netlink I/O error: {0}")]
+    /// A socket or I/O operation failed.
     Io(io::Error),
     /// The kernel replied with `NLMSG_ERROR` and this non-zero errno, positive
     /// (`libc::EPERM`, not the `-EPERM` on the wire).

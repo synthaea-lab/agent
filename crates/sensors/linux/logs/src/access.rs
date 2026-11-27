@@ -20,27 +20,33 @@ use crate::{ParseError, clamp, tokenizer::Cursor};
 
 /// Which preset a source is declared as.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[allow(missing_docs)] // #362
 pub enum AccessFormat {
+    /// Common Log Format: `host ident user [time] "request" status bytes`.
     Common,
+    /// Combined Log Format: Common plus the quoted referer and user agent.
     Combined,
 }
 
 /// One access-log line. Strings are as logged: the request line, referer and user
 /// agent are attacker-controlled and unredacted at this layer.
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[allow(missing_docs)] // #362
 pub struct AccessRecord {
+    /// Client address (first field), as logged.
     pub client: String,
+    /// Authenticated user, `None` when logged as `-`.
     pub user: Option<String>,
     /// As written between the brackets, e.g. `10/Oct/2026:13:55:36 +0000`.
     pub time: String,
     /// The full request line (`GET /a?b=c HTTP/1.1`), possibly garbage for a
     /// request the server could not parse.
     pub request: String,
+    /// HTTP status code.
     pub status: u16,
+    /// Response size in bytes, `None` when logged as `-`.
     pub bytes: Option<u64>,
+    /// Referer header, `None` for a `common` line or a `-`.
     pub referer: Option<String>,
+    /// User-Agent header, `None` for a `common` line or a `-`.
     pub user_agent: Option<String>,
     /// The line was longer than [`crate::MAX_LINE_BYTES`] and cut.
     pub truncated: bool,

@@ -10,9 +10,9 @@ use thiserror::Error;
 
 /// Rejected probe configuration. Returned by the budget setters on `UprobesConfig` when a rate is 0.
 #[derive(Debug, Error)]
-#[allow(missing_docs)] // #362
 pub enum ConfigError {
     #[error("invalid budget value: {0}")]
+    /// A rate or budget value was 0 or otherwise unusable; the payload describes it.
     InvalidBudget(String),
 }
 

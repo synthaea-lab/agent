@@ -18,9 +18,10 @@ pub const MIN_LINES: u32 = 10;
 
 /// A window in which at least half of the lines that reached a parser were rejected.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[allow(missing_docs)] // #362
 pub struct Misparse {
+    /// Lines that parsed in the window.
     pub parsed: u32,
+    /// Lines a parser rejected in the window (at least half of `parsed + failed`).
     pub failed: u32,
 }
 

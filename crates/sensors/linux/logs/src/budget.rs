@@ -39,11 +39,14 @@ impl PerSignature {
 
 /// Events shed in the window that just ended, per signature, for the log line.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[allow(missing_docs)] // #362
 pub struct Dropped {
+    /// Events dropped for the path-traversal signature.
     pub path_traversal: u32,
+    /// Events dropped for the SQL-injection signature.
     pub sql_injection: u32,
+    /// Events dropped for the scanner-user-agent signature.
     pub scanner_user_agent: u32,
+    /// Events dropped for the webshell-like signature.
     pub webshell_like: u32,
 }
 

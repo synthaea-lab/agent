@@ -7,24 +7,35 @@ use crate::parse::AuditRecord;
 /// An audit record reduced to what the sensor reports: an exec with its argv, an outbound connect,
 /// or a `SELinux` AVC denial. Built by [`classify`]; any other record type yields `None` there.
 #[derive(Debug)]
-#[allow(missing_docs)] // #362
 pub enum AuditEvent {
+    /// An `execve` seen through its `EXECVE` record(s).
     Exec {
+        /// Process ID, from the record's `pid=` field (0 when absent or not a number).
         pid: u32,
+        /// Real user ID, from the record's `uid=` field (0 when absent).
         uid: u32,
+        /// Real group ID, from the record's `gid=` field (0 when absent).
         gid: u32,
+        /// Executed image path: the first argv element (`a0`), as decoded from the record.
         image_path: String,
+        /// Decoded argument vector, `argv[0]` first.
         argv: Vec<String>,
         /// The kernel's `EXECVE` records did not carry every argument: a piece or a
         /// follow-on record never arrived, or the hold bound in `execve.rs` was hit.
         /// `argv` is the head that did arrive (#51).
         argv_incomplete: bool,
     },
+    /// An outbound `connect` seen through its `SOCKADDR` record.
     Connect {
+        /// Process ID, from the record's `pid=` field (0 when absent).
         pid: u32,
+        /// User ID, from the record's `uid=` field (0 when absent).
         uid: u32,
+        /// Group ID, from the record's `gid=` field (0 when absent).
         gid: u32,
+        /// Peer address decoded from the hex `saddr` (`sockaddr_in` or `sockaddr_in6`).
         remote_addr: SocketAddr,
+        /// IP protocol number. Always 6 (`IPPROTO_TCP`): the `SOCKADDR` record does not carry it.
         protocol: u8,
     },
     /// A `SELinux` AVC record (`type=AVC`) — arrives at this sensor's socket for free
@@ -47,9 +58,13 @@ pub enum AuditEvent {
     /// unlikely. A misclassified grant-as-denial would be a very rare false
     /// positive, not a false negative.
     PolicyDenial {
+        /// The `comm=` value: the denied process's command name, when present.
         comm: Option<String>,
+        /// The `scontext=` value: the `SELinux` security context of the acting process.
         scontext: Option<String>,
+        /// The `tcontext=` value: the `SELinux` security context of the target object.
         tcontext: Option<String>,
+        /// The `tclass=` value: the object class (`file`, `process`, `tcp_socket`, ...).
         tclass: Option<String>,
         /// The requested permission(s) (`SELinux` `{ read }`, or `{ read write }` for
         /// more than one — space-joined as the kernel wrote them). Recovered from the
@@ -61,6 +76,7 @@ pub enum AuditEvent {
         /// record carries a `{ ... }` pair — an AVC variant this scan doesn't
         /// recognize, not a normal case (#813).
         action: Option<String>,
+        /// The record's `permissive=` flag: `true` when the denial was only logged because the domain is permissive (not enforced).
         permissive: bool,
         /// The object's path, from `path=` (rare, only when the kernel
         /// resolved a full path) or `name=` (the common case — often just a

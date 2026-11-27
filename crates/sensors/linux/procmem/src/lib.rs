@@ -18,8 +18,8 @@ use std::io;
 
 /// One line of `/proc/<pid>/maps`.
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[allow(missing_docs)] // #362
 pub struct MapsEntry {
+    /// Inclusive start address.
     pub start: u64,
     /// Exclusive end.
     pub end: u64,
@@ -32,13 +32,15 @@ pub struct MapsEntry {
 
 /// Why a maps line was refused.
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
-#[allow(missing_docs)] // #362
 pub enum MapsError {
     #[error("maps line has no address range")]
+    /// The line has no address range (empty line or no first column).
     NoRange,
     #[error("maps address range `{0}` is not `start-end` in hex")]
+    /// The first column is not `start-end` in hex; the payload is that column.
     BadRange(String),
     #[error("maps line has no permissions column")]
+    /// The line has no permissions column after the range.
     NoPerms,
 }
 
