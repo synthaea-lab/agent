@@ -1,8 +1,11 @@
 //! Ownership and modes of the quarantine directory and what it holds.
 
-use super::invalid;
-use super::slots::{payload_slot, sidecar_slot};
 use std::path::Path;
+
+use super::{
+    invalid,
+    slots::{payload_slot, sidecar_slot},
+};
 
 pub(super) fn secure_quarantine_dir(path: &Path) -> std::io::Result<()> {
     if let Some(parent) = path

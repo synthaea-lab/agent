@@ -46,11 +46,12 @@
 //! equivalent privilege) can still replace entries or edit sidecar contents; `0700` isolates
 //! other local users, not another process with the same identity.
 
-use policy::ResponsePolicy;
 use std::{
     io::Write as _,
     path::{Path, PathBuf},
 };
+
+use policy::ResponsePolicy;
 
 mod copy;
 mod origin;
@@ -61,20 +62,19 @@ mod snapshot;
 mod source;
 
 pub use self::restore::{QuarantinedFile, is_still_quarantined, list_quarantined, unquarantine};
-
-use self::copy::move_file_no_clobber;
-use self::origin::encode_origin_record;
-use self::permissions::{
-    secure_existing_files, secure_payload, secure_quarantine_dir, secure_sidecar,
-};
-use self::slots::slot_stem;
 #[cfg(unix)]
 use self::snapshot::is_written_after_hash;
 #[cfg(unix)]
 use self::snapshot::quarantine_snapshot;
 #[cfg(unix)]
 use self::snapshot::sweep_stale_snapshots;
-use self::source::Source;
+use self::{
+    copy::move_file_no_clobber,
+    origin::encode_origin_record,
+    permissions::{secure_existing_files, secure_payload, secure_quarantine_dir, secure_sidecar},
+    slots::slot_stem,
+    source::Source,
+};
 
 /// What happened to a quarantine attempt — see [`crate::kill::KillOutcome`] for why
 /// this is one enum covering both the acted and observe-only cases rather than two

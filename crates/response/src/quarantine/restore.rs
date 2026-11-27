@@ -1,13 +1,16 @@
 //! Listing what is quarantined and putting a file back.
 
+use std::path::{Path, PathBuf};
+
 #[cfg(unix)]
 use super::copy::restore_file_with_mode;
-use super::copy::{move_file_no_clobber, sha256_file};
-use super::invalid;
-use super::origin::decode_origin_record;
-use super::permissions::{secure_existing_files, secure_quarantine_dir};
-use super::slots::{is_sha256_hex, parse_slot_stem, quarantine_slots, sidecar_slot};
-use std::path::{Path, PathBuf};
+use super::{
+    copy::{move_file_no_clobber, sha256_file},
+    invalid,
+    origin::decode_origin_record,
+    permissions::{secure_existing_files, secure_quarantine_dir},
+    slots::{is_sha256_hex, parse_slot_stem, quarantine_slots, sidecar_slot},
+};
 
 /// Reverses one [`quarantine_file`](super::quarantine_file) operation for `sha256_hex`: moves one matching
 /// payload back to its original path and removes that slot's sidecar. If identical

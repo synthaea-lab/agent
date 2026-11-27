@@ -1,10 +1,13 @@
 //! The file being quarantined, held open so that what is hashed is what is stored.
 
-use super::copy::{copy_open_no_clobber_with, sha256_reader};
-use super::invalid;
+use std::path::Path;
+
 #[cfg(unix)]
 use super::snapshot::WrittenAfterHash;
-use std::path::Path;
+use super::{
+    copy::{copy_open_no_clobber_with, sha256_reader},
+    invalid,
+};
 
 /// The file being quarantined, opened once.
 ///

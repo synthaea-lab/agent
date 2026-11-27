@@ -1,7 +1,8 @@
 //! Moving and copying files without ever overwriting one, hashing what is copied.
 
-use super::invalid;
 use std::path::Path;
+
+use super::invalid;
 
 /// Moves `from` to `to`, failing with `AlreadyExists` instead of replacing
 /// whatever is at `to` — restoring must never destroy a file that has since

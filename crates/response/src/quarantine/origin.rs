@@ -1,7 +1,8 @@
 //! The sidecar that records where a quarantined file came from.
 
-use super::invalid;
 use std::path::{Path, PathBuf};
+
+use super::invalid;
 
 /// A NUL-prefixed header cannot be a legacy path because Unix paths and Windows paths cannot
 /// contain NUL. The four-byte mode uses `u32::MAX` when no Unix mode was recorded.

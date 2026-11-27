@@ -1,12 +1,7 @@
 #[cfg(any(test, not(unix)))]
 use super::copy::move_to_quarantine;
-use super::copy::{
-    copy_no_clobber, copy_no_clobber_with, move_file_no_clobber, sha256_file, sha256_reader,
-};
-use super::origin::{decode_origin_record, encode_origin_record, origin_sidecar_path};
 #[cfg(unix)]
 use super::permissions::quarantine_dir_needs_chmod;
-use super::permissions::{secure_payload, secure_quarantine_dir};
 #[cfg(unix)]
 use super::snapshot::SnapshotLock;
 #[cfg(unix)]
@@ -21,12 +16,19 @@ use super::snapshot::quarantine_snapshot;
 use super::snapshot::sweep_stale_snapshots;
 #[cfg(unix)]
 use super::snapshot::try_lock_exclusive;
-use super::source::Source;
 #[cfg(unix)]
 use super::source::can_fall_back_to_copy;
 #[cfg(unix)]
 use super::source::copy_open_file_no_clobber;
-use super::*;
+use super::{
+    copy::{
+        copy_no_clobber, copy_no_clobber_with, move_file_no_clobber, sha256_file, sha256_reader,
+    },
+    origin::{decode_origin_record, encode_origin_record, origin_sidecar_path},
+    permissions::{secure_payload, secure_quarantine_dir},
+    source::Source,
+    *,
+};
 
 fn temp_dir(name: &str) -> PathBuf {
     use std::sync::atomic::{AtomicU32, Ordering};

@@ -1,9 +1,8 @@
 //! The private copy quarantine takes of a file it cannot move, and the sweep of copies left behind.
 
-use super::copy::sha256_copy;
-use super::source::Source;
-use super::store_in_slot;
 use std::path::{Path, PathBuf};
+
+use super::{copy::sha256_copy, source::Source, store_in_slot};
 
 /// Quarantines a source that is being written to: copies it from the descriptor into a private
 /// file in the quarantine directory, hashing the bytes as they are copied, and files that

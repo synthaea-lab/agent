@@ -1,7 +1,8 @@
 //! How quarantined files are named: a SHA-256 and a slot number.
 
-use super::invalid;
 use std::path::{Path, PathBuf};
+
+use super::invalid;
 
 pub(super) fn slot_stem(sha256_hex: &str, slot: u64) -> String {
     if slot == 0 {
