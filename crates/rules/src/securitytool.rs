@@ -550,14 +550,7 @@ const THROTTLE_FILES: &[&str] = &[
 /// event carries no working directory. An `x.service/memory.max` from an unrelated directory is
 /// read as the cgroup of `x` (a false positive only for a listed tool's name).
 fn cgroup_unit_and_file(path: &str) -> Option<(&str, &str)> {
-    let mut segments: Vec<&str> = Vec::new();
-    for segment in path.split('/').filter(|s| !s.is_empty() && *s != ".") {
-        if segment == ".." {
-            segments.pop();
-        } else {
-            segments.push(segment);
-        }
-    }
+    let segments = crate::lexical_path::lexical_segments(path);
     let [.., unit, file] = &segments[..] else {
         return None;
     };

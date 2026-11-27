@@ -240,7 +240,7 @@ fn load_embedded(tamper_pin: Option<&std::path::Path>) -> Result<aya::Ebpf, Sens
 
 /// bpffs directory holding the agent's pinned maps (issue #362).
 #[cfg(ebpf_embedded)]
-const PIN_DIR: &str = "/sys/fs/bpf/synthaea";
+const PIN_DIR: &str = schema::AGENT_BPF_PIN_DIR;
 
 /// Pin path of `SIGNAL_TAMPER_LAST`. Versioned by `WIRE_VERSION`: aya reuses an
 /// existing pin as-is without checking its value size, so a pin left by an agent
@@ -248,7 +248,8 @@ const PIN_DIR: &str = "/sys/fs/bpf/synthaea";
 #[cfg(ebpf_embedded)]
 fn tamper_pin_path() -> std::path::PathBuf {
     std::path::Path::new(PIN_DIR).join(format!(
-        "signal_tamper_last_v{}",
+        "{}{}",
+        schema::AGENT_TAMPER_PIN_NAME_PREFIX,
         sensor_linux_wire::WIRE_VERSION
     ))
 }

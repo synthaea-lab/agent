@@ -51,9 +51,10 @@ fn file_id(_meta: &std::fs::Metadata) -> Option<FileId> {
 
 /// Where a source was read up to: the file and the offset of the next line to read.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[allow(missing_docs)] // #362
 pub struct Position {
+    /// Identity of the file read, `None` where the platform gives none (non-Unix).
     pub id: Option<FileId>,
+    /// Byte offset of the next line to read.
     pub offset: u64,
 }
 

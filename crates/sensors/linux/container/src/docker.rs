@@ -26,9 +26,10 @@ const REQUEST_TIMEOUT: Duration = Duration::from_millis(500);
 
 /// What the Docker daemon reported for one container. `None` means it did not say.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-#[allow(missing_docs)] // #362
 pub struct DockerContainerInfo {
+    /// Image the container was created from (`Config.Image`, as written: name and tag, or a digest).
     pub image: Option<String>,
+    /// Container name without the leading `/` that the daemon stores.
     pub name: Option<String>,
 }
 

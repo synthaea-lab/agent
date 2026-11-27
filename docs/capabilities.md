@@ -12,7 +12,7 @@ What the agent can do today, area by area, with the code and tests that back eac
 
 Every `partial` and `planned` row links a tracking issue; `tools/check-docs.py` fails CI otherwise.
 
-Totals: 271 capabilities, 152 built, 80 partial, 39 planned.
+Totals: 272 capabilities, 152 built, 81 partial, 39 planned.
 
 ## Contents
 
@@ -30,6 +30,7 @@ Totals: 271 capabilities, 152 built, 80 partial, 39 planned.
 
 | Capability | Status | Evidence | Tracking issue | Docs |
 | --- | --- | --- | --- | --- |
+| Removal of the agent's pinned SIGKILL state, and an `AppArmor` profile unloaded, alert (T1562.001) | partial | wire path_filter.rs is_bpffs_mutation/is_apparmor_profile_removal (6 tests); rules stateless/impair_defenses.rs check_agent_pin_removed/check_apparmor_profile_removed (8 tests, non-normalized, `/proc/self/root/` and relative spellings). Not yet run on a lab host or measured against the verifier budget | [#356](https://github.com/synthaea-lab/agent/issues/356) | [sensors/linux/signals.md#the-pinned-sigkill-slot](sensors/linux/signals.md#the-pinned-sigkill-slot) |
 | Dependency-direction enforcement between workspace crates | built | tools/check-deps.py run in .github/workflows/ci.yml on every push |  | [architecture.md#dependency-direction](architecture.md#dependency-direction) |
 | Fail-fast config loading with discovery order (--config, SYNTHAEA_CONFIG, OS default) | built | apps/agent/src/main.rs try_main, apps/watchdog/src/main.rs run_cli -&gt; crates/config/src/load.rs load, discovery.rs discover (config crate tests) |  | [architecture.md#binaries](architecture.md#binaries) |
 

@@ -222,34 +222,9 @@ fn matches_any(patterns: &[&[&str]], rest: &[&str]) -> bool {
     })
 }
 
-/// The path as the kernel resolves it for the cheap aliases, or `None` for a relative one.
-fn normalize(path: &str) -> Option<Vec<&str>> {
-    if !path.starts_with('/') {
-        return None;
-    }
-    let mut segments: Vec<&str> = Vec::new();
-    for segment in path.split('/') {
-        match segment {
-            "" | "." => {}
-            ".." => {
-                segments.pop();
-            }
-            other => segments.push(other),
-        }
-    }
-    // `/proc/<pid>/root/<path>` and `/proc/self/root/<path>` are `<path>`.
-    if let [first, pid, "root", rest @ ..] = segments.as_slice()
-        && *first == "proc"
-        && (*pid == "self" || (!pid.is_empty() && pid.bytes().all(|b| b.is_ascii_digit())))
-    {
-        return Some(rest.to_vec());
-    }
-    Some(segments)
-}
-
 /// The credential file `path` names, when it names one.
 pub(crate) fn classify(path: &str) -> Option<CredFile> {
-    let segments = normalize(path)?;
+    let segments = crate::lexical_path::absolute_segments(path)?;
     match segments.as_slice() {
         ["etc", "shadow" | "gshadow" | "shadow-" | "gshadow-"] => Some(CredFile::Shadow),
         ["Library", "Keychains", "System.keychain"] => Some(CredFile::Keychain),

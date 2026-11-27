@@ -93,16 +93,23 @@ pub const PROC_EVENT_EXIT: u32 = 0x8000_0000;
 /// nothing to cross-check them against yet, so they fold into [`Other`](ProcEvent::Other)
 /// rather than getting their own dead variant.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[allow(missing_docs)] // #362
 pub enum ProcEvent {
+    /// A `fork` or `clone` that created a new task.
     Fork {
+        /// PID of the parent task.
         parent_pid: u32,
+        /// Thread group ID of the parent.
         parent_tgid: u32,
+        /// PID of the new task.
         child_pid: u32,
+        /// Thread group ID of the new task.
         child_tgid: u32,
     },
+    /// A task called `execve`.
     Exec {
+        /// PID of the task.
         pid: u32,
+        /// Thread group ID of the task.
         tgid: u32,
     },
     /// `exit_proc_event` also carries `parent_pid`/`parent_tgid`, dropped here:
@@ -110,9 +117,13 @@ pub enum ProcEvent {
     /// parentage, this cross-check only needs "did this pid exit, with what
     /// code/signal".
     Exit {
+        /// PID of the exited task.
         pid: u32,
+        /// Thread group ID of the exited task.
         tgid: u32,
+        /// The task's exit code, as the kernel reports it.
         exit_code: u32,
+        /// The signal sent to the parent at exit (`SIGCHLD` for a normal exit).
         exit_signal: u32,
     },
     /// An event kind this module doesn't decode further, carrying the raw

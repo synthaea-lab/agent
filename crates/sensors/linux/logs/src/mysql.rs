@@ -24,15 +24,17 @@ use crate::{ParseError, clamp};
 
 /// One failed authentication attempt.
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[allow(missing_docs)] // #362
 pub struct MysqlLoginFailure {
     /// The line's leading timestamp, as written.
     pub timestamp: String,
+    /// The user name from the `Access denied for user '...'` message.
     pub user: String,
+    /// The client host the attempt came from.
     pub host: String,
     /// `Some` when the server says whether a password was sent (`MySQL` does, `MariaDB`
     /// does not).
     pub used_password: Option<bool>,
+    /// The line was longer than [`crate::MAX_LINE_BYTES`] and cut.
     pub truncated: bool,
 }
 

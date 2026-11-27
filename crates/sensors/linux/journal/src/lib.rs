@@ -95,14 +95,17 @@ pub use unitstop::to_unit_stop_event;
 
 /// Errors from parsing a journal record or driving `journalctl`.
 #[derive(Debug, thiserror::Error)]
-#[allow(missing_docs)] // #362
 pub enum JournalError {
     #[error("failed to parse journal line as JSON: {0}")]
+    /// The line is not valid JSON, or not the shape a record needs.
     Json(#[from] serde_json::Error),
     #[error("journal record is missing expected field {0:?}")]
+    /// A field the classifier needs is absent; the payload names it.
     MissingField(&'static str),
     #[error("I/O error reading the journal stream: {0}")]
+    /// Reading the journal stream failed.
     Io(#[from] std::io::Error),
     #[error("failed to spawn or read from journalctl: {0}")]
+    /// `journalctl` could not be started or its output could not be read.
     Spawn(std::io::Error),
 }
