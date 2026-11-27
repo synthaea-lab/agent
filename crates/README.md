@@ -10,6 +10,7 @@ described in [docs/architecture.md](../docs/architecture.md).
 | Base | `schema` | Event types and the `Sensor`/`EventSink` contract every sensor implements |
 | | `policy` | Policy types shared by the agent and the control plane |
 | Sensors | [`sensors/`](sensors/README.md) | One crate per platform collection mechanism |
+| | `bounded-lines` | Line reading with a byte cap, shared by the sensors that read another program's output |
 | Detection | `rules` | Stateless and stateful behavioral rules |
 | | `sigma` | Sigma rule parsing and compilation |
 | | `yara` | YARA-X file and process-memory scanning behind a budgeted queue |

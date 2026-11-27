@@ -41,6 +41,20 @@ class DetectionTier(unittest.TestCase):
                 self.assertFalse(any(dep.startswith("sensor-") for dep in tool.allowed(crate)))
 
 
+class SensorTier(unittest.TestCase):
+    def test_a_sensor_may_use_the_shared_line_reader_on_any_platform(self) -> None:
+        for sensor in ("sensor-linux-journal", "sensor-macos-unifiedlog", "sensor-windows-eventlog"):
+            with self.subTest(sensor=sensor):
+                self.assertIn("bounded-lines", tool.allowed(sensor))
+
+    def test_a_sensor_may_not_depend_on_another_platforms_sensor_crates(self) -> None:
+        self.assertNotIn("sensor-linux-wire", tool.allowed("sensor-macos"))
+        self.assertNotIn("sensor-linux-container", tool.allowed("sensor-windows"))
+
+    def test_a_shared_sensor_helper_depends_on_no_workspace_crate(self) -> None:
+        self.assertEqual(tool.allowed("bounded-lines"), set())
+
+
 class RealTree(unittest.TestCase):
     def test_the_workspace_respects_the_rules(self) -> None:
         result = subprocess.run([sys.executable, str(TOOL)], cwd=REPO, capture_output=True, text=True, check=False)

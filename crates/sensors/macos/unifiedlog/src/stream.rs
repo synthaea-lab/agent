@@ -16,12 +16,10 @@ use std::{
     },
 };
 
+use bounded_lines::{BoundedLines, Line, MAX_LINE_BYTES};
+
 use crate::{
-    UnifiedLogError,
-    bounded_lines::{BoundedLines, Line, MAX_LINE_BYTES},
-    classify, normalize, parse_record,
-    record::LogRecord,
-    tcc::TccJoiner,
+    UnifiedLogError, classify, normalize, parse_record, record::LogRecord, tcc::TccJoiner,
 };
 
 /// The `log stream` predicate. One string, OR-joined, kept next to the

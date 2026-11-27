@@ -465,6 +465,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "bounded-lines"
+version = "0.0.1"
+
+[[package]]
 name = "bstr"
 version = "1.13.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2680,6 +2684,7 @@ dependencies = [
 name = "sensor-linux-journal"
 version = "0.0.1"
 dependencies = [
+ "bounded-lines",
  "schema",
  "serde",
  "serde_json",
@@ -2771,6 +2776,7 @@ dependencies = [
 name = "sensor-macos-network-extension"
 version = "0.0.1"
 dependencies = [
+ "bounded-lines",
  "schema",
  "serde",
  "serde_json",
@@ -2792,6 +2798,7 @@ dependencies = [
 name = "sensor-macos-unifiedlog"
 version = "0.0.1"
 dependencies = [
+ "bounded-lines",
  "schema",
  "serde",
  "serde_json",

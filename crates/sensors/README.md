@@ -16,5 +16,6 @@ normalization code is tested on all three operating systems.
 | [`macos/`](macos/README.md) | EndpointSecurity, unified log, socket-table snapshots, Network Extension | [docs/sensors/macos](../../docs/sensors/macos/README.md) |
 
 Sensors depend only on `schema` (plus their platform's shared crates, such as
-`sensor-linux-wire`), never on a detection crate or on each other;
+`sensor-linux-wire`, and [`bounded-lines`](bounded-lines/src/lib.rs), the capped line reader any
+sensor may use), never on a detection crate or on each other;
 [`tools/check-deps.py`](../../tools/check-deps.py) enforces it.

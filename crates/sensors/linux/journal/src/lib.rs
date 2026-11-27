@@ -72,7 +72,6 @@
 //!   cursor now being persisted.
 
 mod auth;
-mod bounded_lines;
 mod canary;
 mod classify;
 mod pam_filter;

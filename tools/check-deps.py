@@ -5,7 +5,8 @@ Rules (see CLAUDE.md):
   - `schema` depends on no workspace crate; `policy` depends only on `schema`.
     Together they are the BASE tier every other crate may use.
   - Sensor crates (`sensor-*`) depend only on `schema`, plus their own platform's
-    shared crates (`sensor-linux-wire`, `sensor-linux-container`).
+    shared crates (`sensor-linux-wire`, `sensor-linux-container`) and the helpers any
+    sensor may use (`bounded-lines`), which depend on no workspace crate.
   - Detection crates (rules, sigma, correlator, verdict, ml, yara, enrich) depend on
     the base tier, each other, `store` and `event-window` — never on a sensor crate.
   - Within detection, the engines never depend on the stages that consume their output
@@ -42,6 +43,8 @@ PLATFORM_SHARED = {
     "sensor-linux-wire": "sensor-linux",
     "sensor-linux-container": "sensor-linux",
 }
+# Helpers sensors on different platforms share instead of copying: no workspace deps.
+SENSOR_SHARED = {"bounded-lines"}
 # Dev-only helpers: leaves with no workspace deps, usable as a dev-dependency anywhere.
 TEST_SUPPORT = {"siblings"}
 
@@ -50,7 +53,7 @@ def allowed(crate: str) -> set[str] | None:
     """Workspace crates `crate` may depend on; None means unrestricted."""
     if crate in BINARIES:
         return None
-    if crate == SCHEMA or crate in TEST_SUPPORT:
+    if crate == SCHEMA or crate in TEST_SUPPORT or crate in SENSOR_SHARED:
         return set()
     if crate == "policy":
         return {SCHEMA}
@@ -58,7 +61,8 @@ def allowed(crate: str) -> set[str] | None:
         # Shared crates depend only on `schema`, so they never pull a sibling sensor in.
         if crate in PLATFORM_SHARED:
             return {SCHEMA}
-        return {SCHEMA} | {c for c, prefix in PLATFORM_SHARED.items() if crate.startswith(prefix)}
+        own_platform = {c for c, prefix in PLATFORM_SHARED.items() if crate.startswith(prefix)}
+        return {SCHEMA} | SENSOR_SHARED | own_platform
     if crate in DETECTION_CONSUMERS:
         return BASE | DETECTION | DETECTION_SHARED
     if crate in DETECTION:

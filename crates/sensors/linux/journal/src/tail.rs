@@ -14,12 +14,10 @@
 
 use std::{collections::VecDeque, io::BufRead};
 
+use bounded_lines::{BoundedLines, Line, MAX_LINE_BYTES};
+
 use crate::{
-    JournalError, JournalEvent, JournalRecord,
-    bounded_lines::{BoundedLines, Line, MAX_LINE_BYTES},
-    classify,
-    pam_filter::PamFailureFilter,
-    parse_record,
+    JournalError, JournalEvent, JournalRecord, classify, pam_filter::PamFailureFilter, parse_record,
 };
 
 /// Whether the `count`th dropped oversize line is logged: the first, then every
@@ -44,7 +42,7 @@ const OVERSIZE_LOG_EVERY: u64 = 1000;
 /// and drops a failure that a second stacked PAM module logged for the same attempt.
 pub struct ClassifiedJournal<R> {
     lines: BoundedLines<R>,
-    /// Lines over [`crate::bounded_lines::MAX_LINE_BYTES`], read to their end and dropped.
+    /// Lines over [`MAX_LINE_BYTES`], read to their end and dropped.
     oversize_lines: u64,
     on_line: Option<Box<dyn FnMut() + Send>>,
     pam_filter: PamFailureFilter,

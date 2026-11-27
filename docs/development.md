@@ -120,7 +120,7 @@ Other workflows:
 
 - **Dependency direction** ([`check-deps.py`](../tools/check-deps.py)): `schema` depends on no
   workspace crate; `policy` only on `schema`; sensor crates only on `schema` and their platform's shared crates
-  (`sensor-linux-wire`, `sensor-linux-container`); detection crates never
+  (`sensor-linux-wire`, `sensor-linux-container`) and `bounded-lines`; detection crates never
   on a sensor; leaf crates (`transport`, `ipc`, `sinks`, `updater`, `config`, `store`, `response`,
   `conformance`) only on the base tier; only the binaries compose everything. A new crate must be
   added to the script's rules in the same change. This is why fetch-and-apply logic lives in the

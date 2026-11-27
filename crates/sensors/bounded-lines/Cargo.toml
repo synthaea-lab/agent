@@ -1,0 +1,12 @@
+[package]
+name = "bounded-lines"
+version.workspace = true
+description = "Line reading with a byte cap, for sensors that read another program's output"
+license.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
