@@ -32,6 +32,7 @@ described in [docs/architecture.md](../docs/architecture.md).
 | | `redact` | Credential redaction for data leaving the process |
 | | `inventory` | Software and asset inventory |
 | Utility | `file-hash` | Streaming SHA-256 of a file or reader, shared by every crate that hashes one |
+| Utility | `workers` | Worker threads done one way: named spawn, the poisoned-lock policy, bounded shutdown |
 | Test support | `siblings` | Locates the sibling repositories for cross-repository contract tests (dev-dependency only) |
 
 Some crates are still early or empty; [docs/capabilities.md](../docs/capabilities.md) records

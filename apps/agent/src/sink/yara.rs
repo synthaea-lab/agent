@@ -8,9 +8,10 @@ use std::{
 };
 
 use schema::Event;
+use workers::sync::LockExt as _;
 
 use super::{DetectionSink, Load, ResponseCell, escalate_if_warranted, techniques_from};
-use crate::{alerts::AlertLog, sync::LockExt as _};
+use crate::alerts::AlertLog;
 
 impl DetectionSink {
     /// Asks for a budgeted YARA scan of the memory of the process behind `event` (#85):

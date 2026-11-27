@@ -1,0 +1,13 @@
+[package]
+name = "workers"
+version.workspace = true
+description = "Worker threads done one way: named spawn, the poisoned-lock policy, bounded shutdown"
+license.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+tracing = { workspace = true }

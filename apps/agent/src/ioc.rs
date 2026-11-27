@@ -25,8 +25,9 @@ use std::{
 
 use intel::{DEFAULT_MEMORY_BUDGET_BYTES, FeedId, IndicatorKind, IndicatorSet, SetBuilder};
 use schema::detection::{IocKind, Severity};
+use workers::sync::LockExt;
 
-use crate::{own_traffic::AgentOrigin, sync::LockExt};
+use crate::own_traffic::AgentOrigin;
 
 /// The label an IOC finding carries where other engines carry an ATT&CK technique. Not a
 /// technique: an indicator says a thing is known bad, not which tactic it served.

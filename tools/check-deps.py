@@ -14,7 +14,7 @@ Rules (see CLAUDE.md):
   - Leaf crates (response, transport, ipc, sinks, updater, config, store)
     depend only on the base tier.
   - Only the binaries (`agent`, `watchdog`, `cli`) may depend on anything.
-  - Utility crates (`file-hash`) depend on no workspace crate; any detection or leaf crate
+  - Utility crates (`file-hash`, `workers`) depend on no workspace crate; any detection or leaf crate
     may use them. They exist so two tiers that may not depend on each other need not
     each keep a copy of the same code.
   - Test-support crates (`siblings`) depend on no workspace crate and may be a
@@ -47,7 +47,7 @@ PLATFORM_SHARED = {
     "sensor-linux-container": "sensor-linux",
 }
 # Helpers the detection and leaf tiers share instead of copying: no workspace deps.
-UTILITY = {"file-hash"}
+UTILITY = {"file-hash", "workers"}
 # Helpers sensors on different platforms share instead of copying: no workspace deps.
 SENSOR_SHARED = {"bounded-lines"}
 # Dev-only helpers: leaves with no workspace deps, usable as a dev-dependency anywhere.

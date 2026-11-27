@@ -15,11 +15,11 @@ use std::{
 
 use schema::{Event, sensor::EventSink};
 use sinks::JsonlWriter;
+use workers::sync::LockExt as _;
 
 use crate::{
     alerts::{AlertLog, RECENT_ALERTS_CAPACITY},
     enrich_queue::EnrichQueue,
-    sync::LockExt as _,
 };
 
 mod baseline;

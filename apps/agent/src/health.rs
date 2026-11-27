@@ -22,8 +22,7 @@ use std::{
 };
 
 use schema::{HealthBeacon, SensorHealth};
-
-use crate::sync::{CondvarExt, LockExt};
+use workers::sync::{CondvarExt, LockExt};
 
 /// Default beacon interval (30 seconds).
 pub const DEFAULT_INTERVAL: Duration = Duration::from_secs(30);
@@ -240,10 +239,10 @@ impl HealthCollector {
     ///
     /// # Errors
     ///
-    /// The OS refused the thread (see [`crate::spawn::spawn_named`]).
+    /// The OS refused the thread (see [`workers::spawn::spawn_named`]).
     pub fn spawn(self) -> std::io::Result<(JoinHandle<()>, StopHandle)> {
         let stop = self.stop.clone();
-        let handle = crate::spawn::spawn_named("health-beacon", move || self.run())?;
+        let handle = workers::spawn::spawn_named("health-beacon", move || self.run())?;
         Ok((handle, StopHandle(stop)))
     }
 

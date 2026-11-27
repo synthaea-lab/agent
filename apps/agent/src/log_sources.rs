@@ -38,11 +38,9 @@ use sensor_linux_logs::{
     AccessFormat, Misparse, MisparseWatch, Position, SignatureBudget, Summarizer, Tailer,
     match_request, parse_access_line, parse_mysql_error_line, to_auth_event, to_http_request_event,
 };
+use workers::shutdown::{ShutdownPlan, sleep_unless_stopped};
 
-use crate::{
-    shutdown::{ShutdownPlan, sleep_unless_stopped},
-    sink::DetectionSink,
-};
+use crate::sink::DetectionSink;
 
 const POLL_INTERVAL: Duration = Duration::from_secs(1);
 
@@ -267,7 +265,7 @@ pub(crate) fn spawn(
 
     let stop = Arc::new(AtomicBool::new(false));
     let worker_stop = Arc::clone(&stop);
-    let handle = crate::spawn::spawn_named("log-sources", move || {
+    let handle = workers::spawn::spawn_named("log-sources", move || {
         while !worker_stop.load(Ordering::SeqCst) {
             for source in &mut active {
                 poll_source(source, &sink);

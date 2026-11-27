@@ -45,7 +45,7 @@ const TAMPER_TECHNIQUE: &str = "T1601";
 /// itself is built from — the updater and this check must agree on it, or the
 /// manifest this reads back is never the one a real update actually staged.
 pub(crate) fn spawn_monitor(state_dir: PathBuf, sink: Arc<DetectionSink>) -> std::io::Result<()> {
-    crate::spawn::spawn_named("self-integrity", move || {
+    workers::spawn::spawn_named("self-integrity", move || {
         let layout = updater::layout::Layout::new(&state_dir);
         loop {
             std::thread::sleep(CHECK_INTERVAL);

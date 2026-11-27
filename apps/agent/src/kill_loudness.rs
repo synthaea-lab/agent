@@ -97,7 +97,7 @@ pub(crate) fn spawn_watcher(
     enrich_queue: EnrichQueue,
     on_exit: impl FnOnce() + Send + 'static,
 ) -> std::io::Result<()> {
-    crate::spawn::spawn_named("kill-loudness", move || {
+    workers::spawn::spawn_named("kill-loudness", move || {
         let set = watched_signal_set();
         // SAFETY: `set` watches only the signals blocked by
         // `block_termination_signals`; `info` is an output-only `siginfo_t` the

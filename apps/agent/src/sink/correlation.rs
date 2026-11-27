@@ -12,9 +12,9 @@ use std::{
 };
 
 use schema::Event;
+use workers::sync::LockExt as _;
 
 use super::{DetectionSink, entity_key, recording::Finding, response::crosses_kill_gate};
-use crate::sync::LockExt as _;
 
 /// The ML correlation model family of this platform.
 #[cfg(target_os = "linux")]

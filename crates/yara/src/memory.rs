@@ -382,7 +382,7 @@ impl MemoryScanQueue {
     /// A poisoned admission lock is taken back, cleared and logged once: the gate holds the
     /// cooldown table and the per-minute rate window, so a half-updated state costs at most one
     /// missed or repeated scan, which is cheaper than the capture thread panicking on every
-    /// later event (the agent's policy for in-memory detection state, `apps/agent/src/sync.rs`).
+    /// later event (the agent's policy for in-memory detection state, `crates/workers/src/sync.rs`).
     pub fn enqueue(
         &self,
         pid: u32,

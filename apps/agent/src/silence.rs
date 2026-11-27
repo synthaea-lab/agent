@@ -23,8 +23,9 @@ use std::{
 
 use schema::{Event, sensor::EventSink};
 use tamper::heartbeat::{SensorHeartbeat, SilenceMonitor};
+use workers::sync::LockExt;
 
-use crate::{health::SensorHealthSource, sink::DetectionSink, sync::LockExt};
+use crate::{health::SensorHealthSource, sink::DetectionSink};
 
 /// How often the dedicated monitor thread checks every registered heartbeat against
 /// its deadline. Independent of the health beacon's own (much longer) cadence —
@@ -142,7 +143,7 @@ pub(crate) fn spawn_monitor(
     monitor: Arc<Mutex<SilenceMonitor>>,
     sink: Arc<DetectionSink>,
 ) -> std::io::Result<()> {
-    crate::spawn::spawn_named("sensor-silence", move || {
+    workers::spawn::spawn_named("sensor-silence", move || {
         loop {
             std::thread::sleep(POLL_INTERVAL);
             poll_and_emit(&monitor, &sink, schema::time::now_ns());

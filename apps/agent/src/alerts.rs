@@ -18,8 +18,7 @@ use std::{
 };
 
 use sinks::{AlertRecord, JsonlWriter};
-
-use crate::sync::LockExt;
+use workers::sync::LockExt;
 
 /// How many recent alerts the agent keeps in memory for `cli detections`.
 /// Equal to `ipc::RECENT_DETECTIONS_HARD_LIMIT`, the most a client can ask

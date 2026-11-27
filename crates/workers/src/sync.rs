@@ -29,7 +29,7 @@ fn log_recovery(site: &Location<'_>) {
 }
 
 /// [`Mutex::lock`] under the agent's poisoned-lock policy (see the module docs).
-pub(crate) trait LockExt<T: ?Sized> {
+pub trait LockExt<T: ?Sized> {
     /// Locks the mutex, taking the guard back if a previous holder panicked.
     ///
     /// Never panics on poison: a poisoned lock is logged at `warn`, un-poisoned and
@@ -50,7 +50,7 @@ impl<T: ?Sized> LockExt<T> for Mutex<T> {
 }
 
 /// [`RwLock::read`] and [`RwLock::write`] under the same policy as [`LockExt`].
-pub(crate) trait RwLockExt<T: ?Sized> {
+pub trait RwLockExt<T: ?Sized> {
     /// Takes a read guard, taking it back if a writer panicked.
     fn read_recovering(&self) -> RwLockReadGuard<'_, T>;
     /// Takes the write guard, taking it back if a previous holder panicked.
@@ -80,7 +80,7 @@ impl<T: ?Sized> RwLockExt<T> for RwLock<T> {
 /// [`Condvar::wait_timeout`] under the same policy: the guard comes back even if the
 /// mutex was poisoned while the caller waited. The poison itself is left for the next
 /// [`LockExt::lock_recovering`] to clear and log, since a guard cannot reach its mutex.
-pub(crate) trait CondvarExt {
+pub trait CondvarExt {
     /// Waits for a notification or `timeout`, recovering a poisoned mutex instead of
     /// panicking. Returns the guard only: callers re-check their own deadline.
     fn wait_timeout_recovering<'a, T>(
