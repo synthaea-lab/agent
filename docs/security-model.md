@@ -161,7 +161,7 @@ flowchart TD
    message spells out the consequence: whoever can serve the release routes could run
    code as root.
 3. Once a rotation has replaced the test key, the install is no longer treated as
-   test-keyed. [`trust::load`](../apps/agent/src/trust.rs) replays the applied rotations from
+   test-keyed. [`keys_in_force`](../crates/updater/src/trust_state.rs) replays the applied rotations from
    [`TrustState`](../crates/updater/src/trust_state.rs). If that record is corrupt, the
    command refuses. It does not fall back to the embedded keys, because those may already
    have been rotated away.

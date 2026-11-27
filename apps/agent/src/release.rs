@@ -191,7 +191,7 @@ mod linux {
         // The release key in force, which is the embedded one until a rotation replaced it, and
         // the counter releases share with rotations (ADR-0027): a release numbered at or below
         // an applied rotation is a rollback of it.
-        let keys = crate::trust::load(&state_dir(layout))?;
+        let keys = updater::trust_state::keys_in_force(&state_dir(layout))?;
         let manifest: ReleaseManifest = client.get_json(&client.config().release_manifest_url())?;
         manifest.verify_signature_with(keys.release.as_ref())?;
         manifest.validate_entry_paths()?;
@@ -754,7 +754,7 @@ mod linux {
         #[test]
         fn a_corrupt_record_of_rotations_stops_apply_release_before_the_network() {
             let (base, layout) = install("record-corrupt", &[1]);
-            std::fs::write(crate::trust::record_path(&base), b"{ truncated").unwrap();
+            std::fs::write(updater::trust_state::record_path(&base), b"{ truncated").unwrap();
             let manifest = signed(2, &[("agent", b"x")]);
             let server = serve(&manifest, vec![("agent", b"x".to_vec())]);
 

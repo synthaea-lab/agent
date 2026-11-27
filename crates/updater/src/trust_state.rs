@@ -25,14 +25,17 @@
 //! access to the state directory, which is root's; this is the same trust boundary as the ban
 //! list and the content state.
 
-use std::{io, path::Path};
+use std::{
+    io,
+    path::{Path, PathBuf},
+};
 
 use serde::{Deserialize, Serialize};
 
 use crate::{
     error::UpdaterError,
     fsutil::write_atomically,
-    key::RECOVERY_PUBLIC_KEY,
+    key::{CONTENT_PUBLIC_KEY, RECOVERY_PUBLIC_KEY, RELEASE_PUBLIC_KEY},
     rotation::{KeyRotationManifest, TrustedKeys},
 };
 
@@ -304,6 +307,63 @@ impl TrustState {
         self.rotations.push(rotation.clone());
         Ok(next)
     }
+}
+
+/// The keys this install trusts now (ADR-0027): the embedded ones, then the key rotations it
+/// applied, replayed and re-verified from the record under the state directory
+/// ([`TrustState`]). Loaded where the verification happens, never cached across
+/// commands, so a rotation applied by another process is in force at the next check.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KeysInForce {
+    /// Verifies binary release manifests; `None` when no `release` key is provisioned.
+    pub release: Option<[u8; 32]>,
+    /// Verifies content manifests; `None` when no `content` key is provisioned.
+    pub content: Option<[u8; 32]>,
+    /// The highest `release_version` of a rotation applied here: releases share its counter.
+    pub applied_release_version: Option<u64>,
+    /// Every `release` key this install has trusted, for re-checking a manifest that was
+    /// promoted under an earlier one.
+    pub release_lineage: Vec<[u8; 32]>,
+    /// Whether a recorded rotation replaced the embedded `release` key.
+    pub release_rotated: bool,
+    /// Whether a recorded rotation replaced the embedded `content` key.
+    pub content_rotated: bool,
+}
+
+/// Where the record of applied rotations lives for a given state directory.
+#[must_use]
+pub fn record_path(state_dir: &Path) -> PathBuf {
+    state_dir.join(TRUST_STATE_FILE)
+}
+
+/// The keys in force under `state_dir`. No record is a fresh install: the embedded keys.
+///
+/// # Errors
+///
+/// A record that exists and cannot be trusted ([`UpdaterError::TrustStateCorrupt`]) or
+/// read: refused rather than answered with the embedded keys, which may have been rotated away
+/// from. The operator removes the file on purpose, knowing what that re-trusts.
+pub fn keys_in_force(state_dir: &Path) -> Result<KeysInForce, UpdaterError> {
+    let record = TrustState::load(&record_path(state_dir))?;
+    if record.is_empty() {
+        return Ok(KeysInForce {
+            release: *RELEASE_PUBLIC_KEY,
+            content: *CONTENT_PUBLIC_KEY,
+            applied_release_version: None,
+            release_lineage: RELEASE_PUBLIC_KEY.iter().copied().collect(),
+            release_rotated: false,
+            content_rotated: false,
+        });
+    }
+    let resolved = record.resolve()?;
+    Ok(KeysInForce {
+        release: Some(resolved.keys.release),
+        content: Some(resolved.keys.content),
+        applied_release_version: resolved.applied_release_version,
+        release_lineage: resolved.release_lineage,
+        release_rotated: resolved.release_rotated,
+        content_rotated: resolved.content_rotated,
+    })
 }
 
 #[cfg(test)]
