@@ -293,7 +293,7 @@ On Linux, where versioned self-update exists:
 
 ## Peer mesh (planned)
 
-[`crates/mesh`](../crates/mesh/src/lib.rs) is a design with no code. Its intent: a
+The peer mesh is a design with no code, kept in [planned.md](planned.md#peer-mesh). Its intent: a
 killed or silenced agent cannot report its own death, but its neighbours can. Agents
 on one segment would exchange signed attestation heartbeats and gossip posture
 changes, authenticated with their enrollment identities. The guardrails are part of

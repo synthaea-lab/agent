@@ -47,8 +47,8 @@ and build-machine toolchain scripts live here under `packaging/toolchain/`.
   depend on the base tier, each other, and `store` — **never on a sensor**. The engines never
   depend on `correlator` or `verdict`, which consume their output; what both sides share
   (the event window) lives in `event-window`, a leaf crate.
-- Leaf crates (`response`, `transport`, `ipc`, `sinks`, `updater`, `config`, `store`,
-  `conformance`) depend only on the base tier.
+- Leaf crates (`response`, `transport`, `ipc`, `sinks`, `updater`, `config`, `store`)
+  depend only on the base tier.
 - Only the binaries (`apps/agent/`, `apps/watchdog/`, `apps/cli/`, and the offline `tools/release/`) may depend on everything.
 
 New crate? Add it to the rules in `tools/check-deps.py` in the same change.

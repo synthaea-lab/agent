@@ -31,9 +31,6 @@ described in [docs/architecture.md](../docs/architecture.md).
 | | `tamper` | Heartbeats, sensor-silence detection and integrity checks |
 | | `redact` | Credential redaction for data leaving the process |
 | | `inventory` | Software and asset inventory |
-| | `mesh` | Peer attestation and posture gossip between agents |
-| | `device-control` | Removable-media telemetry and control |
-| | `conformance` | Sensor conformance suite |
 | Test support | `siblings` | Locates the sibling repositories for cross-repository contract tests (dev-dependency only) |
 
 Some crates are still early or empty; [docs/capabilities.md](../docs/capabilities.md) records

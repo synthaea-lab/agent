@@ -11,7 +11,7 @@ Rules (see CLAUDE.md):
     the base tier, each other, `store` and `event-window` — never on a sensor crate.
   - Within detection, the engines never depend on the stages that consume their output
     (`correlator`, `verdict`): what both sides share lives in `event-window`.
-  - Leaf crates (response, transport, ipc, sinks, updater, config, store, conformance)
+  - Leaf crates (response, transport, ipc, sinks, updater, config, store)
     depend only on the base tier.
   - Only the binaries (`agent`, `watchdog`, `cli`) may depend on anything.
   - Test-support crates (`siblings`) depend on no workspace crate and may be a
@@ -35,7 +35,7 @@ DETECTION_CONSUMERS = {"correlator", "verdict"}
 # Leaf crates every detection crate may build on: bounded state, and the event window.
 DETECTION_SHARED = {"store", "event-window"}
 LEAF = {"response", "transport", "ipc", "sinks", "updater", "config", "store", "event-window",
-        "conformance", "tamper", "mesh", "device-control", "inventory", "redact"}
+        "tamper", "inventory", "redact"}
 BINARIES = {"agent", "watchdog", "cli", "release-tool"}
 # Crates shared by one platform's sensors, keyed to that platform's package prefix:
 # the wire crate (kernel<->userspace ABI) and the container-attribution runtime.
