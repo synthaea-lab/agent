@@ -34,7 +34,6 @@ mod health;
     not(any(target_os = "linux", target_os = "macos", windows)),
     allow(dead_code)
 )]
-mod heartbeat;
 mod host_counters;
 // Linux-only: the module itself calls raw POSIX signal APIs
 // (sigemptyset/pthread_sigmask/sigwaitinfo) that don't exist in the `libc` crate on

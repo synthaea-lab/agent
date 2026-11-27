@@ -18,7 +18,7 @@
 //! thread dead while the main thread parks. For an EDR that is the worst
 //! failure mode: the endpoint looks protected while collecting nothing.
 //! [`HeartbeatMonitor`] polls the progress-backed heartbeat file
-//! `agent::heartbeat` writes (advances only when the sensor pipeline actually
+//! `tamper::progress` writes (advances only when the sensor pipeline actually
 //! processes an event end to end) and, after `miss_limit` consecutive checks
 //! see no advance, kills the child — feeding the same [`Backoff`] a crash
 //! would, per #102's "same path as a crash, feeding the backoff (#101)".
@@ -46,7 +46,7 @@ use anyhow::Context as _;
 use sinks::AlertRecord;
 
 use crate::{
-    paths::{heartbeat_path_for, resolve_agent_bin},
+    paths::resolve_agent_bin,
     probation::{Probation, Verdict},
 };
 
@@ -154,7 +154,7 @@ impl HeartbeatMonitor {
             return false;
         }
         self.ticks_since_check = 0;
-        self.observe(read_heartbeat(&self.path))
+        self.observe(tamper::progress::read(&self.path))
     }
 
     /// Whether the counter has advanced at least once since this monitor started.
@@ -179,14 +179,6 @@ impl HeartbeatMonitor {
         }
         self.misses >= self.miss_limit
     }
-}
-
-/// Reads and parses the heartbeat file `agent::heartbeat` writes; `None` on
-/// any I/O or parse failure (missing file, mid-write race the temp-file+
-/// rename couldn't fully hide, garbage content) — treated as "no reading
-/// yet", never as a miss (see [`HeartbeatMonitor::observe`]).
-fn read_heartbeat(path: &Path) -> Option<u64> {
-    std::fs::read_to_string(path).ok()?.trim().parse().ok()
 }
 
 /// Why [`supervise_loop`] returned.
@@ -275,7 +267,7 @@ impl<'a> Supervisor<'a> {
         };
         Self {
             backoff: Backoff::new(config.restart_delay_secs),
-            heartbeat_path: heartbeat_path_for(config.alerts),
+            heartbeat_path: tamper::progress::heartbeat_path_for(config.alerts),
             config,
             probation,
             binary_pin,

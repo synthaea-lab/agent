@@ -346,7 +346,7 @@ pub(crate) fn cmd_run(opts: super::RunOptions) -> anyhow::Result<()> {
 
     // Automated response (#25): policy off by default (observe-only), opted into
     // per flag. Quarantine lands next to alerts.ndjson, the same "derived, no
-    // separate flag" convention `heartbeat::heartbeat_path_for` uses for #102.
+    // separate flag" convention `tamper::progress::heartbeat_path_for` uses for #102.
     sink.enable_response(
         policy::ResponsePolicy {
             kill_enabled: enable_kill,

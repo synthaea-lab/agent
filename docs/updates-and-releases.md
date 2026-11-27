@@ -199,7 +199,7 @@ stateDiagram-v2
 ```
 
 - The proof is the progress-backed heartbeat file the agent writes, which advances only when an
-  event goes end to end through the pipeline ([`heartbeat.rs`](../apps/agent/src/heartbeat.rs)), not a
+  event goes end to end through the pipeline ([`progress.rs`](../crates/tamper/src/progress.rs)), not a
   process-alive check. The deadline, [`PROBATION_DEADLINE`](../apps/watchdog/src/probation.rs), is
   120 s, the same silence deadline every sensor gets; progress seen in the same poll as the
   deadline counts as life.

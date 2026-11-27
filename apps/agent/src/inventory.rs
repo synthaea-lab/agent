@@ -101,7 +101,7 @@ fn save_snapshot(path: &Path, snapshot: &PackageSnapshot) {
         return;
     }
     if let Ok(json) = serde_json::to_string(snapshot) {
-        // Same temp-file-then-rename shape as `heartbeat::write_once`: a reader
+        // Same temp-file-then-rename shape as the progress heartbeat: a reader
         // (there is none today, but the next `check_once` is one) never sees a
         // torn write.
         let tmp = path.with_extension("json.tmp");

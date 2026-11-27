@@ -12,6 +12,7 @@ workspace = true
 [dependencies]
 file-hash = { path = "../file-hash" }
 schema.path = "../schema"
+workers = { path = "../workers" }
 
 [dev-dependencies]
 sha2 = "0.11"

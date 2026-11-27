@@ -94,7 +94,7 @@ pub(crate) struct DetectionSink {
     /// a detection.
     detection_spool: Option<Arc<Mutex<store::EventSpool>>>,
     /// Liveness counter for the watchdog's heartbeat monitor (#102): incremented
-    /// once `on_event` has fully processed an event, so `agent::heartbeat`'s
+    /// once `on_event` has fully processed an event, so `tamper::progress`'s
     /// writer thread can sample it and expose real forward progress — not just
     /// "the process is scheduled" — to `watchdog::supervise::HeartbeatMonitor`.
     /// See `progress_handle`.
@@ -435,7 +435,7 @@ impl DetectionSink {
         drop((yara, memscan));
     }
 
-    /// Hands out the shared progress counter for `agent::heartbeat::start` to
+    /// Hands out the shared progress counter for `tamper::progress::start` to
     /// sample (#102) — a clone of the `Arc`, not the sink itself, so the
     /// heartbeat writer thread needs no reference to the sink or its other
     /// state.

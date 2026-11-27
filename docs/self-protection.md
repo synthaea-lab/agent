@@ -23,7 +23,7 @@ hardening step can be undone by an administrator through the documented commands
 | --- | --- | --- |
 | Kill the agent | watchdog respawns it | [`supervise.rs`](../apps/watchdog/src/supervise.rs) |
 | Kill the watchdog | service manager respawns it; the agent dies with it | [`service/`](../apps/watchdog/src/service/mod.rs), [`die_with_parent`](../apps/watchdog/src/supervise.rs) |
-| Freeze or wedge the agent | progress heartbeat stalls, watchdog kills and restarts it | [`heartbeat.rs`](../apps/agent/src/heartbeat.rs), [`HeartbeatMonitor`](../apps/watchdog/src/supervise.rs) |
+| Freeze or wedge the agent | progress heartbeat stalls, watchdog kills and restarts it | [`progress.rs`](../crates/tamper/src/progress.rs), [`HeartbeatMonitor`](../apps/watchdog/src/supervise.rs) |
 | Detach or stop one sensor | sensor-silence alert (T1562) | [`tamper::heartbeat`](../crates/tamper/src/heartbeat.rs), [`silence.rs`](../apps/agent/src/silence.rs) |
 | Swap the binary on disk | watchdog refuses to launch it; periodic manifest check alerts (T1601) | [`BinaryPin`](../apps/watchdog/src/tamper.rs), [`integrity.rs`](../apps/agent/src/integrity.rs) |
 | Edit or disable the service definition | drift report (Linux) | [`drift_report`](../apps/watchdog/src/service/linux.rs) |
@@ -89,11 +89,10 @@ check misses all of these.
 
 - **Writer.** [`DetectionSink`](../apps/agent/src/sink/mod.rs) increments a progress counter
   once `on_event` has fully processed an event. A thread in
-  [`heartbeat.rs`](../apps/agent/src/heartbeat.rs) writes it to a file next to the alert
+  [`progress.rs`](../crates/tamper/src/progress.rs) writes it to a file next to the alert
   log every 2 s (`WRITE_INTERVAL`). The path transform
-  ([`heartbeat_path_for`](../apps/agent/src/heartbeat.rs)) is duplicated in
-  [`watchdog::paths::heartbeat_path_for`](../apps/watchdog/src/paths.rs), because the
-  watchdog cannot depend on the agent binary; the two must stay identical.
+  ([`heartbeat_path_for`](../crates/tamper/src/progress.rs)) is the one the watchdog
+  calls too: writer and reader share the definition in `tamper`.
 - **Reader.** [`HeartbeatMonitor`](../apps/watchdog/src/supervise.rs) reads the file every
   `--heartbeat-interval-secs` (default 5 s), counted in 500 ms poll ticks so the state
   machine needs no clock and is unit-tested with hand-fed readings. After
