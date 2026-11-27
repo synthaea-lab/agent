@@ -11,7 +11,11 @@
 use std::borrow::Cow;
 
 use crate::{
-    REDACTED, is_secret_key, push_value_edit, redact_command_line_with, token_ranges, trim_quotes,
+    REDACTED,
+    cmdline::redact_command_line_with,
+    is_secret_key,
+    options::push_value_edit,
+    tokens::{token_ranges, trim_quotes},
 };
 
 /// The language a block of command text is written in, which decides how it is cut into
