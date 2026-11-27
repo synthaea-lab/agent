@@ -12,9 +12,14 @@
 //! open (`O_WRONLY`/`O_RDWR`/`O_CREAT`/`O_TRUNC`) or any of
 //! delete/rename/chmod/chown/setxattr/removexattr is the payload lifecycle itself,
 //! and is never dropped there. `/dev/` (minus `/dev/shm/`, handled above) and
-//! `/sys/` are unconditional, unchanged from #325, with one exception: a write-intent open of
-//! a cgroup limit file (`memory.max`, `cgroup.freeze`...) is how a security tool is ended or
-//! frozen without a signal, and passes ([`is_cgroup_limit_write`], #49).
+//! `/sys/` are unconditional, unchanged from #325, with three exceptions, each a way to blind a
+//! security tool that leaves no other event (#356):
+//! - a write-intent open of a cgroup limit file (`memory.max`, `cgroup.freeze`...), which ends or
+//!   freezes a tool without a signal ([`is_cgroup_limit_write`], #49);
+//! - a write-intent open of the `AppArmor` `.remove` file, which unloads a confinement profile
+//!   ([`is_apparmor_profile_removal`]);
+//! - any mutation under bpffs (`/sys/fs/bpf/`), where removing a pin detaches or forgets a
+//!   tool's BPF object, this agent's `SIGKILL` attribution included ([`is_bpffs_mutation`]).
 //!
 //! `/proc/` gets the same intent rule as the tmp family, not the unconditional
 //! drop #429 originally gave it (review on #429/#426): `/proc/<pid>/root/...` is
@@ -151,6 +156,29 @@ fn is_cgroup_limit_write(path: &[u8], flags: i64, is_mutation: bool) -> bool {
         || path.ends_with(b".freeze")
         || path.ends_with(b".state")
         || path.ends_with(b"_bytes")
+}
+
+/// Whether `path` (already known to start with `/sys/`) is a write of the `AppArmor` profile-removal
+/// file, `<securityfs>/apparmor/.remove` (#356): `aa-disable`, `aa-teardown` and
+/// `apparmor_parser -R` write a profile name to it, and the profile's confinement is gone with
+/// no signal and no exec of the confined tool. Same shape and budget as [`is_cgroup_limit_write`]:
+/// one constant tail compare, no `securityfs` prefix test (a non-normalized spelling would step
+/// around it), write-intent `open`/`openat` only. `.load` and `.replace` are left filtered: they
+/// add or tighten a policy, and `apparmor.service` writes them for every profile at boot.
+fn is_apparmor_profile_removal(path: &[u8], flags: i64, is_mutation: bool) -> bool {
+    !is_mutation && is_write_intent(flags) && path.ends_with(b"/.remove")
+}
+
+/// Whether `path` is an `unlink`/`rename`/`chmod`/`chown`/xattr change under bpffs (#356). A
+/// pinned BPF object lives as long as its pin or an open handle: removing the pin of a tool's
+/// program detaches it once the tool lets go, and removing this agent's
+/// `SIGNAL_TAMPER_LAST` pin before a `SIGKILL` leaves the restarted agent nothing to attribute.
+/// bpffs is written only when something is pinned or unpinned, so passing every mutation there
+/// costs no volume. Opens stay filtered: a pinned object is reached with `bpf(BPF_OBJ_GET)`, not
+/// `open(2)`. A literal prefix, like the other prefix rules here: a non-normalized spelling
+/// (`/sys//fs/bpf/...`) is the general prefix-escape question of #350, not this rule's.
+fn is_bpffs_mutation(path: &[u8], is_mutation: bool) -> bool {
+    is_mutation && path.starts_with(b"/sys/fs/bpf/")
 }
 
 /// Whether a file event on `path` should be dropped before it reaches the ring
@@ -306,9 +334,11 @@ fn drops_by_prefix(path: &[u8], flags: i64, is_mutation: bool) -> bool {
         return !(is_mutation || is_write_intent(flags));
     }
     if path.starts_with(b"/sys/") {
-        // Only a write to a cgroup limit file leaves `/sys/` (see `is_cgroup_limit_write`);
-        // every other path under it, and every read, stays dropped.
-        return !is_cgroup_limit_write(path, flags, is_mutation);
+        // Only the three tamper routes of the module doc leave `/sys/`; every other path under
+        // it, and every read, stays dropped.
+        return !(is_cgroup_limit_write(path, flags, is_mutation)
+            || is_apparmor_profile_removal(path, flags, is_mutation)
+            || is_bpffs_mutation(path, is_mutation));
     }
     if path.starts_with(b"/dev/shm/")
         || path.starts_with(b"/tmp/")
@@ -442,7 +472,7 @@ mod tests {
     }
 
     #[test]
-    fn sys_is_filtered_except_a_cgroup_limit_write() {
+    fn sys_is_filtered_except_its_tamper_routes() {
         assert!(is_filtered_path(b"/sys/kernel/x", O_WRONLY, false));
         assert!(is_filtered_path(b"/sys/kernel/x", 0, true));
         assert!(is_filtered_path(
@@ -541,6 +571,54 @@ mod tests {
         let path = b"/sys/fs/cgroup/system.slice/auditd.service/memory.max";
         assert!(is_filtered_path(path, 0, true));
         assert!(is_filtered_path(path, O_WRONLY, true));
+    }
+
+    #[test]
+    fn a_mutation_under_bpffs_passes() {
+        for path in [
+            &b"/sys/fs/bpf/synthaea/signal_tamper_last_v21"[..],
+            b"/sys/fs/bpf/falco/prog",
+        ] {
+            assert!(!is_filtered_path(path, 0, true), "{path:?}");
+        }
+    }
+
+    #[test]
+    fn an_open_under_bpffs_stays_filtered() {
+        let path = b"/sys/fs/bpf/synthaea/signal_tamper_last_v21";
+        assert!(is_filtered_path(path, 0, false));
+        assert!(is_filtered_path(path, O_WRONLY, false));
+    }
+
+    #[test]
+    fn a_bpffs_lookalike_elsewhere_under_sys_stays_filtered() {
+        assert!(is_filtered_path(b"/sys/fs/bpfx/prog", 0, true));
+        assert!(is_filtered_path(b"/sys/kernel/bpf/prog", 0, true));
+    }
+
+    #[test]
+    fn a_write_open_of_apparmors_remove_file_passes() {
+        let path = b"/sys/kernel/security/apparmor/.remove";
+        for flags in [O_WRONLY, O_RDWR, O_WRONLY | O_TRUNC] {
+            assert!(!is_filtered_path(path, flags, false), "{flags:o}");
+        }
+    }
+
+    #[test]
+    fn a_read_or_mutation_of_apparmors_remove_file_stays_filtered() {
+        let path = b"/sys/kernel/security/apparmor/.remove";
+        assert!(is_filtered_path(path, 0, false));
+        assert!(is_filtered_path(path, 0, true));
+    }
+
+    #[test]
+    fn apparmor_policy_loads_stay_filtered() {
+        for path in [
+            &b"/sys/kernel/security/apparmor/.load"[..],
+            b"/sys/kernel/security/apparmor/.replace",
+        ] {
+            assert!(is_filtered_path(path, O_WRONLY, false), "{path:?}");
+        }
     }
 
     #[test]

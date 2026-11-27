@@ -12,7 +12,7 @@ What the agent can do today, area by area, with the code and tests that back eac
 
 Every `partial` and `planned` row links a tracking issue; `tools/check-docs.py` fails CI otherwise.
 
-Totals: 273 capabilities, 153 built, 79 partial, 41 planned.
+Totals: 272 capabilities, 152 built, 81 partial, 39 planned.
 
 ## Contents
 
@@ -141,6 +141,7 @@ Totals: 273 capabilities, 153 built, 79 partial, 41 planned.
 
 | Capability | Status | Evidence | Tracking issue | Docs |
 | --- | --- | --- | --- | --- |
+| Removal of the agent's pinned SIGKILL state, and an `AppArmor` profile unloaded, alert (T1562.001) | partial | wire path_filter.rs is_bpffs_mutation/is_apparmor_profile_removal (6 tests); rules stateless/impair_defenses.rs check_agent_pin_removed/check_apparmor_profile_removed (8 tests, non-normalized, `/proc/self/root/` and relative spellings). Not yet run on a lab host or measured against the verifier budget | [#356](https://github.com/synthaea-lab/agent/issues/356) | [sensors/linux/signals.md#the-pinned-sigkill-slot](sensors/linux/signals.md#the-pinned-sigkill-slot) |
 | Signals to the agent, including cross-restart SIGKILL attribution through a pinned map | built | mount_signal/signal.rs emit_signal_event/SIGNAL_TAMPER_LAST, userspace ebpf.rs load_ebpf_for_run/reclaim_foreign_pin (4 tests), sensor.rs sweep_survived_sigkill |  | [sensors/linux/signals.md#the-pinned-sigkill-slot](sensors/linux/signals.md#the-pinned-sigkill-slot) |
 | Signals to listed security tools (signal_generate, unit cgroup membership, reload filtering, drop counter) | built | raw.rs raw_signal_generate, unit_procs.rs ToolWatch/UnitResolver (30 tests), SIGNAL_TOOL_DROPS + normalize::signals_lost; kernel-mediated stops are read from how the limit is set (the command `systemctl freeze`/`set-property` or `prlimit --pid`, or a write to a cgroup limit file of a listed unit); the kernel's own kill (`memory.max` OOM or CPU rlimit) is not reported. Permanent limits (security-model.md#what-is-not-defended): a bare file name after a `cd` into the unit's cgroup is not read | | [sensors/linux/signals.md#signals-to-security-tools](sensors/linux/signals.md#signals-to-security-tools) |
 

@@ -64,6 +64,13 @@ syscall entry, before the kernel delivers the signal. The map is pinned under
 ([`load_ebpf_for_run`](../../../crates/sensors/linux/userspace/src/ebpf.rs)), so it survives the
 process.
 
+Removing the pin first and killing second would leave the kill with no sender, so the removal is
+itself the alert: the file probes pass every mutation under `/sys/fs/bpf/`, and AGENT-PIN-REMOVED
+([`check_agent_pin_removed`](../../../crates/rules/src/stateless/impair_defenses.rs), T1562.001,
+High, #356) fires on any entry of `/sys/fs/bpf/synthaea/` removed, or on the pin's name when the
+path is relative. The agent's own removal of a stale pin (#589) runs before its probes attach, so
+it never alerts.
+
 ```mermaid
 sequenceDiagram
   participant A as attacker
