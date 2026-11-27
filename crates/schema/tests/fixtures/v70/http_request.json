@@ -1,0 +1,18 @@
+{
+  "type": "http_request",
+  "meta": {
+    "pid": 0,
+    "ppid": 0,
+    "user": { "os": "unknown" },
+    "timestamp_ns": 1756900029000000000,
+    "comm": "http-access-log"
+  },
+  "client": "203.0.113.9",
+  "method": "GET",
+  "path": "/index.php",
+  "param_names": ["id", "page"],
+  "status": 200,
+  "signature": "sql_injection",
+  "evidence": { "param": "id", "value": "1' OR '1'='1" },
+  "truncated": false
+}

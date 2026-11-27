@@ -366,6 +366,9 @@ pub(crate) fn health_collector(
                 etw_silo_evicted = beacon.etw_silo_evicted,
                 etw_marks_dropped = beacon.etw_marks_dropped,
                 etw_quarantine_unremembered = beacon.etw_quarantine_unremembered,
+                etw_registry_unresolved_writes = beacon.etw_registry_unresolved_writes,
+                etw_registry_keys_evicted = beacon.etw_registry_keys_evicted,
+                etw_registry_names_truncated = beacon.etw_registry_names_truncated,
                 "health beacon"
             );
             // #24/#134: the dedicated health channel — best-effort, an

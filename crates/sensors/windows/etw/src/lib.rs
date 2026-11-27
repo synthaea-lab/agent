@@ -11,6 +11,8 @@
 mod amsi;
 pub mod bits;
 #[cfg(any(windows, test))]
+mod bounded_lru;
+#[cfg(any(windows, test))]
 mod budget;
 #[cfg(any(windows, test))]
 mod cross_process;
@@ -31,6 +33,8 @@ mod payload;
 mod pid_cache;
 #[cfg(windows)]
 mod providers;
+#[cfg(any(windows, test))]
+mod registry_keys;
 
 #[cfg(windows)]
 mod sensor;

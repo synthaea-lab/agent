@@ -38,10 +38,10 @@ use crate::{
     ListenPortEvent, LogClearedEvent, MemfdCreateEvent, NamespaceEvent, NamespaceSyscall,
     NetworkFlowEvent, NtlmAuthEvent, NtlmDirection, PackageChangeEvent, PackageChangeKind,
     PolicyDenialEvent, PrctlEvent, ProcessAccessEvent, ProcessVmReadEvent, ProcessVmWriteEvent,
-    PtraceEvent, RawVolumeOpenEvent, ReadlineInputEvent, RegistrySetEvent, RemoteThreadEvent,
-    ScriptBlockEvent, SessionEvent, SessionState, ShellType, SmbConnectEvent, SocketAcceptEvent,
-    SocketBindEvent, SocketCreateEvent, SocketListenEvent, TlsCaptureEvent, TlsDirection,
-    TlsLibraryType, UdpRecvEvent, UdpSendEvent, User, WmiActivityEvent,
+    PtraceEvent, RawVolumeOpenEvent, ReadlineInputEvent, RegistryKey, RegistrySetEvent,
+    RemoteThreadEvent, ScriptBlockEvent, SessionEvent, SessionState, ShellType, SmbConnectEvent,
+    SocketAcceptEvent, SocketBindEvent, SocketCreateEvent, SocketListenEvent, TlsCaptureEvent,
+    TlsDirection, TlsLibraryType, UdpRecvEvent, UdpSendEvent, User, WmiActivityEvent,
 };
 
 /// The TEST-NET-1 address every address-carrying fixture defaults to.
@@ -124,7 +124,9 @@ pub fn dns_query() -> DnsQueryEvent {
 pub fn registry_set() -> RegistrySetEvent {
     RegistrySetEvent {
         meta: meta(),
-        key: String::new(),
+        key: RegistryKey::Resolved {
+            path: String::new(),
+        },
         value_name: String::new(),
         data_type: 0,
         data: None,

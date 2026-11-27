@@ -1,0 +1,15 @@
+{
+  "type": "file_set_time",
+  "meta": {
+    "pid": 7004,
+    "ppid": 0,
+    "user": { "os": "unknown" },
+    "timestamp_ns": 1760000000000000000,
+    "comm": ""
+  },
+  "path": "C:\\Users\\alice\\invoice.docx",
+  "creation_time": null,
+  "last_access_time": null,
+  "last_write_time": 132537600000000000,
+  "change_time": null
+}

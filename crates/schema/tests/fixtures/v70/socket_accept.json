@@ -1,0 +1,14 @@
+{
+  "type": "socket_accept",
+  "meta": {
+    "pid": 8004,
+    "ppid": 8000,
+    "user": { "os": "unix", "uid": 0, "gid": 0 },
+    "timestamp_ns": 1756900018000000000,
+    "comm": "nc"
+  },
+  "listen_fd": 3,
+  "accepted_fd": 4,
+  "peer_addr": "203.0.113.42",
+  "peer_port": 54321
+}

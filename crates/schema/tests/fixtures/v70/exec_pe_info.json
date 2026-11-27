@@ -1,0 +1,19 @@
+{
+  "type": "exec",
+  "meta": {
+    "pid": 7700,
+    "ppid": 512,
+    "user": { "os": "unix", "uid": 0, "gid": 0 },
+    "timestamp_ns": 1756900007000000000,
+    "comm": "svchost.exe"
+  },
+  "image_path": "C:\\Users\\Public\\svchost.exe",
+  "cmdline": "C:\\Users\\Public\\svchost.exe /c whoami",
+  "argv": [],
+  "sha256": "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
+  "signature": "unsigned",
+  "original_file_name": "Cmd.Exe",
+  "company_name": "Microsoft Corporation",
+  "file_description": "Windows Command Processor",
+  "product_name": "Microsoft® Windows® Operating System"
+}

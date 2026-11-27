@@ -20,11 +20,11 @@ use schema::{
     MemfdCreateEvent, MountEvent, NamespaceEvent, NamespaceSyscall, NetworkFlowEvent,
     NtlmAuthEvent, NtlmDirection, POLICY_MECHANISM_SELINUX, PackageChangeEvent, PackageChangeKind,
     PolicyDenialEvent, PrctlEvent, ProcessAccessEvent, ProcessVmReadEvent, ProcessVmWriteEvent,
-    PtraceEvent, RawVolumeOpenEvent, ReadlineInputEvent, RegistrySetEvent, RemoteThreadEvent,
-    ScriptBlockEvent, SessionEvent, SessionState, ShellType, SignalEvent, SmbConnectEvent,
-    SocketAcceptEvent, SocketBindEvent, SocketCreateEvent, SocketListenEvent, TccDecisionEvent,
-    TlsCaptureEvent, TlsDirection, TlsLibraryType, UdpRecvEvent, UdpSendEvent, UnitStopEvent, User,
-    WmiActivityEvent, XpcConnectEvent,
+    PtraceEvent, RawVolumeOpenEvent, ReadlineInputEvent, RegistryKey, RegistrySetEvent,
+    RemoteThreadEvent, ScriptBlockEvent, SessionEvent, SessionState, ShellType, SignalEvent,
+    SmbConnectEvent, SocketAcceptEvent, SocketBindEvent, SocketCreateEvent, SocketListenEvent,
+    TccDecisionEvent, TlsCaptureEvent, TlsDirection, TlsLibraryType, UdpRecvEvent, UdpSendEvent,
+    UnitStopEvent, User, WmiActivityEvent, XpcConnectEvent,
     detection::{Detection, DetectionSource, IocKind, ScoreAttribution, Severity},
 };
 
@@ -1030,12 +1030,43 @@ fn registry_set_golden() {
                 process_generation: None,
                 parent_process_generation: None,
             },
-            key: r"HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Run".into(),
+            key: RegistryKey::Resolved {
+                path: r"HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Run".into(),
+            },
             value_name: "ChromeUpdate".into(),
             data_type: 1,
             data: Some(r"C:\Users\Public\chrome-update.exe".into()),
         }),
         "registry_set",
+    );
+}
+
+#[test]
+fn registry_set_unresolved_golden() {
+    // Opened relative to the process's HKCU root, which it opened before the session.
+    assert_golden(
+        &Event::RegistrySet(RegistrySetEvent {
+            meta: EventMeta {
+                pid: 4243,
+                ppid: 1337,
+                user: User::Windows {
+                    sid: "S-1-5-21-1-2-3-1001".into(),
+                    integrity_level: Some(0x2000),
+                },
+                timestamp_ns: 1_756_900_021_000_000_000,
+                comm: "explorer.exe".into(),
+                container: None,
+                process_generation: None,
+                parent_process_generation: None,
+            },
+            key: RegistryKey::Unresolved {
+                relative_name: r"Software\Microsoft\Windows\CurrentVersion\Run".into(),
+            },
+            value_name: "Updater".into(),
+            data_type: 1,
+            data: None,
+        }),
+        "registry_set_unresolved",
     );
 }
 
@@ -2829,7 +2860,9 @@ fn meta_accessor_covers_all_variants() {
         }),
         Event::RegistrySet(RegistrySetEvent {
             meta: meta.clone(),
-            key: String::new(),
+            key: RegistryKey::Unresolved {
+                relative_name: String::new(),
+            },
             value_name: String::new(),
             data_type: 1,
             data: None,
