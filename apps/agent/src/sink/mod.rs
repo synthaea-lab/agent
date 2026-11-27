@@ -124,8 +124,8 @@ pub(crate) struct DetectionSink {
     /// Which canary touches become findings (#81).
     canary: canary::CanaryGate,
     /// The ransomware reflex's trigger (#82): a process that raised the burst rule and
-    /// touched a canary inside one window. See [`crate::ransomware_join`].
-    ransomware_join: Mutex<crate::ransomware_join::RansomwareJoin>,
+    /// touched a canary inside one window. See [`rules::RansomwareJoin`].
+    ransomware_join: Mutex<rules::RansomwareJoin>,
 }
 
 /// The verdict entity an event belongs to: `(ppid, comm)` plus the incarnation of the
@@ -331,7 +331,7 @@ impl DetectionSink {
             verdict,
             content_root,
             canary: canary::CanaryGate::new(),
-            ransomware_join: Mutex::new(crate::ransomware_join::RansomwareJoin::new()),
+            ransomware_join: Mutex::new(rules::RansomwareJoin::new()),
         })
     }
 

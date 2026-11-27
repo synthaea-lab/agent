@@ -30,7 +30,7 @@ pub(super) type ResponseCell = OnceLock<ResponseHooks>;
 
 /// The reason the audit line gives when the ransomware reflex kills (#82). A trigger of its
 /// own, never severity or the Bayes gate: it needs both the burst rule and a canary touch
-/// from the same process (`crate::ransomware_join`).
+/// from the same process (`rules::RansomwareJoin`).
 const RANSOMWARE_REFLEX_REASON: &str =
     "a corroborated ransomware signal (burst rule + canary touch)";
 

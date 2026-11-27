@@ -66,7 +66,6 @@ mod memscan;
 mod own_traffic;
 mod protected;
 mod quarantine_cmd;
-mod ransomware_join;
 mod release;
 mod replay;
 mod rotation;
