@@ -7,7 +7,8 @@ The rule engine, Sigma, the correlator, the ML feature extractors, the spool and
 the uploader read only these types. A detection engine never sees a sensor's
 internal format.
 
-Sources: [`crates/schema/src/lib.rs`](../crates/schema/src/lib.rs),
+Sources: [`crates/schema/src/lib.rs`](../crates/schema/src/lib.rs) and the modules it re-exports,
+one per domain (`event.rs`, `meta.rs`, `process.rs`, `file.rs`, `network.rs`, `auth.rs`, …),
 [`sensor.rs`](../crates/schema/src/sensor.rs),
 [`detection.rs`](../crates/schema/src/detection.rs),
 [`time.rs`](../crates/schema/src/time.rs),
@@ -60,7 +61,7 @@ platform sensor implements:
 | [`SensorError`](../crates/schema/src/sensor.rs) | A boxed error, so the contract crate needs no error-handling dependency. |
 
 `EventSink` has one method rather than one per event type because
-[`Event`](../crates/schema/src/lib.rs) is `#[non_exhaustive]`. A new telemetry
+[`Event`](../crates/schema/src/event.rs) is `#[non_exhaustive]`. A new telemetry
 category reaches existing sinks without a breaking trait change. Sinks match the
 variants they understand and ignore the rest.
 
@@ -68,25 +69,25 @@ variants they understand and ignore the rest.
 
 ### `Event` and `EventMeta`
 
-[`Event`](../crates/schema/src/lib.rs) is an internally tagged enum
+[`Event`](../crates/schema/src/event.rs) is an internally tagged enum
 (`#[serde(tag = "type", rename_all = "snake_case")]`). The JSON form of an exec
 is `{"type": "exec", "meta": {...}, "image_path": ...}`. Every variant holds one
-struct that carries an [`EventMeta`](../crates/schema/src/lib.rs):
+struct that carries an [`EventMeta`](../crates/schema/src/meta.rs):
 
 | `EventMeta` field | Meaning |
 |---|---|
 | `pid`, `ppid` | Emitting process and its parent. Log-derived events that name no process (`HttpRequest`, `HttpSummary`) carry 0. |
-| `user` | [`User`](../crates/schema/src/lib.rs): `Unix {uid, gid}`, `Windows {sid, integrity_level}`, or `Unknown`. A bare `uid` cannot tell SYSTEM from a standard user on Windows. A sensor that cannot attribute a user says `Unknown` and reports it in its capabilities. |
+| `user` | [`User`](../crates/schema/src/meta.rs): `Unix {uid, gid}`, `Windows {sid, integrity_level}`, or `Unknown`. A bare `uid` cannot tell SYSTEM from a standard user on Windows. A sensor that cannot attribute a user says `Unknown` and reports it in its capabilities. |
 | `timestamp_ns` | Nanoseconds since the UNIX epoch. Sensors convert boot-relative eBPF clocks and ETW `FILETIME` before emitting. [`time::now_ns`](../crates/schema/src/time.rs) is the one shared wall-clock helper. It returns 0 rather than panicking if the clock reads before the epoch. |
 | `comm` | Short process name (Linux `comm`, image basename elsewhere). |
-| `container` | [`ContainerContext`](../crates/schema/src/lib.rs). Linux fills it from the cgroup path, Windows from the server silo (`silo:<n>` until the Host Compute Service names the container). `image` and `name` stay `None` until a runtime-socket lookup exists. |
+| `container` | [`ContainerContext`](../crates/schema/src/meta.rs). Linux fills it from the cgroup path, Windows from the server silo (`silo:<n>` until the Host Compute Service names the container). `image` and `name` stay `None` until a runtime-socket lookup exists. |
 | `process_generation`, `parent_process_generation` | An opaque value that tells two incarnations of the same pid apart. It is meaningful **only as equality between two events with the same pid**. It is not a timestamp and does not survive an agent restart. When it is `None`, a consumer must treat the pid as unchanged, never as new. |
 
-[`Event::meta`](../crates/schema/src/lib.rs) returns the shared metadata. Its
+[`Event::meta`](../crates/schema/src/event.rs) returns the shared metadata. Its
 `match` has no wildcard arm on purpose. `#[non_exhaustive]` has no effect inside
 the defining crate, so a new variant without an arm there is a compile error.
 
-[`HealthBeacon`](../crates/schema/src/lib.rs) is **not** an `Event` variant. It
+[`HealthBeacon`](../crates/schema/src/health.rs) is **not** an `Event` variant. It
 has no originating process and goes over a separate transport channel. Its
 counters (spool bytes and drops, enrichment drops, rarity, IOC, watchdog and
 tamper counters, parent-image cache evictions, alerts the log file refused, and
@@ -118,7 +119,7 @@ telemetry with no counterpart elsewhere (`Ptrace`, `Namespace`, `Prctl`...) is
 deliberately Linux-only rather than forced into a shared shape. Each struct's
 doc comment states which sensor fills it and when a field is `None`.
 
-`RegistrySet`'s `key` is a [`RegistryKey`](../crates/schema/src/lib.rs):
+`RegistrySet`'s `key` is a [`RegistryKey`](../crates/schema/src/host.rs):
 `resolved` with the full `HKLM\...`/`HKU\...` path, or `unresolved` with the
 `relative_name` the process opened the key by, below a key the sensor never saw
 opened (a root handle that predates its session). Most writes on a live Windows
@@ -127,19 +128,19 @@ too ([ETW registry key paths](sensors/windows/etw.md#registry-key-paths)).
 
 ### The exec event and its command line
 
-[`ExecEvent`](../crates/schema/src/lib.rs) is the most heavily used event. It
+[`ExecEvent`](../crates/schema/src/process.rs) is the most heavily used event. It
 carries several fields with specific rules:
 
 - `cmdline` is the flat command line that rules, Sigma and the ML command-line
   features evaluate. It must never be a placeholder for the image path.
 - `argv` is filled where the platform has one (Unix `execve`). It is empty on
   Windows, where consumers fall back to `cmdline`.
-- [`ExecEvent::ml_cmdline`](../crates/schema/src/lib.rs) is the **one canonical
+- [`ExecEvent::ml_cmdline`](../crates/schema/src/process.rs) is the **one canonical
   ML input**: the `argv` tokens each followed by a NUL, or `cmdline` verbatim
   when `argv` is empty. A space-joined string would collapse the token count to
   one. The Python training pipeline mirrors this function exactly.
-- [`bound_argv`](../crates/schema/src/lib.rs) cuts `argv` to
-  [`ARGV_CAPTURE_BUDGET`](../crates/schema/src/lib.rs) (32 KiB, counting one
+- [`bound_argv`](../crates/schema/src/process.rs) cuts `argv` to
+  [`ARGV_CAPTURE_BUDGET`](../crates/schema/src/process.rs) (32 KiB, counting one
   separator per token) and keeps the head. The token that crosses the budget is
   cut on a UTF-8 character boundary, not dropped, because the head of a long
   encoded payload is what rules match. A flood of empty arguments is bounded as
@@ -174,7 +175,7 @@ carries several fields with specific rules:
 (`O_ACCMODE`, `O_WRONLY`, `O_RDWR`, `O_CREAT`, `O_TRUNC`) instead of depending on `libc`,
 which would drag platform differences into a crate that must compile everywhere.
 
-[`has_write_intent`](../crates/schema/src/lib.rs) is the only write-intent
+[`has_write_intent`](../crates/schema/src/file.rs) is the only write-intent
 predicate in the workspace outside the `no_std` eBPF filter, which keeps its own copy
 (`sensors/linux/wire/src/path_filter.rs`, it cannot depend on this crate). It treats the access mode as a 2-bit field, as the
 kernel does: `O_WRONLY` or `O_RDWR`, or `O_CREAT` or `O_TRUNC` with any mode
@@ -193,7 +194,7 @@ unit's first start, and the macOS sensor for a BTM launch item:
 
 | Constant | Source record |
 |---|---|
-| [`FLAG_PERSISTENCE_ARTIFACT`](../crates/schema/src/lib.rs) | Windows 7045 service install |
+| [`FLAG_PERSISTENCE_ARTIFACT`](../crates/schema/src/flags.rs) | Windows 7045 service install |
 | `FLAG_PERSISTENCE_TASK_ARTIFACT` | Windows 4698 scheduled task created |
 | `FLAG_PERSISTENCE_TASK_ACTION_UNKNOWN` | set with the above when the task action could not be read |
 | `FLAG_PERSISTENCE_TASK_UPDATE_ARTIFACT` | Windows 4702 task updated (the rule also requires a suspicious action path) |
@@ -205,7 +206,7 @@ unit's first start, and the macOS sensor for a BTM launch item:
 Invariants:
 
 - Every flag is a distinct bit, so two techniques never fire from one event.
-  [`SYNTHETIC_FLAGS`](../crates/schema/src/lib.rs) lists them all. A
+  [`SYNTHETIC_FLAGS`](../crates/schema/src/flags.rs) lists them all. A
   `const` block checks at compile time that they are non-zero and pairwise
   disjoint, and the `every_pub_flag_constant_is_in_synthetic_flags` unit test
   fails if a new `pub const FLAG_*` is missing from the list.
@@ -286,7 +287,7 @@ crates/schema/tests/fixtures/
 | [`tests/v1_compat.rs`](../crates/schema/tests/v1_compat.rs) | The frozen `v1` events and detection still deserialize under today's types. This is the standing proof that additive changes stayed additive. |
 | [`tests/health_beacon.rs`](../crates/schema/tests/health_beacon.rs) | A beacon without the newer counters parses with zeros, and the counters round-trip. |
 | [`tests/file_activity_edge_cases.rs`](../crates/schema/tests/file_activity_edge_cases.rs) | Long paths, special and non-ASCII characters, large byte counts survive serialization. |
-| unit tests in [`lib.rs`](../crates/schema/src/lib.rs) | `has_write_intent` semantics, `bound_argv` boundaries, synthetic-flag list completeness. |
+| unit tests in [`file.rs`](../crates/schema/src/file.rs), [`process.rs`](../crates/schema/src/process.rs) and [`flags.rs`](../crates/schema/src/flags.rs) | `has_write_intent` semantics, `bound_argv` boundaries, synthetic-flag list completeness. |
 
 The golden suite is the one place in the workspace that writes every field of
 an event literal by hand, because it pins serialization. Everywhere else, tests
@@ -305,7 +306,7 @@ a matching change on the consumer side.
 
 1. Add the field with `#[serde(default, skip_serializing_if = "...")]` (or the
    variant). Document when it is `None` and which sensor fills it.
-2. For a variant: add its arm to [`Event::meta`](../crates/schema/src/lib.rs)
+2. For a variant: add its arm to [`Event::meta`](../crates/schema/src/event.rs)
    (the compiler insists) and a baseline in
    [`fixtures.rs`](../crates/schema/src/fixtures.rs).
 3. Bump [`SCHEMA_VERSION`](../crates/schema/src/lib.rs) and record the reason
