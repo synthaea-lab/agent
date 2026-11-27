@@ -68,7 +68,7 @@ copying each `d_name` into a 32-byte slot; `SET_TIME_TRUNCATED` marks a deeper c
 name. Userspace joins the names root first and prefixes an incomplete chain with `/...`, so it never
 passes for an absolute path. A file on a mount other than `/` lacks its mount prefix. The raw
 `timespec64` values are converted to `FILETIME` units so one rule serves Linux and Windows
-([`file_set_time`](../../../crates/sensors/linux/userspace/src/normalize.rs)).
+([`file_set_time`](../../../crates/sensors/linux/userspace/src/normalize/file.rs)).
 
 ### Kernel requirements
 

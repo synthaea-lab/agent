@@ -212,7 +212,7 @@ Invariants:
   fails if a new `pub const FLAG_*` is missing from the list.
 - Only userspace sensors that build their own `FileOpenEvent` set these bits. On
   Linux, the eBPF sensor masks raw `open(2)` flags with
-  [`OPEN_FLAGS_MASK`](../crates/sensors/linux/userspace/src/normalize.rs) before
+  [`OPEN_FLAGS_MASK`](../crates/sensors/linux/userspace/src/normalize/file.rs) before
   emitting, because the kernel ignores unknown flag bits and any local user
   could otherwise set a synthetic bit.
 - A new bit inside an existing field is **not** a schema change: the field's

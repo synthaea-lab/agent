@@ -10,7 +10,7 @@ tested without a kernel is pure and compiles on every OS:
 
 | Pure module | What its tests pin |
 | --- | --- |
-| [`normalize.rs`](../../../crates/sensors/linux/userspace/src/normalize.rs) | Every wire → schema mapping; open-flag masking; argv truth table; rename path resolution; FILETIME conversion |
+| [`normalize/`](../../../crates/sensors/linux/userspace/src/normalize) | Every wire → schema mapping; open-flag masking; argv truth table; rename path resolution; FILETIME conversion |
 | [`proc.rs`](../../../crates/sensors/linux/userspace/src/proc.rs) | cmdline/environ/stat parsing, argv windows to tokens, comm with spaces and `)` |
 | [`btf.rs`](../../../crates/sensors/linux/userspace/src/btf.rs) | Synthetic BTF blobs, refusal of truncated or incomplete BTF, the running kernel's BTF when present |
 | [`syscall.rs`](../../../crates/sensors/linux/userspace/src/syscall.rs) | Dispatch handler ids unique and in range |
