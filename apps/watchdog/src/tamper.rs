@@ -10,28 +10,9 @@
 //! Linux only for now. Windows service-ACL hardening and macOS's Endpoint Security
 //! system-extension path are tracked in the issue but not implemented here.
 
-use std::{fs::File, io::Read as _, path::Path};
+use std::path::Path;
 
-/// Hashes a file's contents with SHA-256. Same buffered-read shape as
-/// `enrich::hash_file` (`sha2` 0.11 dropped `impl Write for Sha256`, so
-/// `io::copy` doesn't apply — read into a buffer and feed `Digest::update` by hand).
-///
-/// # Errors
-/// Propagates any I/O error opening or reading `path`.
-pub(crate) fn sha256_file(path: &Path) -> std::io::Result<[u8; 32]> {
-    use sha2::{Digest, Sha256};
-    let mut file = File::open(path)?;
-    let mut hasher = Sha256::new();
-    let mut buf = [0u8; 64 * 1024];
-    loop {
-        let n = file.read(&mut buf)?;
-        if n == 0 {
-            break;
-        }
-        hasher.update(&buf[..n]);
-    }
-    Ok(hasher.finalize().into())
-}
+use file_hash::sha256_file;
 
 /// Refuses to proceed if `dir` is world-writable (mode & `0o002`). An attacker with
 /// write access to the agent's own install directory can drop a replacement binary

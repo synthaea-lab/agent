@@ -1,11 +1,9 @@
 //! SHA-256 hashing shared by manifest verification and staged-file checking.
 //!
-//! Deliberately independent of `tamper::integrity`'s equivalent (`hash_file`) even
-//! though the logic is similar — `updater` and `tamper` are both leaf crates and
-//! may not depend on each other (`tools/check-deps.py`); the `agent` binary is
-//! where their outputs meet.
+//! The read loop itself is `file_hash`'s, shared with `tamper`, `enrich`, `response` and the
+//! watchdog; this module keeps the hex forms the manifests use.
 
-use std::{fs::File, io::Read as _, path::Path};
+use std::path::Path;
 
 use sha2::{Digest, Sha256};
 
@@ -15,17 +13,7 @@ use sha2::{Digest, Sha256};
 ///
 /// Propagates any [`std::io::Error`] opening or reading `path`.
 pub fn hash_file(path: &Path) -> std::io::Result<String> {
-    let mut file = File::open(path)?;
-    let mut hasher = Sha256::new();
-    let mut buf = [0u8; 64 * 1024];
-    loop {
-        let n = file.read(&mut buf)?;
-        if n == 0 {
-            break;
-        }
-        hasher.update(&buf[..n]);
-    }
-    Ok(hex_encode(&hasher.finalize()))
+    file_hash::sha256_file(path).map(|digest| hex_encode(&digest))
 }
 
 /// SHA-256 of an in-memory buffer, lowercase hex — same encoding as
@@ -38,12 +26,7 @@ pub fn hash_bytes(bytes: &[u8]) -> String {
 /// Lowercase-hex encoding, used for both file hashes and the manifest signature.
 #[must_use]
 pub fn hex_encode(bytes: &[u8]) -> String {
-    use std::fmt::Write as _;
-    let mut out = String::with_capacity(bytes.len() * 2);
-    for b in bytes {
-        let _ = write!(out, "{b:02x}");
-    }
-    out
+    file_hash::hex(bytes)
 }
 
 /// Decodes a lowercase- or uppercase-hex string. `None` on odd length or a

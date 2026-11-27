@@ -10,7 +10,7 @@ publish.workspace = true
 workspace = true
 
 [dependencies]
+file-hash = { path = "../file-hash" }
 schema = { path = "../schema" }
 store = { path = "../store" }
-sha2 = "0.11"
 tracing = { workspace = true }

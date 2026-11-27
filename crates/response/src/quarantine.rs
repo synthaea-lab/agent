@@ -47,7 +47,6 @@
 //! other local users, not another process with the same identity.
 
 use std::{
-    fmt::Write as _,
     io::Write as _,
     path::{Path, PathBuf},
 };
@@ -1296,30 +1295,12 @@ fn sha256_reader(file: &mut impl std::io::Read) -> std::io::Result<String> {
     sha256_copy(file, &mut std::io::sink())
 }
 
-/// Copies `from` to `to` and returns the SHA-256 of exactly the bytes copied.
+/// Copies `from` to `to` and returns the SHA-256, in lowercase hex, of exactly the bytes copied.
 fn sha256_copy(
     from: &mut impl std::io::Read,
     to: &mut impl std::io::Write,
 ) -> std::io::Result<String> {
-    use sha2::{Digest, Sha256};
-    let mut hasher = Sha256::new();
-    let mut buf = [0u8; 64 * 1024];
-    loop {
-        let n = from.read(&mut buf)?;
-        if n == 0 {
-            break;
-        }
-        hasher.update(&buf[..n]);
-        to.write_all(&buf[..n])?;
-    }
-    let digest = hasher.finalize();
-    let mut hex = String::with_capacity(64);
-    for byte in digest {
-        // Writing to a `String` cannot fail — `fmt::Write`'s `Result` exists for
-        // formatters that do I/O, not this one; nothing to propagate.
-        let _ = write!(hex, "{byte:02x}");
-    }
-    Ok(hex)
+    file_hash::sha256_copy(from, to).map(|digest| file_hash::hex(&digest))
 }
 
 #[cfg(test)]

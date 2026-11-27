@@ -23,15 +23,10 @@
 mod pe_info;
 mod sig;
 
-use std::{
-    fs::File,
-    io::{Read as _, Seek as _},
-    path::Path,
-};
+use std::{fs::File, io::Seek as _, path::Path};
 
 pub use pe_info::PeInfo;
 use schema::Signature;
-use sha2::{Digest, Sha256};
 use store::BoundedMap;
 
 /// Files larger than this are not hashed on the event path (64 MiB).
@@ -229,25 +224,9 @@ impl Enricher {
 }
 
 fn hash_file(file: &mut File) -> Option<String> {
-    let mut hasher = Sha256::new();
-    // `sha2` 0.11 dropped `impl Write for Sha256` (it never guaranteed the
-    // infallible-write contract `io::Write` implies), so `io::copy` no longer
-    // applies here — read into a buffer and feed `Digest::update` by hand.
-    let mut buf = [0u8; 64 * 1024];
-    loop {
-        let n = file.read(&mut buf).ok()?;
-        if n == 0 {
-            break;
-        }
-        hasher.update(&buf[..n]);
-    }
-    let digest = hasher.finalize();
-    let mut out = String::with_capacity(64);
-    for byte in digest {
-        use std::fmt::Write as _;
-        let _ = write!(out, "{byte:02x}");
-    }
-    Some(out)
+    file_hash::sha256_reader(file)
+        .ok()
+        .map(|digest| file_hash::hex(&digest))
 }
 
 #[cfg(test)]

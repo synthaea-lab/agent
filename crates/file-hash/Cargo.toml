@@ -1,0 +1,13 @@
+[package]
+name = "file-hash"
+version.workspace = true
+description = "Streaming SHA-256 of a file or reader, shared by every crate that hashes one"
+license.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+sha2 = "0.11"
