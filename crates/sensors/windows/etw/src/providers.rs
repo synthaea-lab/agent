@@ -1,6 +1,6 @@
 //! The ETW provider callbacks, each normalizing its records into schema events.
-//! Lab notes: `TcpClient` emits no EID 42 (2026-08-25), PID recycling prunes on
-//! `ProcessEnd`, canary events are filtered from emission.
+//! Lab notes: `TcpClient` emits no EID 42 (2026-08-25: 42 is a UDP v4 send, #253 review),
+//! PID recycling prunes on `ProcessEnd`, canary events are filtered from emission.
 
 use std::sync::{Arc, atomic::Ordering};
 
@@ -18,6 +18,7 @@ use schema::{
 use crate::{
     amsi,
     cross_process::{self, ThreadOrigin},
+    kernel_network::{self, NetworkEvent},
     kernel_process::{self, ExecContext, KernelProcessEvent, ProcessStart, UNKNOWN_IMAGE},
     normalize, payload,
     registry_keys::RegistryOperation,
@@ -44,14 +45,47 @@ const FILE_EVENT_KEYWORDS: [(u16, u64); 3] = [
     (30, FILE_KEYWORD_CREATE_NEW_FILE),
 ];
 
+/// The ids of [`FILE_EVENT_KEYWORDS`]: the provider's event-id filter.
+const FILE_EVENT_IDS: [u16; 3] = [
+    FILE_EVENT_KEYWORDS[0].0,
+    FILE_EVENT_KEYWORDS[1].0,
+    FILE_EVENT_KEYWORDS[2].0,
+];
+
 fn file_event_keyword(event_id: u16) -> Option<u64> {
     FILE_EVENT_KEYWORDS
         .iter()
         .find_map(|(id, keyword)| (*id == event_id).then_some(*keyword))
 }
 
+/// Kernel-Network `KERNEL_NETWORK_KEYWORD_IPV4` (0x10: 12, 42) and `_IPV6` (0x20: 28, 58).
+const NETWORK_KEYWORDS: u64 = 0x10 | 0x20;
+
 /// Microsoft-Windows-DNS-Client
 const DNS_CLIENT_GUID: &str = "1C95126E-7EEA-49A9-A3FE-A378B03DDB4D";
+/// EID 3008 `QueryCompleted`: the name and the answer (3006 `QueryStarted` has no answer).
+/// The manifest gives it no keyword but its channel's, so it is kept by id alone.
+const DNS_QUERY_COMPLETED: u16 = 3008;
+/// PowerShell EID 4104 (script block), keyword `Runspace`.
+const POWERSHELL_SCRIPT_BLOCK: u16 = 4104;
+const POWERSHELL_KEYWORD_RUNSPACE: u64 = 0x1;
+/// AMSI EID 1101 (scan), keyword `Event1`.
+const AMSI_SCAN: u16 = 1101;
+const AMSI_KEYWORD_EVENT1: u64 = 0x1;
+/// LDAP-Client EID 30 (search request), keyword `search`.
+const LDAP_SEARCH: u16 = 30;
+const LDAP_KEYWORD_SEARCH: u64 = 0x1;
+/// `DotNETRuntime` EID 154 `AssemblyLoad`, keyword `LoaderKeyword`. Every other CLR keyword
+/// (GC, JIT, stacks…) makes every .NET process on the host do work for events dropped here.
+const DOTNET_ASSEMBLY_LOAD: u16 = 154;
+const DOTNET_KEYWORD_LOADER: u64 = 0x8;
+/// `SMBClient` EID 30704, connection established, keyword `Smb_MultiChannel` (0x20, which
+/// carries only the 307xx/309xx connection and multichannel events, not the I/O ones).
+const SMB_CONNECTED: u16 = 30704;
+const SMB_KEYWORD_MULTICHANNEL: u64 = 0x20;
+/// Bits-Client 16403 file added, 4 completed, 5 cancelled, 61 transfer error. No keyword
+/// isolates them.
+const BITS_EVENTS: [u16; 4] = [4, 5, 61, 16403];
 /// Microsoft-Windows-Kernel-Registry
 const KERNEL_REGISTRY_GUID: &str = "70EB4F03-C1DE-4F73-A051-33D13D5413BD";
 /// Kernel-Registry manifest keywords (Windows 11 26300), one per operation read: `CloseKey`
@@ -60,11 +94,13 @@ const KERNEL_REGISTRY_GUID: &str = "70EB4F03-C1DE-4F73-A051-33D13D5413BD";
 /// ([`RegistryKeys`](crate::registry_keys::RegistryKeys)).
 const REGISTRY_KEYWORDS: u64 = 0x1 | 0x100 | 0x1000 | 0x2000;
 
-/// What the sensor asks of one provider: its GUID, the keyword mask (`None`: every keyword)
-/// and the event ids its callback reads, which ETW filters on before delivery
-/// (`EVENT_FILTER_TYPE_EVENT_ID`: Windows 8.1 / Server 2012 R2 and later; older systems
-/// reject it and the session does not start). The real-session tests enable providers from
-/// it, so they check the shipped values.
+/// What the sensor asks of one provider: its GUID, the keyword mask and the event ids its
+/// callback reads. ETW drops every other id before delivery (`EVENT_FILTER_TYPE_EVENT_ID`:
+/// Windows 8.1 / Server 2012 R2 and later; older systems reject it and the session does not
+/// start). `keywords`, where the manifest has keywords that isolate those ids, stops the
+/// provider writing the rest at all; `None` enables every keyword. The real-session tests
+/// enable providers from it, so they check the shipped values. See
+/// `docs/sensors/windows/etw.md#providers`.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct ProviderConfig {
     pub(crate) guid: &'static str,
@@ -92,7 +128,7 @@ pub(crate) const KERNEL_REGISTRY: ProviderConfig = ProviderConfig {
 const POWERSHELL_GUID: &str = "A0C1853B-5C40-4B15-8766-3CF1C58F985A";
 /// Microsoft-Windows-WMI-Activity
 const WMI_ACTIVITY_GUID: &str = "1418EF04-B0B4-4623-BF7E-D74AB47BBDAA";
-/// Microsoft-Windows-DotNETRuntime (EID 154 `AssemblyLoad`), enabled with no keyword mask
+/// Microsoft-Windows-DotNETRuntime (EID 154 `AssemblyLoad`)
 const DOTNET_RUNTIME_GUID: &str = "e13c0d23-ccbc-4e12-931b-d9cc2eee27e4";
 /// Microsoft-Antimalware-Scan-Interface (EID 1101, the scanned buffer)
 const AMSI_GUID: &str = "2A576B87-09A7-520E-C21A-4942F0271D67";
@@ -105,7 +141,7 @@ const SMB_CLIENT_GUID: &str = "988C59C5-0A1C-45B6-A555-0C62276E327D";
 /// Microsoft-Windows-Bits-Client (EIDs 16403/4/5/61, BITS jobs)
 const BITS_CLIENT_GUID: &str = "EF1CC15B-46C1-414E-BB95-E76B077BD51E";
 /// Microsoft-Windows-Kernel-Audit-API-Calls (EID 5 `PsOpenProcess`). The manifest
-/// declares no keywords, so every id arrives and the callback keeps 5.
+/// declares no keywords, so 5 is kept by id alone.
 const KERNEL_AUDIT_API_GUID: &str = "E02A841C-75A3-4FA7-AFC8-AE09CF9B7F23";
 /// Kernel-Audit-API-Calls `PsOpenProcess`: `TargetProcessId`, `DesiredAccess`,
 /// `ReturnCode`; the caller is the record header's pid.
@@ -138,6 +174,84 @@ pub(crate) const ALL_PROVIDERS: [(&str, &str); 14] = [
 /// parsing.
 const KERNEL_PROCESS_KEYWORDS: u64 = 0x10 | 0x20 | 0x40 | 0x4000;
 
+pub(crate) const KERNEL_PROCESS: ProviderConfig = ProviderConfig {
+    guid: KERNEL_PROCESS_GUID,
+    keywords: Some(KERNEL_PROCESS_KEYWORDS),
+    event_ids: &KernelProcessEvent::EVENT_IDS,
+};
+
+pub(crate) const KERNEL_AUDIT_API: ProviderConfig = ProviderConfig {
+    guid: KERNEL_AUDIT_API_GUID,
+    keywords: None,
+    event_ids: &[AUDIT_OPEN_PROCESS],
+};
+
+pub(crate) const KERNEL_NETWORK: ProviderConfig = ProviderConfig {
+    guid: KERNEL_NETWORK_GUID,
+    keywords: Some(NETWORK_KEYWORDS),
+    event_ids: &NetworkEvent::EVENT_IDS,
+};
+
+pub(crate) const KERNEL_FILE: ProviderConfig = ProviderConfig {
+    guid: KERNEL_FILE_GUID,
+    keywords: Some(FILE_KEYWORDS),
+    event_ids: &FILE_EVENT_IDS,
+};
+
+pub(crate) const DNS_CLIENT: ProviderConfig = ProviderConfig {
+    guid: DNS_CLIENT_GUID,
+    keywords: None,
+    event_ids: &[DNS_QUERY_COMPLETED],
+};
+
+pub(crate) const POWERSHELL: ProviderConfig = ProviderConfig {
+    guid: POWERSHELL_GUID,
+    keywords: Some(POWERSHELL_KEYWORD_RUNSPACE),
+    event_ids: &[POWERSHELL_SCRIPT_BLOCK],
+};
+
+pub(crate) const AMSI: ProviderConfig = ProviderConfig {
+    guid: AMSI_GUID,
+    keywords: Some(AMSI_KEYWORD_EVENT1),
+    event_ids: &[AMSI_SCAN],
+};
+
+pub(crate) const LDAP_CLIENT: ProviderConfig = ProviderConfig {
+    guid: LDAP_CLIENT_GUID,
+    keywords: Some(LDAP_KEYWORD_SEARCH),
+    event_ids: &[LDAP_SEARCH],
+};
+
+pub(crate) const NTLM: ProviderConfig = ProviderConfig {
+    guid: NTLM_GUID,
+    keywords: None,
+    event_ids: &payload::NTLM_EVENT_IDS,
+};
+
+pub(crate) const WMI_ACTIVITY: ProviderConfig = ProviderConfig {
+    guid: WMI_ACTIVITY_GUID,
+    keywords: None,
+    event_ids: &payload::WmiOperation::EVENT_IDS,
+};
+
+pub(crate) const DOTNET_RUNTIME: ProviderConfig = ProviderConfig {
+    guid: DOTNET_RUNTIME_GUID,
+    keywords: Some(DOTNET_KEYWORD_LOADER),
+    event_ids: &[DOTNET_ASSEMBLY_LOAD],
+};
+
+pub(crate) const SMB_CLIENT: ProviderConfig = ProviderConfig {
+    guid: SMB_CLIENT_GUID,
+    keywords: Some(SMB_KEYWORD_MULTICHANNEL),
+    event_ids: &[SMB_CONNECTED],
+};
+
+pub(crate) const BITS_CLIENT: ProviderConfig = ProviderConfig {
+    guid: BITS_CLIENT_GUID,
+    keywords: None,
+    event_ids: &BITS_EVENTS,
+};
+
 pub(crate) fn process_provider(sink: Arc<dyn EventSink>, state: Arc<SharedState>) -> Provider {
     let callback = move |record: &EventRecord, locator: &SchemaLocator| {
         let Some(event) = KernelProcessEvent::from_id(record.event_id()) else {
@@ -163,10 +277,7 @@ pub(crate) fn process_provider(sink: Arc<dyn EventSink>, state: Arc<SharedState>
             KernelProcessEvent::SiloChange => on_silo_change(&parser, &state),
         }
     };
-    Provider::by_guid(KERNEL_PROCESS_GUID)
-        .any(KERNEL_PROCESS_KEYWORDS)
-        .add_callback(callback)
-        .build()
+    KERNEL_PROCESS.builder().add_callback(callback).build()
 }
 
 /// Kernel-Process 1 (`ProcessStart`): records the process in the pid store and forwards it
@@ -462,99 +573,82 @@ pub(crate) fn audit_api_provider(sink: Arc<dyn EventSink>, state: Arc<SharedStat
         }));
     };
 
-    Provider::by_guid(KERNEL_AUDIT_API_GUID)
-        .add_callback(callback)
-        .build()
+    KERNEL_AUDIT_API.builder().add_callback(callback).build()
 }
 
+/// Kernel-Network: TCP connection attempts (12 v4, 28 v6) as `Connect`, UDP sends (42 v4,
+/// 58 v6) as `UdpSend`. Receives are not read: they would count the same flow on the
+/// receiver side. Ids per the manifest (Windows 11 26300) and a live session (#253 review).
 pub(crate) fn network_provider(sink: Arc<dyn EventSink>, state: Arc<SharedState>) -> Provider {
     let callback = move |record: &EventRecord, locator: &SchemaLocator| {
-        let eid = record.event_id();
-
-        // EID 14 = UDPSend (IPv4): dest addr + port + payload size.
-        // Handled early and returned: UDP is stateless so no dedup filter applies,
-        // and the field set differs from TCP (no sport needed for emit).
-        if eid == 14 {
-            state.events_seen.fetch_add(1, Ordering::Relaxed);
-            let Ok(schema_def) = locator.event_schema(record) else {
-                return;
-            };
-            let parser = Parser::create(record, &schema_def);
-            let pid: u32 = parser.try_parse("PID").unwrap_or(0);
-            let raw: u32 = parser.try_parse("daddr").unwrap_or(0);
-            if raw == 0 {
-                return;
-            }
-            let daddr = std::net::IpAddr::V4(raw.to_ne_bytes().into());
-            let dport = parser.try_parse::<u16>("dport").unwrap_or(0).swap_bytes();
-            let size: u32 = parser.try_parse("size").unwrap_or(0);
-            let timestamp_ns = normalize::filetime_to_ns(record.raw_timestamp());
-            let Some(comm) = state.comm_for(pid) else {
-                return;
-            };
-            sink.on_event(Event::UdpSend(UdpSendEvent {
-                meta: state.meta(pid, 0, comm, timestamp_ns),
-                daddr,
-                dport,
-                size,
-            }));
+        let Some(event) = NetworkEvent::from_id(record.event_id()) else {
             return;
-        }
-
-        // v4: 42=TcpIpConnect, 12=TcpIpSend (TcpClient emits no 42 — lab
-        // 2026-08-25). v6 counterparts (F-7): 58=connect, 26=send. Recv excluded:
-        // would double-count on the receiver side.
-        let is_v6 = eid == 58 || eid == 26;
-        if eid != 42 && eid != 12 && !is_v6 {
-            return;
-        }
+        };
         state.events_seen.fetch_add(1, Ordering::Relaxed);
         let Ok(schema_def) = locator.event_schema(record) else {
             return;
         };
         let parser = Parser::create(record, &schema_def);
-        let pid: u32 = parser.try_parse("PID").unwrap_or(0);
-        let dport = parser.try_parse::<u16>("dport").unwrap_or(0).swap_bytes();
-        let sport = parser.try_parse::<u16>("sport").unwrap_or(0).swap_bytes();
+        let Some(flow) = kernel_network::flow(event.family(), &parser) else {
+            return;
+        };
         let timestamp_ns = normalize::filetime_to_ns(record.raw_timestamp());
-
-        let daddr: std::net::IpAddr = if is_v6 {
-            let raw: Vec<u8> = parser.try_parse("daddr").unwrap_or_default();
-            let Ok(bytes) = <[u8; 16]>::try_from(raw) else {
-                return;
-            };
-            std::net::IpAddr::V6(bytes.into())
-        } else {
-            let raw: u32 = parser.try_parse("daddr").unwrap_or(0);
-            if raw == 0 {
-                return;
+        match event {
+            NetworkEvent::TcpConnect(_) => {
+                forward_connect(&flow, timestamp_ns, &state, sink.as_ref());
             }
-            // ETW stores the v4 address in memory order — to_ne_bytes preserves it.
-            std::net::IpAddr::V4(raw.to_ne_bytes().into())
-        };
-
-        // F-7: one logical connection = one event — flow-keyed (sport included) so
-        // parallel connections stay distinct and chatty flows never re-emit.
-        if state
-            .dedup
-            .lock_or_recover()
-            .is_duplicate(pid, sport, daddr, dport, timestamp_ns)
-        {
-            return;
+            NetworkEvent::UdpSend(_) => {
+                forward_udp_send(&flow, timestamp_ns, &state, sink.as_ref());
+            }
         }
-
-        let Some(comm) = state.comm_for(pid) else {
-            return;
-        };
-        sink.on_event(Event::Connect(ConnectEvent {
-            meta: state.meta(pid, 0, comm, timestamp_ns),
-            daddr,
-            dport,
-        }));
     };
-    Provider::by_guid(KERNEL_NETWORK_GUID)
-        .add_callback(callback)
-        .build()
+    KERNEL_NETWORK.builder().add_callback(callback).build()
+}
+
+/// A TCP connection attempt, once per flow (F-7): keyed on the source port too, so parallel
+/// connections stay distinct and a retried attempt is not reported twice.
+fn forward_connect(
+    flow: &kernel_network::Flow,
+    timestamp_ns: u64,
+    state: &SharedState,
+    sink: &dyn EventSink,
+) {
+    if state.dedup.lock_or_recover().is_duplicate(
+        flow.pid,
+        flow.sport,
+        flow.daddr,
+        flow.dport,
+        timestamp_ns,
+    ) {
+        return;
+    }
+    let Some(comm) = state.comm_for(flow.pid) else {
+        return;
+    };
+    sink.on_event(Event::Connect(ConnectEvent {
+        meta: state.meta(flow.pid, 0, comm, timestamp_ns),
+        daddr: flow.daddr,
+        dport: flow.dport,
+    }));
+}
+
+/// A UDP datagram, every one: the schema's consumers aggregate on (pid, address, port) and
+/// read the size, so there is no dedup.
+fn forward_udp_send(
+    flow: &kernel_network::Flow,
+    timestamp_ns: u64,
+    state: &SharedState,
+    sink: &dyn EventSink,
+) {
+    let Some(comm) = state.comm_for(flow.pid) else {
+        return;
+    };
+    sink.on_event(Event::UdpSend(UdpSendEvent {
+        meta: state.meta(flow.pid, 0, comm, timestamp_ns),
+        daddr: flow.daddr,
+        dport: flow.dport,
+        size: flow.size,
+    }));
 }
 
 pub(crate) fn file_provider(sink: Arc<dyn EventSink>, state: Arc<SharedState>) -> Provider {
@@ -623,10 +717,7 @@ pub(crate) fn file_provider(sink: Arc<dyn EventSink>, state: Arc<SharedState>) -
         }
         sink.on_event(Event::FileOpen(FileOpenEvent { meta, path, flags }));
     };
-    Provider::by_guid(KERNEL_FILE_GUID)
-        .any(FILE_KEYWORDS)
-        .add_callback(callback)
-        .build()
+    KERNEL_FILE.builder().add_callback(callback).build()
 }
 
 /// Kernel-File 26 (`DeletePath`, `FilePath` field): forwards the deletion of a
@@ -672,9 +763,7 @@ fn forward_mark_removal(
 ///   field — DNS-Client fires in the calling thread's context, same as file events.
 pub(crate) fn dns_provider(sink: Arc<dyn EventSink>, state: Arc<SharedState>) -> Provider {
     let callback = move |record: &EventRecord, locator: &SchemaLocator| {
-        // EID 3008 = QueryCompleted — has both the query name and the answer.
-        // EID 3006 = QueryStarted — no answer yet, emitting it would be noise.
-        if record.event_id() != 3008 {
+        if record.event_id() != DNS_QUERY_COMPLETED {
             return;
         }
         state.events_seen.fetch_add(1, Ordering::Relaxed);
@@ -687,9 +776,7 @@ pub(crate) fn dns_provider(sink: Arc<dyn EventSink>, state: Arc<SharedState>) ->
         }
     };
 
-    Provider::by_guid(DNS_CLIENT_GUID)
-        .add_callback(callback)
-        .build()
+    DNS_CLIENT.builder().add_callback(callback).build()
 }
 
 /// Registry value writes (EID 5 `SetValueKey`), with the creates, opens and closes (EIDs 1,
@@ -766,8 +853,7 @@ pub(crate) fn registry_provider(sink: Arc<dyn EventSink>, state: Arc<SharedState
 /// - `MessageTotal` : total fragment count for this `ScriptBlockId`.
 pub(crate) fn powershell_provider(sink: Arc<dyn EventSink>, state: Arc<SharedState>) -> Provider {
     let callback = move |record: &EventRecord, locator: &SchemaLocator| {
-        // EID 4104 = ScriptBlockLogging — the only EID that carries script text.
-        if record.event_id() != 4104 {
+        if record.event_id() != POWERSHELL_SCRIPT_BLOCK {
             return;
         }
         state.events_seen.fetch_add(1, Ordering::Relaxed);
@@ -780,9 +866,7 @@ pub(crate) fn powershell_provider(sink: Arc<dyn EventSink>, state: Arc<SharedSta
         }
     };
 
-    Provider::by_guid(POWERSHELL_GUID)
-        .add_callback(callback)
-        .build()
+    POWERSHELL.builder().add_callback(callback).build()
 }
 
 /// AMSI scans (EID 1101): the buffer a runtime hands to AMSI before running
@@ -798,7 +882,7 @@ pub(crate) fn powershell_provider(sink: Arc<dyn EventSink>, state: Arc<SharedSta
 /// process: AMSI runs in-process.
 pub(crate) fn amsi_provider(sink: Arc<dyn EventSink>, state: Arc<SharedState>) -> Provider {
     let callback = move |record: &EventRecord, locator: &SchemaLocator| {
-        if record.event_id() != 1101 {
+        if record.event_id() != AMSI_SCAN {
             return;
         }
         state.events_seen.fetch_add(1, Ordering::Relaxed);
@@ -849,7 +933,7 @@ pub(crate) fn amsi_provider(sink: Arc<dyn EventSink>, state: Arc<SharedState>) -
         }));
     };
 
-    Provider::by_guid(AMSI_GUID).add_callback(callback).build()
+    AMSI.builder().add_callback(callback).build()
 }
 
 /// LDAP searches (EID 30): the directory-reconnaissance fingerprint (#364).
@@ -864,7 +948,7 @@ pub(crate) fn amsi_provider(sink: Arc<dyn EventSink>, state: Arc<SharedState>) -
 /// never answers shows up, a failed connect does not.
 pub(crate) fn ldap_provider(sink: Arc<dyn EventSink>, state: Arc<SharedState>) -> Provider {
     let callback = move |record: &EventRecord, locator: &SchemaLocator| {
-        if record.event_id() != 30 {
+        if record.event_id() != LDAP_SEARCH {
             return;
         }
         state.events_seen.fetch_add(1, Ordering::Relaxed);
@@ -882,9 +966,7 @@ pub(crate) fn ldap_provider(sink: Arc<dyn EventSink>, state: Arc<SharedState>) -
         sink.on_event(Event::LdapSearch(payload::ldap_search(&parser, meta)));
     };
 
-    Provider::by_guid(LDAP_CLIENT_GUID)
-        .add_callback(callback)
-        .build()
+    LDAP_CLIENT.builder().add_callback(callback).build()
 }
 
 /// NTLM usage (#364): 4020/4021/4026/4027 = this host authenticated out,
@@ -932,7 +1014,7 @@ pub(crate) fn ntlm_provider(sink: Arc<dyn EventSink>, state: Arc<SharedState>) -
         sink.on_event(Event::NtlmAuth(auth.into_event(meta)));
     };
 
-    Provider::by_guid(NTLM_GUID).add_callback(callback).build()
+    NTLM.builder().add_callback(callback).build()
 }
 
 /// WMI activity events (EID 23 — `ExecQuery`, EID 24 — `ExecMethod`).
@@ -963,9 +1045,7 @@ pub(crate) fn wmi_provider(sink: Arc<dyn EventSink>, state: Arc<SharedState>) ->
         }
     };
 
-    Provider::by_guid(WMI_ACTIVITY_GUID)
-        .add_callback(callback)
-        .build()
+    WMI_ACTIVITY.builder().add_callback(callback).build()
 }
 
 /// In-memory .NET assembly loads (EID 154 — `AssemblyLoad`) from
@@ -983,8 +1063,7 @@ pub(crate) fn wmi_provider(sink: Arc<dyn EventSink>, state: Arc<SharedState>) ->
 /// PID comes from the record header.
 pub(crate) fn dotnet_provider(sink: Arc<dyn EventSink>, state: Arc<SharedState>) -> Provider {
     let callback = move |record: &EventRecord, locator: &SchemaLocator| {
-        // EID 154 = AssemblyLoad — the only EID that carries assembly identity.
-        if record.event_id() != 154 {
+        if record.event_id() != DOTNET_ASSEMBLY_LOAD {
             return;
         }
         let Ok(schema_def) = locator.event_schema(record) else {
@@ -997,9 +1076,7 @@ pub(crate) fn dotnet_provider(sink: Arc<dyn EventSink>, state: Arc<SharedState>)
         }
     };
 
-    Provider::by_guid(DOTNET_RUNTIME_GUID)
-        .add_callback(callback)
-        .build()
+    DOTNET_RUNTIME.builder().add_callback(callback).build()
 }
 
 /// SMB client connections to remote servers (EID 30704) from
@@ -1018,8 +1095,7 @@ pub(crate) fn dotnet_provider(sink: Arc<dyn EventSink>, state: Arc<SharedState>)
 /// `(Get-WinEvent -ListProvider Microsoft-Windows-SMBClient).Events`.
 pub(crate) fn smb_provider(sink: Arc<dyn EventSink>, state: Arc<SharedState>) -> Provider {
     let callback = move |record: &EventRecord, locator: &SchemaLocator| {
-        // EID 30704 = TCP connection established to remote SMB server.
-        if record.event_id() != 30704 {
+        if record.event_id() != SMB_CONNECTED {
             return;
         }
         let Ok(schema_def) = locator.event_schema(record) else {
@@ -1032,9 +1108,7 @@ pub(crate) fn smb_provider(sink: Arc<dyn EventSink>, state: Arc<SharedState>) ->
         }
     };
 
-    Provider::by_guid(SMB_CLIENT_GUID)
-        .add_callback(callback)
-        .build()
+    SMB_CLIENT.builder().add_callback(callback).build()
 }
 
 /// BITS jobs (#284, T1197) from `Microsoft-Windows-Bits-Client`: 16403 (file
@@ -1052,7 +1126,7 @@ pub(crate) fn smb_provider(sink: Arc<dyn EventSink>, state: Arc<SharedState>) ->
 pub(crate) fn bits_provider(sink: Arc<dyn EventSink>, state: Arc<SharedState>) -> Provider {
     let callback = move |record: &EventRecord, locator: &SchemaLocator| {
         let eid = record.event_id();
-        if !matches!(eid, 4 | 5 | 61 | 16403) {
+        if !BITS_EVENTS.contains(&eid) {
             return;
         }
         state.events_seen.fetch_add(1, Ordering::Relaxed);
@@ -1107,9 +1181,7 @@ pub(crate) fn bits_provider(sink: Arc<dyn EventSink>, state: Arc<SharedState>) -
         }
     };
 
-    Provider::by_guid(BITS_CLIENT_GUID)
-        .add_callback(callback)
-        .build()
+    BITS_CLIENT.builder().add_callback(callback).build()
 }
 
 /// EID 16403 through the job table, with its drops logged at debug and

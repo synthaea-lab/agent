@@ -22,18 +22,26 @@ pub struct CorrelationAlert {
     pub trigger_event: Option<Box<Event>>,
 }
 
-/// The "network" leg of the co-occurrence rules: a `ConnectEvent`, except sshd's
-/// address-selection probe (`connect()` to `0.0.0.0:65535` / `:::65535`), which reaches
-/// no remote peer. Without this, every SSH login (`sshd-auth` and `sshd-session` exec,
+/// The "network" leg of the co-occurrence rules: a `ConnectEvent` or a `UdpSendEvent`,
+/// except sshd's address-selection probe (`connect()` to `0.0.0.0:65535` / `:::65535`),
+/// which reaches no remote peer. A datagram is a C2 channel as much as a TCP connect
+/// (custom UDP C2, DNS to a chosen resolver): before #253, Windows read every UDP send as
+/// a `Connect`, and the bus holds one `UdpSend` per flow per second (`udp_flows`).
+///
+/// Without the probe exclusion, every SSH login (`sshd-auth` and `sshd-session` exec,
 /// then probe) raised `rule_spawn_connect` twice and, after a few logins,
 /// `rule_respawn_connect` (#538). The same predicate BEACON uses
 /// ([`policy::is_address_selection_probe`]), and only the probe, not the whole
 /// unspecified address.
 ///
-/// `BehaviorVector`'s connect features are deliberately not filtered here: they feed
-/// the ML side, whose calibration this fix should not shift.
-fn is_network_connect(event: &Event) -> bool {
-    matches!(event, Event::Connect(c) if !policy::is_address_selection_probe(c.daddr, c.dport))
+/// `BehaviorVector`'s connect features neither drop the probe nor read `UdpSend`: they
+/// feed the ML side, whose calibration this should not shift.
+fn reaches_network_peer(event: &Event) -> bool {
+    match event {
+        Event::Connect(c) => !policy::is_address_selection_probe(c.daddr, c.dport),
+        Event::UdpSend(u) => !policy::is_address_selection_probe(u.daddr, u.dport),
+        _ => false,
+    }
 }
 
 /// T1059/T1071 — A recently spawned process establishes a network connection within
@@ -47,7 +55,7 @@ pub(crate) fn rule_spawn_connect(
     let events: Vec<&Event> = bus.events_for_pid(pid, generation).collect();
 
     let has_exec = events.iter().any(|e| matches!(e, Event::Exec(_)));
-    let has_connect = events.iter().any(|e| is_network_connect(e));
+    let has_connect = events.iter().any(|e| reaches_network_peer(e));
 
     if has_exec && has_connect {
         Some(CorrelationAlert {
@@ -114,7 +122,7 @@ pub(crate) fn rule_connect_filewrite(
 ) -> Option<CorrelationAlert> {
     let events: Vec<&Event> = bus.events_for_pid(pid, generation).collect();
 
-    let has_connect = events.iter().any(|e| is_network_connect(e));
+    let has_connect = events.iter().any(|e| reaches_network_peer(e));
     let has_filewrite = events.iter().any(|e| writes_payload_file(e));
 
     if has_connect && has_filewrite {
@@ -142,7 +150,7 @@ pub(crate) fn rule_spawn_connect_filewrite(
     let events: Vec<&Event> = bus.events_for_pid(pid, generation).collect();
 
     let has_exec = events.iter().any(|e| matches!(e, Event::Exec(_)));
-    let has_connect = events.iter().any(|e| is_network_connect(e));
+    let has_connect = events.iter().any(|e| reaches_network_peer(e));
     let has_filewrite = events.iter().any(|e| writes_payload_file(e));
 
     if has_exec && has_connect && has_filewrite {
@@ -193,7 +201,7 @@ pub(crate) fn rule_respawn_connect(
         .iter()
         .filter(|e| matches!(e, Event::Exec(_)))
         .count();
-    let has_connect = events.iter().any(|e| is_network_connect(e));
+    let has_connect = events.iter().any(|e| reaches_network_peer(e));
 
     if spawn_count >= RESPAWN_THRESHOLD && has_connect {
         Some(CorrelationAlert {
@@ -253,7 +261,7 @@ pub(crate) fn rule_assembly_connect(
     let events: Vec<&Event> = bus.events_for_pid(pid, generation).collect();
 
     let has_assembly = events.iter().any(|e| matches!(e, Event::AssemblyLoad(_)));
-    let has_connect = events.iter().any(|e| is_network_connect(e));
+    let has_connect = events.iter().any(|e| reaches_network_peer(e));
 
     if has_assembly && has_connect {
         let assembly_name = events.iter().find_map(|e| {

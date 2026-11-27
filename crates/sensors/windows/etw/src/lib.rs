@@ -21,6 +21,8 @@ mod etw_sessions;
 #[cfg(windows)]
 mod hcs;
 #[cfg(any(windows, test))]
+mod kernel_network;
+#[cfg(any(windows, test))]
 mod kernel_process;
 #[cfg(any(windows, test))]
 mod long_path;
