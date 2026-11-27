@@ -2,12 +2,15 @@
 
 use aya_ebpf::{
     helpers::{bpf_get_current_comm, bpf_get_current_pid_tgid, bpf_probe_read_user_str_bytes},
-    macros::map,
+    macros::{map, raw_tracepoint},
     maps::{PerCpuArray, RingBuf},
-    programs::TracePointContext,
+    programs::{RawTracePointContext, TracePointContext},
 };
-use sensor_linux_wire::{FileDeleteEvent, FileRenameEvent, FileWriteEvent, is_filtered_path};
+use sensor_linux_wire::{
+    FileDeleteEvent, FileRenameEvent, FileWriteEvent, file_filter, is_filtered_path,
+};
 
+use super::{FILE_FILTER_PROGS, stored_path_filtered};
 use crate::{
     arch::{SyscallRecord, arg_offset},
     fill_event_meta, into_ret,
@@ -97,34 +100,75 @@ const UNLINK_PATHNAME_PTR_OFFSET: usize = arg_offset(0);
 /// i686: inferred, not independently verified (see `sys_enter_open`'s i686 note).
 const UNLINKAT_PATHNAME_PTR_OFFSET: usize = arg_offset(1);
 
-pub fn sys_enter_unlink(ctx: TracePointContext) -> u32 {
-    into_ret(try_sys_enter_unlink(ctx))
+#[inline(always)]
+pub fn sys_enter_unlink<const TC: bool>(raw: &RawTracePointContext, ctx: TracePointContext) -> u32 {
+    into_ret(try_sys_enter_unlink::<TC>(raw, ctx))
 }
 
-fn try_sys_enter_unlink(ctx: TracePointContext) -> Result<u32, u32> {
+#[inline(always)]
+fn try_sys_enter_unlink<const TC: bool>(
+    raw: &RawTracePointContext,
+    ctx: TracePointContext,
+) -> Result<u32, u32> {
     let pathname_ptr: u64 = unsafe {
         ctx.read_ulong_arg(UNLINK_PATHNAME_PTR_OFFSET)
             .map_err(|_| 1u32)?
     };
 
-    emit_file_delete_event(pathname_ptr)
+    emit_file_delete_event::<TC>(raw, pathname_ptr)
 }
 
-pub fn sys_enter_unlinkat(ctx: TracePointContext) -> u32 {
-    into_ret(try_sys_enter_unlinkat(ctx))
+#[inline(always)]
+pub fn sys_enter_unlinkat<const TC: bool>(
+    raw: &RawTracePointContext,
+    ctx: TracePointContext,
+) -> u32 {
+    into_ret(try_sys_enter_unlinkat::<TC>(raw, ctx))
 }
 
-fn try_sys_enter_unlinkat(ctx: TracePointContext) -> Result<u32, u32> {
+#[inline(always)]
+fn try_sys_enter_unlinkat<const TC: bool>(
+    raw: &RawTracePointContext,
+    ctx: TracePointContext,
+) -> Result<u32, u32> {
     let pathname_ptr: u64 = unsafe {
         ctx.read_ulong_arg(UNLINKAT_PATHNAME_PTR_OFFSET)
             .map_err(|_| 1u32)?
     };
 
-    emit_file_delete_event(pathname_ptr)
+    emit_file_delete_event::<TC>(raw, pathname_ptr)
 }
 
 /// Shared by `sys_enter_unlink` and `sys_enter_unlinkat` above.
-fn emit_file_delete_event(pathname_ptr: u64) -> Result<u32, u32> {
+#[inline(always)]
+fn emit_file_delete_event<const TC: bool>(
+    raw: &RawTracePointContext,
+    pathname_ptr: u64,
+) -> Result<u32, u32> {
+    if TC {
+        build_file_delete_event::<true>(raw, pathname_ptr)
+    } else {
+        emit_file_delete_event_inline(raw, pathname_ptr)
+    }
+}
+
+/// `emit_file_delete_event` for the inline router, out of line as LLVM leaves it on `main`: inlined
+/// into `raw_sys_enter` with the other file handlers, it took the router past 700k verified
+/// instructions on 7.2 (#351).
+#[inline(never)]
+fn emit_file_delete_event_inline(
+    raw: &RawTracePointContext,
+    pathname_ptr: u64,
+) -> Result<u32, u32> {
+    build_file_delete_event::<false>(raw, pathname_ptr)
+}
+
+/// The body of `emit_file_delete_event`, for both routers.
+#[inline(always)]
+fn build_file_delete_event<const TC: bool>(
+    raw: &RawTracePointContext,
+    pathname_ptr: u64,
+) -> Result<u32, u32> {
     let comm = bpf_get_current_comm().map_err(|_| 1u32)?;
     let uid_gid = aya_ebpf::helpers::bpf_get_current_uid_gid();
 
@@ -142,17 +186,20 @@ fn emit_file_delete_event(pathname_ptr: u64) -> Result<u32, u32> {
             && let Ok(path) =
                 bpf_probe_read_user_str_bytes(pathname_ptr as *const u8, &mut (*e).path)
         {
-            if is_filtered_path(path, 0, true) {
+            // The inline router filters here, on the slice the helper returned, as before #351.
+            if !TC && is_filtered_path(path, 0, true) {
                 return Ok(0);
             }
             (*e).path_len = path.len() as u16;
         }
 
-        if FILE_DELETE_EVENTS
-            .output::<FileDeleteEvent>(&*e, 0)
-            .is_err()
-        {
-            crate::count_ring_drop(sensor_linux_wire::ring::FILE_DELETE);
+        // Does not return when the slot holds `raw_file_delete_filter`; an empty slot falls
+        // through and the event goes out unfiltered (#351).
+        if TC {
+            FILE_FILTER_PROGS.tail_call(raw, file_filter::DELETE);
+            output_file_delete_event(&*e);
+        } else {
+            output_file_delete_event(&*e);
         }
     }
 
@@ -197,11 +244,16 @@ const RENAMEAT2_NEWDFD_OFFSET: usize = arg_offset(2);
 const RENAMEAT2_OLDNAME_PTR_OFFSET: usize = arg_offset(1);
 const RENAMEAT2_NEWNAME_PTR_OFFSET: usize = arg_offset(3);
 
-pub fn sys_enter_rename(ctx: TracePointContext) -> u32 {
-    into_ret(try_sys_enter_rename(ctx))
+#[inline(always)]
+pub fn sys_enter_rename<const TC: bool>(raw: &RawTracePointContext, ctx: TracePointContext) -> u32 {
+    into_ret(try_sys_enter_rename::<TC>(raw, ctx))
 }
 
-fn try_sys_enter_rename(ctx: TracePointContext) -> Result<u32, u32> {
+#[inline(always)]
+fn try_sys_enter_rename<const TC: bool>(
+    raw: &RawTracePointContext,
+    ctx: TracePointContext,
+) -> Result<u32, u32> {
     let oldname_ptr: u64 = unsafe {
         ctx.read_ulong_arg(RENAME_OLDNAME_PTR_OFFSET)
             .map_err(|_| 1u32)?
@@ -211,14 +263,22 @@ fn try_sys_enter_rename(ctx: TracePointContext) -> Result<u32, u32> {
             .map_err(|_| 1u32)?
     };
 
-    emit_file_rename_event(AT_FDCWD, oldname_ptr, AT_FDCWD, newname_ptr)
+    emit_file_rename_event::<TC>(raw, AT_FDCWD, oldname_ptr, AT_FDCWD, newname_ptr)
 }
 
-pub fn sys_enter_renameat(ctx: TracePointContext) -> u32 {
-    into_ret(try_sys_enter_renameat(ctx))
+#[inline(always)]
+pub fn sys_enter_renameat<const TC: bool>(
+    raw: &RawTracePointContext,
+    ctx: TracePointContext,
+) -> u32 {
+    into_ret(try_sys_enter_renameat::<TC>(raw, ctx))
 }
 
-fn try_sys_enter_renameat(ctx: TracePointContext) -> Result<u32, u32> {
+#[inline(always)]
+fn try_sys_enter_renameat<const TC: bool>(
+    raw: &RawTracePointContext,
+    ctx: TracePointContext,
+) -> Result<u32, u32> {
     let oldname_ptr: u64 = unsafe {
         ctx.read_ulong_arg(RENAMEAT_OLDNAME_PTR_OFFSET)
             .map_err(|_| 1u32)?
@@ -239,14 +299,22 @@ fn try_sys_enter_renameat(ctx: TracePointContext) -> Result<u32, u32> {
             .map_err(|_| 1u32)?
     } as i32;
 
-    emit_file_rename_event(olddfd, oldname_ptr, newdfd, newname_ptr)
+    emit_file_rename_event::<TC>(raw, olddfd, oldname_ptr, newdfd, newname_ptr)
 }
 
-pub fn sys_enter_renameat2(ctx: TracePointContext) -> u32 {
-    into_ret(try_sys_enter_renameat2(ctx))
+#[inline(always)]
+pub fn sys_enter_renameat2<const TC: bool>(
+    raw: &RawTracePointContext,
+    ctx: TracePointContext,
+) -> u32 {
+    into_ret(try_sys_enter_renameat2::<TC>(raw, ctx))
 }
 
-fn try_sys_enter_renameat2(ctx: TracePointContext) -> Result<u32, u32> {
+#[inline(always)]
+fn try_sys_enter_renameat2<const TC: bool>(
+    raw: &RawTracePointContext,
+    ctx: TracePointContext,
+) -> Result<u32, u32> {
     let oldname_ptr: u64 = unsafe {
         ctx.read_ulong_arg(RENAMEAT2_OLDNAME_PTR_OFFSET)
             .map_err(|_| 1u32)?
@@ -267,11 +335,46 @@ fn try_sys_enter_renameat2(ctx: TracePointContext) -> Result<u32, u32> {
             .map_err(|_| 1u32)?
     } as i32;
 
-    emit_file_rename_event(olddfd, oldname_ptr, newdfd, newname_ptr)
+    emit_file_rename_event::<TC>(raw, olddfd, oldname_ptr, newdfd, newname_ptr)
 }
 
 /// Shared by `sys_enter_rename`/`sys_enter_renameat`/`sys_enter_renameat2` above.
-fn emit_file_rename_event(
+#[inline(always)]
+fn emit_file_rename_event<const TC: bool>(
+    raw: &RawTracePointContext,
+
+    olddfd: i32,
+    oldname_ptr: u64,
+    newdfd: i32,
+    newname_ptr: u64,
+) -> Result<u32, u32> {
+    if TC {
+        build_file_rename_event::<true>(raw, olddfd, oldname_ptr, newdfd, newname_ptr)
+    } else {
+        emit_file_rename_event_inline(raw, olddfd, oldname_ptr, newdfd, newname_ptr)
+    }
+}
+
+/// `emit_file_rename_event` for the inline router, out of line as LLVM leaves it on `main`: inlined
+/// into `raw_sys_enter` with the other file handlers, it took the router past 700k verified
+/// instructions on 7.2 (#351).
+#[inline(never)]
+fn emit_file_rename_event_inline(
+    raw: &RawTracePointContext,
+
+    olddfd: i32,
+    oldname_ptr: u64,
+    newdfd: i32,
+    newname_ptr: u64,
+) -> Result<u32, u32> {
+    build_file_rename_event::<false>(raw, olddfd, oldname_ptr, newdfd, newname_ptr)
+}
+
+/// The body of `emit_file_rename_event`, for both routers.
+#[inline(always)]
+fn build_file_rename_event<const TC: bool>(
+    raw: &RawTracePointContext,
+
     olddfd: i32,
     oldname_ptr: u64,
     newdfd: i32,
@@ -296,7 +399,8 @@ fn emit_file_rename_event(
             && let Ok(path) =
                 bpf_probe_read_user_str_bytes(oldname_ptr as *const u8, &mut (*e).old_path)
         {
-            if is_filtered_path(path, 0, true) {
+            // The inline router filters here, on the slice the helper returned, as before #351.
+            if !TC && is_filtered_path(path, 0, true) {
                 return Ok(0);
             }
             (*e).old_path_len = path.len() as u16;
@@ -305,19 +409,90 @@ fn emit_file_rename_event(
             && let Ok(path) =
                 bpf_probe_read_user_str_bytes(newname_ptr as *const u8, &mut (*e).new_path)
         {
-            if is_filtered_path(path, 0, true) {
+            // The inline router filters here, on the slice the helper returned, as before #351.
+            if !TC && is_filtered_path(path, 0, true) {
                 return Ok(0);
             }
             (*e).new_path_len = path.len() as u16;
         }
 
-        if FILE_RENAME_EVENTS
-            .output::<FileRenameEvent>(&*e, 0)
-            .is_err()
-        {
-            crate::count_ring_drop(sensor_linux_wire::ring::FILE_RENAME);
+        // Does not return when the slot holds `raw_file_rename_filter`; an empty slot falls
+        // through and the event goes out unfiltered (#351).
+        if TC {
+            FILE_FILTER_PROGS.tail_call(raw, file_filter::RENAME);
+            output_file_rename_event(&*e);
+        } else {
+            output_file_rename_event(&*e);
         }
     }
 
     Ok(0)
+}
+
+/// The tail of every `delete` event (#351), reached from `raw_sys_enter` through
+/// `FILE_FILTER_PROGS`: the path filter on the event left in `DELETE_SCRATCH`, then the output. See
+/// `raw_file_open_filter`.
+#[raw_tracepoint(tracepoint = "sys_enter")]
+pub fn raw_file_delete_filter(_ctx: RawTracePointContext) -> u32 {
+    let Some(e) = DELETE_SCRATCH.get_ptr(0) else {
+        return 0;
+    };
+    // SAFETY: the per-CPU scratch the tail-calling handler just filled, on the same CPU.
+    unsafe {
+        finish_file_delete_event(&*e);
+    }
+    0
+}
+
+/// One `output` copy of a finished event into `FILE_DELETE_EVENTS`, counting a full ring.
+#[inline(always)]
+fn output_file_delete_event(e: &FileDeleteEvent) {
+    if FILE_DELETE_EVENTS.output::<FileDeleteEvent>(e, 0).is_err() {
+        crate::count_ring_drop(sensor_linux_wire::ring::FILE_DELETE);
+    }
+}
+
+/// The tail of every `rename` event (#351), reached from `raw_sys_enter` through
+/// `FILE_FILTER_PROGS`: the path filter on the event left in `RENAME_SCRATCH`, then the output. See
+/// `raw_file_open_filter`.
+#[raw_tracepoint(tracepoint = "sys_enter")]
+pub fn raw_file_rename_filter(_ctx: RawTracePointContext) -> u32 {
+    let Some(e) = RENAME_SCRATCH.get_ptr(0) else {
+        return 0;
+    };
+    // SAFETY: the per-CPU scratch the tail-calling handler just filled, on the same CPU.
+    unsafe {
+        finish_file_rename_event(&*e);
+    }
+    0
+}
+
+/// One `output` copy of a finished event into `FILE_RENAME_EVENTS`, counting a full ring.
+#[inline(always)]
+fn output_file_rename_event(e: &FileRenameEvent) {
+    if FILE_RENAME_EVENTS.output::<FileRenameEvent>(e, 0).is_err() {
+        crate::count_ring_drop(sensor_linux_wire::ring::FILE_RENAME);
+    }
+}
+
+/// The filter and the output of a finished `delete` event: what `raw_file_delete_filter` does after
+/// the tail call, and what the handler does itself in `raw_sys_enter`, the inline variant (#351).
+#[inline(always)]
+fn finish_file_delete_event(e: &FileDeleteEvent) {
+    if stored_path_filtered(&e.path, e.path_len, 0, true) {
+        return;
+    }
+    output_file_delete_event(e);
+}
+
+/// The filter and the output of a finished `rename` event: what `raw_file_rename_filter` does after
+/// the tail call, and what the handler does itself in `raw_sys_enter`, the inline variant (#351).
+#[inline(always)]
+fn finish_file_rename_event(e: &FileRenameEvent) {
+    if stored_path_filtered(&e.old_path, e.old_path_len, 0, true)
+        || stored_path_filtered(&e.new_path, e.new_path_len, 0, true)
+    {
+        return;
+    }
+    output_file_rename_event(e);
 }

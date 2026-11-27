@@ -46,7 +46,9 @@ mod watchdog;
 #[cfg(all(target_os = "linux", ebpf_embedded))]
 pub use ebpf::verifier_loader;
 #[cfg(target_os = "linux")]
-pub use ebpf::{RAW_TRACEPOINTS, load_ebpf, load_program};
+pub use ebpf::{
+    FILE_FILTER_PROGRAMS, RAW_TRACEPOINTS, SYS_ENTER_TAIL_CALL_PROGRAM, load_ebpf, load_program,
+};
 #[cfg(target_os = "linux")]
 pub use parent_image::ParentImageEvictions;
 #[cfg(target_os = "linux")]

@@ -22,6 +22,7 @@ map maps EXEC_SCRATCH
 map maps FILE_CHMOD_EVENTS
 map maps FILE_CHOWN_EVENTS
 map maps FILE_DELETE_EVENTS
+map maps FILE_FILTER_PROGS
 map maps FILE_OPEN_EVENTS
 map maps FILE_REMOVEXATTR_EVENTS
 map maps FILE_RENAME_EVENTS
@@ -95,7 +96,15 @@ program raw_tp/sched_process_exit raw_sched_process_exit
 program raw_tp/sched_process_fork raw_sched_process_fork
 program raw_tp/signal_generate raw_signal_generate
 program raw_tp/sys_enter raw_dns_udp_enter
+program raw_tp/sys_enter raw_file_chmod_filter
+program raw_tp/sys_enter raw_file_chown_filter
+program raw_tp/sys_enter raw_file_delete_filter
+program raw_tp/sys_enter raw_file_open_filter
+program raw_tp/sys_enter raw_file_removexattr_filter
+program raw_tp/sys_enter raw_file_rename_filter
+program raw_tp/sys_enter raw_file_setxattr_filter
 program raw_tp/sys_enter raw_sys_enter
+program raw_tp/sys_enter raw_sys_enter_tc
 program raw_tp/sys_exit raw_sys_exit
 program uprobe getaddrinfo_entry
 program uprobe gethostbyname2_r_entry

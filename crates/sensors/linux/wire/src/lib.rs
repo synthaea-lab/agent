@@ -473,6 +473,31 @@ pub mod ring {
     }
 }
 
+/// Slots of the eBPF map `FILE_FILTER_PROGS` (#351): one tail-call target per file event kind.
+/// A file handler of `raw_sys_enter` fills its event in its per-CPU scratch, then tail-calls the
+/// kind's slot, whose program runs [`is_filtered_path`] and outputs the event. The path scan is
+/// then verified once, in a small program, instead of once per verifier state that reaches each
+/// handler inside `raw_sys_enter`. When a slot is empty the tail call falls through and the
+/// handler outputs the event unfiltered: a missing slot costs volume, never visibility.
+pub mod file_filter {
+    /// Slot of `raw_file_open_filter`, for `open`/`openat`.
+    pub const OPEN: u32 = 0;
+    /// Slot of `raw_file_delete_filter`, for `unlink`/`unlinkat`.
+    pub const DELETE: u32 = 1;
+    /// Slot of `raw_file_rename_filter`, for `rename`/`renameat`/`renameat2` (both paths).
+    pub const RENAME: u32 = 2;
+    /// Slot of `raw_file_chmod_filter`, for `chmod`/`fchmodat`.
+    pub const CHMOD: u32 = 3;
+    /// Slot of `raw_file_chown_filter`, for `chown`/`lchown`/`fchownat`.
+    pub const CHOWN: u32 = 4;
+    /// Slot of `raw_file_setxattr_filter`.
+    pub const SETXATTR: u32 = 5;
+    /// Slot of `raw_file_removexattr_filter`.
+    pub const REMOVEXATTR: u32 = 6;
+    /// Number of slots, the size of `FILE_FILTER_PROGS`.
+    pub const COUNT: u32 = 7;
+}
+
 /// Set in [`SignalEvent::signal`] by the `signal_generate` probe when the siginfo's `si_code` is
 /// `SI_TIMER`, `SI_MESGQ` or `SI_ASYNCIO` (-2..=-4): codes the kernel sets from interrupt or
 /// completion context, where `current` is a bystander. A process can also **forge** them with
