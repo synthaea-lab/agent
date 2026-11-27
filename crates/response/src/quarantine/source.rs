@@ -3,11 +3,12 @@
 use std::path::Path;
 
 #[cfg(unix)]
+use super::copy::{copy_open_no_clobber_with, sha256_reader};
+#[cfg(not(unix))]
+use super::copy::{move_to_quarantine, sha256_file};
+use super::invalid;
+#[cfg(unix)]
 use super::snapshot::WrittenAfterHash;
-use super::{
-    copy::{copy_open_no_clobber_with, sha256_reader},
-    invalid,
-};
 
 /// The file being quarantined, opened once.
 ///

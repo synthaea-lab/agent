@@ -21,13 +21,17 @@ use super::source::can_fall_back_to_copy;
 #[cfg(unix)]
 use super::source::copy_open_file_no_clobber;
 use super::{
-    copy::{
-        copy_no_clobber, copy_no_clobber_with, move_file_no_clobber, sha256_file, sha256_reader,
-    },
-    origin::{decode_origin_record, encode_origin_record, origin_sidecar_path},
-    permissions::{secure_payload, secure_quarantine_dir},
-    source::Source,
+    copy::{copy_no_clobber, copy_no_clobber_with, move_file_no_clobber},
+    origin::{decode_origin_record, origin_sidecar_path},
+    permissions::secure_payload,
     *,
+};
+#[cfg(unix)]
+use super::{
+    copy::{sha256_file, sha256_reader},
+    origin::encode_origin_record,
+    permissions::secure_quarantine_dir,
+    source::Source,
 };
 
 fn temp_dir(name: &str) -> PathBuf {

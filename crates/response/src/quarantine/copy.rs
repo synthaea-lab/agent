@@ -2,6 +2,7 @@
 
 use std::path::Path;
 
+#[cfg(unix)]
 use super::invalid;
 
 /// Moves `from` to `to`, failing with `AlreadyExists` instead of replacing

@@ -58,6 +58,7 @@ mod origin;
 mod permissions;
 mod restore;
 mod slots;
+#[cfg(unix)]
 mod snapshot;
 mod source;
 
