@@ -72,7 +72,7 @@ flowchart BT
 The rules:
 
 - `schema` depends on no workspace crate. `policy` depends only on `schema`.
-- A `sensor-*` crate depends on `schema`, plus its own platform's shared crates. For example, `sensor-linux` and `sensor-linux-uprobes` may use `sensor-linux-wire` and `sensor-linux-container`. A shared crate depends only on `schema`.
+- A `sensor-*` crate depends on `schema`, plus its own platform's shared crates and `bounded-lines`, a line reader with a byte cap that sensors on any platform may use and that depends on no workspace crate. For example, `sensor-linux` and `sensor-linux-uprobes` may use `sensor-linux-wire` and `sensor-linux-container`. A shared crate depends only on `schema`.
 - Detection crates may use the base tier, each other, and `store`. They may never use a sensor crate. The engines may not use `correlator` or `verdict`, the two stages that consume their output; the event window both sides read is in the leaf crate `event-window`.
 - Leaf crates may use only the base tier. In particular, `transport` and `store` do not know each other, `updater` does not know `transport`, and `response` does not call the OS.
 - Only binaries may depend on anything. No crate depends on a binary.

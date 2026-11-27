@@ -14,10 +14,10 @@ use std::{
     },
 };
 
+use bounded_lines::{BoundedLines, Line, MAX_LINE_BYTES};
+
 use crate::{
-    NetworkExtensionError,
-    bounded_lines::{BoundedLines, Line, MAX_LINE_BYTES},
-    normalize,
+    NetworkExtensionError, normalize,
     wire::{NeRecord, WIRE_VERSION},
 };
 

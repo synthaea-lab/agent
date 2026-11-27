@@ -10,6 +10,7 @@ publish.workspace = true
 workspace = true
 
 [dependencies]
+bounded-lines = { path = "../../bounded-lines" }
 schema = { path = "../../../schema" }
 serde = { workspace = true }
 serde_json = { workspace = true }

@@ -1,20 +1,24 @@
 //! Line reading with a byte cap, so one line without a newline cannot grow the agent's
 //! memory without limit.
 //!
-//! `BufRead::lines` buffers a whole line before returning it. The journal tail reads the
-//! stdout of `journalctl`, so an oversized line is a bound on memory, not a parsing detail.
+//! `BufRead::lines` buffers a whole line before returning it. A sensor that reads another
+//! program's output (`journalctl`, `log stream`, the Network Extension's socket) does not
+//! control how long a line is, so an oversized line is a bound on memory, not a parsing
+//! detail.
+//!
+//! A crate of its own because sensors on different platforms need the same reader and may
+//! not depend on each other.
 
 use std::io::{self, BufRead, ErrorKind};
 
-/// The longest line kept, in bytes, `\n` excluded. A trailing `\r` counts toward it. `journalctl -o json` writes a field
-/// larger than 4096 bytes as `null`, so a record of ordinary size is a few kilobytes; the
-/// cap is 256 maximum-size fields. A memory bound chosen by reasoning, not measured on a
-/// busy host.
-pub(crate) const MAX_LINE_BYTES: usize = 1024 * 1024;
+/// The longest line kept, in bytes, `\n` excluded. A trailing `\r` counts toward it. 1 MiB: a
+/// memory bound chosen by reasoning, not measured on a busy host. For scale, `journalctl -o json`
+/// writes a field larger than 4096 bytes as `null`, so the cap is 256 maximum-size fields.
+pub const MAX_LINE_BYTES: usize = 1024 * 1024;
 
 /// One line read from the stream.
 #[derive(Debug, PartialEq, Eq)]
-pub(crate) enum Line {
+pub enum Line {
     /// A line within the cap, without its `\n` or `\r\n`.
     Text(String),
     /// A line over the cap, read to its end and dropped.
@@ -25,7 +29,7 @@ pub(crate) enum Line {
 ///
 /// Like [`BufRead::lines`], a line that is not UTF-8 is an `InvalidData` error and the next
 /// call goes on with the following line.
-pub(crate) struct BoundedLines<R> {
+pub struct BoundedLines<R> {
     reader: R,
     max_bytes: usize,
     /// The line being read. Kept here, not local to `next`, so a read error in the middle of
@@ -35,11 +39,13 @@ pub(crate) struct BoundedLines<R> {
 }
 
 impl<R: BufRead> BoundedLines<R> {
-    pub(crate) fn new(reader: R) -> Self {
+    /// Reads `reader` line by line, holding each line to [`MAX_LINE_BYTES`].
+    pub fn new(reader: R) -> Self {
         Self::with_cap(reader, MAX_LINE_BYTES)
     }
 
-    pub(crate) fn with_cap(reader: R, max_bytes: usize) -> Self {
+    /// Reads `reader` line by line, holding each line to `max_bytes`.
+    pub fn with_cap(reader: R, max_bytes: usize) -> Self {
         Self {
             reader,
             max_bytes,
