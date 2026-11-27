@@ -1,10 +1,18 @@
 //! Per-domain normalization: one parsed Event Log record into a `schema::Event`. Pure code, built
 //! on every platform so its tests run everywhere; the poll targets that wire each normalizer to a
 //! channel stay in the Windows-only `sensor.rs`.
+//!
+//! Every normalizer lives here. The tests of the five moved last (`persistence`, `logon`,
+//! `applocker`, `defender`, `wdac`) are still in `sensor.rs` and so run on Windows only.
 
+pub(crate) mod applocker;
+pub(crate) mod defender;
 pub(crate) mod kerberos;
 pub(crate) mod log_cleared;
+pub(crate) mod logon;
+pub(crate) mod persistence;
 pub(crate) mod session;
+pub(crate) mod wdac;
 
 use schema::Event;
 
