@@ -2,12 +2,13 @@
 
 use aya_ebpf::{
     helpers::{bpf_get_current_comm, bpf_get_current_pid_tgid, bpf_probe_read_user_str_bytes},
-    macros::map,
+    macros::{map, raw_tracepoint},
     maps::{PerCpuArray, RingBuf},
-    programs::TracePointContext,
+    programs::{RawTracePointContext, TracePointContext},
 };
-use sensor_linux_wire::{FileOpenEvent, is_filtered_path};
+use sensor_linux_wire::{FileOpenEvent, file_filter, is_filtered_path};
 
+use super::{FILE_FILTER_PROGS, stored_path_filtered};
 use crate::{
     arch::{SyscallRecord, arg_offset},
     fill_event_meta, into_ret,
@@ -62,11 +63,16 @@ const OPENAT_FLAGS_OFFSET: usize = arg_offset(2);
 const OPEN_FILENAME_PTR_OFFSET: usize = arg_offset(0);
 const OPEN_FLAGS_OFFSET: usize = arg_offset(1);
 
-pub fn sys_enter_openat(ctx: TracePointContext) -> u32 {
-    into_ret(try_sys_enter_openat(ctx))
+#[inline(always)]
+pub fn sys_enter_openat<const TC: bool>(raw: &RawTracePointContext, ctx: TracePointContext) -> u32 {
+    into_ret(try_sys_enter_openat::<TC>(raw, ctx))
 }
 
-fn try_sys_enter_openat(ctx: TracePointContext) -> Result<u32, u32> {
+#[inline(always)]
+fn try_sys_enter_openat<const TC: bool>(
+    raw: &RawTracePointContext,
+    ctx: TracePointContext,
+) -> Result<u32, u32> {
     let filename_ptr: u64 = unsafe {
         ctx.read_ulong_arg(OPENAT_FILENAME_PTR_OFFSET)
             .map_err(|_| 1u32)?
@@ -74,14 +80,19 @@ fn try_sys_enter_openat(ctx: TracePointContext) -> Result<u32, u32> {
 
     let flags: i64 = unsafe { ctx.read_long_arg(OPENAT_FLAGS_OFFSET).map_err(|_| 1u32)? };
 
-    emit_file_open_event(filename_ptr, flags)
+    emit_file_open_event::<TC>(raw, filename_ptr, flags)
 }
 
-pub fn sys_enter_open(ctx: TracePointContext) -> u32 {
-    into_ret(try_sys_enter_open(ctx))
+#[inline(always)]
+pub fn sys_enter_open<const TC: bool>(raw: &RawTracePointContext, ctx: TracePointContext) -> u32 {
+    into_ret(try_sys_enter_open::<TC>(raw, ctx))
 }
 
-fn try_sys_enter_open(ctx: TracePointContext) -> Result<u32, u32> {
+#[inline(always)]
+fn try_sys_enter_open<const TC: bool>(
+    raw: &RawTracePointContext,
+    ctx: TracePointContext,
+) -> Result<u32, u32> {
     let filename_ptr: u64 = unsafe {
         ctx.read_ulong_arg(OPEN_FILENAME_PTR_OFFSET)
             .map_err(|_| 1u32)?
@@ -89,13 +100,47 @@ fn try_sys_enter_open(ctx: TracePointContext) -> Result<u32, u32> {
 
     let flags: i64 = unsafe { ctx.read_long_arg(OPEN_FLAGS_OFFSET).map_err(|_| 1u32)? };
 
-    emit_file_open_event(filename_ptr, flags)
+    emit_file_open_event::<TC>(raw, filename_ptr, flags)
 }
 
 /// Shared by `sys_enter_openat` and `sys_enter_open` above: both land on the same
 /// `FileOpenEvent` shape/`FILE_OPEN_EVENTS` ring buffer, and differ only in where
-/// `filename`/`flags` sit in the tracepoint record.
-fn emit_file_open_event(filename_ptr: u64, flags: i64) -> Result<u32, u32> {
+/// `filename`/`flags` sit in the tracepoint record. The path filter runs in
+/// `raw_file_open_filter`, reached by a tail call (#351).
+// Inlined down to `raw_sys_enter`: the verifier allows a tail call only in a function that
+// returns `int` (6.1, #351), and a Rust `Result` comes back through memory.
+#[inline(always)]
+fn emit_file_open_event<const TC: bool>(
+    raw: &RawTracePointContext,
+    filename_ptr: u64,
+    flags: i64,
+) -> Result<u32, u32> {
+    if TC {
+        build_file_open_event::<true>(raw, filename_ptr, flags)
+    } else {
+        emit_file_open_event_inline(raw, filename_ptr, flags)
+    }
+}
+
+/// `emit_file_open_event` for the inline router, out of line as LLVM leaves it on `main`: inlined
+/// into `raw_sys_enter` with the other file handlers, it took the router past 700k verified
+/// instructions on 7.2 (#351).
+#[inline(never)]
+fn emit_file_open_event_inline(
+    raw: &RawTracePointContext,
+    filename_ptr: u64,
+    flags: i64,
+) -> Result<u32, u32> {
+    build_file_open_event::<false>(raw, filename_ptr, flags)
+}
+
+/// The body of `emit_file_open_event`, for both routers.
+#[inline(always)]
+fn build_file_open_event<const TC: bool>(
+    raw: &RawTracePointContext,
+    filename_ptr: u64,
+    flags: i64,
+) -> Result<u32, u32> {
     let pid = (bpf_get_current_pid_tgid() >> 32) as u32;
     if is_agent_own_pid(pid) {
         return Ok(0);
@@ -118,16 +163,57 @@ fn emit_file_open_event(filename_ptr: u64, flags: i64) -> Result<u32, u32> {
             && let Ok(path) =
                 bpf_probe_read_user_str_bytes(filename_ptr as *const u8, &mut (*e).path)
         {
-            if is_filtered_path(path, flags, false) {
+            // The inline router filters here, on the slice the helper returned, as before #351.
+            if !TC && is_filtered_path(path, flags, false) {
                 return Ok(0);
             }
             (*e).path_len = path.len() as u16;
         }
 
-        if FILE_OPEN_EVENTS.output::<FileOpenEvent>(&*e, 0).is_err() {
-            crate::count_ring_drop(sensor_linux_wire::ring::FILE_OPEN);
+        // Does not return when the slot holds `raw_file_open_filter`. An empty slot (userspace
+        // has not filled it) falls through, and the event goes out unfiltered.
+        if TC {
+            FILE_FILTER_PROGS.tail_call(raw, file_filter::OPEN);
+            output_file_open_event(&*e);
+        } else {
+            output_file_open_event(&*e);
         }
     }
 
     Ok(0)
+}
+
+/// The tail of every `open` event (#351): runs the path filter on the event the handler left in
+/// `OPEN_SCRATCH`, then outputs it. Its own program, so the verifier walks the path scan once
+/// here rather than once per state that reaches the handler inside `raw_sys_enter`. Never
+/// attached: `raw_sys_enter` reaches it through `FILE_FILTER_PROGS`.
+#[raw_tracepoint(tracepoint = "sys_enter")]
+pub fn raw_file_open_filter(_ctx: RawTracePointContext) -> u32 {
+    let Some(e) = OPEN_SCRATCH.get_ptr(0) else {
+        return 0;
+    };
+    // SAFETY: the per-CPU scratch the tail-calling handler just filled; a tail call runs on the
+    // same CPU with preemption still off, so nothing wrote it in between.
+    unsafe {
+        finish_file_open_event(&*e);
+    }
+    0
+}
+
+/// One `output` copy of a finished event into `FILE_OPEN_EVENTS`, counting a full ring.
+#[inline(always)]
+fn output_file_open_event(e: &FileOpenEvent) {
+    if FILE_OPEN_EVENTS.output::<FileOpenEvent>(e, 0).is_err() {
+        crate::count_ring_drop(sensor_linux_wire::ring::FILE_OPEN);
+    }
+}
+
+/// The filter and the output of a finished `open` event: what `raw_file_open_filter` does after
+/// the tail call, and what the handler does itself in `raw_sys_enter`, the inline variant (#351).
+#[inline(always)]
+fn finish_file_open_event(e: &FileOpenEvent) {
+    if stored_path_filtered(&e.path, e.path_len, i64::from(e.flags), false) {
+        return;
+    }
+    output_file_open_event(e);
 }

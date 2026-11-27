@@ -17,9 +17,10 @@ use tracing::warn;
 use crate::{
     drain::exec_record,
     ebpf::{
-        DNS_UDP_PROGRAM, RAW_TRACEPOINTS, TamperSlot, attach_inode_setattr, attach_raw_tracepoint,
-        clear_tamper_slot, err, load_ebpf_for_run, prime_proc_lineage, read_tamper_slot,
-        take_signal_tool_drops, take_signal_watch_tools, take_tamper_slot, write_signal_watch_pid,
+        DNS_UDP_PROGRAM, RAW_TRACEPOINTS, SYS_ENTER_PROGRAM, TamperSlot, attach_inode_setattr,
+        attach_raw_tracepoint, attach_sys_enter, clear_tamper_slot, err, load_ebpf_for_run,
+        populate_file_filters, prime_proc_lineage, read_tamper_slot, take_signal_tool_drops,
+        take_signal_watch_tools, take_tamper_slot, write_signal_watch_pid,
     },
     normalize,
     parent_image::{ExecStamps, IMAGE_CACHE_CAP, ParentImageEvictions, ParentImages},
@@ -330,9 +331,35 @@ impl LinuxSensor {
         let mut tool_drops_seen = 0u64;
         let mut tool_rescan = tokio::time::interval(TOOL_RESCAN_INTERVAL);
 
+        // Before `raw_sys_enter` is attached, so its first file events are already filtered.
+        // The tail-call router only with every filter slot filled: otherwise a kind's events would
+        // go out unfiltered, where the inline router filters them all (#351).
+        let filters_ready = match populate_file_filters(&mut ebpf) {
+            Ok(failed) => {
+                for (program, e) in &failed {
+                    tracing::warn!(
+                        program,
+                        error = %e,
+                        "sensor-linux: file filter program refused: sys_enter keeps the inline filters"
+                    );
+                }
+                failed.is_empty()
+            }
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "sensor-linux: file filter map unusable: sys_enter keeps the inline filters"
+                );
+                false
+            }
+        };
         for (program, name) in RAW_TRACEPOINTS {
             // The UDP/53 capture is a program of its own, attached only when asked for.
             if *program == DNS_UDP_PROGRAM && !self.dns_udp {
+                continue;
+            }
+            if *program == SYS_ENTER_PROGRAM {
+                attach_sys_enter(&mut ebpf, filters_ready)?;
                 continue;
             }
             attach_raw_tracepoint(&mut ebpf, program, name)?;

@@ -141,6 +141,30 @@ pub(crate) fn cmd_status() -> anyhow::Result<()> {
             }
         }
     }
+    // The tail-call router (#351): refused, the sensor keeps the inline one, so a warning only.
+    match sensor_linux::load_program(&mut ebpf, sensor_linux::SYS_ENTER_TAIL_CALL_PROGRAM) {
+        Ok(()) => println!(
+            "[OK]   raw tracepoint program `{}` (sys_enter, tail-call filters) accepted by the verifier",
+            sensor_linux::SYS_ENTER_TAIL_CALL_PROGRAM
+        ),
+        Err(e) => println!(
+            "[WARN] raw tracepoint program `{}` refused, the sensor keeps the inline filters: {e}",
+            sensor_linux::SYS_ENTER_TAIL_CALL_PROGRAM
+        ),
+    }
+    // The file handlers' tail-call targets (#351): never attached, but refused they would leave
+    // the file events unfiltered, so the preflight checks them too.
+    for (program_name, _slot) in sensor_linux::FILE_FILTER_PROGRAMS {
+        match sensor_linux::load_program(&mut ebpf, program_name) {
+            Ok(()) => {
+                println!("[OK]   file filter program `{program_name}` accepted by the verifier");
+            }
+            Err(e) => {
+                failures += 1;
+                println!("[FAIL] file filter program `{program_name}` rejected: {e}");
+            }
+        }
+    }
 
     // Scripts and provisioning gate on the exit code, not on parsing stdout —
     // a rejected probe must fail the preflight (review finding: `status` always
