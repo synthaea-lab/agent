@@ -155,7 +155,7 @@ because `current` may be a bystander. Permission is checked before this tracepoi
 A tool kill does not take the agent down, so the ring is enough; nothing is written to the pinned
 slot. When `SIGNAL_EVENTS` is full the loss is counted per CPU in `SIGNAL_TOOL_DROPS`; the drain
 reads it every 5 s, logs the increase, and emits a
-[`signals_lost`](../../../crates/sensors/linux/userspace/src/normalize.rs) event, because a flood of
+[`signals_lost`](../../../crates/sensors/linux/userspace/src/normalize/process.rs) event, because a flood of
 signals ahead of a kill is a way to end a tool unseen.
 
 In the drain, a target found in the watch set gets the tool's exe and unit; the agent's own pid

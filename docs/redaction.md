@@ -6,7 +6,7 @@ command line: `curl -u user:pass`, `mysql -pS3cret`, a presigned S3 URL, a
 agent removes the recognizable ones **from every copy that leaves the process**.
 The in-memory event that detection evaluates stays untouched.
 
-Sources: the pure functions in [`crates/redact`](../crates/redact/src/lib.rs)
+Sources: the pure functions in [`crates/redact`](../crates/redact/src)
 (plus [`text.rs`](../crates/redact/src/text.rs)) and the event-level boundary in
 [`apps/agent/src/redact.rs`](../apps/agent/src/redact.rs).
 
@@ -65,7 +65,7 @@ option names, separators, quoting and argument count.
 
 ### URLs: `redact_url_secrets`
 
-[`redact_url_secrets`](../crates/redact/src/lib.rs) follows RFC 3986: the
+[`redact_url_secrets`](../crates/redact/src/url.rs) follows RFC 3986: the
 fragment starts at the first `#`, and the query at the first `?` before it.
 
 - `userinfo@` in the authority becomes `REDACTED@`. The **last** `@` ends the
@@ -78,7 +78,7 @@ fragment starts at the first `#`, and the query at the first `?` before it.
 
 ### Secret-named keys: `is_secret_key`
 
-[`is_secret_key`](../crates/redact/src/lib.rs) decides for query parameters,
+[`is_secret_key`](../crates/redact/src/secrets.rs) decides for query parameters,
 `--long-option` names, header names, shell variables and PowerShell
 parameters. The name is lowercased, any trailing `[]` is dropped, and the name is
 checked both as written and after two rounds of percent-decoding, so
@@ -96,15 +96,15 @@ they point to where a secret is stored, not to the secret itself.
 
 ### Command lines: `redact_command_line` and `redact_argv`
 
-[`redact_command_line`](../crates/redact/src/lib.rs) works on a flat string.
-[`redact_argv`](../crates/redact/src/lib.rs) works in place on an argument
+[`redact_command_line`](../crates/redact/src/cmdline.rs) works on a flat string.
+[`redact_argv`](../crates/redact/src/argv.rs) works in place on an argument
 vector and keeps the number and order of arguments. Both pick the tool from the
 **basename of the image**, lowercased, with `.exe` dropped. Tokenization follows
 `CommandLineToArgvW` quoting for `.exe` images and POSIX-like rules otherwise.
 An unbalanced quote falls back to splitting on whitespace from that token on.
 
-Recognized shapes (see [`credential_option`](../crates/redact/src/lib.rs) and
-[`should_redact_next`](../crates/redact/src/lib.rs)):
+Recognized shapes (see [`credential_option`](../crates/redact/src/options.rs) and
+[`should_redact_next`](../crates/redact/src/options.rs)):
 
 | Shape | Examples |
 |---|---|
@@ -182,7 +182,7 @@ above applies regardless.
 
 ## Testing
 
-- Table tests in [`crates/redact/src/lib.rs`](../crates/redact/src/lib.rs)
+- Table tests in [`crates/redact/src/tests.rs`](../crates/redact/src/tests.rs)
   (`redacts_supported_command_line_shapes_and_keeps_near_misses` and others)
   pin each supported shape **and** near misses that must be kept.
 - Property tests (`proptest`) check that redaction never panics on arbitrary or

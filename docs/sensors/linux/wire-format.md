@@ -11,7 +11,7 @@ built from the same revision.
 ## Versioning: `WIRE_VERSION`
 
 Ring-buffer items carry no header and no version. [`WIRE_VERSION`](../../../crates/sensors/linux/wire/src/lib.rs)
-is a build-time tripwire instead: [`normalize.rs`](../../../crates/sensors/linux/userspace/src/normalize.rs)
+is a build-time tripwire instead: [`normalize/`](../../../crates/sensors/linux/userspace/src/normalize)
 asserts `const _: () = assert!(wire::WIRE_VERSION == N)`, so a layout change that does not revisit
 the mappings fails to compile. Bump it on any change to a struct's size, field order or meaning,
 and update the assertion after checking each mapping.

@@ -4,9 +4,6 @@
 //! query, parser and normalization.
 
 use std::{
-    fs::File,
-    io::Read,
-    path::Path,
     process::Command,
     sync::{
         Arc,
@@ -15,25 +12,25 @@ use std::{
     time::Duration,
 };
 
-use schema::{
-    AuthEvent, AuthKind, AuthOutcome, DefenderEvent, DefenderEventKind, Event, EventMeta,
-    FLAG_PERSISTENCE_ACCOUNT_ARTIFACT, FLAG_PERSISTENCE_ARTIFACT, FLAG_PERSISTENCE_TASK_ARTIFACT,
-    FLAG_PERSISTENCE_TASK_UPDATE_ARTIFACT, FileOpenEvent, POLICY_MECHANISM_APPLOCKER,
-    POLICY_MECHANISM_WDAC, PolicyDenialEvent, User,
-    sensor::{Capabilities, EventSink, Sensor, SensorError},
-    time::now_ns,
-};
+use schema::sensor::{Capabilities, EventSink, Sensor, SensorError};
 
 use crate::{
     error::EventQueryError,
     query::{Direction, query_events},
     targets::{
         BlockOutcome,
+        applocker::normalize_applocker_block,
+        defender::normalize_defender_block,
         kerberos::normalize_kerberos_delegation_failure_block,
         log_cleared::normalize_log_cleared_block,
+        logon::normalize_logon,
+        persistence::{
+            normalize_account_created, normalize_scheduled_task, normalize_scheduled_task_update,
+            normalize_service_install, normalize_task_scheduler_op_registered,
+        },
         session::{normalize_rdp_connection_block, normalize_session_lifecycle_block},
+        wdac::normalize_wdac_block,
     },
-    xml::{self, LogonEvent},
 };
 
 /// The poll cadence of every target: none has sub-second stakes, since the event
@@ -60,12 +57,6 @@ const SPECIAL_LOGON_AUDIT_SUBCATEGORY_GUID: &str = "{0CCE921B-69AE-11D9-BED3-505
 /// default audit policy of Client and Server SKUs, so a failure to enable is rare and
 /// non-blocking.
 const USER_ACCOUNT_MGMT_AUDIT_SUBCATEGORY_GUID: &str = "{0CCE9235-69AE-11D9-BED3-505054503030}";
-
-/// The "Microsoft-Windows-Security-Auditing" provider that writes 4624/4625/
-/// 4648/4672 runs inside the LSA subsystem process, not the account's own
-/// process — see [`LogonEvent`]'s doc. `EventMeta::comm` names that reporting
-/// process rather than leaving it blank.
-const LSASS_COMM: &str = "lsass.exe";
 
 // ── The shared poll pipeline ─────────────────────────────────────────────────
 //
@@ -224,26 +215,6 @@ fn poll(
     })
 }
 
-/// The meta shape shared by the three persistence-artifact targets, which all
-/// reuse [`FileOpenEvent`] (see ADR-0004) rather than defining event types of
-/// their own.
-fn persistence_file_open(pid: u32, comm: String, path: String, flags: u32) -> Event {
-    Event::FileOpen(FileOpenEvent {
-        meta: EventMeta {
-            pid,
-            ppid: 0,
-            user: User::Unknown,
-            timestamp_ns: now_ns(),
-            comm,
-            container: None, // attributed by the ETW sensor only (https://github.com/synthaea-lab/agent/issues/39)
-            process_generation: None,
-            parent_process_generation: None,
-        },
-        path,
-        flags,
-    })
-}
-
 /// Runs `auditpol /set /subcategory:<guid>` — best-effort and non-blocking: if
 /// it fails (insufficient rights despite being admin, a GPO overriding it, the
 /// command missing...), the failure is logged with `consequence` (what
@@ -280,27 +251,6 @@ fn enable_audit_subcategory(label: &str, guid: &str, consequence: &str) {
     }
 }
 
-// ── Event 7045 — service install (T1543.003) ─────────────────────────────────
-
-/// A 7045 without a service name or image path is unusable — the alert quotes
-/// them as `comm`/`path`. Skip, advancing the cursor.
-fn normalize_service_install(block: &str) -> BlockOutcome {
-    let Some(install) = xml::parse_service_install_block(block) else {
-        return BlockOutcome::Unparseable;
-    };
-    let record_id = install.record_id;
-    if install.service_name.is_empty() || install.image_path.is_empty() {
-        return BlockOutcome::Filtered { record_id };
-    }
-    let event = persistence_file_open(
-        install.pid,
-        install.service_name,
-        install.image_path,
-        FLAG_PERSISTENCE_ARTIFACT,
-    );
-    BlockOutcome::Event { record_id, event }
-}
-
 static SERVICE_INSTALLS: PollTarget = PollTarget {
     label: "service-install",
     heartbeat: "windows-eventlog:service-install",
@@ -327,37 +277,6 @@ fn enable_scheduled_task_audit() {
     );
 }
 
-/// Same tolerance rule as [`normalize_service_install`].
-fn normalize_scheduled_task(block: &str) -> BlockOutcome {
-    let Some(task) = xml::parse_scheduled_task_block(block) else {
-        return BlockOutcome::Unparseable;
-    };
-    normalize_task(task, FLAG_PERSISTENCE_TASK_ARTIFACT)
-}
-
-/// Shared by 4698 (creation) and 4702 (update): only the parser and the flag
-/// differ between the two. A task with no name is filtered; an unreadable action
-/// is reported, not skipped.
-fn normalize_task(task: xml::ScheduledTaskEvent, flag: u32) -> BlockOutcome {
-    let record_id = task.record_id;
-    if task.task_name.is_empty() {
-        return BlockOutcome::Filtered { record_id };
-    }
-    // A task whose action we cannot read is still a persistence artifact: report
-    // it with a placeholder path instead of dropping it (#422). Every action is
-    // read, not only the first (#443): a benign first action must not hide a
-    // malicious second one — on creation or on update alike.
-    let (path, flags) = match xml::task_actions_display(&task.task_content) {
-        Some(actions) => (actions, flag),
-        None => (
-            xml::TASK_ACTION_UNKNOWN.to_string(),
-            flag | schema::FLAG_PERSISTENCE_TASK_ACTION_UNKNOWN,
-        ),
-    };
-    let event = persistence_file_open(task.pid, xml::task_leaf_name(&task.task_name), path, flags);
-    BlockOutcome::Event { record_id, event }
-}
-
 static SCHEDULED_TASKS: PollTarget = PollTarget {
     label: "scheduled-task",
     heartbeat: "windows-eventlog:scheduled-task",
@@ -368,15 +287,6 @@ static SCHEDULED_TASKS: PollTarget = PollTarget {
     enable_audit: Some(enable_scheduled_task_audit),
     enabled: |c| c.scheduled_tasks_enabled,
 };
-
-// ── Event 4702 — scheduled task update (T1053.005 task-hijack) ───────────────
-
-fn normalize_scheduled_task_update(block: &str) -> BlockOutcome {
-    let Some(task) = xml::parse_scheduled_task_update_block(block) else {
-        return BlockOutcome::Unparseable;
-    };
-    normalize_task(task, FLAG_PERSISTENCE_TASK_UPDATE_ARTIFACT)
-}
 
 /// Own target rather than `EventID=4698 or EventID=4702` on [`SCHEDULED_TASKS`]:
 /// the two parse a differently named content field, and a separate volume counter
@@ -409,13 +319,6 @@ fn enable_logon_audit() {
     }
 }
 
-fn normalize_logon(block: &str) -> BlockOutcome {
-    let Some(logon) = xml::parse_logon_block(block) else {
-        return BlockOutcome::Unparseable;
-    };
-    BlockOutcome::from_optional(logon.record_id, to_auth_event(&logon))
-}
-
 static LOGON_EVENTS: PollTarget = PollTarget {
     label: "logon",
     heartbeat: "windows-eventlog:logon",
@@ -429,74 +332,6 @@ static LOGON_EVENTS: PollTarget = PollTarget {
     enable_audit: Some(enable_logon_audit),
     enabled: |c| c.logon_events_enabled,
 };
-
-/// Maps a parsed [`LogonEvent`] to the normalized [`Event::Auth`], or `None`
-/// when the event carries no usable account identity (a shape this module does
-/// not yet understand — skip rather than report a hollow event).
-fn to_auth_event(logon: &LogonEvent) -> Option<Event> {
-    let (kind, outcome) = match logon.event_id {
-        4624 => (AuthKind::Logon, AuthOutcome::Success),
-        4625 => (AuthKind::LogonFailure, AuthOutcome::Failure),
-        // 4648 fires when explicit credentials are used to attempt a logon; it
-        // carries no pass/fail status of its own (whether the attempt actually
-        // succeeded is a separate 4624/4625), so it is reported as `Success`
-        // meaning "the explicit-credential attempt was observed", not "and it
-        // succeeded".
-        4648 => (AuthKind::ExplicitCredentials, AuthOutcome::Success),
-        // 4672 only fires for a logon that already succeeded.
-        4672 => (AuthKind::PrivilegedSession, AuthOutcome::Success),
-        _ => return None,
-    };
-
-    // 4672 has no Target* fields — the Subject *is* the account granted the
-    // special privileges (see `LogonEvent`'s doc).
-    let (target_user, target_user_sid) = if logon.event_id == 4672 {
-        (
-            logon.subject_user_name.clone(),
-            logon.subject_user_sid.clone(),
-        )
-    } else {
-        (
-            logon.target_user_name.clone(),
-            logon.target_user_sid.clone(),
-        )
-    };
-    let target_user = target_user?;
-
-    let source_address = logon.ip_address.as_deref().and_then(|s| s.parse().ok());
-    let status_code = match (&logon.status, &logon.sub_status) {
-        (Some(status), Some(sub)) => Some(format!("{status}/{sub}")),
-        (Some(status), None) => Some(status.clone()),
-        (None, Some(sub)) => Some(sub.clone()),
-        (None, None) => None,
-    };
-    let user = match &logon.subject_user_sid {
-        Some(sid) => User::Windows {
-            sid: sid.clone(),
-            integrity_level: None,
-        },
-        None => User::Unknown,
-    };
-
-    Some(Event::Auth(AuthEvent {
-        meta: EventMeta {
-            pid: logon.pid,
-            ppid: 0,
-            user,
-            timestamp_ns: logon.time_created_ns.unwrap_or_else(now_ns),
-            comm: LSASS_COMM.to_string(),
-            container: None, // attributed by the ETW sensor only (https://github.com/synthaea-lab/agent/issues/39)
-            process_generation: None,
-            parent_process_generation: None,
-        },
-        outcome,
-        kind,
-        target_user,
-        target_user_sid,
-        source_address,
-        status_code,
-    }))
-}
 
 // ── Event 4720 — account creation (T1136.001) ────────────────────────────────
 
@@ -512,33 +347,6 @@ fn enable_account_creation_audit() {
     );
 }
 
-/// A 4720 without a target user name is not usable — the alert message quotes
-/// it as `comm`. Skip, advancing the cursor.
-fn normalize_account_created(block: &str) -> BlockOutcome {
-    let Some(account) = xml::parse_account_created_block(block) else {
-        return BlockOutcome::Unparseable;
-    };
-    let record_id = account.record_id;
-    let Some(target_name) = account.target_user_name else {
-        return BlockOutcome::Filtered { record_id };
-    };
-    // TargetSid is preferred as `path` (the persistence artifact's canonical
-    // identifier — survives an account rename). Falling back to the leaf name
-    // reproduced as a placeholder path keeps the alert well-formed if the SID
-    // is missing on some future Windows shape rather than dropping the event
-    // outright.
-    let sid = account
-        .target_user_sid
-        .unwrap_or_else(|| format!("(unknown-sid:{target_name})"));
-    let event = persistence_file_open(
-        account.pid,
-        target_name,
-        sid,
-        FLAG_PERSISTENCE_ACCOUNT_ARTIFACT,
-    );
-    BlockOutcome::Event { record_id, event }
-}
-
 static ACCOUNT_CREATIONS: PollTarget = PollTarget {
     label: "account-creation",
     heartbeat: "windows-eventlog:account-creation",
@@ -549,107 +357,6 @@ static ACCOUNT_CREATIONS: PollTarget = PollTarget {
     enable_audit: Some(enable_account_creation_audit),
     enabled: |c| c.account_creations_enabled,
 };
-
-// ── Events 8003/8004 — `AppLocker` EXE/DLL audit/block (Microsoft-Windows-AppLocker/EXE and DLL)
-//
-// `AppLocker`'s operational channel is on by default where `AppLocker` ships, with no
-// `auditpol` toggle. A channel disabled by group policy returns nothing: a coverage
-// gap the start-up channel check logs.
-
-/// `AppLocker` event id for "blocked" (enforce mode).
-const APPLOCKER_EVENT_BLOCKED: u32 = 8004;
-/// `AppLocker` event id for "allowed, but would have been blocked" (audit
-/// mode). Same payload shape as 8004.
-const APPLOCKER_EVENT_AUDITED: u32 = 8003;
-const APPLOCKER_MSI_AUDITED: u32 = 8006;
-const APPLOCKER_MSI_BLOCKED: u32 = 8007;
-const APPLOCKER_PACKAGED_EXEC_AUDITED: u32 = 8021;
-const APPLOCKER_PACKAGED_EXEC_BLOCKED: u32 = 8022;
-const APPLOCKER_PACKAGED_DEPLOY_AUDITED: u32 = 8024;
-const APPLOCKER_PACKAGED_DEPLOY_BLOCKED: u32 = 8025;
-
-/// Normalizes a blocked or audit-only `AppLocker` decision into a
-/// [`PolicyDenialEvent`] (#427):
-/// 8004/8007/8022/8025 are enforced denials, 8003/8006/8021/8024 are audit
-/// decisions (`enforced: false`) —
-/// the `SELinux` enforcing/permissive split, which is what lets a rule tell
-/// "stopped at the OS boundary" from "ran, and policy only noticed".
-///
-/// - `object_path`: `FullFilePath` when the event carries it (real path,
-///   original case); otherwise `FilePath`, expanded from `AppLocker`'s path
-///   variables (`%OSDRIVE%\USERS\...` → `C:\USERS\...`) so path-based rules
-///   can still match it.
-/// - `object_class`: the rule collection (`EXE`, `DLL`, `MSI`, `SCRIPT`, `APPX`), as reported.
-/// - `action`: `install` for packaged-app deployment decisions, `execute` otherwise.
-/// - `meta.pid`: `<Execution ProcessID>`, the process that tried to launch
-///   the image — the actor. Not `TargetProcessId`, which names the process
-///   being created for the image itself (lab-checked for 8003 and 8004, #529).
-/// - `meta.user`: `TargetUser`, the SID whose execution was refused.
-/// - `meta.comm`: empty. The event carries the launcher's pid but not its
-///   name, and the image's leaf name — what the pre-#427 `FileOpenEvent` put
-///   there — names the *object*, not the actor.
-///
-/// Skipped (cursor still advances): a block without `FilePath` or a packaged
-/// app's `Package` identity (nothing to attribute), and any event id outside
-/// the audit/enforced allowlist that an `XPath` filter let through — don't guess
-/// a verdict for an event we haven't seen the shape of.
-fn normalize_applocker_block(block: &str) -> BlockOutcome {
-    let Some(ev) = xml::parse_applocker_event(block) else {
-        return BlockOutcome::Unparseable;
-    };
-    let record_id = ev.record_id;
-    let enforced = match ev.event_id {
-        APPLOCKER_EVENT_BLOCKED
-        | APPLOCKER_MSI_BLOCKED
-        | APPLOCKER_PACKAGED_EXEC_BLOCKED
-        | APPLOCKER_PACKAGED_DEPLOY_BLOCKED => true,
-        APPLOCKER_EVENT_AUDITED
-        | APPLOCKER_MSI_AUDITED
-        | APPLOCKER_PACKAGED_EXEC_AUDITED
-        | APPLOCKER_PACKAGED_DEPLOY_AUDITED => false,
-        _ => return BlockOutcome::Filtered { record_id },
-    };
-    if ev.file_path.is_empty() {
-        return BlockOutcome::Filtered { record_id };
-    }
-    let path = ev.full_file_path.unwrap_or_else(|| {
-        xml::expand_applocker_path(&ev.file_path, |name| std::env::var(name).ok())
-    });
-    let user = ev.target_user.map_or(User::Unknown, |sid| User::Windows {
-        sid,
-        integrity_level: None,
-    });
-    let event = Event::PolicyDenial(PolicyDenialEvent {
-        meta: EventMeta {
-            pid: ev.pid,
-            ppid: 0,
-            user,
-            timestamp_ns: now_ns(),
-            comm: String::new(),
-            container: None, // attributed by the ETW sensor only (https://github.com/synthaea-lab/agent/issues/39)
-            process_generation: None,
-            parent_process_generation: None,
-        },
-        mechanism: POLICY_MECHANISM_APPLOCKER.into(),
-        subject_context: None,
-        object_context: None,
-        object_class: Some(ev.policy_name).filter(|p| !p.is_empty()),
-        action: Some(
-            if matches!(
-                ev.event_id,
-                APPLOCKER_PACKAGED_DEPLOY_AUDITED | APPLOCKER_PACKAGED_DEPLOY_BLOCKED
-            ) {
-                "install"
-            } else {
-                "execute"
-            }
-            .into(),
-        ),
-        enforced,
-        object_path: Some(path),
-    });
-    BlockOutcome::Event { record_id, event }
-}
 
 static APPLOCKER_BLOCKS: PollTarget = PollTarget {
     label: "applocker-block",
@@ -700,73 +407,6 @@ static APPLOCKER_PACKAGED_DEPLOYMENT: PollTarget = PollTarget {
     enabled: |c| c.applocker_blocks_enabled,
 };
 
-// ── Event 106 — TaskScheduler Operational "task registered" ─────────────────
-//
-// The `Microsoft-Windows-TaskScheduler/Operational` channel is Task Scheduler's
-// "history" switch, and it is **off by default**: disabled, with no log file, on a
-// Windows 11 25H2 client (lab, 2026-10-12, #786; Server not checked). Where an
-// operator turned it on, it needs no `auditpol` interaction and complements the
-// Security 4698 path whose `enable_scheduled_task_audit` may fail on a hardened
-// host. Where it is off, this target sees nothing and the start-up channel check
-// says so (`warn_about_disabled_channels`). When both channels
-// are up, one registration yields a 4698 and a 106 carrying the same task and
-// actions: both raw events are kept, and the rules layer reports the pair once
-// (`RuleState`'s scheduled-task registration dedup, #422).
-
-/// Same shape as a 4698 once the actions are known: a 106 carries no task XML,
-/// so the definition is read back from the task's file and the result goes
-/// through [`normalize_task`], placeholder and all. The first cut reported the
-/// task *name* as the action path, and the rule printed it as an executable
-/// (#422). A task already deleted by the time of the read, or one the sensor
-/// may not read, is reported as action-unknown rather than dropped.
-fn normalize_task_scheduler_op_registered(block: &str) -> BlockOutcome {
-    let tasks_dir =
-        std::env::var_os("SystemRoot").map(|root| Path::new(&root).join("System32").join("Tasks"));
-    normalize_task_registered_from(block, tasks_dir.as_deref())
-}
-
-/// [`normalize_task_scheduler_op_registered`] with the Tasks directory passed
-/// in, so tests can point it at a temporary tree.
-fn normalize_task_registered_from(block: &str, tasks_dir: Option<&Path>) -> BlockOutcome {
-    let Some(ev) = xml::parse_task_scheduler_op_registered_block(block) else {
-        return BlockOutcome::Unparseable;
-    };
-    let task_content = tasks_dir
-        .and_then(|dir| read_task_definition(dir, &ev.task_name))
-        .unwrap_or_default();
-    normalize_task(
-        xml::ScheduledTaskEvent {
-            record_id: ev.record_id,
-            task_name: ev.task_name,
-            task_content,
-            pid: ev.pid,
-        },
-        FLAG_PERSISTENCE_TASK_ARTIFACT,
-    )
-}
-
-/// Task `task_name`'s definition, read from `tasks_dir`
-/// (`%SystemRoot%\System32\Tasks`, readable by SYSTEM and Administrators only,
-/// as the agent runs). `None` when the name does not map to a safe path, the
-/// file is gone or unreadable, or it exceeds [`xml::MAX_TASK_DEFINITION_BYTES`].
-fn read_task_definition(tasks_dir: &Path, task_name: &str) -> Option<String> {
-    let path = tasks_dir.join(xml::task_definition_relative_path(task_name)?);
-    let mut bytes = Vec::new();
-    let read = File::open(&path).and_then(|file| {
-        file.take(xml::MAX_TASK_DEFINITION_BYTES + 1)
-            .read_to_end(&mut bytes)
-    });
-    if let Err(error) = read {
-        tracing::debug!(%error, path = %path.display(), "task definition read-back failed");
-        return None;
-    }
-    if bytes.len() as u64 > xml::MAX_TASK_DEFINITION_BYTES {
-        tracing::debug!(path = %path.display(), "task definition over the size cap, not parsed");
-        return None;
-    }
-    Some(xml::decode_task_definition(&bytes))
-}
-
 static TASK_SCHEDULER_OP: PollTarget = PollTarget {
     label: "task-scheduler-op",
     heartbeat: "windows-eventlog:task-scheduler-op",
@@ -779,177 +419,6 @@ static TASK_SCHEDULER_OP: PollTarget = PollTarget {
     enable_audit: None,
     enabled: |c| c.task_scheduler_op_enabled,
 };
-
-// ── Microsoft Defender Operational (#283) ──────────────────────────────────
-//
-// The channel's own verdicts (1116 detected, 1117 action taken) and the traces
-// of someone weakening it (5001/5010/5012 protection turned off, 5007 a setting
-// changed, T1562.001). Enabled by default on every Windows SKU that ships
-// Defender: no audit toggle. The channel is **localized**: only numeric ids and
-// the untranslated `Threat Name`/`Path` are read, never the `* Name` texts.
-
-const DEFENDER_DETECTED: u32 = 1116;
-const DEFENDER_REMEDIATED: u32 = 1117;
-const DEFENDER_REALTIME_DISABLED: u32 = 5001;
-const DEFENDER_CONFIG_CHANGED: u32 = 5007;
-const DEFENDER_SPYWARE_DISABLED: u32 = 5010;
-const DEFENDER_VIRUS_DISABLED: u32 = 5012;
-
-/// A command-line detection's `Path` is the whole command line (lab,
-/// 2026-10-02: a multi-line script). The event keeps the start: enough to
-/// identify what was caught, bounded so one detection cannot carry a script.
-const DEFENDER_PATH_MAX_CHARS: usize = 1024;
-
-/// Registry value names (last path component, lowercase) whose change is a
-/// protection being weakened. The rules decide which changes alert; the sensor
-/// only has to keep the rest of the 5007 flood (service start-up progress:
-/// 42 % of the channel on the lab host) out of the pipeline.
-const DEFENDER_SECURITY_VALUES: &[&str] = &[
-    "disablerealtimemonitoring",
-    "disablebehaviormonitoring",
-    "disableonaccessprotection",
-    "disableioavprotection",
-    "disablescriptscanning",
-    "disableantispyware",
-    "disableantivirus",
-    "tamperprotection",
-];
-
-/// Whether a 5007's registry value is one a rule could act on: any
-/// exclusion, or one of [`DEFENDER_SECURITY_VALUES`].
-fn is_security_relevant_setting(setting: &str) -> bool {
-    let lower = setting.to_ascii_lowercase();
-    lower.contains("\\exclusions\\")
-        || DEFENDER_SECURITY_VALUES
-            .iter()
-            .any(|value| lower.ends_with(&format!("\\{value}")))
-}
-
-/// Defender renders a changed setting as `<registry value path> = <data>`.
-fn split_registry_assignment(text: &str) -> (&str, &str) {
-    match text.split_once(" = ") {
-        Some((path, data)) => (path.trim(), data.trim()),
-        None => (text.trim(), ""),
-    }
-}
-
-fn truncate_chars(text: String, max: usize) -> String {
-    if text.chars().count() <= max {
-        text
-    } else {
-        text.chars().take(max).collect()
-    }
-}
-
-/// A [`DefenderEvent`] of `kind` with nothing filled in. Defender names no
-/// actor (which process changed a setting, or owns a detection): pid 0, no
-/// comm, no user.
-fn defender_base(kind: DefenderEventKind) -> DefenderEvent {
-    DefenderEvent {
-        meta: EventMeta {
-            pid: 0,
-            ppid: 0,
-            user: User::Unknown,
-            timestamp_ns: now_ns(),
-            comm: String::new(),
-            container: None, // attributed by the ETW sensor only (https://github.com/synthaea-lab/agent/issues/39)
-            process_generation: None,
-            parent_process_generation: None,
-        },
-        kind,
-        detection_id: None,
-        threat_name: None,
-        severity_id: None,
-        category_id: None,
-        action_id: None,
-        path: None,
-        process_name: None,
-        user: None,
-        setting: None,
-        old_value: None,
-        new_value: None,
-    }
-}
-
-/// Normalizes a Defender Operational event into a [`DefenderEvent`].
-///
-/// Skipped (cursor still advances): a detection without a threat name, a
-/// 5007 about a setting no rule watches, and any event id the `XPath` filter
-/// let through that this function has no shape for.
-fn normalize_defender_block(block: &str) -> BlockOutcome {
-    let Some(ev) = xml::parse_defender_event(block) else {
-        return BlockOutcome::Unparseable;
-    };
-    let record_id = ev.record_id;
-    let event = match ev.event_id {
-        DEFENDER_DETECTED | DEFENDER_REMEDIATED => {
-            let Some(threat_name) = ev.threat_name else {
-                return BlockOutcome::Filtered { record_id };
-            };
-            let kind = if ev.event_id == DEFENDER_DETECTED {
-                DefenderEventKind::Detection
-            } else {
-                DefenderEventKind::Remediation
-            };
-            DefenderEvent {
-                detection_id: ev.detection_id,
-                threat_name: Some(threat_name),
-                severity_id: ev.severity_id,
-                category_id: ev.category_id,
-                action_id: ev
-                    .action_id
-                    .filter(|_| kind == DefenderEventKind::Remediation),
-                path: ev.path.map(|p| truncate_chars(p, DEFENDER_PATH_MAX_CHARS)),
-                process_name: ev.process_name,
-                user: ev.detection_user,
-                ..defender_base(kind)
-            }
-        }
-        DEFENDER_REALTIME_DISABLED | DEFENDER_SPYWARE_DISABLED | DEFENDER_VIRUS_DISABLED => {
-            // Fixed English labels: the event text is localized.
-            let component = match ev.event_id {
-                DEFENDER_REALTIME_DISABLED => "real-time protection",
-                DEFENDER_SPYWARE_DISABLED => "spyware scanning",
-                _ => "virus scanning",
-            };
-            DefenderEvent {
-                setting: Some(component.to_string()),
-                ..defender_base(DefenderEventKind::ProtectionDisabled)
-            }
-        }
-        DEFENDER_CONFIG_CHANGED => {
-            let old = ev.old_value.as_deref().map(split_registry_assignment);
-            let new = ev.new_value.as_deref().map(split_registry_assignment);
-            // The path is the same on both sides; after a removal only the
-            // old side has one.
-            let Some(path) = new
-                .map(|(path, _)| path)
-                .filter(|p| !p.is_empty())
-                .or_else(|| old.map(|(path, _)| path))
-            else {
-                return BlockOutcome::Filtered { record_id };
-            };
-            if !is_security_relevant_setting(path) {
-                return BlockOutcome::Filtered { record_id };
-            }
-            let value = |side: Option<(&str, &str)>| {
-                side.map(|(_, data)| data.to_string())
-                    .filter(|data| !data.is_empty())
-            };
-            DefenderEvent {
-                setting: Some(path.to_string()),
-                old_value: value(old),
-                new_value: value(new),
-                ..defender_base(DefenderEventKind::ConfigChanged)
-            }
-        }
-        _ => return BlockOutcome::Filtered { record_id },
-    };
-    BlockOutcome::Event {
-        record_id,
-        event: Event::Defender(event),
-    }
-}
 
 static DEFENDER_OP: PollTarget = PollTarget {
     label: "defender",
@@ -964,65 +433,6 @@ static DEFENDER_OP: PollTarget = PollTarget {
     enable_audit: None,
     enabled: |c| c.defender_enabled,
 };
-
-// ── WDAC (CodeIntegrity Operational) 3076 / 3077 (#283) ─────────────────────
-
-const WDAC_EVENT_ENFORCED: u32 = 3077;
-const WDAC_EVENT_AUDITED: u32 = 3076;
-
-/// Normalizes a WDAC 3077 (blocked) / 3076 (audit mode, would have been
-/// blocked) into a [`PolicyDenialEvent`], the shape `AppLocker` verdicts use.
-///
-/// - `object_path`: `File Name`, as the **NT device path** the event carries
-///   (`\Device\HarddiskVolume3\...`): not converted to a drive letter here.
-/// - `subject_context`: `Process Name` (also an NT path), the loader.
-/// - `object_class`: `kernel-mode` / `user-mode` from `SI Signing Scenario`.
-/// - `action`: `load`. `meta.pid` is 0: the event logs the policy engine,
-///   not the loader's pid.
-///
-/// The issue's third id, 3033 (a DLL failed a signing level), is deliberately
-/// not subscribed: 584 of them on one lab host in a day, all Chrome loading
-/// its own DLLs. Skipped (cursor advances): a block without a file name, and
-/// any other event id the filter let through.
-fn normalize_wdac_block(block: &str) -> BlockOutcome {
-    let Some(ev) = xml::parse_code_integrity_event(block) else {
-        return BlockOutcome::Unparseable;
-    };
-    let record_id = ev.record_id;
-    let enforced = match ev.event_id {
-        WDAC_EVENT_ENFORCED => true,
-        WDAC_EVENT_AUDITED => false,
-        _ => return BlockOutcome::Filtered { record_id },
-    };
-    let Some(file_name) = ev.file_name else {
-        return BlockOutcome::Filtered { record_id };
-    };
-    let object_class = match ev.signing_scenario {
-        Some(0) => Some("kernel-mode".to_string()),
-        Some(1) => Some("user-mode".to_string()),
-        _ => None,
-    };
-    let event = Event::PolicyDenial(PolicyDenialEvent {
-        meta: EventMeta {
-            pid: 0,
-            ppid: 0,
-            user: User::Unknown,
-            timestamp_ns: now_ns(),
-            comm: String::new(),
-            container: None, // attributed by the ETW sensor only (https://github.com/synthaea-lab/agent/issues/39)
-            process_generation: None,
-            parent_process_generation: None,
-        },
-        mechanism: POLICY_MECHANISM_WDAC.into(),
-        subject_context: ev.process_name,
-        object_context: None,
-        object_class,
-        action: Some("load".into()),
-        enforced,
-        object_path: Some(file_name),
-    });
-    BlockOutcome::Event { record_id, event }
-}
 
 static WDAC_OP: PollTarget = PollTarget {
     label: "wdac",
@@ -1471,6 +881,10 @@ impl Sensor for EventLogSensor {
 
 #[cfg(test)]
 mod config_tests {
+    use std::sync::atomic::Ordering;
+
+    use schema::sensor::Sensor;
+
     use super::*;
 
     #[test]
@@ -1697,7 +1111,16 @@ mod config_tests {
 
 #[cfg(test)]
 mod query_tests {
+    use std::{process::Command, sync::atomic::Ordering};
+
+    use schema::Event;
+
     use super::*;
+    use crate::{
+        query::{Direction, query_events},
+        targets::BlockOutcome,
+        xml::{self},
+    };
 
     /// Writes one Application event whose only insertion string is `text`, from an
     /// unregistered source: no admin rights needed.
@@ -1910,7 +1333,15 @@ mod query_tests {
 
 #[cfg(test)]
 mod scheduled_task_tests {
+    use std::path::Path;
+
+    use schema::{Event, FLAG_PERSISTENCE_TASK_ARTIFACT, FLAG_PERSISTENCE_TASK_UPDATE_ARTIFACT};
+
     use super::*;
+    use crate::{
+        targets::{BlockOutcome, persistence::normalize_task_registered_from},
+        xml::{self},
+    };
 
     /// Minimal 4698 block: only the fields `parse_scheduled_task_block` reads.
     fn block_4698(task_content_escaped: &str) -> String {
@@ -2082,7 +1513,11 @@ mod scheduled_task_tests {
 
 #[cfg(test)]
 mod applocker_tests {
+
+    use schema::{Event, POLICY_MECHANISM_APPLOCKER, PolicyDenialEvent, User};
+
     use super::*;
+    use crate::targets::BlockOutcome;
 
     fn applocker_block(event_id: u32) -> String {
         format!(
@@ -2331,7 +1766,13 @@ mod applocker_tests {
 
 #[cfg(test)]
 mod defender_wdac_tests {
+
+    use schema::{
+        DefenderEvent, DefenderEventKind, Event, POLICY_MECHANISM_WDAC, PolicyDenialEvent,
+    };
+
     use super::*;
+    use crate::targets::{BlockOutcome, defender::DEFENDER_PATH_MAX_CHARS};
 
     fn defender_block(event_id: u32, data: &str) -> String {
         format!(
@@ -2552,6 +1993,7 @@ mod defender_wdac_tests {
 
 #[cfg(test)]
 mod target_wiring_tests {
+
     use super::*;
 
     #[test]
@@ -2570,7 +2012,10 @@ mod subscribe_tests {
         sync::{Arc, Once, atomic::AtomicBool},
     };
 
+    use schema::{Event, sensor::EventSink};
+
     use super::*;
+    use crate::targets::BlockOutcome;
 
     struct NullSink;
 

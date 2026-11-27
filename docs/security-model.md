@@ -232,9 +232,9 @@ leaves the process should be scrubbed. [`RedactingSink`](../apps/agent/src/redac
 that split. Live detection pipelines see `Exec`, `ReadlineInput`, `ScriptBlock`,
 `AmsiContent` and `WmiActivity` raw, while capture and output sinks get them redacted.
 URL secrets in download provenance, BITS jobs and HTTP evidence are always redacted. The
-pure functions ([`redact_command_line`](../crates/redact/src/lib.rs),
+pure functions ([`redact_command_line`](../crates/redact/src/cmdline.rs),
 [`redact_command_text`](../crates/redact/src/text.rs),
-[`redact_url_secrets`](../crates/redact/src/lib.rs)) keep the line's formatting, are
+[`redact_url_secrets`](../crates/redact/src/url.rs)) keep the line's formatting, are
 idempotent, and are property-tested. Positional and encoded credential forms are not
 recognized.
 
