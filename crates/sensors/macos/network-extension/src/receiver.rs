@@ -15,7 +15,9 @@ use std::{
 };
 
 use crate::{
-    NetworkExtensionError, normalize,
+    NetworkExtensionError,
+    bounded_lines::{BoundedLines, Line, MAX_LINE_BYTES},
+    normalize,
     wire::{NeRecord, WIRE_VERSION},
 };
 
@@ -28,6 +30,7 @@ pub struct SkewCounters {
     unparseable: AtomicU64,
     unknown_version: AtomicU64,
     unmapped: AtomicU64,
+    oversize_lines: AtomicU64,
 }
 
 /// Why the receiver skipped a record.
@@ -59,6 +62,8 @@ pub struct SkewTotals {
     /// Records that parsed but have no schema event (for example a remote address that is not a
     /// literal IP).
     pub unmapped: u64,
+    /// Lines over the length cap, read to their end and dropped unparsed.
+    pub oversize_lines: u64,
 }
 
 impl SkewTotals {
@@ -75,6 +80,7 @@ impl SkewTotals {
             unparseable: self.unparseable.saturating_sub(earlier.unparseable),
             unknown_version: self.unknown_version.saturating_sub(earlier.unknown_version),
             unmapped: self.unmapped.saturating_sub(earlier.unmapped),
+            oversize_lines: self.oversize_lines.saturating_sub(earlier.oversize_lines),
         }
     }
 }
@@ -97,6 +103,7 @@ impl SkewCounters {
             unparseable: self.unparseable.load(Ordering::Relaxed),
             unknown_version: self.unknown_version.load(Ordering::Relaxed),
             unmapped: self.unmapped.load(Ordering::Relaxed),
+            oversize_lines: self.oversize_lines.load(Ordering::Relaxed),
         }
     }
 }
@@ -104,7 +111,7 @@ impl SkewCounters {
 /// Reads normalized schema events out of any line-oriented wire-record
 /// source (one accepted extension connection).
 pub struct NormalizedNeStream<R> {
-    lines: std::io::Lines<R>,
+    lines: BoundedLines<R>,
     counters: Arc<SkewCounters>,
 }
 
@@ -119,7 +126,7 @@ impl<R: BufRead> NormalizedNeStream<R> {
     /// A stream that adds to `counters`, shared with the other connections.
     pub fn with_counters(reader: R, counters: Arc<SkewCounters>) -> Self {
         Self {
-            lines: reader.lines(),
+            lines: BoundedLines::new(reader),
             counters,
         }
     }
@@ -129,6 +136,19 @@ impl<R: BufRead> NormalizedNeStream<R> {
     #[must_use]
     pub fn counters(&self) -> Arc<SkewCounters> {
         Arc::clone(&self.counters)
+    }
+
+    /// Counts a line dropped for its length, warning when the total reaches a power of two. The
+    /// warning carries the count and the cap, never the line.
+    fn count_oversize(&self) {
+        let total = self.counters.oversize_lines.fetch_add(1, Ordering::Relaxed) + 1;
+        if total.is_power_of_two() {
+            tracing::warn!(
+                dropped = total,
+                max_bytes = MAX_LINE_BYTES,
+                "network-extension receiver: line over the size cap dropped"
+            );
+        }
     }
 
     /// Counts one skipped record, warning when the total for its cause reaches a power of two:
@@ -152,7 +172,11 @@ impl<R: BufRead> Iterator for NormalizedNeStream<R> {
     fn next(&mut self) -> Option<Self::Item> {
         loop {
             let line = match self.lines.next()? {
-                Ok(line) => line,
+                Ok(Line::Text(line)) => line,
+                Ok(Line::Oversize) => {
+                    self.count_oversize();
+                    continue;
+                }
                 Err(e) => return Some(Err(NetworkExtensionError::Io(e))),
             };
             if line.trim().is_empty() {
@@ -252,6 +276,7 @@ mod tests {
                 unparseable: 1,
                 unknown_version: 1,
                 unmapped: 0,
+                oversize_lines: 0,
             }
         );
     }
@@ -267,6 +292,7 @@ mod tests {
                 unparseable: 0,
                 unknown_version: 0,
                 unmapped: 1,
+                oversize_lines: 0,
             }
         );
     }
@@ -347,5 +373,27 @@ mod tests {
         );
         writer.join().unwrap();
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn an_oversize_line_is_dropped_and_counted_and_the_next_record_is_still_read() {
+        let good = r#"{"kind":"flow","v":1,"ts_ns":1,"pid":4242,"process_path":"/usr/bin/curl","direction":"outbound","remote_addr":"203.0.113.7","remote_port":443,"local_port":52344,"protocol":6}"#;
+        let input = format!("{}\n{good}\n", "x".repeat(MAX_LINE_BYTES + 1));
+        let mut stream = NormalizedNeStream::new(Cursor::new(input));
+        let event = stream.next().unwrap().unwrap();
+        assert!(matches!(event, schema::Event::Connect(_)));
+        assert!(stream.next().is_none());
+        let totals = stream.counters().totals();
+        assert_eq!(totals.oversize_lines, 1);
+        // An oversize line is its own cause: not a parse failure.
+        assert_eq!(totals.unparseable, 0);
+    }
+
+    #[test]
+    fn an_oversize_line_with_no_newline_ends_the_stream_without_growing_memory_past_the_cap() {
+        let input = "y".repeat(MAX_LINE_BYTES * 3);
+        let mut stream = NormalizedNeStream::new(Cursor::new(input));
+        assert!(stream.next().is_none());
+        assert_eq!(stream.counters().totals().oversize_lines, 1);
     }
 }

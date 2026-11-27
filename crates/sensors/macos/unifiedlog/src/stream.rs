@@ -17,7 +17,11 @@ use std::{
 };
 
 use crate::{
-    UnifiedLogError, classify, normalize, parse_record, record::LogRecord, tcc::TccJoiner,
+    UnifiedLogError,
+    bounded_lines::{BoundedLines, Line, MAX_LINE_BYTES},
+    classify, normalize, parse_record,
+    record::LogRecord,
+    tcc::TccJoiner,
 };
 
 /// The `log stream` predicate. One string, OR-joined, kept next to the
@@ -46,6 +50,7 @@ pub struct StreamCounters {
     shed_events: AtomicU64,
     tcc_shed_contexts: AtomicU64,
     tcc_unmatched_results: AtomicU64,
+    oversize_lines: AtomicU64,
 }
 
 /// A reading of [`StreamCounters`] at one instant.
@@ -57,6 +62,8 @@ pub struct StreamTotals {
     pub tcc_shed_contexts: u64,
     /// TCC results with no pending context.
     pub tcc_unmatched_results: u64,
+    /// Lines over the length cap, read to their end and dropped unparsed.
+    pub oversize_lines: u64,
 }
 
 impl StreamTotals {
@@ -75,6 +82,7 @@ impl StreamCounters {
             shed_events: self.shed_events.load(Ordering::Relaxed),
             tcc_shed_contexts: self.tcc_shed_contexts.load(Ordering::Relaxed),
             tcc_unmatched_results: self.tcc_unmatched_results.load(Ordering::Relaxed),
+            oversize_lines: self.oversize_lines.load(Ordering::Relaxed),
         }
     }
 }
@@ -98,7 +106,7 @@ fn add_new_losses(total: &AtomicU64, count: u64, published: &mut u64) -> Option<
 /// same
 /// type on macOS.
 pub struct NormalizedLogStream<R> {
-    lines: std::io::Lines<R>,
+    lines: BoundedLines<R>,
     joiner: TccJoiner,
     /// What of the joiner's `shed_contexts` was already added to `counters`.
     published_shed_contexts: u64,
@@ -119,7 +127,7 @@ impl<R: BufRead> NormalizedLogStream<R> {
     /// A stream that adds to `counters`, which the caller keeps to read the totals.
     pub fn with_counters(reader: R, counters: Arc<StreamCounters>) -> Self {
         Self {
-            lines: reader.lines(),
+            lines: BoundedLines::new(reader),
             joiner: TccJoiner::new(),
             published_shed_contexts: 0,
             published_unmatched_results: 0,
@@ -162,6 +170,19 @@ impl<R: BufRead> NormalizedLogStream<R> {
         }
     }
 
+    /// Counts a line dropped for its length, warning when the total reaches a power of two. The
+    /// warning carries the count and the cap, never the line.
+    fn count_oversize(&self) {
+        let total = self.counters.oversize_lines.fetch_add(1, Ordering::Relaxed) + 1;
+        if total.is_power_of_two() {
+            tracing::warn!(
+                dropped = total,
+                max_bytes = MAX_LINE_BYTES,
+                "unified-log tail: line over the size cap dropped"
+            );
+        }
+    }
+
     /// Sliding-window admission: true when the event at `now_ns` fits.
     fn admit(&mut self, now_ns: u64) -> bool {
         while let Some(&front) = self.window.front() {
@@ -193,7 +214,11 @@ impl<R: BufRead> Iterator for NormalizedLogStream<R> {
     fn next(&mut self) -> Option<Self::Item> {
         loop {
             let line = match self.lines.next()? {
-                Ok(line) => line,
+                Ok(Line::Text(line)) => line,
+                Ok(Line::Oversize) => {
+                    self.count_oversize();
+                    continue;
+                }
                 Err(e) => return Some(Err(UnifiedLogError::Io(e))),
             };
             if line.trim().is_empty() {
@@ -358,5 +383,27 @@ mod tests {
     #[test]
     fn empty_input_yields_nothing() {
         assert!(NormalizedLogStream::new(Cursor::new("")).next().is_none());
+    }
+
+    #[test]
+    fn an_oversize_line_is_dropped_and_counted_and_the_next_record_is_still_read() {
+        let input = format!(
+            "{}\n{}\n",
+            "x".repeat(MAX_LINE_BYTES + 1),
+            sudo_line("2026-09-22 11:12:26.000000+0200")
+        );
+        let mut stream = NormalizedLogStream::new(Cursor::new(input));
+        let (_, event) = stream.next().unwrap().unwrap();
+        assert!(matches!(event, schema::Event::Auth(_)));
+        assert!(stream.next().is_none());
+        assert_eq!(stream.counters().totals().oversize_lines, 1);
+    }
+
+    #[test]
+    fn an_oversize_line_with_no_newline_ends_the_stream_without_growing_memory_past_the_cap() {
+        let input = "y".repeat(MAX_LINE_BYTES * 3);
+        let mut stream = NormalizedLogStream::new(Cursor::new(input));
+        assert!(stream.next().is_none());
+        assert_eq!(stream.counters().totals().oversize_lines, 1);
     }
 }

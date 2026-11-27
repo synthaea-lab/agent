@@ -11,6 +11,7 @@
 //! is no [`schema::sensor::Sensor`] implementation: the agent runs this as a
 //! supplementary tail. See `docs/sensors/macos/unified-log.md`.
 
+mod bounded_lines;
 mod classify;
 mod normalize;
 mod record;
