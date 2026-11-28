@@ -105,6 +105,15 @@ pub struct HealthBeacon {
     /// older beacon.
     #[serde(default)]
     pub exec_ring_dropped: u64,
+    /// Cumulative events the Linux reordering stage passed on out of order because they
+    /// arrived more than its hold behind a later one: detection judged them against a state a
+    /// later event had already changed. Zero on other platforms and in an older beacon.
+    #[serde(default)]
+    pub reorder_late: u64,
+    /// Cumulative events that stage released early because its window was full: a burst cost
+    /// ordering. Zero on other platforms and in an older beacon.
+    #[serde(default)]
+    pub reorder_forced: u64,
     /// Cumulative entries the Windows ETW sensor's pid cache dropped at its cap: a later event of
     /// such a process misses its image path (issue #178). Zero on other platforms and in a
     /// beacon from an older agent.

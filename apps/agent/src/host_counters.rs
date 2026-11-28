@@ -84,6 +84,7 @@ pub(crate) struct AgentHostCounters {
     sink: Arc<DetectionSink>,
     watchdog: WatchdogReport,
     ebpf_totals: Option<EbpfSensorTotalsReader>,
+    reorder: Option<pipeline::reorder::ReorderCounters>,
     etw_shed: Option<EtwShedReader>,
 }
 
@@ -96,12 +97,23 @@ impl AgentHostCounters {
             sink,
             watchdog,
             ebpf_totals: None,
+            reorder: None,
             etw_shed: None,
         }
     }
 
     /// Reports what `read` says the Linux eBPF sensor lost.
     #[cfg(any(target_os = "linux", test))]
+    /// Reports what the reordering stage in front of the primary sensor could not order.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    pub(crate) fn with_reorder_counters(
+        mut self,
+        counters: pipeline::reorder::ReorderCounters,
+    ) -> Self {
+        self.reorder = Some(counters);
+        self
+    }
+
     pub(crate) fn with_ebpf_sensor_totals(mut self, read: EbpfSensorTotalsReader) -> Self {
         self.ebpf_totals = Some(read);
         self
@@ -158,6 +170,11 @@ impl HostCountersSource for AgentHostCounters {
             alerts_dropped: self.sink.alert_log().dropped_writes(),
             ring_dropped: sensor.ring_dropped,
             exec_ring_dropped: sensor.exec_ring_dropped,
+            reorder_late: self.reorder.as_ref().map_or(0, |counters| counters.late()),
+            reorder_forced: self
+                .reorder
+                .as_ref()
+                .map_or(0, |counters| counters.forced()),
             etw_pid_cache_evicted: etw_shed.pid_cache_evicted,
             etw_silo_evicted: etw_shed.silo_evicted,
             etw_marks_dropped: etw_shed.marks_dropped,
@@ -333,6 +350,31 @@ mod tests {
             ),
             (0, 0, 0, 0)
         );
+    }
+
+    #[test]
+    fn what_the_reordering_stage_could_not_order_reaches_the_counters() {
+        use schema::sensor::EventSink as _;
+
+        let at = |timestamp_ns: u64| {
+            let mut exec = schema::fixtures::exec();
+            exec.meta.timestamp_ns = timestamp_ns;
+            schema::Event::Exec(exec)
+        };
+        let detection = sink("reorder");
+        let reorder = pipeline::reorder::ReorderCounters::default();
+        let ordered = pipeline::reorder::ReorderingSink::new(Arc::clone(&detection))
+            .counting_into(reorder.clone());
+        let counters = AgentHostCounters::new(detection, WatchdogReport::default())
+            .with_reorder_counters(reorder);
+        assert_eq!(counters.host_counters().reorder_late, 0);
+
+        // The third event is 295 ms older than one already seen: past the hold.
+        for timestamp_ms in [10, 300, 5] {
+            ordered.on_event(at(timestamp_ms * 1_000_000));
+        }
+        let host = counters.host_counters();
+        assert_eq!((host.reorder_late, host.reorder_forced), (1, 0));
     }
 
     #[test]

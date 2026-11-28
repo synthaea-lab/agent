@@ -460,6 +460,8 @@ pub(crate) fn cmd_run(opts: super::RunOptions) -> anyhow::Result<()> {
         Arc::clone(&pipeline.sink),
         crate::host_counters::WatchdogReport::from_env(),
     );
+    let reorder_counters = pipeline::reorder::ReorderCounters::default();
+    let counters = counters.with_reorder_counters(reorder_counters.clone());
     let counters = match sensor_totals {
         Some(read) => counters.with_ebpf_sensor_totals(read),
         None => counters,
@@ -517,7 +519,9 @@ pub(crate) fn cmd_run(opts: super::RunOptions) -> anyhow::Result<()> {
     // The probes write one ring buffer per event type, so their events arrive out of order;
     // detection reads them in timestamp order, a hold later. The heartbeat is pulsed on
     // arrival, before the hold: it measures the sensor, not the pipeline.
-    let ordered = pipeline::reorder::ReorderingSink::new(guarded).start()?;
+    let ordered = pipeline::reorder::ReorderingSink::new(guarded)
+        .counting_into(reorder_counters)
+        .start()?;
     let result = sensor.run(Box::new(PulsingSink::new(
         ordered.clone(),
         primary_heartbeat,

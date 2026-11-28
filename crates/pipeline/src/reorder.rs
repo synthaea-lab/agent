@@ -68,13 +68,35 @@ struct Window {
     last_arrival: Instant,
 }
 
+/// What the stage could not put in order, cumulative. Cloned to whoever reports it: the
+/// health beacon is built before the sink that counts.
+#[derive(Debug, Clone, Default)]
+pub struct ReorderCounters {
+    late: Arc<AtomicU64>,
+    forced: Arc<AtomicU64>,
+}
+
+impl ReorderCounters {
+    /// Events that arrived more than the hold behind a later one, and were passed on out of
+    /// order.
+    #[must_use]
+    pub fn late(&self) -> u64 {
+        self.late.load(Ordering::Relaxed)
+    }
+
+    /// Events released early because the window was full.
+    #[must_use]
+    pub fn forced(&self) -> u64 {
+        self.forced.load(Ordering::Relaxed)
+    }
+}
+
 /// An [`EventSink`] that passes events to `inner` in timestamp order, [`HOLD`] later.
 pub struct ReorderingSink<S> {
     inner: S,
     hold_ns: u64,
     window: Mutex<Window>,
-    late: AtomicU64,
-    forced: AtomicU64,
+    counters: ReorderCounters,
     stopped: AtomicBool,
 }
 
@@ -96,21 +118,28 @@ impl<S: EventSink> ReorderingSink<S> {
                 arrivals: 0,
                 last_arrival: Instant::now(),
             }),
-            late: AtomicU64::new(0),
-            forced: AtomicU64::new(0),
+            counters: ReorderCounters::default(),
             stopped: AtomicBool::new(false),
         }
+    }
+
+    /// Counts into `counters` instead of counters of its own, so a reporter that was built
+    /// first reads the same numbers.
+    #[must_use]
+    pub fn counting_into(mut self, counters: ReorderCounters) -> Self {
+        self.counters = counters;
+        self
     }
 
     /// Events that arrived more than the hold behind a later one, and were passed on out of
     /// order.
     pub fn late(&self) -> u64 {
-        self.late.load(Ordering::Relaxed)
+        self.counters.late()
     }
 
     /// Events released early because the window was full.
     pub fn forced(&self) -> u64 {
-        self.forced.load(Ordering::Relaxed)
+        self.counters.forced()
     }
 
     /// Releases every held event, in order. Called when the stream ends, and by the
@@ -177,7 +206,7 @@ impl<S: EventSink> EventSink for ReorderingSink<S> {
         window.last_arrival = Instant::now();
         if timestamp_ns < window.released_ns {
             // Later than the hold: its place in the order is already gone.
-            self.late.fetch_add(1, Ordering::Relaxed);
+            self.counters.late.fetch_add(1, Ordering::Relaxed);
             self.inner.on_event(event);
             return;
         }
@@ -193,7 +222,7 @@ impl<S: EventSink> EventSink for ReorderingSink<S> {
             self.release(&mut window, |held| held.timestamp_ns <= horizon);
         }
         while window.held.len() > CAPACITY {
-            self.forced.fetch_add(1, Ordering::Relaxed);
+            self.counters.forced.fetch_add(1, Ordering::Relaxed);
             let oldest = window.held.peek().map(|Reverse(held)| held.timestamp_ns);
             self.release(&mut window, |held| Some(held.timestamp_ns) == oldest);
         }
@@ -292,6 +321,18 @@ mod tests {
         }
         assert_eq!(seen(&recorder), vec![0]);
         assert_eq!(sink.forced(), 1);
+    }
+
+    #[test]
+    fn counters_handed_in_first_read_what_the_sink_counts() {
+        let counters = ReorderCounters::default();
+        let recorder = Arc::new(Recorder::default());
+        let sink = ReorderingSink::holding(recorder, Duration::from_millis(100))
+            .counting_into(counters.clone());
+        sink.on_event(at(10 * MS));
+        sink.on_event(at(300 * MS));
+        sink.on_event(at(5 * MS));
+        assert_eq!((counters.late(), counters.forced()), (1, 0));
     }
 
     #[test]

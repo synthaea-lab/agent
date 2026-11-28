@@ -76,6 +76,10 @@ pub struct HostCounters {
     pub ring_dropped: u64,
     /// The part of it lost from the exec ring.
     pub exec_ring_dropped: u64,
+    /// Events the Linux reordering stage passed on out of order (later than its hold).
+    pub reorder_late: u64,
+    /// Events that stage released early because its window was full.
+    pub reorder_forced: u64,
     /// Windows ETW pid-cache entries the cap dropped (#178).
     pub etw_pid_cache_evicted: u64,
     /// Windows ETW silo-directory entries the cap dropped.
@@ -287,6 +291,8 @@ impl HealthCollector {
             alerts_dropped: host.alerts_dropped,
             ring_dropped: host.ring_dropped,
             exec_ring_dropped: host.exec_ring_dropped,
+            reorder_late: host.reorder_late,
+            reorder_forced: host.reorder_forced,
             etw_pid_cache_evicted: host.etw_pid_cache_evicted,
             etw_silo_evicted: host.etw_silo_evicted,
             etw_marks_dropped: host.etw_marks_dropped,
@@ -391,6 +397,8 @@ mod tests {
             alerts_dropped: 8,
             ring_dropped: 51_064_213,
             exec_ring_dropped: 7,
+            reorder_late: 31,
+            reorder_forced: 32,
             etw_pid_cache_evicted: 21,
             etw_silo_evicted: 22,
             etw_marks_dropped: 23,
@@ -477,6 +485,11 @@ mod tests {
             (beacon.ring_dropped, beacon.exec_ring_dropped),
             (51_064_213, 7),
             "the eBPF ring losses ride the beacon (#335)"
+        );
+        assert_eq!(
+            (beacon.reorder_late, beacon.reorder_forced),
+            (31, 32),
+            "what the reordering stage could not order rides the beacon"
         );
         assert_eq!(
             (
