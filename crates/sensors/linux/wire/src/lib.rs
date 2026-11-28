@@ -294,7 +294,11 @@ pub const fn syscall_nr_from_i32(syscall_nr: i32) -> Option<u32> {
 ///   block after the fixed part: the head window, then the tail window. Exec-time, so a process
 ///   that exits before the drain or rewrites its argv region afterwards keeps the argv it was
 ///   started with. Read with [`parse_exec_record`], never with a bare `read_unaligned`.
-pub const WIRE_VERSION: u32 = 28;
+/// - v29: the exec record's argv windows grow from 1 KiB (768 + 256) to 4 KiB (3072 + 1024).
+///   The lab showed ordinary programs over 1 KiB (`collect2` and `ld` on every link), each
+///   raising the "command line not captured whole" alert; no command line in the samples the
+///   windows were sized on exceeded 4 KiB. No field changed, only the bounds of the lengths.
+pub const WIRE_VERSION: u32 = 29;
 
 /// Size of a kernel `comm` buffer (`TASK_COMM_LEN`): 15 bytes of process name plus the NUL.
 pub const TASK_COMM_LEN: usize = 16;
@@ -511,10 +515,10 @@ pub const MAX_PATH_LEN: usize = 256;
 /// Bytes of the argument block (`mm->arg_start .. mm->arg_end`) the exec probe captures at most
 ///: the whole block when it fits, else [`ARGV_HEAD_BYTES`] from the start and
 /// [`ARGV_TAIL_BYTES`] from the end.
-pub const ARGV_WINDOW_BYTES: usize = 1024;
+pub const ARGV_WINDOW_BYTES: usize = 4096;
 /// The tail window of a block over [`ARGV_WINDOW_BYTES`]: padding put in front of a payload at the
 /// end of the block does not hide it.
-pub const ARGV_TAIL_BYTES: usize = 256;
+pub const ARGV_TAIL_BYTES: usize = 1024;
 /// The head window of a block over [`ARGV_WINDOW_BYTES`].
 pub const ARGV_HEAD_BYTES: usize = ARGV_WINDOW_BYTES - ARGV_TAIL_BYTES;
 /// Maximum captured length of an xattr name (issue #262 Phase 3): the kernel's own

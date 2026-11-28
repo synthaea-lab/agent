@@ -414,7 +414,7 @@ mod tests {
     #[test]
     fn a_payload_after_padding_is_kept_in_the_tail_and_the_middle_is_counted() {
         let mut block = b"sh\0-c\0".to_vec();
-        block.extend(std::iter::repeat_n(b'A', 3000));
+        block.extend(std::iter::repeat_n(b'A', 3 * ARGV_WINDOW_BYTES));
         block.extend_from_slice(b"; run-the-payload\0");
         let (head, tail) = (
             &block[..ARGV_HEAD_BYTES],

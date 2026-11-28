@@ -42,8 +42,8 @@ the struct definitions say.
 | --- | --- | --- | --- |
 | `TASK_COMM_LEN` | 16 | `comm`, `pcomm` | Kernel's own size (15 bytes + NUL) |
 | `MAX_PATH_LEN` | 256 | paths, image, mount source | Fits the per-CPU scratch pattern |
-| `ARGV_WINDOW_BYTES` | 1024 | exec argv | Whole block when it fits, else head + tail |
-| `ARGV_HEAD_BYTES` / `ARGV_TAIL_BYTES` | 768 / 256 | exec argv over the window | Tail defeats front padding |
+| `ARGV_WINDOW_BYTES` | 4096 | exec argv | Whole block when it fits, else head + tail |
+| `ARGV_HEAD_BYTES` / `ARGV_TAIL_BYTES` | 3072 / 1024 | exec argv over the window | Tail defeats front padding |
 | `MAX_XATTR_NAME_LEN` | 255 | xattr name | Kernel's `XATTR_NAME_MAX`, so no truncation case exists |
 | `MAX_FS_TYPE_LEN` | 32 | mount fs type | fs type names are short |
 | `MAX_MODULE_NAME_LEN` | 64 | `delete_module` name | Kernel `MODULE_NAME_LEN` is 56 |
@@ -76,14 +76,17 @@ The generation fields are explained in [process context](process-context.md#proc
 
 The exec record is the only variable-length record. The probe builds an
 [`ExecRecord`](../../../crates/sensors/linux/wire/src/lib.rs) (the fixed `ExecEvent` followed by a
-1024-byte `argv` area) in per-CPU scratch and emits only
+4096-byte `argv` area) in per-CPU scratch and emits only
 `size_of::<ExecEvent>() + argv_head_len + argv_tail_len` bytes. A compile-time assertion pins
 `offset_of!(ExecRecord, argv) == size_of::<ExecEvent>()`, which both the probe's slice and the
 parser rely on.
 
-A fixed 1 KiB argv area in every record would have cut the ring's capacity by about four for a
+A fixed argv area in every record would have cut the ring's capacity many times over for a
 sample whose p99.9 command line is a few hundred bytes. With variable-length records the ring was
-raised from 256 to 512 KiB, which holds about as many records as before.
+raised from 256 to 512 KiB, which holds about as many records as before. The area grew from 1 to
+4 KiB in wire v29: a record costs the ring only what its command line is long, so only the rare
+long ones cost more, and a burst of 4 KiB command lines fills the ring after about 115 of them
+where 1 KiB ones took about 370.
 
 ```text
 | ExecEvent (fixed) ................................ | head bytes ......... | tail bytes ... |
@@ -101,8 +104,8 @@ probe writes and returns [`ExecRecordError`](../../../crates/sensors/linux/wire/
 | --- | --- | --- | --- |
 | 0 | 0 | any | Probe read nothing; fall back to `/proc/<pid>/cmdline` |
 | `== total` | 0 | `<= 1024` | Whole block captured |
-| 768 | 256 | `> 1024` | Head and tail captured |
-| 768 | 0 | `> 1024` | Tail read failed; head only |
+| 3072 | 1024 | `> 4096` | Head and tail captured |
+| 3072 | 0 | `> 4096` | Tail read failed; head only |
 
 Anything else is `BadLengths`; a record shorter than its fixed part is `Short`; shorter than the
 fixed part plus the announced lengths is `Truncated`. A refused record is dropped and counted by

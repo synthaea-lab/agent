@@ -20,7 +20,7 @@ use core::mem::{align_of, offset_of, size_of};
 use crate::*;
 
 /// The [`WIRE_VERSION`] this table was last checked against. Bump both together.
-const PINNED_WIRE_VERSION: u32 = 28;
+const PINNED_WIRE_VERSION: u32 = 29;
 
 const _: () = assert!(
     PINNED_WIRE_VERSION == WIRE_VERSION,
@@ -75,7 +75,7 @@ pin_layout!(ExecEvent {
 });
 
 pin_layout!(ExecRecord {
-    size: 1392,
+    size: 4464,
     align: 8,
     event: 0,
     argv: 368,
