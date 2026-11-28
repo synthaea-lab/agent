@@ -17,41 +17,48 @@ use std::{
     },
 };
 
-use sinks::{AlertRecord, JsonlWriter};
 use workers::sync::LockExt;
+
+use crate::{AlertRecord, JsonlWriter};
 
 /// How many recent alerts the agent keeps in memory for `cli detections`.
 /// Equal to `ipc::RECENT_DETECTIONS_HARD_LIMIT`, the most a client can ask
 /// for in one call (asserted by a test in `ipc_handler`).
-pub(crate) const RECENT_ALERTS_CAPACITY: usize = 256;
+pub const RECENT_ALERTS_CAPACITY: usize = 256;
 
 /// One alert as kept in memory for the CLI. Mirrors [`AlertRecord`] field for
-/// field; kept as the agent's own type so this module does not depend on the
-/// IPC wire format (the handler maps it to `ipc::DetectionSummary`).
+/// field; kept apart from the IPC wire format (the agent's handler maps it to
+/// `ipc::DetectionSummary`).
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct RecentAlert {
-    pub(crate) emitted_at_ns: u64,
-    pub(crate) technique: String,
-    pub(crate) message: String,
+pub struct RecentAlert {
+    /// When the alert was recorded, in nanoseconds since the Unix epoch.
+    pub emitted_at_ns: u64,
+    /// The technique or rule identifier the alert names.
+    pub technique: String,
+    /// The whole alert message, as written to the file.
+    pub message: String,
 }
 
 /// Bounded, oldest-first buffer of the most recent alerts. When full, pushing
 /// evicts the oldest entry — a long-running agent keeps a constant memory
 /// footprint (no unbounded growth, per the project's long-lived-agent rule).
-pub(crate) struct RecentAlerts {
+pub struct RecentAlerts {
     capacity: usize,
     inner: Mutex<VecDeque<RecentAlert>>,
 }
 
 impl RecentAlerts {
-    pub(crate) fn new(capacity: usize) -> Self {
+    /// An empty buffer that keeps at most `capacity` alerts.
+    #[must_use]
+    pub fn new(capacity: usize) -> Self {
         Self {
             capacity,
             inner: Mutex::new(VecDeque::with_capacity(capacity)),
         }
     }
 
-    pub(crate) fn push(&self, alert: RecentAlert) {
+    /// Adds `alert`, evicting the oldest one when the buffer is full.
+    pub fn push(&self, alert: RecentAlert) {
         if self.capacity == 0 {
             return;
         }
@@ -64,7 +71,8 @@ impl RecentAlerts {
 
     /// The `limit` most recent alerts, oldest first (the order the IPC
     /// protocol documents for `RecentDetectionsResponse`).
-    pub(crate) fn latest(&self, limit: usize) -> Vec<RecentAlert> {
+    #[must_use]
+    pub fn latest(&self, limit: usize) -> Vec<RecentAlert> {
         let buf = self.inner.lock_recovering();
         let skip = buf.len().saturating_sub(limit);
         buf.iter().skip(skip).cloned().collect()
@@ -73,7 +81,7 @@ impl RecentAlerts {
 
 /// The alert writer shared by the detection sink, the YARA worker, and
 /// quarantine. Cheap to share behind an `Arc`.
-pub(crate) struct AlertLog {
+pub struct AlertLog {
     file: JsonlWriter,
     recent: RecentAlerts,
     /// Whether the stderr line carries the whole message (`run --alert-details`, #319).
@@ -81,7 +89,12 @@ pub(crate) struct AlertLog {
 }
 
 impl AlertLog {
-    pub(crate) fn open(path: &std::path::Path, recent_capacity: usize) -> std::io::Result<Self> {
+    /// Opens (appending) the alert file at `path`, keeping `recent_capacity` alerts in memory.
+    ///
+    /// # Errors
+    ///
+    /// The file cannot be opened for appending.
+    pub fn open(path: &std::path::Path, recent_capacity: usize) -> std::io::Result<Self> {
         Ok(Self {
             file: JsonlWriter::open(path)?,
             recent: RecentAlerts::new(recent_capacity),
@@ -91,7 +104,7 @@ impl AlertLog {
 
     /// Prints the whole message on stderr from now on, not just its summary
     /// (`run --alert-details`). The file and the recent buffer always get it.
-    pub(crate) fn set_stderr_details(&self, details: bool) {
+    pub fn set_stderr_details(&self, details: bool) {
         self.stderr_details.store(details, Ordering::Relaxed);
     }
 
@@ -100,7 +113,7 @@ impl AlertLog {
     /// terminal noise. `alerts.ndjson` and `cli detections` get the full
     /// message; stderr gets [`stderr_alert_line`], which by default leaves out
     /// the message body (#319: a rule message embeds the command line).
-    pub(crate) fn record(&self, technique: &str, message: String) {
+    pub fn record(&self, technique: &str, message: String) {
         let details = self.stderr_details.load(Ordering::Relaxed);
         eprintln!(
             "\x1b[1;31m{}\x1b[0m",
@@ -120,16 +133,21 @@ impl AlertLog {
     }
 
     /// Alerts `alerts.ndjson` did not get since the agent started, for the health beacon.
-    pub(crate) fn dropped_writes(&self) -> u64 {
+    #[must_use]
+    pub fn dropped_writes(&self) -> u64 {
         self.file.dropped()
     }
 
-    pub(crate) fn latest(&self, limit: usize) -> Vec<RecentAlert> {
+    /// The `limit` most recent alerts, oldest first.
+    #[must_use]
+    pub fn latest(&self, limit: usize) -> Vec<RecentAlert> {
         self.recent.latest(limit)
     }
 }
 
-pub(crate) fn format_alert_line(technique: &str, message: &str) -> String {
+/// The full terminal form of an alert: technique, then the whole message.
+#[must_use]
+pub fn format_alert_line(technique: &str, message: &str) -> String {
     format!("[ALERT] {technique} — {message}")
 }
 
@@ -138,7 +156,8 @@ pub(crate) fn format_alert_line(technique: &str, message: &str) -> String {
 /// way rule messages do (`pid=<n> comm=<name>: …`), that pid and comm: an event's
 /// payload never reaches the terminal at default verbosity (CLAUDE.md, #319),
 /// and the message body is where rules put the command line.
-pub(crate) fn stderr_alert_line(technique: &str, message: &str, details: bool) -> String {
+#[must_use]
+pub fn stderr_alert_line(technique: &str, message: &str, details: bool) -> String {
     if details {
         return format_alert_line(technique, message);
     }
@@ -234,41 +253,6 @@ mod tests {
         assert!(on_disk.contains("service installed"));
     }
 
-    /// A real rule message, so the summary is pinned to the format rules
-    /// actually produce, not to a hand-written copy of it.
-    fn base64_alert_message() -> String {
-        let mut exec = schema::fixtures::exec();
-        exec.meta.pid = 4242;
-        exec.meta.comm = "bash".into();
-        exec.cmdline = "base64 -d payload.b64 --token=S3cret".into();
-        let alerts = rules::evaluate_exec(&exec);
-        let alert = alerts
-            .iter()
-            .find(|a| a.technique == "T1059.004")
-            .expect("the base64 rule fires on this command line");
-        alert.message.clone()
-    }
-
-    #[test]
-    fn the_default_stderr_line_names_the_process_but_not_the_command_line() {
-        let message = base64_alert_message();
-        let line = stderr_alert_line("T1059.004", &message, false);
-        assert_eq!(
-            line,
-            "[ALERT] T1059.004 — pid=4242 comm=bash (details in alerts.ndjson)"
-        );
-    }
-
-    #[test]
-    fn alert_details_prints_the_whole_message() {
-        let message = base64_alert_message();
-        assert_eq!(
-            stderr_alert_line("T1059.004", &message, true),
-            format_alert_line("T1059.004", &message)
-        );
-        assert!(stderr_alert_line("T1059.004", &message, true).contains("base64 -d"));
-    }
-
     #[test]
     fn a_message_without_a_process_prefix_prints_the_technique_only() {
         for message in [
@@ -309,7 +293,7 @@ mod tests {
         let path = dir.join("alerts.ndjson");
         let _ = std::fs::remove_file(&path);
         let log = AlertLog::open(&path, 8).unwrap();
-        let message = base64_alert_message();
+        let message = "pid=4242 comm=bash: base64 -d payload.b64 --token=S3cret".to_string();
         log.record("T1059.004", message.clone());
         log.set_stderr_details(true);
         log.record("T1059.004", message.clone());

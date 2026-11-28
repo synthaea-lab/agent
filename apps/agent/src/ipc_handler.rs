@@ -13,12 +13,9 @@ use ipc::{
     ReloadContentResponse, SensorHealth, SensorHealthResponse, SensorState, Server, StatusResponse,
     SuppressionEntry, SuppressionResponse,
 };
+use sinks::alert_log::{AlertLog, RecentAlert};
 
-use crate::{
-    alerts::{AlertLog, RecentAlert},
-    health::SensorHealthSource,
-    sink::DetectionSink,
-};
+use crate::{health::SensorHealthSource, sink::DetectionSink};
 
 /// Where a platform deposits its sensor-health source once it has built one.
 /// Empty until then: `cli health` reports no sensors rather than inventing
@@ -212,8 +209,9 @@ pub(crate) fn spawn(endpoint: String, handler: AgentHandler) {
 
 #[cfg(test)]
 mod tests {
+    use sinks::alert_log::RECENT_ALERTS_CAPACITY;
+
     use super::*;
-    use crate::alerts::RECENT_ALERTS_CAPACITY;
 
     struct FixedHealth(Vec<(&'static str, bool)>);
 

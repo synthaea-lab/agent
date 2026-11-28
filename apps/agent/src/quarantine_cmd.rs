@@ -14,7 +14,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use crate::alerts::AlertLog;
+use sinks::alert_log::AlertLog;
 
 /// Where `agent run` quarantines payloads for the alert log at `alerts`. The one
 /// definition both `run` and this command use, so they cannot disagree.
