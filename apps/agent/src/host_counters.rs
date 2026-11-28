@@ -102,10 +102,8 @@ impl AgentHostCounters {
         }
     }
 
-    /// Reports what `read` says the Linux eBPF sensor lost.
+    /// Reports what the reordering stage in front of the Linux primary sensor could not order.
     #[cfg(any(target_os = "linux", test))]
-    /// Reports what the reordering stage in front of the primary sensor could not order.
-    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     pub(crate) fn with_reorder_counters(
         mut self,
         counters: pipeline::reorder::ReorderCounters,
@@ -114,6 +112,8 @@ impl AgentHostCounters {
         self
     }
 
+    /// Reports what `read` says the Linux eBPF sensor lost.
+    #[cfg(any(target_os = "linux", test))]
     pub(crate) fn with_ebpf_sensor_totals(mut self, read: EbpfSensorTotalsReader) -> Self {
         self.ebpf_totals = Some(read);
         self
