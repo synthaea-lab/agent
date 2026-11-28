@@ -2,8 +2,8 @@
 
 The [`intel`](../../crates/intel/src/lib.rs) crate answers one question quickly and within a
 fixed memory budget: is this SHA-256, IP address or domain on a loaded indicator list?
-[`crates/intel/src/matcher.rs`](../../crates/intel/src/matcher.rs) wires it to the event stream and turns a match
-into a detection.
+Its [`matcher`](../../crates/intel/src/matcher.rs) module checks each event against the loaded
+lists and turns a match into a detection.
 
 Behavioural indicators (IOAs) are deliberately not part of this crate. They are what `rules`,
 Sigma and the correlator already express, and an IOA feed is converted into rule content on
