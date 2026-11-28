@@ -283,10 +283,10 @@ fn wire_run_pipeline(
 
     // Progress-backed liveness (#102): started here because it only needs a
     // clone of the shared counter, not the sink itself.
-    crate::heartbeat::start(
-        crate::heartbeat::heartbeat_path_for(alerts),
+    tamper::progress::start(
+        tamper::progress::heartbeat_path_for(alerts),
         sink.progress_handle(),
-        crate::heartbeat::WRITE_INTERVAL,
+        tamper::progress::WRITE_INTERVAL,
     )?;
 
     // Local control channel (#388): non-fatal by design, see `ipc_handler`.

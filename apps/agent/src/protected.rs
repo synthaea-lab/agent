@@ -62,7 +62,7 @@ pub(crate) fn protected_paths(
 ) -> Vec<PathBuf> {
     let mut paths = vec![
         absolute_or_given(alerts),
-        absolute_or_given(&crate::heartbeat::heartbeat_path_for(alerts)),
+        absolute_or_given(&tamper::progress::heartbeat_path_for(alerts)),
         absolute_or_given(config_path),
     ];
     paths.extend(events.map(absolute_or_given));

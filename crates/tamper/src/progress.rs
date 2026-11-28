@@ -1,17 +1,17 @@
 //! Progress-backed heartbeat (#102): a background thread periodically writes
 //! the sensor pipeline's live event counter to a small file next to the
 //! alerts output, which the watchdog polls to detect a hung agent. Unlike a
-//! bare "I'm still scheduled" timer, this only advances when
-//! [`crate::sink::DetectionSink`]'s `on_event` (its `EventSink` trait impl —
-//! rustdoc cannot link trait-impl methods) completes end-to-end for a real
+//! bare "I'm still scheduled" timer, this only advances when the agent's
+//! detection sink completes `on_event` end-to-end for a real
 //! event — a wedged sensor thread, a poisoned lock, or a stalled drain loop
 //! all stop it, exactly the failure mode a plain process-alive (`try_wait`)
 //! check misses (the endpoint looks protected while collecting nothing).
 //!
 //! File-based rather than a socket/named pipe or `crates/ipc`: cross-platform
 //! for free (no `cfg(windows)`/`cfg(unix)` split anywhere in this path), and
-//! `watchdog` has no dependency on `agent`'s or `schema`'s types to decode a
-//! richer protocol with — a plain advancing counter is all liveness needs.
+//! a plain advancing counter is all liveness needs. The agent writes it
+//! ([`start`]) and the watchdog reads it ([`read`]); both derive its path with
+//! [`heartbeat_path_for`].
 //! `crates/ipc`'s richer protocol (agent status, recent detections, policy
 //! version) remains the right tool for the UI/CLI control channel it's
 //! designed for; this is a narrower, purpose-built mechanism for one signal.
@@ -29,27 +29,25 @@ use std::{
 /// Independent of the watchdog's own `--heartbeat-interval-secs` (its poll
 /// cadence) — this just needs to be frequent enough that the watchdog's
 /// coarser polling always sees fresh data, not tuned per deployment.
-pub(crate) const WRITE_INTERVAL: Duration = Duration::from_secs(2);
+pub const WRITE_INTERVAL: Duration = Duration::from_secs(2);
 
 /// Derives the heartbeat file path from the alerts output path — the two
 /// always travel together, so no separate CLI flag or install-time wiring is
-/// needed. **Must stay in sync with `watchdog::paths::heartbeat_path_for`**,
-/// which computes the same transform independently (the two crates share no
-/// dependency to hang a single implementation off of, and `watchdog` cannot
-/// depend on this binary-only `agent` crate to reuse it directly).
-pub(crate) fn heartbeat_path_for(alerts: &Path) -> PathBuf {
+/// needed.
+#[must_use]
+pub fn heartbeat_path_for(alerts: &Path) -> PathBuf {
     alerts.with_extension("heartbeat")
 }
 
 /// Starts the writer thread (detached — it runs until the process exits, no
 /// shutdown handshake needed: the file simply stops advancing). `counter` is
-/// the same `Arc` [`crate::sink::DetectionSink`] increments per event
+/// the same `Arc` the agent's detection sink increments per event
 /// (`DetectionSink::progress_handle`).
-pub(crate) fn start(
-    path: PathBuf,
-    counter: Arc<AtomicU64>,
-    interval: Duration,
-) -> std::io::Result<()> {
+///
+/// # Errors
+///
+/// The OS refused the thread.
+pub fn start(path: PathBuf, counter: Arc<AtomicU64>, interval: Duration) -> std::io::Result<()> {
     workers::spawn::spawn_named("heartbeat", move || {
         loop {
             write_once(&path, counter.load(Ordering::Relaxed));
@@ -68,6 +66,13 @@ fn write_once(path: &Path, count: u64) {
     if std::fs::write(&tmp, count.to_string()).is_ok() {
         let _ = std::fs::rename(&tmp, path);
     }
+}
+
+/// Reads the count [`start`] last wrote; `None` on any I/O or parse failure (missing
+/// file, garbage content): "no reading yet", which a reader must not count as a stall.
+#[must_use]
+pub fn read(path: &Path) -> Option<u64> {
+    std::fs::read_to_string(path).ok()?.trim().parse().ok()
 }
 
 #[cfg(test)]

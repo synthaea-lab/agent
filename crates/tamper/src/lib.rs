@@ -23,6 +23,8 @@
 //!
 //! - [`heartbeat`] — sensor-silence detection: the platform-agnostic core of the F-2
 //!   canary, turning "a sensor stopped producing telemetry" into an alert.
+//! - [`progress`] — the progress-backed heartbeat file the agent writes and the
+//!   watchdog reads to tell a hung agent from a live one.
 //! - [`integrity`] — self-integrity: hashing the agent's own binaries and config
 //!   against the signed manifest, so a swapped/neutered build is a detection.
 //!
@@ -30,6 +32,7 @@
 
 pub mod heartbeat;
 pub mod integrity;
+pub mod progress;
 
 pub use heartbeat::{SensorHeartbeat, SilenceMonitor, SilenceVerdict};
 pub use integrity::{IntegrityViolation, Manifest, ViolationKind};

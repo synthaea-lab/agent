@@ -53,16 +53,6 @@ pub(crate) fn child_log_path() -> &'static str {
     r"C:\Windows\Temp\synthaea-agent.log"
 }
 
-/// Derives the heartbeat file path from the alerts output path (#102) — the
-/// two always travel together, so no separate CLI flag or install-time wiring
-/// is needed for it. **Must stay in sync with `agent::heartbeat::heartbeat_path_for`**,
-/// which computes the same transform independently (the two crates share no
-/// dependency to hang a single implementation off of — `watchdog` cannot
-/// depend on the binary-only `agent` crate).
-pub(crate) fn heartbeat_path_for(alerts: &std::path::Path) -> PathBuf {
-    alerts.with_extension("heartbeat")
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -119,16 +109,6 @@ mod tests {
         assert!(
             p.ends_with(&relative),
             "absolutized path {p:?} should still end with {relative:?}"
-        );
-    }
-
-    #[test]
-    fn heartbeat_path_is_derived_from_alerts() {
-        // Must match agent::heartbeat::heartbeat_path_for byte for byte —
-        // this is the independent side of that transform (see its doc).
-        assert_eq!(
-            heartbeat_path_for(std::path::Path::new("/var/lib/synthaea/alerts.ndjson")),
-            PathBuf::from("/var/lib/synthaea/alerts.heartbeat")
         );
     }
 }
