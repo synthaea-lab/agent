@@ -222,7 +222,7 @@ impl EnrichQueue {
     }
 }
 
-impl crate::health::DroppedCounter for EnrichQueue {
+impl health::DroppedCounter for EnrichQueue {
     fn dropped(&self) -> u64 {
         EnrichQueue::dropped(self)
     }

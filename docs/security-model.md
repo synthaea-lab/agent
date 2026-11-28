@@ -386,7 +386,7 @@ products rightly flag hiding behavior whatever the intent.
 | Edit the service definition | Linux: drift against an install-time snapshot is reported | [`service/linux.rs`](../apps/watchdog/src/service/linux.rs) |
 | `sc stop` / `sc delete` as a non-SYSTEM admin | A hardened service DACL removes stop, pause and delete from Administrators. Admins keep `WRITE_DAC`, so this is friction, not a boundary | [`service/windows.rs`](../apps/watchdog/src/service/windows.rs) |
 | Install into a world-writable directory | Refused on Unix, and installed binaries are set to root-owned `0755` | [`tamper.rs`](../apps/watchdog/src/tamper.rs), [`service/mod.rs`](../apps/watchdog/src/service/mod.rs) |
-| Firewall the agent off the server | The agent sends a periodic health beacon. The server treats an agent that stops sending it as suspicious. The spool keeps events until the link returns | [`health.rs`](../apps/agent/src/health.rs), [`TransportClient::send_heartbeat`](../crates/transport/src/client.rs) |
+| Firewall the agent off the server | The agent sends a periodic health beacon. The server treats an agent that stops sending it as suspicious. The spool keeps events until the link returns | [`health.rs`](../crates/health/src/lib.rs), [`TransportClient::send_heartbeat`](../crates/transport/src/client.rs) |
 | Unhook userland APIs, direct syscalls, patch ETW in a process | Nothing to unhook: telemetry comes from the kernel (eBPF, kernel ETW, ES), not inline hooks | — |
 
 ## Response actions: fail-closed guards

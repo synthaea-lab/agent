@@ -6,15 +6,15 @@
 
 use std::sync::{Arc, Mutex};
 
+use health::{
+    DroppedCounter, HealthCollector, HealthCollectorConfig, HostCountersSource, NoopSpoolStats,
+    RarityStatsSource, SensorHealthSource, SpoolStatsSource,
+};
 use tamper::heartbeat::SilenceMonitor;
 use workers::shutdown::{SHUTDOWN_BUDGET, ShutdownPlan};
 
 use super::{RunOptions, localzone};
 use crate::{
-    health::{
-        DroppedCounter, HealthCollector, HealthCollectorConfig, HostCountersSource, NoopSpoolStats,
-        RarityStatsSource, SensorHealthSource, SpoolStatsSource,
-    },
     ipc_handler::{AgentHandler, SensorHealthSlot},
     silence::{SilenceHealthSource, SourceStatus},
     sink::DetectionSink,

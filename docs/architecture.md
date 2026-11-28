@@ -66,7 +66,7 @@ flowchart BT
   detection["rules, sigma, correlator, verdict,<br/>ml, yara, enrich, intel, deception"] --> schema & policy
   detection --> store[store]
   detection --> detection
-  leaf["store, transport, sinks, ipc, response, updater,<br/>config, tamper, redact, inventory"] --> schema & policy
+  leaf["store, transport, sinks, ipc, response, updater,<br/>config, tamper, redact, inventory, health"] --> schema & policy
   bins["agent, watchdog, cli, release-tool"] --> sensors & detection & leaf
 ```
 
@@ -115,7 +115,7 @@ The detection sink ([`sink/mod.rs`](../apps/agent/src/sink/mod.rs)) has no platf
 | [`sinks::alert_log`](../crates/sinks/src/alert_log.rs) | `AlertLog`, the single alert funnel: `alerts.ndjson`, stderr, and the 256-entry in-memory buffer that `cli detections` reads. |
 | [`upload`](../apps/agent/src/upload.rs) | The event spool and detection spool, plus their upload threads. Resolves which control plane `run` talks to. |
 | [`silence`](../apps/agent/src/silence.rs) | Per-sensor heartbeats, the silence-monitor thread, and `PulsingSink`. |
-| [`health`](../apps/agent/src/health.rs) | Health-beacon collector, sent every 30 s by default. |
+| [`health`](../crates/health/src/lib.rs) (crate) | Health-beacon collector, sent every 30 s by default. |
 | [`tamper::progress`](../crates/tamper/src/progress.rs) | Progress-counter file for the watchdog (in the `tamper` crate, which the watchdog reads it through). |
 | [`ipc_handler`](../apps/agent/src/ipc_handler.rs) | IPC server thread answering `cli` requests and content reloads. |
 | [`spawn`](../crates/workers/src/spawn.rs) | `spawn_named`, which starts a named background thread and returns the OS error, with the thread's name, instead of panicking. |

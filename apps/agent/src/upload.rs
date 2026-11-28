@@ -319,7 +319,7 @@ pub(crate) struct SpoolHealth {
     pub(crate) detections: Arc<Mutex<EventSpool>>,
 }
 
-impl crate::health::SpoolStatsSource for SpoolHealth {
+impl health::SpoolStatsSource for SpoolHealth {
     fn spool_bytes(&self) -> u64 {
         self.events.lock_recovering().stats().bytes
             + self.detections.lock_recovering().stats().bytes
@@ -761,7 +761,7 @@ mod tests {
             events: Arc::clone(&poisoned),
             detections: spool("poisoned-detections"),
         };
-        assert_eq!(crate::health::SpoolStatsSource::spool_dropped(&health), 0);
+        assert_eq!(health::SpoolStatsSource::spool_dropped(&health), 0);
         assert!(!poisoned.is_poisoned());
         assert!(
             SpoolDrain(Arc::clone(&poisoned))

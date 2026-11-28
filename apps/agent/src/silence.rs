@@ -21,11 +21,12 @@ use std::{
     time::Duration,
 };
 
+use health::SensorHealthSource;
 use schema::{Event, sensor::EventSink};
 use tamper::heartbeat::{SensorHeartbeat, SilenceMonitor};
 use workers::sync::LockExt;
 
-use crate::{health::SensorHealthSource, sink::DetectionSink};
+use crate::sink::DetectionSink;
 
 /// How often the dedicated monitor thread checks every registered heartbeat against
 /// its deadline. Independent of the health beacon's own (much longer) cadence —

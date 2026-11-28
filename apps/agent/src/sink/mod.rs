@@ -1086,9 +1086,9 @@ pub(crate) struct RarityStats {
     unapplied: AtomicU64,
 }
 
-impl crate::health::RarityStatsSource for RarityStats {
-    fn rarity_counts(&self) -> crate::health::RarityCounts {
-        crate::health::RarityCounts {
+impl health::RarityStatsSource for RarityStats {
+    fn rarity_counts(&self) -> health::RarityCounts {
+        health::RarityCounts {
             applied: self.applied.load(Ordering::Relaxed),
             withheld: self.withheld.load(Ordering::Relaxed),
             unapplied: self.unapplied.load(Ordering::Relaxed),

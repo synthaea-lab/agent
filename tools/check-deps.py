@@ -38,7 +38,7 @@ DETECTION_CONSUMERS = {"correlator", "verdict"}
 # Leaf crates every detection crate may build on: bounded state, and the event window.
 DETECTION_SHARED = {"store", "event-window"}
 LEAF = {"response", "transport", "ipc", "sinks", "updater", "config", "store", "event-window",
-        "tamper", "inventory", "redact"}
+        "tamper", "inventory", "redact", "health"}
 BINARIES = {"agent", "watchdog", "cli", "release-tool"}
 # Crates shared by one platform's sensors, keyed to that platform's package prefix:
 # the wire crate (kernel<->userspace ABI) and the container-attribution runtime.
