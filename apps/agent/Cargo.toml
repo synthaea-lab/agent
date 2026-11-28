@@ -103,6 +103,7 @@ sensor-linux-lsm = { path = "../../crates/sensors/linux/lsm" }
 aya = { version = "0.16", default-features = false }
 
 [dev-dependencies]
+deception = { path = "../../crates/deception", features = ["test-fixtures"] }
 # Cross-repo contract fixtures (sibling checkouts of the other public repos), skipped when absent.
 siblings = { path = "../../crates/siblings" }
 tempfile = "3"

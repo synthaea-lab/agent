@@ -49,10 +49,12 @@
 //! does no I/O except through [`plant`], [`verify`], [`refresh`] and [`remove`], and holds no
 //! platform branches.
 
+mod allow;
 mod lifecycle;
 mod plan;
 mod tripwire;
 
+pub use allow::{CanaryAllow, ExecImage, ExecImages, ProcessLookup};
 pub use lifecycle::{
     DeceptionError, Drift, DriftKind, Inventory, InventoryEntry, PlantReport, RefreshReport,
     RemoveReport, Skipped, plant, refresh, remove, sha256_hex, verify,

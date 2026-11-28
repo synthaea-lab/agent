@@ -488,7 +488,7 @@ impl DetectionSink {
 
     /// Installs the executables allowed to touch a canary (#81). Called once, with the
     /// tripwires.
-    pub(crate) fn set_canary_allow(&self, allow: crate::deception::CanaryAllow) {
+    pub(crate) fn set_canary_allow(&self, allow: deception::CanaryAllow) {
         self.canary.set_allow(allow);
     }
 

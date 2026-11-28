@@ -829,7 +829,7 @@ fn a_second_process_touching_the_same_canary_is_not_absorbed() {
 fn an_allowed_executable_touching_a_canary_is_not_a_detection() {
     let dir = tmp("canary-allowed");
     let (sink, canary) = sink_watching_canary(&dir);
-    sink.set_canary_allow(crate::deception::CanaryAllow::for_test(
+    sink.set_canary_allow(deception::CanaryAllow::for_test(
         "/usr/bin/updatedb",
         |_| Some("/usr/bin/updatedb".into()),
     ));
@@ -854,8 +854,9 @@ fn an_exec_is_recorded_only_when_an_executable_may_be_allowed() {
     let dir = tmp("exec-record-empty");
     let (sink, _canary) = sink_watching_canary(&dir);
     // What a host with `[deception]` but no `allow_exe` has: an allow list, empty.
-    sink.set_canary_allow(crate::deception::CanaryAllow::new(
-        &config::DeceptionConfig::default(),
+    sink.set_canary_allow(deception::CanaryAllow::new(
+        &[],
+        deception::ProcessLookup::UNAVAILABLE,
     ));
     assert!(
         record(&sink).is_none(),
@@ -863,7 +864,7 @@ fn an_exec_is_recorded_only_when_an_executable_may_be_allowed() {
     );
     let dir = tmp("exec-record-listed");
     let (sink, _canary) = sink_watching_canary(&dir);
-    sink.set_canary_allow(crate::deception::CanaryAllow::for_test(
+    sink.set_canary_allow(deception::CanaryAllow::for_test(
         "/usr/bin/updatedb",
         |_| None,
     ));
@@ -875,7 +876,7 @@ fn a_process_seen_to_exec_an_allowed_image_may_touch_a_canary_without_proc() {
     let dir = tmp("canary-exec-image");
     let (sink, canary) = sink_watching_canary(&dir);
     // The /proc fallback resolves nothing: only the Exec the sink saw can allow.
-    sink.set_canary_allow(crate::deception::CanaryAllow::for_test(
+    sink.set_canary_allow(deception::CanaryAllow::for_test(
         "/usr/bin/updatedb",
         |_| None,
     ));
@@ -935,10 +936,7 @@ fn sink_allowing_tar(name: &str) -> (Arc<DetectionSink>, String, std::path::Path
     let dir = tmp(name);
     let (sink, canary) = sink_watching_canary(&dir);
     // The `/proc` fallback resolves nothing, as for a process that already exited.
-    sink.set_canary_allow(crate::deception::CanaryAllow::for_test(
-        "/usr/bin/tar",
-        |_| None,
-    ));
+    sink.set_canary_allow(deception::CanaryAllow::for_test("/usr/bin/tar", |_| None));
     (sink, canary, dir)
 }
 
@@ -1114,8 +1112,9 @@ fn a_held_touch_is_judged_on_the_last_exec_before_it_not_on_a_later_one() {
 fn an_empty_allow_list_raises_a_touch_at_once() {
     let dir = tmp("canary-empty-allow");
     let (sink, canary) = sink_watching_canary(&dir);
-    sink.set_canary_allow(crate::deception::CanaryAllow::new(
-        &config::DeceptionConfig::default(),
+    sink.set_canary_allow(deception::CanaryAllow::new(
+        &[],
+        deception::ProcessLookup::UNAVAILABLE,
     ));
     sink.on_event(canary_touch(&canary, std::process::id() + 1, 3, 10_000));
     assert_eq!(canary_alert_count(&dir), 1, "nothing to wait for");
@@ -1127,8 +1126,7 @@ fn a_process_in_another_mount_namespace_is_raised_at_once() {
     let dir = tmp("canary-foreign-ns");
     let (sink, canary) = sink_watching_canary(&dir);
     sink.set_canary_allow(
-        crate::deception::CanaryAllow::for_test("/usr/bin/tar", |_| None)
-            .in_foreign_mount_ns_for_test(),
+        deception::CanaryAllow::for_test("/usr/bin/tar", |_| None).in_foreign_mount_ns_for_test(),
     );
     sink.on_event(canary_touch(&canary, std::process::id() + 1, 3, 10_000));
     assert_eq!(canary_alert_count(&dir), 1, "not held");
@@ -1154,10 +1152,7 @@ fn the_reflex_does_not_kill_from_a_touch_judged_after_the_hold() {
     // `/proc` was empty when the touch was held: by now the pid may be someone else's.
     let dir = tmp("reflex-held-touch");
     let (sink, canary, killed) = reflex_sink(&dir, true);
-    sink.set_canary_allow(crate::deception::CanaryAllow::for_test(
-        "/usr/bin/tar",
-        |_| None,
-    ));
+    sink.set_canary_allow(deception::CanaryAllow::for_test("/usr/bin/tar", |_| None));
     burst(&sink, 900);
     let touch_at = BURST_END_NS + 1_000_000;
     sink.on_event(canary_open_at(&canary, 900, touch_at));
@@ -1211,10 +1206,9 @@ fn a_process_that_proc_shows_running_another_image_is_raised_at_once() {
     // `/proc` is an answer, not a gap: nothing to wait for.
     let dir = tmp("canary-proc-other-image");
     let (sink, canary) = sink_watching_canary(&dir);
-    sink.set_canary_allow(crate::deception::CanaryAllow::for_test(
-        "/usr/bin/tar",
-        |_| Some("/usr/bin/cat".into()),
-    ));
+    sink.set_canary_allow(deception::CanaryAllow::for_test("/usr/bin/tar", |_| {
+        Some("/usr/bin/cat".into())
+    }));
     sink.on_event(canary_touch(&canary, std::process::id() + 1, 3, 10_000));
     assert_eq!(canary_alert_count(&dir), 1);
 }
@@ -2285,7 +2279,7 @@ fn an_allowed_executable_that_also_bursts_is_not_killed_by_the_reflex() {
     let dir = tmp("reflex-allowed");
     let (sink, canary, killed) = reflex_sink(&dir, true);
     // A backup tool: it reads the canaries and rotates archives (a burst of renames).
-    sink.set_canary_allow(crate::deception::CanaryAllow::for_test(
+    sink.set_canary_allow(deception::CanaryAllow::for_test(
         "/usr/bin/backup-tool",
         |_| Some("/usr/bin/backup-tool".into()),
     ));
@@ -2304,7 +2298,7 @@ fn an_allowed_executable_that_also_bursts_is_not_killed_by_the_reflex() {
 fn a_process_allowed_from_its_exec_that_also_bursts_is_not_killed_by_the_reflex() {
     let dir = tmp("reflex-allowed-by-exec");
     let (sink, canary, killed) = reflex_sink(&dir, true);
-    sink.set_canary_allow(crate::deception::CanaryAllow::for_test(
+    sink.set_canary_allow(deception::CanaryAllow::for_test(
         "/usr/bin/backup-tool",
         |_| None,
     ));
@@ -2333,7 +2327,7 @@ fn a_process_allowed_from_its_exec_that_also_bursts_is_not_killed_by_the_reflex(
 fn a_process_that_is_not_on_the_allow_list_is_still_killed_when_a_list_exists() {
     let dir = tmp("reflex-not-allowed");
     let (sink, canary, killed) = reflex_sink(&dir, true);
-    sink.set_canary_allow(crate::deception::CanaryAllow::for_test(
+    sink.set_canary_allow(deception::CanaryAllow::for_test(
         "/usr/bin/backup-tool",
         |_| Some("/tmp/encryptor".into()),
     ));

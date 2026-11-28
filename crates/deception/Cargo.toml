@@ -9,9 +9,16 @@ publish.workspace = true
 [lints]
 workspace = true
 
+[features]
+# Constructors that skip the allow-list's checks, for the tests of the crates that use it.
+test-fixtures = []
+
 [dependencies]
+policy = { path = "../policy" }
 schema = { path = "../schema" }
 serde = { workspace = true }
+store = { path = "../store" }
+tracing = { workspace = true }
 serde_json = { workspace = true }
 sha2 = "0.11"
 thiserror = { workspace = true }

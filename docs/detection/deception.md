@@ -137,7 +137,7 @@ each to the ransomware join.
 
 ### Allow list
 
-[`CanaryAllow`](../../apps/agent/src/deception.rs) allows a process only if its executable is listed
+[`CanaryAllow`](../../crates/deception/src/allow.rs) allows a process only if its executable is listed
 and the process is in the agent's mount namespace and not in a container. Entries outside a
 trusted system location ([`policy::name_exclusion_applies`](../../crates/policy/src/lib.rs))
 are dropped with a warning. Entries are canonicalised at start, so a listed symlink is compared
@@ -145,7 +145,7 @@ as its target. The path as written is also matched, but only if it is itself tru
 user-writable link to a listed binary does not pass.
 
 The image comes first from the agent's own record of the process's last `Exec` at or before the
-touch ([`ExecImages`](../../apps/agent/src/deception.rs), 8,192 processes, keyed by incarnation).
+touch ([`ExecImages`](../../crates/deception/src/allow.rs), 8,192 processes, keyed by incarnation).
 That avoids a `/proc` read, which needs ptrace access for another user's process. If `/proc`
 shows the process now running a different image, the record is stale and the touch is not
 allowed. The exec table is filled only when `allow_exe` is non-empty.
@@ -204,7 +204,9 @@ hold, never kills, because its pid may already belong to another process.
   mtime placement.
 - [`tripwire.rs`](../../crates/deception/src/tripwire.rs) tests: exact, case-folded and
   relative-name matches, ambiguous names, rename in both directions.
-- [`apps/agent/src/deception.rs`](../../apps/agent/src/deception.rs) tests: seed handling, the allow-list
-  rules, the registration retry schedule.
+- [`allow.rs`](../../crates/deception/src/allow.rs) tests: the allow-list rules and the exec
+  table, against a faked process lookup.
+- [`apps/agent/src/deception.rs`](../../apps/agent/src/deception.rs) tests: seed handling, the `/proc`
+  lookups, the registration retry schedule.
 - Sink tests in [`sink/tests.rs`](../../apps/agent/src/sink/tests.rs) (`another_process_opening_a_canary_raises_a_deception_detection`
   and the `held` and cooldown families) drive real events through `on_event`.
