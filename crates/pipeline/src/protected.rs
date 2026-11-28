@@ -28,15 +28,14 @@
 //! state, not release artifacts). So a real self-update never opens a path this module
 //! watches for write, and there is nothing today for an allowlist to legitimately admit.
 
-#![cfg_attr(not(target_os = "linux"), allow(dead_code))]
-
 use std::{
     path::{Path, PathBuf},
     sync::Arc,
 };
 
-use pipeline::sink::DetectionSink;
 use schema::{Event, sensor::EventSink};
+
+use crate::sink::DetectionSink;
 
 /// Builds the set of paths this process treats as its own protected resources.
 /// Best-effort on the executable path: `current_exe` can fail (rare — e.g. the binary
@@ -54,11 +53,7 @@ use schema::{Event, sensor::EventSink};
 /// anything and leave that resource silently unwatched — a real finding from
 /// PR #770's review, caught on `config_path` specifically but just as true of
 /// `alerts`/`events`, which is why the fix sits here rather than on one caller.
-pub(crate) fn protected_paths(
-    alerts: &Path,
-    events: Option<&Path>,
-    config_path: &Path,
-) -> Vec<PathBuf> {
+pub fn protected_paths(alerts: &Path, events: Option<&Path>, config_path: &Path) -> Vec<PathBuf> {
     let mut paths = vec![
         absolute_or_given(alerts),
         absolute_or_given(&tamper::progress::heartbeat_path_for(alerts)),
@@ -89,7 +84,7 @@ fn absolute_or_given(path: &Path) -> PathBuf {
 /// alert through `sink`, the same `alerts.ndjson` path a rule/correlator/Sigma
 /// finding uses — a write-intent open, an outright delete, or a rename on either
 /// side (the resource moved away, or some other file swapped in at its path).
-pub(crate) struct ProtectedResourceGuard<S> {
+pub struct ProtectedResourceGuard<S> {
     inner: S,
     own_pid: u32,
     protected: Arc<[PathBuf]>,
@@ -97,7 +92,9 @@ pub(crate) struct ProtectedResourceGuard<S> {
 }
 
 impl<S> ProtectedResourceGuard<S> {
-    pub(crate) fn new(inner: S, protected: Vec<PathBuf>, sink: Arc<DetectionSink>) -> Self {
+    /// Wraps `inner`: an event that touches one of the `protected` paths from another
+    /// process raises a tamper alert through `sink`.
+    pub fn new(inner: S, protected: Vec<PathBuf>, sink: Arc<DetectionSink>) -> Self {
         Self {
             inner,
             own_pid: std::process::id(),

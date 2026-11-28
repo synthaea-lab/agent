@@ -10,17 +10,16 @@ use std::{
     time::Duration,
 };
 
-use pipeline::sink::DetectionSink;
+use pipeline::{
+    protected::ProtectedResourceGuard,
+    silence::{PulsingSink, SourceStatus},
+    sink::DetectionSink,
+};
 use schema::sensor::Sensor as _;
 use tamper::heartbeat::{SensorHeartbeat, SilenceMonitor};
 use workers::{
     shutdown::{ShutdownPlan, sleep_unless_stopped},
     sync::LockExt,
-};
-
-use crate::{
-    protected::ProtectedResourceGuard,
-    silence::{PulsingSink, SourceStatus},
 };
 
 /// Silence deadlines (#71) fed to `SilenceMonitor::register`. The eBPF sensor and
@@ -354,7 +353,7 @@ pub(crate) fn cmd_run(opts: super::RunOptions) -> anyhow::Result<()> {
             isolate_enabled: false,
         },
         terminate_process,
-        crate::quarantine_cmd::quarantine_dir_for(alerts),
+        pipeline::quarantine_cmd::quarantine_dir_for(alerts),
     );
     if enable_kill || enable_quarantine {
         eprintln!(
@@ -440,19 +439,19 @@ pub(crate) fn cmd_run(opts: super::RunOptions) -> anyhow::Result<()> {
             mon.register(avc_heartbeat.clone(), AVC_SILENCE_DEADLINE_NS, now_ns);
         }
     }
-    crate::silence::spawn_monitor(silence_monitor.clone(), sink.clone())?;
+    pipeline::silence::spawn_monitor(silence_monitor.clone(), sink.clone())?;
 
     // Self-integrity verification (#71/#30): periodic re-check of the installed
     // binaries against the signed release manifest `updater` persisted at promote
     // time — the real root of trust the heartbeat above cannot provide (silence
     // proves a sensor stopped producing, not that the binary producing it is the
     // one that was actually shipped).
-    crate::integrity::spawn_monitor(storage.state_dir.clone(), sink.clone())?;
+    pipeline::integrity::spawn_monitor(storage.state_dir.clone(), sink.clone())?;
 
     // Diffed package inventory (#87): periodic dpkg-status diff, turned into a
     // real case-attachable Detection through the normal sink path (not a
     // local-only alert like the two monitors above).
-    crate::inventory::spawn_monitor(storage.state_dir.clone(), sink.clone())?;
+    pipeline::inventory::spawn_monitor(storage.state_dir.clone(), sink.clone())?;
 
     // Health beacon (#134): periodic self-diagnostics to the control plane, over
     // the silence monitor above. The eBPF sensor adds its loss totals; the audit fallback
@@ -513,7 +512,7 @@ pub(crate) fn cmd_run(opts: super::RunOptions) -> anyhow::Result<()> {
     // Protected-resource monitoring (#71): only the eBPF sensor produces `FileOpen`
     // events, so only its chain needs the guard — the netlink/journal sinks above
     // never see one.
-    let protected = crate::protected::protected_paths(alerts, events, config_path);
+    let protected = pipeline::protected::protected_paths(alerts, events, config_path);
     let guarded = ProtectedResourceGuard::new(sink.clone(), protected, sink.clone());
     let result = sensor.run(Box::new(PulsingSink::new(guarded, primary_heartbeat)));
 
@@ -1230,11 +1229,12 @@ mod tests {
         time::Duration,
     };
 
+    use pipeline::silence::SourceStatus;
+
     use super::{
         AVC_REOPEN_FIRST, AVC_REOPEN_MAX, AvcIo, AvcWorker, next_reopen_delay, selinux_in,
         starts_avc_reader,
     };
-    use crate::silence::SourceStatus;
 
     #[test]
     fn the_reopen_delay_doubles_and_stops_at_the_cap() {
@@ -1457,7 +1457,7 @@ mod tests {
         let monitor = std::sync::Arc::new(std::sync::Mutex::new(
             tamper::heartbeat::SilenceMonitor::new(),
         ));
-        let health = crate::silence::SilenceHealthSource::new(monitor, vec![status.clone()]);
+        let health = pipeline::silence::SilenceHealthSource::new(monitor, vec![status.clone()]);
         let stop = AtomicBool::new(false);
         let during = RefCell::new(None);
         let script = Script::new(&stop, &status, vec![Err("EIO".to_string())], vec![Ok(1)]);

@@ -46,8 +46,8 @@ Before an event reaches `DetectionSink`, it passes through these wrappers:
 
 | Wrapper | Where | Purpose |
 | --- | --- | --- |
-| [`PulsingSink`](../apps/agent/src/silence.rs) | Linux primary and uprobes. Windows ETW. | Pulses the sensor's `SensorHeartbeat` on every event, so the silence monitor can tell a silent sensor apart. Pollers pulse on each successful poll instead, whether or not it returned events. |
-| [`ProtectedResourceGuard`](../apps/agent/src/protected.rs) | Linux primary only | Raises an alert when a foreign process writes to the agent's own files: config, alerts file, events file. |
+| [`PulsingSink`](../crates/pipeline/src/silence.rs) | Linux primary and uprobes. Windows ETW. | Pulses the sensor's `SensorHeartbeat` on every event, so the silence monitor can tell a silent sensor apart. Pollers pulse on each successful poll instead, whether or not it returned events. |
+| [`ProtectedResourceGuard`](../crates/pipeline/src/protected.rs) | Linux primary only | Raises an alert when a foreign process writes to the agent's own files: config, alerts file, events file. |
 | [`RedactingSink`](../crates/redact/src/event.rs) | Windows and macOS, all commands. Linux capture commands. | Redacts URL secrets and similar fields at the boundary. In `run` mode (`redact_commands = false`), events that carry command text (`Exec`, `ReadlineInput`, `ScriptBlock`, `AmsiContent`, `WmiActivity`) pass through unredacted, because the rules must read the raw command line. The capture commands redact everything. |
 
 The Linux `run` path does not put a `RedactingSink` in front of the detection sink. Redaction there happens only on the output copies (step 6).
@@ -120,7 +120,7 @@ With a control plane configured, [`upload::start`](../crates/delivery/src/upload
 
 ### Hot content reload
 
-`agent apply-content-manifest` downloads, verifies and writes content under `<state_dir>/content`. It then notifies the running agent over IPC. The [`AgentHandler::reload_content`](../apps/agent/src/ipc_handler.rs) handler calls [`DetectionSink::reload_content`](../crates/pipeline/src/sink/mod.rs), which swaps in new Sigma and YARA engines and a new common-set snapshot under their mutexes. A missing content directory unloads that engine. A broken one keeps the previous engine running and is reported as failed. If the notification fails, the command still succeeds, and the content is loaded at the next start.
+`agent apply-content-manifest` downloads, verifies and writes content under `<state_dir>/content`. It then notifies the running agent over IPC. The [`AgentHandler::reload_content`](../crates/pipeline/src/ipc_handler.rs) handler calls [`DetectionSink::reload_content`](../crates/pipeline/src/sink/mod.rs), which swaps in new Sigma and YARA engines and a new common-set snapshot under their mutexes. A missing content directory unloads that engine. A broken one keeps the previous engine running and is reported as failed. If the notification fails, the command still succeeds, and the content is loaded at the next start.
 
 ## Threads in `agent run`
 
@@ -132,9 +132,9 @@ With a control plane configured, [`upload::start`](../crates/delivery/src/upload
 | `yara-scan`, `yara-memscan` | all (memscan Linux only) | `start_yara` / `start_memscan` when `rules/yara` exists | With the process |
 | `transport-upload`, `detection-upload` | all, with a control plane | [`upload::start`](../crates/delivery/src/upload.rs) | `ShutdownPlan` through `finish_run`, with a 3 s final drain (all platforms, #147) |
 | `heartbeat` | all | `wire_run_pipeline` | With the process |
-| `ipc-server` | all | [`ipc_handler::spawn`](../apps/agent/src/ipc_handler.rs) (current-thread tokio) | With the process. A failure there is logged and never stops detection. |
+| `ipc-server` | all | [`ipc_handler::spawn`](../crates/pipeline/src/ipc_handler.rs) (current-thread tokio) | With the process. A failure there is logged and never stops detection. |
 | `snapshot-fetch`, `ioc-control-plane`, `decoy-register`, `deception-refresh` | all, when enabled | `wire_run_pipeline` / `plant_canaries` | With the process |
-| `sensor-silence` | Linux, Windows | [`silence::spawn_monitor`](../apps/agent/src/silence.rs). Polls every 10 s and turns each confirmed stall into a T1562 alert. | With the process |
+| `sensor-silence` | Linux, Windows | [`silence::spawn_monitor`](../crates/pipeline/src/silence.rs). Polls every 10 s and turns each confirmed stall into a T1562 alert. | With the process |
 | `health-beacon` | Linux, Windows | `health_collector(...).spawn()` | `ShutdownPlan` through `finish_run` (Linux, Windows) |
 | `kill-loudness` | Linux | [`kill_loudness::spawn_watcher`](../apps/agent/src/kill_loudness.rs) | Ends the process itself |
 | `netlink-poll` | Linux | [`spawn_netlink_poller`](../apps/agent/src/commands/linux.rs), every 10 s | `ShutdownPlan` |

@@ -8,7 +8,7 @@ other tools read (the alert log, the optional raw event capture). This page expl
 
 The [`ipc`](../crates/ipc/src/lib.rs) crate implements a small request/response protocol over a Unix
 domain socket (Linux, macOS) or a named pipe (Windows). The agent hosts the server
-([`ipc_handler.rs`](../apps/agent/src/ipc_handler.rs)); [`cli`](../apps/cli/src/main.rs) and
+([`ipc_handler.rs`](../crates/pipeline/src/ipc_handler.rs)); [`cli`](../apps/cli/src/main.rs) and
 `agent apply-content-manifest` are clients.
 
 | Module | Responsibility |

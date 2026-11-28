@@ -183,7 +183,7 @@ skipped: writing a payload there is itself a file event the sensor sees, and
 re-quarantining it would overwrite its own origin record with the wrong path.
 
 The quarantine directory is `quarantine/` next to the alert log
-([`quarantine_dir_for`](../apps/agent/src/quarantine_cmd.rs)), the one definition both
+([`quarantine_dir_for`](../crates/pipeline/src/quarantine_cmd.rs)), the one definition both
 `agent run` and `agent quarantine` use. Memory-scan matches never quarantine: there is
 no file to move.
 
@@ -252,7 +252,7 @@ payload stays in place.
 ### Restore and list
 
 `agent quarantine list|restore --alerts <same path as run>`
-([`quarantine_cmd.rs`](../apps/agent/src/quarantine_cmd.rs)):
+([`quarantine_cmd.rs`](../crates/pipeline/src/quarantine_cmd.rs)):
 
 - [`list_quarantined`](../crates/response/src/quarantine/restore.rs) prints digest and
   original path, skipping (with a warning) a malformed sidecar so one bad entry cannot
@@ -343,7 +343,7 @@ The Windows enforcement primitive (WFP) is tracked in
 | --- | --- | --- |
 | `RESPONSE-KILL` | [`kill_for`](../crates/pipeline/src/sink/response.rs) | `killed pid N on <reason>`, `pid N would have been killed on <reason> (observe-only)`, `failed to kill pid N on <reason>: <error>`, `refused to kill pid N on <reason>: <why>` |
 | `RESPONSE-QUARANTINE` | [`quarantine_matched_payload`](../crates/pipeline/src/sink/yara.rs) | `quarantined <path> (<sha256>) to <dir> ...`, `... would have been quarantined ... (observe-only)`, `failed to quarantine <path> ...: <error>` |
-| `RESPONSE-UNQUARANTINE` | [`cmd_quarantine_restore`](../apps/agent/src/quarantine_cmd.rs) | restored, or failed with the error |
+| `RESPONSE-UNQUARANTINE` | [`cmd_quarantine_restore`](../crates/pipeline/src/quarantine_cmd.rs) | restored, or failed with the error |
 | `RESPONSE-ESCALATE` | [`escalate_if_warranted`](../crates/pipeline/src/sink/mod.rs) | `escalated <ppid>:<comm> at <severity> severity across N source(s): <techniques>` |
 
 `<reason>` is `a high-confidence correlated verdict` or
@@ -382,4 +382,4 @@ event capture.
   `a_burst_and_a_canary_touch_from_two_processes_kill_neither`),
   `a_beacon_with_a_dropped_payload_is_killed_and_quarantined_and_both_are_audited` and
   the escalation tests, all in [`sink/tests.rs`](../crates/pipeline/src/sink/tests.rs).
-- Restore command: tests in [`quarantine_cmd.rs`](../apps/agent/src/quarantine_cmd.rs).
+- Restore command: tests in [`quarantine_cmd.rs`](../crates/pipeline/src/quarantine_cmd.rs).

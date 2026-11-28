@@ -93,6 +93,8 @@ New crate? Add it to the rules in `tools/check-deps.py` in the same change.
   - `pipeline` (`host.rs`): the one place the pipeline states what it knows about the OS it was
     built for (model family, what the sensor captures, the agent's uid). The code using those
     facts has no branch.
+    `lib.rs` compiles the `integrity` module on Linux only, like the `updater::layout` it
+    verifies.
   - `config`: default config path per OS (`discovery.rs`), the shape of `ipc.endpoint`
     (named pipe or socket path, `load.rs`), the Linux default template (`template.rs`).
   - `ipc` (`stream.rs`): the one place that picks a Unix socket or a Windows named pipe, with

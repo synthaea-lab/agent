@@ -11,7 +11,7 @@
 
 use std::{path::PathBuf, sync::Arc, time::Duration};
 
-use pipeline::sink::DetectionSink;
+use crate::sink::DetectionSink;
 
 /// Whether a failed manifest verification says anything about the file: a build with no
 /// release key (ADR-0027, `crates/updater/keys` unprovisioned) cannot verify any manifest, so
@@ -25,7 +25,7 @@ fn signature_failure_is_tamper(error: &updater::UpdaterError) -> bool {
 /// `silence::POLL_INTERVAL` (10s) — this hashes every protected file (real I/O),
 /// and a same-privilege on-disk swap is not a race that needs sub-minute detection
 /// to still be useful, unlike a sensor going silent mid-attack.
-pub(crate) const CHECK_INTERVAL: Duration = Duration::from_secs(300);
+pub const CHECK_INTERVAL: Duration = Duration::from_secs(300);
 
 /// ATT&CK technique tag for every alert this module emits — "Modify System Image"
 /// (T1601), the closest existing tag to "the installed binary/config no longer
@@ -44,7 +44,11 @@ const TAMPER_TECHNIQUE: &str = "T1601";
 /// `/var/lib/synthaea` in production), the same root `updater::layout::Layout`
 /// itself is built from — the updater and this check must agree on it, or the
 /// manifest this reads back is never the one a real update actually staged.
-pub(crate) fn spawn_monitor(state_dir: PathBuf, sink: Arc<DetectionSink>) -> std::io::Result<()> {
+///
+/// # Errors
+///
+/// When the thread cannot be spawned.
+pub fn spawn_monitor(state_dir: PathBuf, sink: Arc<DetectionSink>) -> std::io::Result<()> {
     workers::spawn::spawn_named("self-integrity", move || {
         let layout = updater::layout::Layout::new(&state_dir);
         loop {

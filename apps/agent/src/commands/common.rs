@@ -10,15 +10,15 @@ use health::{
     DroppedCounter, HealthCollector, HealthCollectorConfig, HostCountersSource, NoopSpoolStats,
     RarityStatsSource, SensorHealthSource, SpoolStatsSource,
 };
-use pipeline::sink::DetectionSink;
+use pipeline::{
+    ipc_handler::{AgentHandler, SensorHealthSlot},
+    silence::{SilenceHealthSource, SourceStatus},
+    sink::DetectionSink,
+};
 use tamper::heartbeat::SilenceMonitor;
 use workers::shutdown::{SHUTDOWN_BUDGET, ShutdownPlan};
 
 use super::{RunOptions, localzone};
-use crate::{
-    ipc_handler::{AgentHandler, SensorHealthSlot},
-    silence::{SilenceHealthSource, SourceStatus},
-};
 
 /// What `run` composes before handing control to the platform's sensors.
 pub(crate) struct RunPipeline {
@@ -295,7 +295,7 @@ fn wire_run_pipeline(
 
     // Local control channel (#388): non-fatal by design, see `ipc_handler`.
     let sensor_health: SensorHealthSlot = Arc::new(std::sync::OnceLock::new());
-    crate::ipc_handler::spawn(
+    pipeline::ipc_handler::spawn(
         ipc_endpoint.to_string(),
         AgentHandler::new(
             sink.alert_log(),
