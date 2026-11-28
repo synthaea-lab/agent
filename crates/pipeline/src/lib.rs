@@ -10,6 +10,7 @@
 //! Beside the sensors, a few sources feed the sink events of their own: the self-integrity
 //! check ([`integrity`], Linux), the package inventory ([`inventory`]), the guard on the
 //! agent's own files ([`protected`]) and the sensor-silence monitor ([`silence`]).
+//! [`reorder`] puts a sensor's events back in timestamp order before the sink judges them.
 //! [`ipc_handler`] answers the local control channel from the sink's state, and
 //! [`quarantine_cmd`] lists and restores what the response quarantined.
 //!
@@ -28,6 +29,7 @@ pub mod ipc_handler;
 mod own_traffic;
 pub mod protected;
 pub mod quarantine_cmd;
+pub mod reorder;
 pub mod replay;
 pub mod silence;
 pub mod sink;
