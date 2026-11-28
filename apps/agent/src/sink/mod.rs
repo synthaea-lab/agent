@@ -82,9 +82,12 @@ pub(crate) struct DetectionSink {
     yara: Mutex<Option<(::yara::ScanQueue, usize)>>,
     /// Budgeted YARA scanning of one process's memory (#85, ADR-0023), requested by a
     /// detection about that process (today the memfd-exec rule, T1620), never swept.
-    /// `None` when `<content_root>/rules/yara` is absent, and on every platform but
-    /// Linux. `Mutex`-wrapped for the same reload reason as `yara`.
+    /// `None` when `<content_root>/rules/yara` is absent, and until the caller provides a
+    /// memory source (only the Linux wiring has one). `Mutex`-wrapped for the same reload
+    /// reason as `yara`.
     memscan: Mutex<Option<::yara::MemoryScanQueue>>,
+    /// How process memory is read, once [`Self::enable_memory_scanning`] provided it.
+    memory_source: std::sync::OnceLock<Arc<dyn ::yara::MemorySource>>,
     /// Enrichment (hash + signature) and the high-volume raw-event logging, off the
     /// drain thread (issue #126). The capture thread runs detection in memory and
     /// hands the event here with a non-blocking send.
@@ -320,9 +323,8 @@ impl DetectionSink {
                 )
                 .into_option(),
             ),
-            memscan: Mutex::new(
-                start_memscan(&content_root, alert_log.clone(), verdict.clone()).into_option(),
-            ),
+            memscan: Mutex::new(None),
+            memory_source: std::sync::OnceLock::new(),
             alert_log,
             enrich_queue,
             detection_spool,
@@ -363,6 +365,7 @@ impl DetectionSink {
         );
         let memscan_loaded = start_memscan(
             &self.content_root,
+            self.memory_source.get().cloned(),
             self.alert_log.clone(),
             self.verdict.clone(),
         );

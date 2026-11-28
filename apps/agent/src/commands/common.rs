@@ -240,6 +240,10 @@ fn wire_run_pipeline(
         &crate::sink::model_root(&storage.state_dir),
     )?);
     sink.start_correlator_ticker()?;
+    // Reading another process's memory is `sensor-linux-procmem`'s mechanism; no other
+    // OS has one yet (ADR-0023).
+    #[cfg(target_os = "linux")]
+    sink.enable_memory_scanning(Arc::new(crate::memscan::ProcMemSource));
     // The agent's own control-plane traffic is not an IOC finding (https://github.com/synthaea-lab/agent/issues/47), and only that
     // destination is: the agent's binary pointed anywhere else still raises.
     if let Some(control_plane) = &server
