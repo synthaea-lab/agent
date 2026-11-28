@@ -1451,7 +1451,7 @@ mod tests {
 
     #[test]
     fn the_source_is_down_while_the_socket_is_gone_and_up_when_it_is_back() {
-        use crate::health::SensorHealthSource as _;
+        use health::SensorHealthSource as _;
 
         let status = SourceStatus::new("linux-avc");
         let monitor = std::sync::Arc::new(std::sync::Mutex::new(

@@ -3546,10 +3546,9 @@ fn rarity_counts_after(
     case: &str,
     sha256: Option<String>,
     correlated: bool,
-) -> crate::health::RarityCounts {
+) -> health::RarityCounts {
+    use health::RarityStatsSource as _;
     use ml::features::common_set::CommonSetSnapshot;
-
-    use crate::health::RarityStatsSource as _;
 
     let snapshot = CommonSetSnapshot::parse(&golden_common_set(golden, case).0).unwrap();
     // "Now" is the instant the snapshot was built: its age is not what these cases are about.
@@ -3621,7 +3620,7 @@ fn rarity_counts_nothing_for_an_image_the_fleet_knows() {
 
 #[test]
 fn rarity_counts_withheld_with_no_snapshot_at_all() {
-    use crate::health::RarityStatsSource as _;
+    use health::RarityStatsSource as _;
     let stats = super::RarityStats::default();
     super::note_image_rarity(
         &Mutex::new(correlator::CorrelationEngine::new()),
@@ -3637,7 +3636,7 @@ fn rarity_counts_withheld_with_no_snapshot_at_all() {
 /// it the snapshot counts as absent and the judgement is withheld (ADR-0033 decision 3).
 #[test]
 fn a_snapshot_past_its_maximum_age_withholds_the_evidence() {
-    use crate::health::RarityStatsSource as _;
+    use health::RarityStatsSource as _;
     let golden = siblings::require!("ml", COMMON_SET_GOLDEN);
     let case = "fifty_hashes_one_percent";
     let absent = golden_non_member(&golden, case);

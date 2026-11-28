@@ -30,6 +30,7 @@ dependencies = [
  "deception",
  "enrich",
  "getrandom 0.4.3",
+ "health",
  "intel",
  "inventory 0.0.1",
  "ipc",
@@ -1426,6 +1427,15 @@ dependencies = [
  "foldhash",
  "serde",
  "serde_core",
+]
+
+[[package]]
+name = "health"
+version = "0.0.1"
+dependencies = [
+ "schema",
+ "tracing",
+ "workers",
 ]
 
 [[package]]

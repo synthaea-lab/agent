@@ -1,0 +1,15 @@
+[package]
+name = "health"
+version.workspace = true
+description = "The agent health beacon: the collector thread and the counter sources it reads"
+license.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+schema = { path = "../schema" }
+tracing = { workspace = true }
+workers = { path = "../workers" }

@@ -8,6 +8,7 @@
 
 use std::sync::{Arc, OnceLock};
 
+use health::SensorHealthSource;
 use ipc::{
     DetectionSummary, Handler, HandlerError, PolicyVersionResponse, RecentDetectionsResponse,
     ReloadContentResponse, SensorHealth, SensorHealthResponse, SensorState, Server, StatusResponse,
@@ -15,7 +16,7 @@ use ipc::{
 };
 use sinks::alert_log::{AlertLog, RecentAlert};
 
-use crate::{health::SensorHealthSource, sink::DetectionSink};
+use crate::sink::DetectionSink;
 
 /// Where a platform deposits its sensor-health source once it has built one.
 /// Empty until then: `cli health` reports no sensors rather than inventing

@@ -8,10 +8,6 @@
 //! "Silence is a detection": an agent that stops beaconing is as suspicious as one
 //! that stops sending events.
 
-// Wired on Linux and Windows (`commands::common::health_collector`, #317); macOS
-// has no silence monitor to feed it yet.
-#![cfg_attr(not(any(target_os = "linux", windows)), allow(dead_code))]
-
 use std::{
     sync::{
         Arc,
@@ -30,6 +26,7 @@ pub const DEFAULT_INTERVAL: Duration = Duration::from_secs(30);
 /// Reads the current dropped count from an enrichment queue (or similar bounded queue).
 /// The health collector calls this periodically to report backpressure loss.
 pub trait DroppedCounter: Send + Sync {
+    /// Items dropped since the agent started.
     fn dropped(&self) -> u64;
 }
 
@@ -47,6 +44,7 @@ pub struct RarityCounts {
 
 /// Reads the rarity evidence counters. The sink implements it over its own atomics.
 pub trait RarityStatsSource: Send + Sync {
+    /// The counters as they stand now.
     fn rarity_counts(&self) -> RarityCounts;
 }
 
@@ -96,19 +94,23 @@ pub struct HostCounters {
 
 /// Reads the [`HostCounters`].
 pub trait HostCountersSource: Send + Sync {
+    /// The counters as they stand now.
     fn host_counters(&self) -> HostCounters;
 }
 
 /// Reads sensor health snapshots. Implementations may wrap a `SilenceMonitor` or
 /// provide mock data for testing.
 pub trait SensorHealthSource: Send + Sync {
+    /// One entry per sensor the agent runs.
     fn sensor_health(&self) -> Vec<SensorHealth>;
 }
 
 /// Reads spool statistics. Implementations may wrap an `EventSpool` or provide
 /// mock data for testing.
 pub trait SpoolStatsSource: Send + Sync {
+    /// Bytes the spool holds on disk now.
     fn spool_bytes(&self) -> u64;
+    /// Events the spool dropped to stay within its bound.
     fn spool_dropped(&self) -> u64;
 }
 
@@ -176,7 +178,6 @@ impl StopFlag {
         }
     }
 
-    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     fn stop(&self) {
         // Set the flag under the mutex: a sleeper checks it under the same
         // mutex before waiting, so the notification can't fall between its
@@ -298,12 +299,10 @@ impl HealthCollector {
 }
 
 /// Handle to stop the health collector.
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 pub struct StopHandle(Arc<StopFlag>);
 
 impl StopHandle {
     /// Signals the collector to stop and wakes it from sleep immediately.
-    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     pub fn stop(&self) {
         self.0.stop();
     }

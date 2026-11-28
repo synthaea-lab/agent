@@ -390,7 +390,7 @@ defaults (not exposed in `agent.toml`):
 | `request_timeout` | 30 s |
 | `max_drain_attempts` | 5 (mirrors `store::MAX_DRAIN_ATTEMPTS`; duplicated because the two leaf crates cannot import each other) |
 | `max_network_drain_attempts` | 20 |
-| `heartbeat_interval` | 30 s, **not wired**: the beacon cadence is `HealthCollectorConfig::interval` in [`health`](../apps/agent/src/health.rs); kept so existing configurations are not refused |
+| `heartbeat_interval` | 30 s, **not wired**: the beacon cadence is `HealthCollectorConfig::interval` in [`health`](../crates/health/src/lib.rs); kept so existing configurations are not refused |
 
 ## Observability
 
