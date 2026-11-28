@@ -35,7 +35,7 @@ The crate split mirrors the dependency rules: [`updater`](../crates/updater/src/
 crate with verification, layout and state logic only, and cannot depend on `transport`. The
 fetch-verify-apply compositions live in the binary: [`release.rs`](../crates/delivery/src/release.rs),
 [`content.rs`](../crates/delivery/src/content.rs), [`rotation.rs`](../crates/delivery/src/rotation.rs),
-[`snapshot_fetch.rs`](../apps/agent/src/snapshot_fetch.rs), with the post-promotion health gate in
+[`snapshot_fetch.rs`](../crates/pipeline/src/snapshot_fetch.rs), with the post-promotion health gate in
 the watchdog ([`probation.rs`](../apps/watchdog/src/probation.rs)).
 
 ## The trust set
@@ -275,7 +275,7 @@ then fetch what differs and delete what is no longer listed.
 
 ## Common-set snapshot
 
-[`snapshot_fetch.rs`](../apps/agent/src/snapshot_fetch.rs) runs a loop inside `agent run` that polls
+[`snapshot_fetch.rs`](../crates/pipeline/src/snapshot_fetch.rs) runs a loop inside `agent run` that polls
 `/api/snapshot/manifest` (every 6 h, jittered; `SYNTHAEA_SNAPSHOT_POLL_SECS` overrides it, clamped to
 at least 5 s), downloads the artifact only when `built_at` moved, verifies size and hash, writes
 `snapshots/common-set.bin` atomically and asks the sink to reload it.

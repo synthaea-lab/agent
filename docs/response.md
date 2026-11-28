@@ -52,14 +52,14 @@ flowchart TD
     EL --> AL
 ```
 
-The hooks live in [`ResponseHooks`](../apps/agent/src/sink/response.rs): the policy, the injected
+The hooks live in [`ResponseHooks`](../crates/pipeline/src/sink/response.rs): the policy, the injected
 `terminate` closure and the quarantine directory. They sit in an `Arc<OnceLock<_>>`
 rather than a constructor argument because the YARA worker's callback is created inside
-[`DetectionSink::new`](../apps/agent/src/sink/mod.rs), before any caller can configure the
+[`DetectionSink::new`](../crates/pipeline/src/sink/mod.rs), before any caller can configure the
 sink; the shared cell lets both the capture thread and that callback read whatever was
 set later.
 
-[`DetectionSink::enable_response`](../apps/agent/src/sink/response.rs) fills the cell, once:
+[`DetectionSink::enable_response`](../crates/pipeline/src/sink/response.rs) fills the cell, once:
 a second call is ignored with a warning, so the policy in force never changes under a
 running agent (pinned by `enable_response_twice_keeps_the_first_policy`). Only the
 Linux `run` command calls it ([`commands/linux.rs`](../apps/agent/src/commands/linux.rs)),
@@ -74,18 +74,18 @@ anything: on Windows and macOS the flags are accepted and ignored, and no
 
 ### What can trigger a kill
 
-Exactly two triggers reach [`DetectionSink::kill_for`](../apps/agent/src/sink/response.rs):
+Exactly two triggers reach [`DetectionSink::kill_for`](../crates/pipeline/src/sink/response.rs):
 
 1. **A `BAYES` alert raised by this event.** In
-   [`emit_correlator_alerts`](../apps/agent/src/sink/correlation.rs), after every correlator alert has
+   [`emit_correlator_alerts`](../crates/pipeline/src/sink/correlation.rs), after every correlator alert has
    been recorded, the pid of the last alert for which
-   [`crosses_kill_gate`](../apps/agent/src/sink/response.rs) is true (technique `BAYES`) is passed to
-   [`maybe_kill`](../apps/agent/src/sink/response.rs). The audit reason is "a high-confidence
+   [`crosses_kill_gate`](../crates/pipeline/src/sink/response.rs) is true (technique `BAYES`) is passed to
+   [`maybe_kill`](../crates/pipeline/src/sink/response.rs). The audit reason is "a high-confidence
    correlated verdict".
 2. **The ransomware reflex.** [`RansomwareJoin`](../crates/rules/src/ransomware_join.rs)
    records, per process incarnation, the last ransomware burst rule (T1486) and the
    last canary touch. When both are fresh within 60 s of each other, in either order,
-   [`ransomware_reflex`](../apps/agent/src/sink/response.rs) kills that pid. Neither signal kills
+   [`ransomware_reflex`](../crates/pipeline/src/sink/response.rs) kills that pid. Neither signal kills
    alone: a burst alone is a backup or an archiver; a canary touch alone is an indexer
    nobody listed. The join tracks at most 256 incarnations and counts evictions; a
    touch judged only after the canary hold expired does not trigger it.
@@ -97,18 +97,18 @@ earned, and none of them widens what the agent kills. `BAYES` also carries `Crit
 but that is incidental. Pinned by `a_critical_sigma_hit_never_triggers_a_kill`,
 `a_high_severity_built_in_alert_never_triggers_a_kill` and
 `a_siblings_weak_alert_never_triggers_kill_from_anothers_bayes_crossing` in
-[`sink/tests.rs`](../apps/agent/src/sink/tests.rs).
+[`sink/tests.rs`](../crates/pipeline/src/sink/tests.rs).
 
 `BAYES` is raised only from the per-event path, never from the one-second
 `advance_time` tick, so the tick passes no shield and cannot reach the gate.
 
 ### Shields: refusing by what the process is
 
-[`DetectionSink::correlate`](../apps/agent/src/sink/correlation.rs) asks the correlator for
+[`DetectionSink::correlate`](../crates/pipeline/src/sink/correlation.rs) asks the correlator for
 [`CorrelationEngine::kill_shield`](../crates/correlator/src/engine.rs) for the event's
 pid and incarnation, before releasing the correlator lock. If a shield is set,
 `kill_for` reports [`KillOutcome::Refused`](../crates/response/src/kill.rs) with a
-fixed reason ([`shield_refusal`](../apps/agent/src/sink/response.rs)) and never calls the policy or
+fixed reason ([`shield_refusal`](../crates/pipeline/src/sink/response.rs)) and never calls the policy or
 `terminate`:
 
 | Shield | Refusal text names |
@@ -130,7 +130,7 @@ Pinned by `a_system_service_crossing_bayes_is_refused_not_killed`,
 `an_ssh_login_session_crossing_bayes_is_refused_not_killed`,
 `a_shell_inside_an_ssh_login_crossing_bayes_is_still_killed`,
 `observe_mode_reports_a_service_as_refused_not_as_would_be_killed` and their
-neighbours in [`sink/tests.rs`](../apps/agent/src/sink/tests.rs).
+neighbours in [`sink/tests.rs`](../crates/pipeline/src/sink/tests.rs).
 
 ### `kill_process`: protected pids and the policy gate
 
@@ -177,7 +177,7 @@ The packaged unit grants `CAP_KILL`
 The YARA file worker scans files opened with write intent (budgeted, off the capture
 thread). On a match it writes one `YARA` line per rule, fuses the match into the
 writing process's verdict, escalates if warranted, then calls
-[`quarantine_matched_payload`](../apps/agent/src/sink/yara.rs). Any matching rule triggers it;
+[`quarantine_matched_payload`](../crates/pipeline/src/sink/yara.rs). Any matching rule triggers it;
 the rule's severity is not consulted. A path already under the quarantine directory is
 skipped: writing a payload there is itself a file event the sensor sees, and
 re-quarantining it would overwrite its own origin record with the wrong path.
@@ -269,7 +269,7 @@ payload stays in place.
 
 ## Escalation
 
-[`escalate_if_warranted`](../apps/agent/src/sink/mod.rs) runs whenever the verdict engine
+[`escalate_if_warranted`](../crates/pipeline/src/sink/mod.rs) runs whenever the verdict engine
 returns a new snapshot (a first sighting, a severity raise, or a recurrence after the
 dedup window, never an absorbed duplicate) and
 [`response::should_escalate`](../crates/response/src/escalate.rs) says its fused
@@ -341,10 +341,10 @@ The Windows enforcement primitive (WFP) is tracked in
 
 | Technique | Written by | Messages |
 | --- | --- | --- |
-| `RESPONSE-KILL` | [`kill_for`](../apps/agent/src/sink/response.rs) | `killed pid N on <reason>`, `pid N would have been killed on <reason> (observe-only)`, `failed to kill pid N on <reason>: <error>`, `refused to kill pid N on <reason>: <why>` |
-| `RESPONSE-QUARANTINE` | [`quarantine_matched_payload`](../apps/agent/src/sink/yara.rs) | `quarantined <path> (<sha256>) to <dir> ...`, `... would have been quarantined ... (observe-only)`, `failed to quarantine <path> ...: <error>` |
+| `RESPONSE-KILL` | [`kill_for`](../crates/pipeline/src/sink/response.rs) | `killed pid N on <reason>`, `pid N would have been killed on <reason> (observe-only)`, `failed to kill pid N on <reason>: <error>`, `refused to kill pid N on <reason>: <why>` |
+| `RESPONSE-QUARANTINE` | [`quarantine_matched_payload`](../crates/pipeline/src/sink/yara.rs) | `quarantined <path> (<sha256>) to <dir> ...`, `... would have been quarantined ... (observe-only)`, `failed to quarantine <path> ...: <error>` |
 | `RESPONSE-UNQUARANTINE` | [`cmd_quarantine_restore`](../apps/agent/src/quarantine_cmd.rs) | restored, or failed with the error |
-| `RESPONSE-ESCALATE` | [`escalate_if_warranted`](../apps/agent/src/sink/mod.rs) | `escalated <ppid>:<comm> at <severity> severity across N source(s): <techniques>` |
+| `RESPONSE-ESCALATE` | [`escalate_if_warranted`](../crates/pipeline/src/sink/mod.rs) | `escalated <ppid>:<comm> at <severity> severity across N source(s): <techniques>` |
 
 `<reason>` is `a high-confidence correlated verdict` or
 `a corroborated ransomware signal (burst rule + canary touch)`.
@@ -381,5 +381,5 @@ event capture.
   (`a_burst_then_a_canary_touch_by_the_same_process_kills_it`,
   `a_burst_and_a_canary_touch_from_two_processes_kill_neither`),
   `a_beacon_with_a_dropped_payload_is_killed_and_quarantined_and_both_are_audited` and
-  the escalation tests, all in [`sink/tests.rs`](../apps/agent/src/sink/tests.rs).
+  the escalation tests, all in [`sink/tests.rs`](../crates/pipeline/src/sink/tests.rs).
 - Restore command: tests in [`quarantine_cmd.rs`](../apps/agent/src/quarantine_cmd.rs).

@@ -27,8 +27,6 @@
 )]
 mod commands;
 mod deception;
-mod enrich_queue;
-mod host;
 #[cfg_attr(
     not(any(target_os = "linux", target_os = "macos", windows)),
     allow(dead_code)
@@ -59,17 +57,9 @@ mod kill_loudness;
 mod log_sources;
 #[cfg(target_os = "linux")]
 mod memscan;
-mod own_traffic;
 mod protected;
 mod quarantine_cmd;
-mod replay;
 mod silence;
-#[cfg_attr(
-    not(any(target_os = "linux", target_os = "macos", windows)),
-    allow(dead_code)
-)]
-mod sink;
-mod snapshot_fetch;
 
 use clap::{Parser, Subcommand};
 #[cfg(target_os = "linux")]
@@ -570,8 +560,8 @@ fn try_main() -> anyhow::Result<std::process::ExitCode> {
             cases,
             content_dir,
             model_root,
-        } => {
-            replay::cmd_replay(&events, &alerts, &cases, &content_dir, &model_root).map(|summary| {
+        } => pipeline::replay::cmd_replay(&events, &alerts, &cases, &content_dir, &model_root).map(
+            |summary| {
                 eprintln!(
                     "replay: {} events ({} lines skipped), {} cases written to {}",
                     summary.events,
@@ -579,8 +569,8 @@ fn try_main() -> anyhow::Result<std::process::ExitCode> {
                     summary.cases,
                     cases.display()
                 );
-            })
-        }
+            },
+        ),
         Command::Quarantine { alerts, action } => match action {
             QuarantineAction::List => {
                 quarantine_cmd::cmd_quarantine_list(&alerts, &mut std::io::stdout().lock())

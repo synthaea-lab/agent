@@ -14,9 +14,8 @@ use ipc::{
     ReloadContentResponse, SensorHealth, SensorHealthResponse, SensorState, Server, StatusResponse,
     SuppressionEntry, SuppressionResponse,
 };
+use pipeline::sink::DetectionSink;
 use sinks::alert_log::{AlertLog, RecentAlert};
-
-use crate::sink::DetectionSink;
 
 /// Where a platform deposits its sensor-health source once it has built one.
 /// Empty until then: `cli health` reports no sensors rather than inventing

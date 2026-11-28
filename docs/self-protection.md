@@ -87,7 +87,7 @@ A process can be alive and still collect nothing: deadlocked, wedged on a poison
 lock, its capture thread dead while the main thread parks. A plain "is it running"
 check misses all of these.
 
-- **Writer.** [`DetectionSink`](../apps/agent/src/sink/mod.rs) increments a progress counter
+- **Writer.** [`DetectionSink`](../crates/pipeline/src/sink/mod.rs) increments a progress counter
   once `on_event` has fully processed an event. A thread in
   [`progress.rs`](../crates/tamper/src/progress.rs) writes it to a file next to the alert
   log every 2 s (`WRITE_INTERVAL`). The path transform

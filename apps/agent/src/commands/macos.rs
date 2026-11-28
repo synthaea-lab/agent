@@ -309,7 +309,7 @@ pub(crate) fn cmd_capture_events(output: &std::path::Path) -> anyhow::Result<()>
 }
 
 pub(crate) fn cmd_capture_baseline(output: &std::path::Path) -> anyhow::Result<()> {
-    let sink = crate::sink::BaselineSink::new(seeded_rule_state(), output)?;
+    let sink = pipeline::sink::BaselineSink::new(seeded_rule_state(), output)?;
     eprintln!("Synthaea — baseline capture (Ctrl-C to stop)");
     eprintln!("Output: {}", output.display());
     run_macos_sensors(Box::new(sink), true)

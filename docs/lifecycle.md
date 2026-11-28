@@ -54,13 +54,13 @@ The Linux `run` path does not put a `RedactingSink` in front of the detection si
 
 ### 3. Detection on the capture thread
 
-[`DetectionSink::on_event`](../apps/agent/src/sink/mod.rs) runs on whatever thread called it, synchronously, entirely in memory:
+[`DetectionSink::on_event`](../crates/pipeline/src/sink/mod.rs) runs on whatever thread called it, synchronously, entirely in memory:
 
 1. **`correlate`.** The event goes to `correlator::CorrelationEngine::on_event`. If an ML model loaded, `ml::CorrelationScorer` scores the process's behavior over the correlator window and feeds the log-likelihood ratio into the Bayesian belief. Results:
    - Out-of-distribution features are logged and give no evidence.
    - Scorer errors fail open.
    - `kill_shield` is read while the correlator lock is still held. The lock is released before any alert I/O.
-2. **Canary hold expiry and tripwires** (`CanaryGate::on_event`, in [`sink/canary.rs`](../apps/agent/src/sink/canary.rs)). Expiry runs only for events from the primary capture stream (exec and file events), because the hold window is measured on that stream's clock.
+2. **Canary hold expiry and tripwires** (`CanaryGate::on_event`, in [`sink/canary.rs`](../crates/pipeline/src/sink/canary.rs)). Expiry runs only for events from the primary capture stream (exec and file events), because the hold window is measured on that stream's clock.
 3. **Per-type dispatch** (`detect_exec`, `detect_file_open`, …). For an exec, the order is: stateless rules (`rules::evaluate_exec`), stateful rules (`RuleState::on_exec`), due identity and unit-stop alerts, then Sigma. A file open with write intent also enqueues a budgeted YARA scan ([`yara::ScanQueue`](../crates/yara/src/queue.rs)), which runs on the `yara-scan` thread.
 4. **Signature-gated findings.** Some exec findings depend on the image's signature, which is not known yet. `RuleState::on_exec_signature_gated` returns them, and they travel with the event into the enrichment queue.
 5. **Progress.** Only after all of the above does `on_event` increment the progress counter. A hang anywhere above, such as a poisoned lock or a wedged engine call, therefore stops the watchdog heartbeat.
@@ -69,9 +69,9 @@ No detection engine needs the file hash or signature synchronously. Rules, Sigma
 
 ### 4. Recording a finding
 
-Every engine's finding goes through [`record_detection`](../apps/agent/src/sink/recording.rs), which is a free function so that the enrichment worker and the YARA worker record findings the same way the capture thread does:
+Every engine's finding goes through [`record_detection`](../crates/pipeline/src/sink/recording.rs), which is a free function so that the enrichment worker and the YARA worker record findings the same way the capture thread does:
 
-1. Builds a `schema::detection::Detection` from **redacted** copies of the trigger event and any extra evidence. Ransomware alerts carry a damage manifest of up to 100 renamed or deleted files (the server keeps 128 events per detection). The message has the raw command line replaced by its redacted form ([`safe_detection_message`](../apps/agent/src/sink/recording.rs)).
+1. Builds a `schema::detection::Detection` from **redacted** copies of the trigger event and any extra evidence. Ransomware alerts carry a damage manifest of up to 100 renamed or deleted files (the server keeps 128 events per detection). The message has the raw command line replaced by its redacted form ([`safe_detection_message`](../crates/pipeline/src/sink/recording.rs)).
 2. Folds the detection into [`verdict::VerdictEngine`](../crates/verdict/src/lib.rs), keyed by `EntityKey` (`ppid`, `comm`, parent incarnation when known), with a 30 s dedup window (`VERDICT_DEDUP_WINDOW_NS`).
 3. **Always** writes a line to [`AlertLog`](../crates/sinks/src/alert_log.rs), even when the verdict engine absorbs the finding as a duplicate. `alerts.ndjson` is the complete audit trail. The verdict is a bounded view for triage.
 4. If a new verdict snapshot comes out at `High` severity or above ([`response::should_escalate`](../crates/response/src/escalate.rs)), writes a `RESPONSE-ESCALATE` alert.
@@ -81,15 +81,15 @@ The worker records gated findings when it reaches them, which can be after the c
 
 ### 5. Automated response
 
-Response is wired only on Linux, by [`DetectionSink::enable_response`](../apps/agent/src/sink/response.rs) in `cmd_run`. It is observe-only unless `--enable-kill` / `--enable-quarantine` is given.
+Response is wired only on Linux, by [`DetectionSink::enable_response`](../crates/pipeline/src/sink/response.rs) in `cmd_run`. It is observe-only unless `--enable-kill` / `--enable-quarantine` is given.
 
-- **Kill gate.** Only a correlator `BAYES` alert ([`crosses_kill_gate`](../apps/agent/src/sink/response.rs)) makes a process eligible for a kill. A Sigma `level: critical` does not. The gate looks only at the triggering event's own alert, never at the entity's accumulated verdict. That verdict is a running maximum over every process sharing `(ppid, comm)`, so gating on it would let one sibling's crossing condemn another. A `KillShield` from the correlator refuses the kill, even in observe mode, for a system service's main process or a login-session holder. Every outcome is audited as `RESPONSE-KILL`.
+- **Kill gate.** Only a correlator `BAYES` alert ([`crosses_kill_gate`](../crates/pipeline/src/sink/response.rs)) makes a process eligible for a kill. A Sigma `level: critical` does not. The gate looks only at the triggering event's own alert, never at the entity's accumulated verdict. That verdict is a running maximum over every process sharing `(ppid, comm)`, so gating on it would let one sibling's crossing condemn another. A `KillShield` from the correlator refuses the kill, even in observe mode, for a system service's main process or a login-session holder. Every outcome is audited as `RESPONSE-KILL`.
 - **Ransomware reflex.** A T1486 burst that is corroborated by a canary touch from the same process incarnation goes through the same policy-gated kill, without the shield.
-- **Quarantine.** A YARA match on a written payload is moved to `quarantine/` next to the alerts file when quarantine is enabled ([`quarantine_matched_payload`](../apps/agent/src/sink/yara.rs)).
+- **Quarantine.** A YARA match on a written payload is moved to `quarantine/` next to the alerts file when quarantine is enabled ([`quarantine_matched_payload`](../crates/pipeline/src/sink/yara.rs)).
 
 ### 6. Enrichment, output and upload
 
-[`EnrichQueue`](../apps/agent/src/enrich_queue.rs) is a single `enrich` thread behind an `mpsc::sync_channel` of `QUEUE_CAP = 4096` items. It is a FIFO carrying three kinds of item:
+[`EnrichQueue`](../crates/pipeline/src/enrich_queue.rs) is a single `enrich` thread behind an `mpsc::sync_channel` of `QUEUE_CAP = 4096` items. It is a FIFO carrying three kinds of item:
 
 - `Event(event, gated)`. The worker hashes and checks the signature of exec images (the `enrich::Enricher` cache is owned by this thread only). Then it:
   - resolves the gated alert against the signature, and records it only if the verified file is confirmed to be the image that ran;
@@ -120,7 +120,7 @@ With a control plane configured, [`upload::start`](../crates/delivery/src/upload
 
 ### Hot content reload
 
-`agent apply-content-manifest` downloads, verifies and writes content under `<state_dir>/content`. It then notifies the running agent over IPC. The [`AgentHandler::reload_content`](../apps/agent/src/ipc_handler.rs) handler calls [`DetectionSink::reload_content`](../apps/agent/src/sink/mod.rs), which swaps in new Sigma and YARA engines and a new common-set snapshot under their mutexes. A missing content directory unloads that engine. A broken one keeps the previous engine running and is reported as failed. If the notification fails, the command still succeeds, and the content is loaded at the next start.
+`agent apply-content-manifest` downloads, verifies and writes content under `<state_dir>/content`. It then notifies the running agent over IPC. The [`AgentHandler::reload_content`](../apps/agent/src/ipc_handler.rs) handler calls [`DetectionSink::reload_content`](../crates/pipeline/src/sink/mod.rs), which swaps in new Sigma and YARA engines and a new common-set snapshot under their mutexes. A missing content directory unloads that engine. A broken one keeps the previous engine running and is reported as failed. If the notification fails, the command still succeeds, and the content is loaded at the next start.
 
 ## Threads in `agent run`
 
@@ -128,7 +128,7 @@ With a control plane configured, [`upload::start`](../crates/delivery/src/upload
 | --- | --- | --- | --- |
 | main (primary sensor) | all | `cmd_run`: `LinuxSensor`/`AuditSensor` (own tokio runtime), ETW, or ES | Returns on Ctrl-C or sensor failure |
 | `enrich` | all | `DetectionSink::new` | When the queue is dropped, i.e. with the process |
-| `correlator-tick` | all | [`start_correlator_ticker`](../apps/agent/src/sink/correlation.rs). Advances the correlator clock every second so window-expiry alerts fire without new events. Holds only a `Weak` reference to the sink. | When the sink is dropped |
+| `correlator-tick` | all | [`start_correlator_ticker`](../crates/pipeline/src/sink/correlation.rs). Advances the correlator clock every second so window-expiry alerts fire without new events. Holds only a `Weak` reference to the sink. | When the sink is dropped |
 | `yara-scan`, `yara-memscan` | all (memscan Linux only) | `start_yara` / `start_memscan` when `rules/yara` exists | With the process |
 | `transport-upload`, `detection-upload` | all, with a control plane | [`upload::start`](../crates/delivery/src/upload.rs) | `ShutdownPlan` through `finish_run`, with a 3 s final drain (all platforms, #147) |
 | `heartbeat` | all | `wire_run_pipeline` | With the process |
@@ -302,8 +302,8 @@ watchdog's hang detection to restart the agent) loses every event in flight and 
 
 ## How this is tested
 
-- **Sink end to end:** the `tests` module of [`sink/tests.rs`](../apps/agent/src/sink/tests.rs) drives a real `DetectionSink` in a temp directory. It covers rule routes, raw command lines reaching Sigma while outputs are redacted, the correlator ticker firing with no further events, quarantine on and off, canary holds and cooldowns, and response scenarios.
-- **Enrichment queue:** [`enrich_queue.rs`](../apps/agent/src/enrich_queue.rs) tests `overflow_sheds_and_counts_instead_of_blocking`, `a_shed_event_hands_its_gated_alert_back`, `flush_waits_for_already_enqueued_events_to_finish` and `flush_times_out_rather_than_waiting_forever_on_a_wedged_worker`.
+- **Sink end to end:** the `tests` module of [`sink/tests.rs`](../crates/pipeline/src/sink/tests.rs) drives a real `DetectionSink` in a temp directory. It covers rule routes, raw command lines reaching Sigma while outputs are redacted, the correlator ticker firing with no further events, quarantine on and off, canary holds and cooldowns, and response scenarios.
+- **Enrichment queue:** [`enrich_queue.rs`](../crates/pipeline/src/enrich_queue.rs) tests `overflow_sheds_and_counts_instead_of_blocking`, `a_shed_event_hands_its_gated_alert_back`, `flush_waits_for_already_enqueued_events_to_finish` and `flush_times_out_rather_than_waiting_forever_on_a_wedged_worker`.
 - **Shutdown:** [`shutdown.rs`](../crates/workers/src/shutdown.rs) tests the shared budget, signalling before the first join, wedged and panicked workers.
 - **Upload:** [`upload.rs`](../crates/delivery/src/upload.rs) tests target resolution, redeliver-until-ack, poison-segment skip, retry keys surviving a reopen, and the offline fallback.
 - **Pipeline wiring:** [`common.rs`](../apps/agent/src/commands/common.rs) checks that the beacon and `cli health` read the same silence monitor.

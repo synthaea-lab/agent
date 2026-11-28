@@ -531,7 +531,7 @@ pub(crate) fn cmd_capture_events(output: &std::path::Path) -> anyhow::Result<()>
 }
 
 pub(crate) fn cmd_capture_baseline(output: &std::path::Path) -> anyhow::Result<()> {
-    let sink = crate::sink::BaselineSink::new(seeded_rule_state(), output)?;
+    let sink = pipeline::sink::BaselineSink::new(seeded_rule_state(), output)?;
     eprintln!("Synthaea — baseline capture (Ctrl-C to stop)");
     eprintln!("Output: {}", output.display());
     run_windows_sensors(
@@ -649,5 +649,16 @@ mod tests {
             SOCKET_SILENCE_DEADLINE_NS,
             3 * u64::try_from(SOCKET_POLL_INTERVAL.as_nanos()).expect("fits")
         );
+    }
+
+    /// #688: the identity the ETW sensor records and the one enrichment reads are the same
+    /// token for the same file; the gate compares them as strings, so a format drift between
+    /// the two crates (they share no code) would silently turn every gated alert on.
+    #[test]
+    fn the_sensor_and_enrichment_agree_on_a_files_identity() {
+        let exe = std::env::current_exe().unwrap();
+        let sensor = sensor_windows::image_file_id(&exe);
+        assert!(sensor.is_some(), "an ordinary file has an identity");
+        assert_eq!(sensor, enrich::path_identity(&exe));
     }
 }

@@ -65,7 +65,7 @@ enum QueueItem {
 /// Owns the worker thread. Dropping the queue stops the worker after the backlog
 /// drains.
 #[derive(Clone)]
-pub(crate) struct EnrichQueue {
+pub struct EnrichQueue {
     tx: mpsc::SyncSender<QueueItem>,
     dropped: Arc<AtomicU64>,
 }
@@ -86,7 +86,11 @@ impl EnrichQueue {
 
     /// Starts the event worker with a second callback for structured detections.
     /// Both callbacks run off the sensor capture thread and share its FIFO queue.
-    pub(crate) fn start_with_detections(
+    ///
+    /// # Errors
+    ///
+    /// When the worker thread cannot be spawned.
+    pub fn start_with_detections(
         mut enricher: Enricher,
         on_enriched: impl Fn(Event, Option<SignatureGatedAlert>) + Send + 'static,
         on_detection: impl Fn(Detection) + Send + 'static,
@@ -169,7 +173,11 @@ impl EnrichQueue {
     /// Queues a finding for durable storage without file I/O on the capture
     /// thread. Returns the finding if the queue is full or disconnected so the
     /// caller can use a synchronous fallback instead of silently losing it.
-    pub(crate) fn enqueue_detection(&self, detection: Detection) -> Result<(), Box<Detection>> {
+    ///
+    /// # Errors
+    ///
+    /// The finding itself, when the queue is full or its worker is gone.
+    pub fn enqueue_detection(&self, detection: Detection) -> Result<(), Box<Detection>> {
         match self.tx.try_send(QueueItem::Detection(Box::new(detection))) {
             Ok(()) => Ok(()),
             Err(
@@ -204,7 +212,8 @@ impl EnrichQueue {
     /// or the worker didn't reach it in time) or if the worker thread is gone —
     /// the caller's own bounded budget is what actually protects it against this
     /// never resolving, not this function's internals.
-    pub(crate) fn flush(&self, timeout: Duration) -> bool {
+    #[must_use]
+    pub fn flush(&self, timeout: Duration) -> bool {
         let deadline = Instant::now() + timeout;
         let (done_tx, done_rx) = mpsc::channel();
         loop {

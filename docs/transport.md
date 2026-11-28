@@ -50,7 +50,7 @@ flowchart LR
 
 - Events are appended to the spool by the enrichment worker, never by a sensor's capture
   thread, and only after [`redact_event`](../crates/redact/src/event.rs) has run on them (see the
-  worker closure in [`DetectionSink::new`](../apps/agent/src/sink/mod.rs)). A spool write is file
+  worker closure in [`DetectionSink::new`](../crates/pipeline/src/sink/mod.rs)). A spool write is file
   I/O, and file I/O must not stall capture.
 - Detections get a random UUIDv4 idempotency key at the moment they are spooled
   ([`persist_detection`](../crates/delivery/src/upload.rs)). The key is stored in the same spool

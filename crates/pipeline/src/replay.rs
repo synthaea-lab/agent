@@ -74,10 +74,13 @@ struct CaseRecord<'a> {
 
 /// What a replay read and wrote, printed on stderr at the end.
 #[derive(Debug, Default, PartialEq, Eq)]
-pub(crate) struct ReplaySummary {
-    pub(crate) events: usize,
-    pub(crate) skipped_lines: usize,
-    pub(crate) cases: usize,
+pub struct ReplaySummary {
+    /// Events read and run through the sink.
+    pub events: usize,
+    /// Lines that were not an event and were skipped.
+    pub skipped_lines: usize,
+    /// Cases written.
+    pub cases: usize,
 }
 
 /// Replays `events` (one `schema::Event` per line) through a fresh [`DetectionSink`],
@@ -89,7 +92,7 @@ pub(crate) struct ReplaySummary {
 ///
 /// Returns an error if a file cannot be opened, read or written, if the sink cannot be
 /// built, or if the enrichment worker stalls or sheds an event.
-pub(crate) fn cmd_replay(
+pub fn cmd_replay(
     events: &Path,
     alerts: &Path,
     cases: &Path,

@@ -10,6 +10,7 @@ use health::{
     DroppedCounter, HealthCollector, HealthCollectorConfig, HostCountersSource, NoopSpoolStats,
     RarityStatsSource, SensorHealthSource, SpoolStatsSource,
 };
+use pipeline::sink::DetectionSink;
 use tamper::heartbeat::SilenceMonitor;
 use workers::shutdown::{SHUTDOWN_BUDGET, ShutdownPlan};
 
@@ -17,7 +18,6 @@ use super::{RunOptions, localzone};
 use crate::{
     ipc_handler::{AgentHandler, SensorHealthSlot},
     silence::{SilenceHealthSource, SourceStatus},
-    sink::DetectionSink,
 };
 
 /// What `run` composes before handing control to the platform's sensors.
@@ -237,7 +237,7 @@ fn wire_run_pipeline(
         spool,
         detection_spool,
         content_dir,
-        &crate::sink::model_root(&storage.state_dir),
+        &pipeline::sink::model_root(&storage.state_dir),
     )?);
     sink.start_correlator_ticker()?;
     // Reading another process's memory is `sensor-linux-procmem`'s mechanism; no other
@@ -257,7 +257,7 @@ fn wire_run_pipeline(
 
     // The fleet common-set snapshot (ADR-0033): off unless this build embeds a `snapshot` key.
     if let Some(handle) = &transport {
-        crate::snapshot_fetch::spawn_if_enabled(
+        pipeline::snapshot_fetch::spawn_if_enabled(
             Arc::clone(&handle.client),
             content_dir.to_path_buf(),
             Arc::clone(&sink),
@@ -603,7 +603,7 @@ mod tests {
 
         let delivered = Arc::new(AtomicUsize::new(0));
         let on_detection = Arc::clone(&delivered);
-        let queue = crate::enrich_queue::EnrichQueue::start_with_detections(
+        let queue = pipeline::EnrichQueue::start_with_detections(
             enrich::Enricher::new(),
             |_, _| {},
             move |_| {

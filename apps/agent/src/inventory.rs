@@ -17,12 +17,11 @@ use std::{
 };
 
 use inventory::{PackageChangeKind, PackageSnapshot};
+use pipeline::sink::DetectionSink;
 use schema::{
     Event, EventMeta, PackageChangeEvent, PackageChangeKind as SchemaChangeKind, User,
     sensor::EventSink,
 };
-
-use crate::sink::DetectionSink;
 
 /// How often the snapshot is re-read and re-diffed after the first, immediate
 /// check (see [`spawn_monitor`]'s doc for why the first one does not wait).
