@@ -27,7 +27,7 @@ pub(crate) enum Source<'a> {
     /// A file, for an offline or lab install.
     File(&'a Path),
     /// The control plane.
-    Server(&'a crate::content::Endpoint),
+    Server(&'a delivery::content::Endpoint),
 }
 
 /// What [`apply`] did.
@@ -89,7 +89,7 @@ fn fetch(source: &Source<'_>) -> anyhow::Result<Option<KeyRotationManifest>> {
             ))
         }
         Source::Server(endpoint) => {
-            let client = crate::content::build_client(
+            let client = delivery::content::build_client(
                 &endpoint.server,
                 endpoint.cert.as_deref(),
                 endpoint.key.as_deref(),

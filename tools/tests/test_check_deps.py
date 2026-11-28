@@ -54,6 +54,21 @@ class UtilityCrates(unittest.TestCase):
         self.assertNotIn("tamper", tool.allowed("updater"))
         self.assertNotIn("updater", tool.allowed("tamper"))
 
+    def test_a_composition_crate_may_join_leaf_and_detection_crates(self) -> None:
+        for dependency in ("store", "transport", "updater", "rules", "verdict", "workers", "schema"):
+            with self.subTest(dependency=dependency):
+                self.assertIn(dependency, tool.allowed("delivery"))
+
+    def test_a_composition_crate_may_not_depend_on_a_sensor_or_a_binary(self) -> None:
+        for dependency in ("sensor-linux", "sensor-windows", "bounded-lines", "agent", "watchdog"):
+            with self.subTest(dependency=dependency):
+                self.assertNotIn(dependency, tool.allowed("delivery"))
+
+    def test_no_crate_below_the_binaries_may_depend_on_a_composition_crate(self) -> None:
+        for crate in ("updater", "transport", "rules", "verdict", "sensor-linux", "workers", "policy"):
+            with self.subTest(crate=crate):
+                self.assertNotIn("delivery", tool.allowed(crate))
+
     def test_a_sensor_may_not_use_a_utility_crate(self) -> None:
         self.assertNotIn("file-hash", tool.allowed("sensor-linux"))
 

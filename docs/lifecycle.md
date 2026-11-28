@@ -96,10 +96,10 @@ Response is wired only on Linux, by [`DetectionSink::enable_response`](../apps/a
   - checks the image hash against the IOC sets;
   - adds image-rarity evidence to the correlator;
   - redacts a copy of the event, then appends that copy to `events.jsonl` (only with `--events`) and to the event spool.
-- `Detection`. The worker adds the hash to the detection's exec events (a cache hit for the event that follows in the queue), then persists it through [`persist_detection`](../apps/agent/src/upload.rs). That function stores a retry key generated with the detection, so a redelivery after a crash carries the same identity.
+- `Detection`. The worker adds the hash to the detection's exec events (a cache hit for the event that follows in the queue), then persists it through [`persist_detection`](../crates/delivery/src/upload.rs). That function stores a retry key generated with the detection, so a redelivery after a crash carries the same identity.
 - `Flush(tx)`. A marker used by shutdown to wait until everything queued before it has been processed.
 
-With a control plane configured, [`upload::start`](../apps/agent/src/upload.rs) opens two [`store::EventSpool`](../crates/store/src/spool.rs) directories next to the alerts file, `spool/` and `detection-spool/` (the latter has one record per segment). Each spool is capped at `storage.spool_max_mb` (default 4096 MiB), so the worst case on disk is twice that value. One `transport::UploadLoop` thread per spool drains it:
+With a control plane configured, [`upload::start`](../crates/delivery/src/upload.rs) opens two [`store::EventSpool`](../crates/store/src/spool.rs) directories next to the alerts file, `spool/` and `detection-spool/` (the latter has one record per segment). Each spool is capped at `storage.spool_max_mb` (default 4096 MiB), so the worst case on disk is twice that value. One `transport::UploadLoop` thread per spool drains it:
 
 - Delivery is at-least-once. A segment is redelivered until it is acked.
 - A segment the server rejects permanently is skipped.
@@ -130,7 +130,7 @@ With a control plane configured, [`upload::start`](../apps/agent/src/upload.rs) 
 | `enrich` | all | `DetectionSink::new` | When the queue is dropped, i.e. with the process |
 | `correlator-tick` | all | [`start_correlator_ticker`](../apps/agent/src/sink/correlation.rs). Advances the correlator clock every second so window-expiry alerts fire without new events. Holds only a `Weak` reference to the sink. | When the sink is dropped |
 | `yara-scan`, `yara-memscan` | all (memscan Linux only) | `start_yara` / `start_memscan` when `rules/yara` exists | With the process |
-| `transport-upload`, `detection-upload` | all, with a control plane | [`upload::start`](../apps/agent/src/upload.rs) | `ShutdownPlan` through `finish_run`, with a 3 s final drain (all platforms, #147) |
+| `transport-upload`, `detection-upload` | all, with a control plane | [`upload::start`](../crates/delivery/src/upload.rs) | `ShutdownPlan` through `finish_run`, with a 3 s final drain (all platforms, #147) |
 | `heartbeat` | all | `wire_run_pipeline` | With the process |
 | `ipc-server` | all | [`ipc_handler::spawn`](../apps/agent/src/ipc_handler.rs) (current-thread tokio) | With the process. A failure there is logged and never stops detection. |
 | `snapshot-fetch`, `ioc-control-plane`, `decoy-register`, `deception-refresh` | all, when enabled | `wire_run_pipeline` / `plant_canaries` | With the process |
@@ -156,7 +156,7 @@ Common to every OS ([`try_main`](../apps/agent/src/main.rs)):
 
 1. Parse the CLI and load the config. A failure here stops the binary.
 2. Set up `tracing` from `log.level`, unless `RUST_LOG` overrides it.
-3. Resolve the upload target ([`resolve_run_target`](../apps/agent/src/upload.rs)):
+3. Resolve the upload target ([`resolve_run_target`](../crates/delivery/src/upload.rs)):
    - `--standalone` uploads nothing.
    - `--server` uploads only to that server, which never receives the configured client certificate (pass `--cert`/`--key` explicitly).
    - With neither flag, the agent uploads to `server.control_plane_url` with the configured mTLS pair.
@@ -165,7 +165,7 @@ Common to every OS ([`try_main`](../apps/agent/src/main.rs)):
 
 Then [`start_pipeline`](../apps/agent/src/commands/common.rs) takes the options by reference and does the same four steps on every platform. The first is `wire_run_pipeline`, in this order:
 
-1. Transport first, because the sink needs the spool handles. If setting up upload fails and `server.offline_fallback` is on (the default), the agent runs without upload and raises an `UPLOAD-DISABLED` alert ([`start_or_disable`](../apps/agent/src/upload.rs)). Without this fallback, an agent missing its certificates would detect nothing, and the watchdog would roll back an otherwise healthy release.
+1. Transport first, because the sink needs the spool handles. If setting up upload fails and `server.offline_fallback` is on (the default), the agent runs without upload and raises an `UPLOAD-DISABLED` alert ([`start_or_disable`](../crates/delivery/src/upload.rs)). Without this fallback, an agent missing its certificates would detect nothing, and the watchdog would roll back an otherwise healthy release.
 2. `DetectionSink::new`: alert log, enrichment worker, correlator, ML scorer, Sigma, YARA, IOC, common set. Absent content is not an error.
 3. Correlator ticker. Then the control-plane URL is registered so the agent's own traffic does not raise IOC findings. Then snapshot fetch, the banner, the heartbeat writer and the IPC server.
 
@@ -305,7 +305,7 @@ watchdog's hang detection to restart the agent) loses every event in flight and 
 - **Sink end to end:** the `tests` module of [`sink/tests.rs`](../apps/agent/src/sink/tests.rs) drives a real `DetectionSink` in a temp directory. It covers rule routes, raw command lines reaching Sigma while outputs are redacted, the correlator ticker firing with no further events, quarantine on and off, canary holds and cooldowns, and response scenarios.
 - **Enrichment queue:** [`enrich_queue.rs`](../apps/agent/src/enrich_queue.rs) tests `overflow_sheds_and_counts_instead_of_blocking`, `a_shed_event_hands_its_gated_alert_back`, `flush_waits_for_already_enqueued_events_to_finish` and `flush_times_out_rather_than_waiting_forever_on_a_wedged_worker`.
 - **Shutdown:** [`shutdown.rs`](../crates/workers/src/shutdown.rs) tests the shared budget, signalling before the first join, wedged and panicked workers.
-- **Upload:** [`upload.rs`](../apps/agent/src/upload.rs) tests target resolution, redeliver-until-ack, poison-segment skip, retry keys surviving a reopen, and the offline fallback.
+- **Upload:** [`upload.rs`](../crates/delivery/src/upload.rs) tests target resolution, redeliver-until-ack, poison-segment skip, retry keys surviving a reopen, and the offline fallback.
 - **Pipeline wiring:** [`common.rs`](../apps/agent/src/commands/common.rs) checks that the beacon and `cli health` read the same silence monitor.
 - **Platform runners:** [`windows.rs`](../apps/agent/src/commands/windows.rs) tests `hold_after_primary` and socket heartbeats. [`linux.rs`](../apps/agent/src/commands/linux.rs) tests the AVC worker's backoff and recovery, SELinux detection, and the journal-to-rules sudo join.
 - **Watchdog:** [`supervise.rs`](../apps/watchdog/src/supervise.rs) tests backoff, `HeartbeatMonitor` and restart counting.

@@ -104,7 +104,7 @@ impl DetectionSink {
             // is never lost), and only reached once the queue is already shedding.
             tracing::warn!("detection queue full; persisting on capture thread");
             if let Some(spool) = &self.detection_spool
-                && let Err(e) = crate::upload::persist_detection(spool, *detection)
+                && let Err(e) = delivery::upload::persist_detection(spool, *detection)
             {
                 tracing::error!(error = %e, "detection spool append failed on fallback");
             }
@@ -228,7 +228,7 @@ pub(super) fn spool_on_worker(
     detection: schema::detection::Detection,
 ) {
     if let Some(spool) = spool
-        && let Err(e) = crate::upload::persist_detection(spool, detection)
+        && let Err(e) = delivery::upload::persist_detection(spool, detection)
     {
         tracing::warn!(error = %e, "detection spool append failed");
     }

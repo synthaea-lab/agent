@@ -67,7 +67,8 @@ flowchart BT
   detection --> store[store]
   detection --> detection
   leaf["store, transport, sinks, ipc, response, updater,<br/>config, tamper, redact, inventory, health"] --> schema & policy
-  bins["agent, watchdog, cli, release-tool"] --> sensors & detection & leaf
+  composition["delivery"] --> detection & leaf
+  bins["agent, watchdog, cli, release-tool"] --> sensors & detection & leaf & composition
 ```
 
 The rules:
@@ -77,12 +78,13 @@ The rules:
 - Detection crates may use the base tier, each other, and `store`. They may never use a sensor crate. The engines may not use `correlator` or `verdict`, the two stages that consume their output; the event window both sides read is in the leaf crate `event-window`.
 - Utility crates (`file-hash`, the streaming SHA-256 every hashing crate uses, and `workers`, the worker-thread policies) depend on no workspace crate. Detection and leaf crates may use them; that is where code two tiers both need goes, instead of a copy in each.
 - Leaf crates may use only the base tier and the utility crates. In particular, `transport` and `store` do not know each other, `updater` does not know `transport`, and `response` does not call the OS.
+- Composition crates (`delivery`) join crates that may not know each other. They may use the base, detection, leaf and utility tiers, never a sensor crate, and no crate below the binaries depends on them.
 - Only binaries may depend on anything. No crate depends on a binary.
 - A crate that the script does not know makes it exit with code 2. A new crate must be added to the script.
 
 Some consequences show up in the agent's code:
 
-- **The binary bridges types that two crates may not share.** [`upload.rs`](../apps/agent/src/upload.rs) adapts `store::EventSpool` to `transport::EventDrain`. [`content.rs`](../apps/agent/src/content.rs) composes `updater` verification with `transport` downloads. [`eventlog_config`](../apps/agent/src/commands/windows.rs) maps `policy::EventLogPolicy` to `sensor-windows-eventlog`'s own config type field by field.
+- **A composition crate bridges types that two crates may not share.** In [`delivery`](../crates/delivery/src/lib.rs), [`upload.rs`](../crates/delivery/src/upload.rs) adapts `store::EventSpool` to `transport::EventDrain`, and [`content.rs`](../crates/delivery/src/content.rs) composes `updater` verification with `transport` downloads. A composition crate may depend on detection and leaf crates, never on a sensor or a binary. What needs a sensor crate stays in the binary: [`eventlog_config`](../apps/agent/src/commands/windows.rs) maps `policy::EventLogPolicy` to `sensor-windows-eventlog`'s own config type field by field.
 - **The binary injects OS calls.** `response::kill_process` takes the actual kill as a closure. On Linux that closure is [`terminate_process`](../apps/agent/src/commands/linux.rs), which sends `SIGKILL`.
 
 ### Layers inside the agent binary
@@ -113,7 +115,7 @@ The detection sink ([`sink/mod.rs`](../apps/agent/src/sink/mod.rs)) has no platf
 | [`sink`](../apps/agent/src/sink/mod.rs) | `DetectionSink`, the `EventSink` that runs every engine, records findings and drives response. Also [`BaselineSink`](../apps/agent/src/sink/baseline.rs) for ML baseline capture. |
 | [`enrich_queue`](../apps/agent/src/enrich_queue.rs) | Bounded worker that moves hashing, signature checks, raw-event logging and spool appends off the capture thread. |
 | [`sinks::alert_log`](../crates/sinks/src/alert_log.rs) | `AlertLog`, the single alert funnel: `alerts.ndjson`, stderr, and the 256-entry in-memory buffer that `cli detections` reads. |
-| [`upload`](../apps/agent/src/upload.rs) | The event spool and detection spool, plus their upload threads. Resolves which control plane `run` talks to. |
+| [`delivery::upload`](../crates/delivery/src/upload.rs) (crate) | The event spool and detection spool, plus their upload threads. Resolves which control plane `run` talks to. |
 | [`silence`](../apps/agent/src/silence.rs) | Per-sensor heartbeats, the silence-monitor thread, and `PulsingSink`. |
 | [`health`](../crates/health/src/lib.rs) (crate) | Health-beacon collector, sent every 30 s by default. |
 | [`tamper::progress`](../crates/tamper/src/progress.rs) | Progress-counter file for the watchdog (in the `tamper` crate, which the watchdog reads it through). |
@@ -122,7 +124,7 @@ The detection sink ([`sink/mod.rs`](../apps/agent/src/sink/mod.rs)) has no platf
 | [`shutdown`](../crates/workers/src/shutdown.rs) | `ShutdownPlan`, a bounded join of the registered workers. |
 | [`kill_loudness`](../apps/agent/src/kill_loudness.rs) | Attributes SIGTERM/SIGHUP/SIGQUIT to their sender before exiting (Linux). |
 | [`redact::event`](../crates/redact/src/event.rs) | `RedactingSink` and `redact_event`, which redact data at the point where events leave the process. |
-| [`content`](../apps/agent/src/content.rs), [`release`](../apps/agent/src/release.rs), [`rotation`](../apps/agent/src/rotation.rs), [`trust`](../apps/agent/src/trust.rs) | Signed content, release and key-rotation commands. |
+| [`delivery::content`](../crates/delivery/src/content.rs) (crate), [`release`](../apps/agent/src/release.rs), [`rotation`](../apps/agent/src/rotation.rs), [`trust`](../apps/agent/src/trust.rs) | Signed content, release and key-rotation commands. |
 | [`protected`](../apps/agent/src/protected.rs), [`integrity`](../apps/agent/src/integrity.rs), [`inventory`](../apps/agent/src/inventory.rs) | Linux self-protection and inventory monitors. |
 
 ## Known gaps

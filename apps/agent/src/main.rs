@@ -26,7 +26,6 @@
     allow(dead_code)
 )]
 mod commands;
-mod content;
 mod deception;
 mod enrich_queue;
 #[cfg_attr(
@@ -77,9 +76,9 @@ mod snapshot_fetch;
     allow(dead_code)
 )]
 mod trust;
-mod upload;
 
 use clap::{Parser, Subcommand};
+use delivery::{content, upload};
 
 #[derive(Parser)]
 #[command(name = "agent")]

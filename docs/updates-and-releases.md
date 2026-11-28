@@ -34,7 +34,7 @@ external scheduler runs them (a timer is tracked in
 The crate split mirrors the dependency rules: [`updater`](../crates/updater/src/lib.rs) is a leaf
 crate with verification, layout and state logic only, and cannot depend on `transport`. The
 fetch-verify-apply compositions live in the binary: [`release.rs`](../apps/agent/src/release.rs),
-[`content.rs`](../apps/agent/src/content.rs), [`rotation.rs`](../apps/agent/src/rotation.rs),
+[`content.rs`](../crates/delivery/src/content.rs), [`rotation.rs`](../apps/agent/src/rotation.rs),
 [`snapshot_fetch.rs`](../apps/agent/src/snapshot_fetch.rs), with the post-promotion health gate in
 the watchdog ([`probation.rs`](../apps/watchdog/src/probation.rs)).
 
@@ -236,15 +236,15 @@ Content is versioned per ring, independently of binaries. Rings are `canary_0`, 
 comes from `--ring` or `updates.ring`, and with neither the command refuses rather than silently
 landing the agent in `prod`. Promotion between rings and automatic halts are server decisions.
 
-[`apply_content_manifest`](../apps/agent/src/content.rs):
+[`apply_content_manifest`](../crates/delivery/src/content.rs):
 
 1. Load the keys in force; build the client; `GET /api/content/manifest/{ring}`.
-2. [`plan_with_key`](../apps/agent/src/content.rs) (pure, no I/O): schema version, signature against
+2. [`plan_with_key`](../crates/delivery/src/content.rs) (pure, no I/O): schema version, signature against
    the `content` key, `ring` equals the requested ring (a valid signature does not prove it is the
    manifest *for this ring*), `release_version` newer than this ring's last applied release, entry
    paths safe. It returns which entries are missing or stale and which applied files the new
    release no longer lists.
-3. [`download_and_apply`](../apps/agent/src/content.rs): each entry is fetched with
+3. [`download_and_apply`](../crates/delivery/src/content.rs): each entry is fetched with
    `max_bytes = declared size`, after the declared size itself is checked against
    `MAX_CONTENT_ARTIFACT_BYTES` (100 MiB; otherwise a signed but huge `size` would drive the
    allocation), hash-checked, written atomically under the content directory, and recorded in the
@@ -255,7 +255,7 @@ landing the agent in `prod`. Promotion between rings and automatic halts are ser
    [Local interfaces](local-interfaces.md#local-control-channel)). If no agent is listening, the
    content is on disk and loads at next start; this is not an error.
 
-The local state ([`ContentState`](../apps/agent/src/content.rs), default
+The local state ([`ContentState`](../crates/delivery/src/content.rs), default
 `<state_dir>/content-state.json`) is unsigned: it is the agent's own record, the same trust boundary
 as the ban list. It is, however, the only thing between the agent and a replayed older manifest, so
 `--content-dir` and `--state` must resolve under `storage.state_dir`; the command refuses any other
@@ -268,7 +268,7 @@ prints that reason and exits with `EXIT_RING_HALTED` (75, `EX_TEMPFAIL`), distin
 **Withdrawing content.** The agent never applies a lower release number, so a server that rolls a
 ring back to an older release cannot take content off an agent that already applied the newer one;
 the command reports such an offer as older than the applied release, not as "up to date"
-([`describe_unchanged_offer`](../apps/agent/src/content.rs)). Content is withdrawn by a **corrective
+([`describe_unchanged_offer`](../crates/delivery/src/content.rs)). Content is withdrawn by a **corrective
 release**: a new, higher-numbered manifest that carries the earlier content, built with
 `release-tool roll-forward` ([`roll_forward.rs`](../tools/release/src/roll_forward.rs)). Agents
 then fetch what differs and delete what is no longer listed.
@@ -397,6 +397,6 @@ Key sources ([`KeySource`](../tools/release/src/main.rs)):
 | [`tests/unprovisioned_build.rs`](../crates/updater/tests/unprovisioned_build.rs), [`tests/test_key_build.rs`](../crates/updater/tests/test_key_build.rs) | The packaged trust set fails closed; the test set is what test builds use (CI runs `cargo test -p updater --no-default-features`). |
 | Tests in [`apps/agent/src/release.rs`](../apps/agent/src/release.rs) | Against a local HTTP server: promotion, tampered artifact, mid-download failure, bad signature, escaping path, bans, rotations, SELinux cases, reuse of a staged release. |
 | Tests in [`apps/watchdog/src/probation.rs`](../apps/watchdog/src/probation.rs) and [`recovery.rs`](../apps/watchdog/src/recovery.rs) | Probation detection, rollback targets, bans, pruning, stale watchdog. |
-| Tests in [`apps/agent/src/content.rs`](../apps/agent/src/content.rs) | Plan, hash mismatch, progress preservation, removal, halted rings. |
+| Tests in [`crates/delivery/src/content.rs`](../crates/delivery/src/content.rs) | Plan, hash mismatch, progress preservation, removal, halted rings. |
 | Tests in [`apps/agent/src/rotation.rs`](../apps/agent/src/rotation.rs) and [`trust_state.rs`](../crates/updater/src/trust_state.rs) | Rotation survives restart, replay and forgery refused, corrupt vs missing record. |
 | [`tools/release/tests/pkcs11_softhsm.rs`](../tools/release/tests/pkcs11_softhsm.rs) | Signing through a SoftHSM token, wrong token/PIN/key refused (run by `tools/test-pkcs11.sh` in CI). |

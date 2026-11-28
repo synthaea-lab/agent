@@ -1,0 +1,30 @@
+[package]
+name = "delivery"
+version.workspace = true
+description = "What the agent sends to and fetches from the control plane: telemetry upload and signed content"
+license.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+anyhow = "1"
+config = { path = "../config" }
+getrandom = "0.4"
+health = { path = "../health" }
+ipc = { path = "../ipc" }
+schema = { path = "../schema" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+store = { path = "../store" }
+tokio = { workspace = true }
+tracing = { workspace = true }
+transport = { path = "../transport" }
+updater = { path = "../updater", default-features = false }
+workers = { path = "../workers" }
+
+[dev-dependencies]
+schema = { path = "../schema", features = ["test-fixtures"] }
+tempfile = "3"

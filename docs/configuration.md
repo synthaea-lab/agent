@@ -98,7 +98,7 @@ use `deny_unknown_fields`, so a typo in a key is an error.
 | `server.mtls_cert`, `server.mtls_key` | path, required | absolute | transport client |
 | `server.mtls_passphrase` | [`SecretRef`](../crates/config/src/secret.rs), required | `envvar:` or `file:` prefix | validated only (see [gaps](#gaps-and-discrepancies)) |
 | `server.ca_cert` | path, optional | absolute | when set, **only** these roots are trusted |
-| `server.offline_fallback` | bool, `true` | | [`upload::start_or_disable`](../apps/agent/src/upload.rs): when uploads cannot be set up (unreadable key, missing CA, spool directory), keep detecting locally instead of exiting |
+| `server.offline_fallback` | bool, `true` | | [`upload::start_or_disable`](../crates/delivery/src/upload.rs): when uploads cannot be set up (unreadable key, missing CA, spool directory), keep detecting locally instead of exiting |
 | `log.dir` | path, required | absolute | read and printed; not yet used to write the agent's log |
 | `log.level` | string, `info` | `trace` / `debug` / `info` / `warn` / `error`, any case | tracing filter |
 | `log.max_mb` | u64, `1024` | > 0 | validated only |
@@ -310,7 +310,7 @@ The code is the reference. Where a doc comment says otherwise, the code wins:
   Transport uses its own retry constants.
 - **The spool does not live in `state_dir`.** `storage.state_dir`'s doc lists
   the spool, but the upload spools are created next to the `--alerts` file
-  ([`upload::start`](../apps/agent/src/upload.rs)).
+  ([`upload::start`](../crates/delivery/src/upload.rs)).
 - **`offline_fallback` covers setup failures, not reachability.** It decides
   whether a failure to *set up* uploads stops the agent. An unreachable control
   plane at run time never stops it: the spool buffers events.

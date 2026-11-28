@@ -51,6 +51,8 @@ and build-machine toolchain scripts live here under `packaging/toolchain/`.
   depend only on the base tier.
 - Utility crates (`file-hash`, `workers`) depend on no workspace crate, and any detection or leaf crate
   may use them: code two tiers both need goes there instead of being copied into each.
+- Composition crates (`delivery`) join crates that may not know each other: they may depend on
+  the base, detection, leaf and utility tiers, never on a sensor crate, and only binaries depend on them.
 - Only the binaries (`apps/agent/`, `apps/watchdog/`, `apps/cli/`, and the offline `tools/release/`) may depend on everything.
 
 New crate? Add it to the rules in `tools/check-deps.py` in the same change.

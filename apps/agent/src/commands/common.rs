@@ -24,11 +24,11 @@ use crate::{
 pub(crate) struct RunPipeline {
     pub(crate) sink: Arc<DetectionSink>,
     /// `Some` when `--server` was given: the upload thread is already running
-    /// and the sink is spooling — see [`crate::upload`].
+    /// and the sink is spooling — see [`delivery::upload`].
     // Read back by `health_collector` (spool stats + heartbeat client), which
     // only the platforms with a silence monitor call.
     #[cfg_attr(not(any(target_os = "linux", windows)), allow(dead_code))]
-    pub(crate) transport: Option<crate::upload::TransportHandle>,
+    pub(crate) transport: Option<delivery::upload::TransportHandle>,
     /// Where the platform deposits its sensor-health source for `cli health`
     /// (issue #388). Left empty on a platform with no silence monitor wired:
     /// the IPC handler then reports no sensors rather than invented ones.
@@ -46,7 +46,7 @@ pub(crate) fn plant_canaries(
     sink: &DetectionSink,
     deception: &config::DeceptionConfig,
     storage: &config::StorageConfig,
-    transport: Option<&crate::upload::TransportHandle>,
+    transport: Option<&delivery::upload::TransportHandle>,
 ) {
     let (tripwires, decoys) = crate::deception::start_with_decoys(deception, &storage.state_dir);
     if let Some(tripwires) = tripwires {
@@ -217,13 +217,13 @@ fn wire_run_pipeline(
         ..
     } = *opts;
     // Transport first: the sink needs the spool handle at construction.
-    let spool_cap = crate::upload::spool_cap_bytes(storage.spool_max_mb);
+    let spool_cap = delivery::upload::spool_cap_bytes(storage.spool_max_mb);
     let (transport, upload_disabled) = match server {
         None => (None, None),
         Some(control_plane) => {
-            match crate::upload::start_or_disable(&control_plane, alerts, spool_cap)? {
-                crate::upload::UploadStart::Running(handle) => (Some(handle), None),
-                crate::upload::UploadStart::Disabled(reason) => (None, Some(reason)),
+            match delivery::upload::start_or_disable(&control_plane, alerts, spool_cap)? {
+                delivery::upload::UploadStart::Running(handle) => (Some(handle), None),
+                delivery::upload::UploadStart::Disabled(reason) => (None, Some(reason)),
             }
         }
     };
@@ -323,7 +323,7 @@ pub(crate) fn health_collector(
     host_counters: Arc<dyn HostCountersSource>,
 ) -> HealthCollector {
     let spool_stats: Arc<dyn SpoolStatsSource> = match &pipeline.transport {
-        Some(t) => Arc::new(crate::upload::SpoolHealth {
+        Some(t) => Arc::new(delivery::upload::SpoolHealth {
             events: Arc::clone(&t.spool),
             detections: Arc::clone(&t.detection_spool),
         }),
@@ -685,7 +685,7 @@ mod tests {
 
         fn options<'a>(
             &'a self,
-            server: Option<crate::upload::ControlPlane<'a>>,
+            server: Option<delivery::upload::ControlPlane<'a>>,
         ) -> RunOptions<'a> {
             RunOptions {
                 alerts: &self.alerts,
@@ -738,7 +738,7 @@ mod tests {
         let _tz = super::localzone::TzGuard::new();
         let fixture = PreludeFixture::new();
         let missing_ca = fixture.dir.path().join("no-such-ca.pem");
-        let server = crate::upload::ControlPlane {
+        let server = delivery::upload::ControlPlane {
             url: "https://127.0.0.1:1",
             ca_cert: Some(&missing_ca),
             client_cert: None,
