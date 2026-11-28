@@ -26,7 +26,7 @@ crate-internal; they are re-exported under `#[cfg(test)]` only, for the tests un
 | `evaluate_file_open`, `evaluate_file_delete`, `evaluate_file_set_time`, `evaluate_raw_volume_open` | file events | stateless |
 | `evaluate_connect`, `evaluate_signal`, `evaluate_log_cleared`, `evaluate_kerberos_delegation_failure` | as named | stateless |
 | [`evaluate_amsi_content`](../../crates/rules/src/amsi.rs), [`evaluate_defender_event`](../../crates/rules/src/defender.rs), [`evaluate_ldap_search`](../../crates/rules/src/ldap.rs), [`evaluate_ntlm_auth`](../../crates/rules/src/ntlm.rs), [`evaluate_package_change`](../../crates/rules/src/inventory.rs) | Windows/inventory events | stateless |
-| `RuleState::on_exec`, `on_connect`, `on_network_flow`, `on_dns_query`, `on_listen_port`, `on_file_open`, `on_file_delete`, `on_file_rename`, `on_file_write`, `on_file_set_time`, `on_memfd_create`, `on_auth`, `on_session`, `on_policy_denial`, `on_ldap_search`, `on_process_access`, `on_remote_thread`, `on_file_quarantine`, `on_bits_job`, `on_unit_stop`, `on_identity_change` | as named | stateful |
+| `RuleState::on_exec`, `on_connect`, `on_network_flow`, `on_dns_query`, `on_listen_port`, `on_socket_listen`, `on_file_open`, `on_file_delete`, `on_file_rename`, `on_file_write`, `on_file_set_time`, `on_memfd_create`, `on_auth`, `on_session`, `on_policy_denial`, `on_ldap_search`, `on_process_access`, `on_remote_thread`, `on_file_quarantine`, `on_bits_job`, `on_unit_stop`, `on_identity_change` | as named | stateful |
 | `RuleState::on_exec_signature_gated` | `ExecEvent` | stateful, waits for the signature |
 | `RuleState::take_due_unit_stops`, `take_due_identity_alerts` | none (clock-driven) | deferred findings |
 
@@ -169,6 +169,10 @@ LISTENER-DRIFT and POLICY-DENIAL-DRIFT alert on a *new shape*, not on volume:
   `RuleState::seed_listen_ports` fills the baseline from one startup snapshot. Otherwise every
   service already listening when the agent starts would look like a planted backdoor on the
   first poll.
+  Two sources feed it: the socket-table poll every ten seconds (`ListenPort`), and on Linux the
+  `listen(2)` call itself (`SocketListen`), which is what catches a listener that takes one
+  connection and exits before the next poll. They share the key, so a listener raises one alert
+  whichever saw it first. Only a `listen` whose address the probe resolved is judged.
 - **Policy denials** are keyed per mechanism. SELinux keys on
   `(scontext, tcontext, class, normalised permissions)`; the permission set is sorted and
   deduplicated by `normalized_permissions`. AppLocker and WDAC events carry no object context,

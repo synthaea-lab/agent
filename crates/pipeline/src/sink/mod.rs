@@ -718,6 +718,12 @@ impl DetectionSink {
         self.rule_alerts(wrapped, |state| state.on_listen_port(event));
     }
 
+    /// `SocketListen` events: LISTENER-DRIFT at the `listen(2)` call, for the listener
+    /// that is gone before the next poll.
+    fn detect_socket_listen(&self, wrapped: &Event, event: &schema::SocketListenEvent) {
+        self.rule_alerts(wrapped, |state| state.on_socket_listen(event));
+    }
+
     /// `PolicyDenial` events (`SELinux` AVC #297, AppLocker/WDAC #283):
     /// POLICY-DENIAL-DRIFT (issue #774).
     fn detect_policy_denial(&self, wrapped: &Event, event: &schema::PolicyDenialEvent) {
@@ -1262,6 +1268,7 @@ impl EventSink for DetectionSink {
             Event::NetworkFlow(e) => self.detect_network_flow(&event, e),
             Event::DnsQuery(e) => self.detect_dns_query(&event, e),
             Event::ListenPort(e) => self.detect_listen_port(&event, e),
+            Event::SocketListen(e) => self.detect_socket_listen(&event, e),
             Event::Auth(e) => self.detect_auth(&event, e),
             Event::Session(e) => self.detect_session(&event, e),
             Event::IdentityChange(e) => self.detect_identity_change(e),

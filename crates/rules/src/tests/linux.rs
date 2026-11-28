@@ -1142,6 +1142,47 @@ fn listen_port_not_in_baseline_alerts_once() {
     assert_eq!(alerts[0].technique, "T1571");
 }
 
+fn listen_call(local_port: Option<u16>) -> schema::SocketListenEvent {
+    schema::SocketListenEvent {
+        local_addr: local_port.map(|_| std::net::IpAddr::V4([0, 0, 0, 0].into())),
+        local_port,
+        ..schema::fixtures::socket_listen()
+    }
+}
+
+#[test]
+fn a_listen_call_on_a_port_not_in_the_baseline_alerts_without_waiting_for_a_poll() {
+    let mut state = RuleState::new();
+    let alerts = state.on_socket_listen(&listen_call(Some(31337)));
+    assert_eq!(alerts.len(), 1);
+    assert_eq!(alerts[0].technique, "T1571");
+}
+
+#[test]
+fn a_listener_seen_by_the_call_and_then_by_the_poll_alerts_once() {
+    let mut state = RuleState::new();
+    assert_eq!(state.on_socket_listen(&listen_call(Some(31337))).len(), 1);
+    let polled = listen_port_event_full(4242, "nc", [0, 0, 0, 0], 31337, 10_000_000_000);
+    assert!(state.on_listen_port(&polled).is_empty());
+}
+
+#[test]
+fn a_listen_call_on_a_baseline_port_does_not_alert() {
+    let mut state = RuleState::new();
+    state.seed_listen_ports([(
+        std::net::IpAddr::V4([0, 0, 0, 0].into()),
+        22,
+        schema::IPPROTO_TCP,
+    )]);
+    assert!(state.on_socket_listen(&listen_call(Some(22))).is_empty());
+}
+
+#[test]
+fn a_listen_call_whose_address_the_sensor_did_not_resolve_is_not_judged() {
+    let mut state = RuleState::new();
+    assert!(state.on_socket_listen(&listen_call(None)).is_empty());
+}
+
 #[test]
 fn listen_port_seeded_at_startup_does_not_alert() {
     // The exact scenario seed_listen_ports exists for: a listener already up
