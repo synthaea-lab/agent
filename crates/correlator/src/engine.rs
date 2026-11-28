@@ -60,6 +60,9 @@ const IGNORED: &[&str] = &[
     "MoUsoCoreWorker", // Windows Update orchestrator — accesses OneSettings/UpdateStore in a loop
     "backgroundTaskH", // backgroundTaskHost.exe truncated by ETW — ContentDelivery/Spotlight
     "nordvpn-service", // NordVPN service — legitimate connections to VPN servers
+    // FPs observed in the Windows 11 lab on 2026-11-28, minutes after boot, with no user action:
+    "MicrosoftEdgeUpdate.exe", // Edge's updater, as SYSTEM from a scheduled task
+    "AppHostRegistrationVerifier.exe", // verifies app-to-website links against each site
 ];
 
 fn is_ignored(comm: &str) -> bool {
