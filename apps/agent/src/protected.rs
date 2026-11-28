@@ -35,9 +35,8 @@ use std::{
     sync::Arc,
 };
 
+use pipeline::sink::DetectionSink;
 use schema::{Event, sensor::EventSink};
-
-use crate::sink::DetectionSink;
 
 /// Builds the set of paths this process treats as its own protected resources.
 /// Best-effort on the executable path: `current_exe` can fail (rare — e.g. the binary

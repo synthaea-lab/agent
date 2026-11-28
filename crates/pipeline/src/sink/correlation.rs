@@ -41,7 +41,8 @@ pub(crate) fn correlator_case_id(entity: &verdict::EntityKey) -> String {
 /// like the content and the updater's files, not the process's working directory
 /// (#559). Lab runs and source checkouts keep working through the relative
 /// `ml/registry` fallback in [`load_correlation_scorer`].
-pub(crate) fn model_root(state_dir: &Path) -> PathBuf {
+#[must_use]
+pub fn model_root(state_dir: &Path) -> PathBuf {
     state_dir.join("ml").join("registry")
 }
 
@@ -136,7 +137,11 @@ impl DetectionSink {
     /// Starts the one-second clock that expires pending web-shell correlations even
     /// when the sensor has stopped producing events. The worker holds only a `Weak`
     /// reference while sleeping, and releases the correlator mutex before log I/O.
-    pub(crate) fn start_correlator_ticker(self: &Arc<Self>) -> io::Result<()> {
+    ///
+    /// # Errors
+    ///
+    /// When the ticker thread cannot be spawned.
+    pub fn start_correlator_ticker(self: &Arc<Self>) -> io::Result<()> {
         let sink = Arc::downgrade(self);
         thread::Builder::new()
             .name("correlator-tick".into())

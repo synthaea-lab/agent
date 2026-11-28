@@ -18,9 +18,7 @@ impl DetectionSink {
     /// and starts the scanner if `rules/yara` content is present. Until it is called a
     /// fileless exec is alerted on but not scanned. The first call wins: the mechanism
     /// cannot change under a running agent.
-    // Only the Linux wiring has a memory source to give (ADR-0023).
-    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-    pub(crate) fn enable_memory_scanning(&self, source: Arc<dyn yara::MemorySource>) {
+    pub fn enable_memory_scanning(&self, source: Arc<dyn yara::MemorySource>) {
         if self.memory_source.set(source).is_err() {
             tracing::warn!(
                 "yara: memory scanning is already enabled; the second source is ignored"

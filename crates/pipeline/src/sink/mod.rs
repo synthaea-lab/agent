@@ -29,8 +29,9 @@ mod recording;
 mod response;
 mod yara;
 
-pub(crate) use baseline::BaselineSink;
-pub(crate) use correlation::{correlator_case_id, model_root};
+pub use baseline::BaselineSink;
+pub(crate) use correlation::correlator_case_id;
+pub use correlation::model_root;
 use recording::{Finding, record_ioc_hit, record_rule_alert, spool_on_worker};
 use response::{DAMAGE_MANIFEST_MAX, ResponseCell};
 
@@ -40,7 +41,7 @@ use self::yara::{start_memscan, start_yara};
 /// around the mutable state (`RuleState`) rather than no synchronization: the
 /// `EventSink` trait requires `Send + Sync` and only exposes `&self`, to stay correct
 /// if several sensors ever share one sink.
-pub(crate) struct DetectionSink {
+pub struct DetectionSink {
     rule_state: Mutex<rules::RuleState>,
     correlator: Arc<Mutex<correlator::CorrelationEngine>>,
     /// ML correlation scorer (issue #46 Phase 3, #47 Phase 2): scores behavior over
@@ -224,7 +225,12 @@ impl DetectionSink {
     /// call, so the two commands agree on one directory instead of the
     /// agent loading from a different, hardcoded location than the one
     /// content was actually applied to.
-    pub(crate) fn new(
+    ///
+    /// # Errors
+    ///
+    /// When the alert log or the raw event log cannot be opened, or the enrichment worker
+    /// cannot be spawned.
+    pub fn new(
         rule_state: rules::RuleState,
         alerts_path: &std::path::Path,
         events_path: Option<&std::path::Path>,
@@ -351,7 +357,7 @@ impl DetectionSink {
     /// set on one bad rule, while Sigma skips (and warns about) an individual
     /// bad rule, so a partly broken Sigma set loads *fewer* rules and is only
     /// visible through the reported count.
-    pub(crate) fn reload_content(&self) -> ReloadReport {
+    pub fn reload_content(&self) -> ReloadReport {
         // Parse/compile first, lock only for the swap: `on_event` takes these
         // locks on the capture thread for every exec and write-open, so loading
         // under them would stall capture for the whole load, which grows with
@@ -417,21 +423,20 @@ impl DetectionSink {
     }
 
     /// Returns a reference to the enrichment queue for health telemetry.
-    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-    pub(crate) fn enrich_queue(&self) -> &EnrichQueue {
+    pub fn enrich_queue(&self) -> &EnrichQueue {
         &self.enrich_queue
     }
 
     /// The fused verdict of the entity `meta` belongs to, or `None` while no finding was
     /// recorded for it. `agent replay` reads it to write one case per entity.
-    pub(crate) fn verdict_for(&self, meta: &schema::EventMeta) -> Option<verdict::Verdict> {
+    pub fn verdict_for(&self, meta: &schema::EventMeta) -> Option<verdict::Verdict> {
         self.verdict.lock_recovering().peek(&entity_key(meta))
     }
 
     /// Stops the YARA file and memory scanners. A replay must not scan anything: the pids
     /// and paths in a recorded trace name processes and files of the host that captured
     /// it, not of the one replaying it.
-    pub(crate) fn stop_host_scans(&self) {
+    pub fn stop_host_scans(&self) {
         let yara = self.yara.lock_recovering().take();
         let memscan = self.memscan.lock_recovering().take();
         // Dropped after the locks are released, like `reload_content` does.
@@ -442,37 +447,37 @@ impl DetectionSink {
     /// sample (#102) — a clone of the `Arc`, not the sink itself, so the
     /// heartbeat writer thread needs no reference to the sink or its other
     /// state.
-    pub(crate) fn progress_handle(&self) -> Arc<AtomicU64> {
+    pub fn progress_handle(&self) -> Arc<AtomicU64> {
         Arc::clone(&self.progress)
     }
 
     /// Installs the planted canaries (#81). Called once, before the sensor starts; a second
     /// call is ignored.
-    pub(crate) fn set_tripwires(&self, tripwires: deception::Tripwires) {
+    pub fn set_tripwires(&self, tripwires: deception::Tripwires) {
         self.canary.set_tripwires(tripwires);
     }
 
     /// Tells the rules the host's UTC offset in minutes (<https://github.com/synthaea-lab/agent/issues/17>); false when it is not a real one.
-    pub(crate) fn set_local_utc_offset_minutes(&self, minutes: i32) -> bool {
+    pub fn set_local_utc_offset_minutes(&self, minutes: i32) -> bool {
         self.rule_state
             .lock_recovering()
             .set_local_utc_offset_minutes(minutes)
     }
 
     /// Declares the ordinary local hours (<https://github.com/synthaea-lab/agent/issues/64>); false when they are not a window.
-    pub(crate) fn set_work_hours(&self, start: u32, end: u32) -> bool {
+    pub fn set_work_hours(&self, start: u32, end: u32) -> bool {
         self.rule_state.lock_recovering().set_work_hours(start, end)
     }
 
     /// Declares the accounts whose odd-hour logons are expected (<https://github.com/synthaea-lab/agent/issues/64>).
-    pub(crate) fn set_odd_hour_exempt_accounts(&self, accounts: &[String]) -> usize {
+    pub fn set_odd_hour_exempt_accounts(&self, accounts: &[String]) -> usize {
         self.rule_state
             .lock_recovering()
             .set_odd_hour_exempt_accounts(accounts)
     }
 
     /// Gives the rules the platform's time zone (<https://github.com/synthaea-lab/agent/issues/15>); false when it has no answer for `now_secs`.
-    pub(crate) fn set_local_zone(&self, zone: rules::LocalOffsetAt, now_secs: i64) -> bool {
+    pub fn set_local_zone(&self, zone: rules::LocalOffsetAt, now_secs: i64) -> bool {
         self.rule_state
             .lock_recovering()
             .set_local_zone(zone, now_secs)
@@ -481,14 +486,15 @@ impl DetectionSink {
     /// Runs one auth event through the rules and returns their alerts, without writing them to
     /// the alert log. The rules still remember the logon (first-seen account, odd-hour quiet
     /// period), so a test that reads several logons gives each its own sink.
-    #[cfg(all(test, unix))]
-    pub(crate) fn auth_alerts_for_test(&self, event: &schema::AuthEvent) -> Vec<rules::Alert> {
+    #[cfg(any(test, feature = "test-fixtures"))]
+    #[must_use]
+    pub fn auth_alerts_for_test(&self, event: &schema::AuthEvent) -> Vec<rules::Alert> {
         self.rule_state.lock_recovering().on_auth(event)
     }
 
     /// Installs the executables allowed to touch a canary (#81). Called once, with the
     /// tripwires.
-    pub(crate) fn set_canary_allow(&self, allow: deception::CanaryAllow) {
+    pub fn set_canary_allow(&self, allow: deception::CanaryAllow) {
         self.canary.set_allow(allow);
     }
 
@@ -810,26 +816,26 @@ impl DetectionSink {
     /// rather than private: `silence::spawn_monitor` (#71) emits a sensor-silence
     /// verdict through the exact same path as a rule/correlator/Sigma finding —
     /// one alert shape, whatever detected it.
-    pub(crate) fn emit(&self, technique: &str, message: &str) {
+    pub fn emit(&self, technique: &str, message: &str) {
         self.alert_log.record(technique, message.to_string());
     }
 
     /// [`Self::emit`] for an alert that says the agent itself is being impaired or no longer
     /// matches what was shipped (a silent sensor, a failed integrity or signature check), which
     /// the health beacon counts so the control plane can show a host where that happened (#863).
-    pub(crate) fn emit_tamper(&self, technique: &str, message: &str) {
+    pub fn emit_tamper(&self, technique: &str, message: &str) {
         self.tamper_events.fetch_add(1, Ordering::Relaxed);
         self.emit(technique, message);
     }
 
     /// Tamper-class alerts raised since the agent started, for the health beacon.
-    pub(crate) fn tamper_events(&self) -> u64 {
+    pub fn tamper_events(&self) -> u64 {
         self.tamper_events.load(Ordering::Relaxed)
     }
 
     /// IOC engine figures for the health beacon: indicators in force, findings raised, matches
     /// the cooldown absorbed (#60).
-    pub(crate) fn ioc_counts(&self) -> (u64, u64, u64) {
+    pub fn ioc_counts(&self) -> (u64, u64, u64) {
         let stats = self.ioc.stats();
         (
             self.ioc.indicator_count() as u64,
@@ -840,7 +846,7 @@ impl DetectionSink {
 
     /// IOC matches skipped as the agent's own control-plane traffic: made by this process, and by
     /// a second process on the agent's executable (<https://github.com/synthaea-lab/agent/issues/47>).
-    pub(crate) fn ioc_own_skips(&self) -> (u64, u64) {
+    pub fn ioc_own_skips(&self) -> (u64, u64) {
         let stats = self.ioc.stats();
         (
             stats.own_skipped.load(Ordering::Relaxed),
@@ -850,7 +856,7 @@ impl DetectionSink {
 
     /// Names the control plane whose traffic, from the agent, an IOC match skips (<https://github.com/synthaea-lab/agent/issues/47>), and
     /// starts following the addresses its host resolves to. `false` when the URL names no host.
-    pub(crate) fn set_control_plane(&self, url: &str) -> bool {
+    pub fn set_control_plane(&self, url: &str) -> bool {
         let set = self.own_traffic.set_control_plane(url);
         if set {
             self.own_traffic.spawn_refresh();
@@ -891,7 +897,7 @@ impl DetectionSink {
     ///
     /// An empty `comm` or `technique` (it could never match a finding), or the
     /// suppression list being full ([`verdict::MAX_SUPPRESSIONS`]).
-    pub(crate) fn suppress_verdict(
+    pub fn suppress_verdict(
         &self,
         ppid: u32,
         comm: &str,
@@ -919,7 +925,7 @@ impl DetectionSink {
 
     /// Issue #613: lifts a suppression made with [`Self::suppress_verdict`].
     /// Returns whether one was removed; audited as `VERDICT-UNSUPPRESS`.
-    pub(crate) fn unsuppress_verdict(&self, ppid: u32, comm: &str, technique: &str) -> bool {
+    pub fn unsuppress_verdict(&self, ppid: u32, comm: &str, technique: &str) -> bool {
         let removed = self
             .verdict
             .lock_recovering()
@@ -935,7 +941,7 @@ impl DetectionSink {
 
     /// Every active verdict suppression as `(ppid, comm, technique)`, for the
     /// agent status (issue #613).
-    pub(crate) fn suppressions(&self) -> Vec<(u32, String, String)> {
+    pub fn suppressions(&self) -> Vec<(u32, String, String)> {
         self.verdict
             .lock_recovering()
             .suppressions()
@@ -960,7 +966,7 @@ impl DetectionSink {
     /// Re-reads only the snapshot file, after the fetch loop wrote a new one (ADR-0033): the
     /// rule directories and models are untouched, so a daily snapshot does not rebuild the
     /// detection engines.
-    pub(crate) fn reload_common_set(&self) {
+    pub fn reload_common_set(&self) {
         self.swap_common_set(load_common_set(&self.content_root));
     }
 
@@ -972,26 +978,28 @@ impl DetectionSink {
     }
 
     /// The rarity evidence counters, for the health beacon (ADR-0020, #76).
-    pub(crate) fn rarity_stats(&self) -> Arc<RarityStats> {
+    pub fn rarity_stats(&self) -> Arc<RarityStats> {
         Arc::clone(&self.rarity_stats)
     }
 
     /// Handle to the alert funnel, for the IPC handler's `recent_detections`
     /// endpoint (issue #388).
-    pub(crate) fn alert_log(&self) -> Arc<AlertLog> {
+    pub fn alert_log(&self) -> Arc<AlertLog> {
         Arc::clone(&self.alert_log)
     }
 }
 
 /// What [`DetectionSink::reload_content`] (and, indirectly, [`DetectionSink::new`])
 /// reports about what's loaded after a (re)load.
-pub(crate) struct ReloadReport {
+pub struct ReloadReport {
     /// Rules loaded *after* the reload (the previous set if the reload failed).
-    pub(crate) sigma_rule_count: Option<usize>,
-    pub(crate) yara_rule_count: Option<usize>,
+    pub sigma_rule_count: Option<usize>,
+    /// YARA rules loaded after the reload, counted the same way.
+    pub yara_rule_count: Option<usize>,
     /// The content was present but failed to load; the previous engine kept running.
-    pub(crate) sigma_reload_failed: bool,
-    pub(crate) yara_reload_failed: bool,
+    pub sigma_reload_failed: bool,
+    /// The same for the YARA content.
+    pub yara_reload_failed: bool,
 }
 
 /// Outcome of loading one content directory.
@@ -1083,7 +1091,7 @@ fn unix_now_secs() -> u64 {
 /// What became of the rarity judgements since start, for the health beacon (ADR-0020, #76).
 /// Plain atomics: bumped on the enrichment worker, read by the beacon thread.
 #[derive(Default)]
-pub(crate) struct RarityStats {
+pub struct RarityStats {
     applied: AtomicU64,
     withheld: AtomicU64,
     unapplied: AtomicU64,
@@ -1180,7 +1188,7 @@ fn note_image_rarity(
 /// The largest snapshot file the agent reads. The content manifest allows an artifact of up to
 /// 100 MiB; a snapshot is a Bloom filter whose size the server caps when it builds it, so
 /// anything near this is a malformed or hostile file, refused before it is read.
-pub(crate) const MAX_COMMON_SET_BYTES: u64 = 64 * 1024 * 1024;
+pub const MAX_COMMON_SET_BYTES: u64 = 64 * 1024 * 1024;
 
 /// Loads `<content_root>/snapshots/common-set.bin`, the file the signed content manifest
 /// delivers (ADR-0020). Absent is "no snapshot yet", not an error; unreadable, too large or
@@ -1314,7 +1322,7 @@ impl EventSink for DetectionSink {
 /// Why [`DetectionSink::suppress_verdict`] refused an operator's suppression. The text is
 /// what the CLI prints back.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
-pub(crate) enum SuppressError {
+pub enum SuppressError {
     /// An empty `comm` or `technique`: the mark could never match a finding.
     #[error("comm and technique must not be empty")]
     EmptyField,

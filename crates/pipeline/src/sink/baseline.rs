@@ -16,7 +16,7 @@ use workers::sync::LockExt as _;
 /// deterministic rule — the "known benign under current rules" corpus consumed by
 /// `synthaea_ml` training. Migrated from the old agent's `BaselineSink`, now
 /// platform-neutral (any sensor speaking the contract feeds it).
-pub(crate) struct BaselineSink {
+pub struct BaselineSink {
     rule_state: Mutex<rules::RuleState>,
     out: JsonlWriter,
     count: AtomicU64,
@@ -35,7 +35,12 @@ struct BaselineRecord<'a> {
 }
 
 impl BaselineSink {
-    pub(crate) fn new(rule_state: rules::RuleState, output: &Path) -> std::io::Result<Self> {
+    /// A sink that appends one record per exec to `output`.
+    ///
+    /// # Errors
+    ///
+    /// When `output` cannot be opened for appending.
+    pub fn new(rule_state: rules::RuleState, output: &Path) -> std::io::Result<Self> {
         Ok(Self {
             rule_state: Mutex::new(rule_state),
             out: JsonlWriter::open(output)?,

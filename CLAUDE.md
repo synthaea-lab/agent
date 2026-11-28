@@ -51,8 +51,9 @@ and build-machine toolchain scripts live here under `packaging/toolchain/`.
   depend only on the base tier.
 - Utility crates (`file-hash`, `workers`) depend on no workspace crate, and any detection or leaf crate
   may use them: code two tiers both need goes there instead of being copied into each.
-- Composition crates (`delivery`) join crates that may not know each other: they may depend on
-  the base, detection, leaf and utility tiers, never on a sensor crate, and only binaries depend on them.
+- Composition crates (`delivery`, then `pipeline`) join crates that may not know each other: they
+  may depend on the base, detection, leaf and utility tiers and on the composition crates listed
+  before them, never on a sensor crate, and only binaries depend on them.
 - Only the binaries (`apps/agent/`, `apps/watchdog/`, `apps/cli/`, and the offline `tools/release/`) may depend on everything.
 
 New crate? Add it to the rules in `tools/check-deps.py` in the same change.
@@ -89,6 +90,9 @@ New crate? Add it to the rules in `tools/check-deps.py` in the same change.
   number is lowered in the same change. The exceptions, each with its reason:
   - `delivery` (`lib.rs`): the `release` module is compiled on Linux only, like the
     `updater::layout` it drives.
+  - `pipeline` (`host.rs`): the one place the pipeline states what it knows about the OS it was
+    built for (model family, what the sensor captures, the agent's uid). The code using those
+    facts has no branch.
   - `config`: default config path per OS (`discovery.rs`), the shape of `ipc.endpoint`
     (named pipe or socket path, `load.rs`), the Linux default template (`template.rs`).
   - `ipc` (`stream.rs`): the one place that picks a Unix socket or a Windows named pipe, with

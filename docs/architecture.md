@@ -67,7 +67,7 @@ flowchart BT
   detection --> store[store]
   detection --> detection
   leaf["store, transport, sinks, ipc, response, updater,<br/>config, tamper, redact, inventory, health"] --> schema & policy
-  composition["delivery"] --> detection & leaf
+  composition["delivery, pipeline"] --> detection & leaf
   bins["agent, watchdog, cli, release-tool"] --> sensors & detection & leaf & composition
 ```
 
@@ -78,7 +78,7 @@ The rules:
 - Detection crates may use the base tier, each other, and `store`. They may never use a sensor crate. The engines may not use `correlator` or `verdict`, the two stages that consume their output; the event window both sides read is in the leaf crate `event-window`.
 - Utility crates (`file-hash`, the streaming SHA-256 every hashing crate uses, and `workers`, the worker-thread policies) depend on no workspace crate. Detection and leaf crates may use them; that is where code two tiers both need goes, instead of a copy in each.
 - Leaf crates may use only the base tier and the utility crates. In particular, `transport` and `store` do not know each other, `updater` does not know `transport`, and `response` does not call the OS.
-- Composition crates (`delivery`) join crates that may not know each other. They may use the base, detection, leaf and utility tiers, never a sensor crate, and no crate below the binaries depends on them.
+- Composition crates (`delivery`, then `pipeline`) join crates that may not know each other. They may use the base, detection, leaf and utility tiers, and the composition crates listed before them, never a sensor crate, and no crate below the binaries depends on them.
 - Only binaries may depend on anything. No crate depends on a binary.
 - A crate that the script does not know makes it exit with code 2. A new crate must be added to the script.
 
@@ -106,14 +106,14 @@ All `cfg(target_os)` dispatch in the agent sits in [`apps/agent/src/commands/`](
 | [`commands/windows.rs`](../apps/agent/src/commands/windows.rs) | ETW plus the Event Log, socket-table and minifilter sources. |
 | [`commands/macos.rs`](../apps/agent/src/commands/macos.rs) | EndpointSecurity plus the unified log, socket-table and NetworkExtension sources. |
 
-The detection sink ([`sink/mod.rs`](../apps/agent/src/sink/mod.rs)) has no platform dispatch of its own. A few agent modules are compiled only on Linux because the mechanism exists only there: `integrity`, `inventory`, `kill_loudness`, `log_sources`, `memscan`, `captures`. See the `mod` declarations in [`main.rs`](../apps/agent/src/main.rs).
+The detection sink ([`sink/mod.rs`](../crates/pipeline/src/sink/mod.rs)) has no platform dispatch of its own. A few agent modules are compiled only on Linux because the mechanism exists only there: `integrity`, `inventory`, `kill_loudness`, `log_sources`, `memscan`, `captures`. See the `mod` declarations in [`main.rs`](../apps/agent/src/main.rs).
 
 ## Agent modules at a glance
 
 | Module | Responsibility |
 | --- | --- |
-| [`sink`](../apps/agent/src/sink/mod.rs) | `DetectionSink`, the `EventSink` that runs every engine, records findings and drives response. Also [`BaselineSink`](../apps/agent/src/sink/baseline.rs) for ML baseline capture. |
-| [`enrich_queue`](../apps/agent/src/enrich_queue.rs) | Bounded worker that moves hashing, signature checks, raw-event logging and spool appends off the capture thread. |
+| [`pipeline::sink`](../crates/pipeline/src/sink/mod.rs) (crate) | `DetectionSink`, the `EventSink` that runs every engine, records findings and drives response. Also [`BaselineSink`](../crates/pipeline/src/sink/baseline.rs) for ML baseline capture. |
+| [`pipeline::EnrichQueue`](../crates/pipeline/src/enrich_queue.rs) (crate) | Bounded worker that moves hashing, signature checks, raw-event logging and spool appends off the capture thread. |
 | [`sinks::alert_log`](../crates/sinks/src/alert_log.rs) | `AlertLog`, the single alert funnel: `alerts.ndjson`, stderr, and the 256-entry in-memory buffer that `cli detections` reads. |
 | [`delivery::upload`](../crates/delivery/src/upload.rs) (crate) | The event spool and detection spool, plus their upload threads. Resolves which control plane `run` talks to. |
 | [`silence`](../apps/agent/src/silence.rs) | Per-sensor heartbeats, the silence-monitor thread, and `PulsingSink`. |

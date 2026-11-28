@@ -11,7 +11,7 @@
 
 use std::{path::PathBuf, sync::Arc, time::Duration};
 
-use crate::sink::DetectionSink;
+use pipeline::sink::DetectionSink;
 
 /// Whether a failed manifest verification says anything about the file: a build with no
 /// release key (ADR-0027, `crates/updater/keys` unprovisioned) cannot verify any manifest, so

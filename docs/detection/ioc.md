@@ -151,7 +151,7 @@ address it sits behind) would make every agent alert on itself at every fetch. W
 finding would start the indicator's cooldown and hide a real process reaching the same address
 right after.
 
-The skip needs both conditions ([`OwnTraffic`](../../apps/agent/src/own_traffic.rs)):
+The skip needs both conditions ([`OwnTraffic`](../../crates/pipeline/src/own_traffic.rs)):
 
 - **The destination is the configured control plane.** A DNS query must name its host exactly;
   a subdomain still raises, so DNS tunnelling under it is not hidden. A connect address must be

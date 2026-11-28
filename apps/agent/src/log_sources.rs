@@ -33,14 +33,13 @@ use std::{
 };
 
 use config::{LogSourceConfig, LogSourceKind};
+use pipeline::sink::DetectionSink;
 use schema::sensor::EventSink as _;
 use sensor_linux_logs::{
     AccessFormat, Misparse, MisparseWatch, Position, SignatureBudget, Summarizer, Tailer,
     match_request, parse_access_line, parse_mysql_error_line, to_auth_event, to_http_request_event,
 };
 use workers::shutdown::{ShutdownPlan, sleep_unless_stopped};
-
-use crate::sink::DetectionSink;
 
 const POLL_INTERVAL: Duration = Duration::from_secs(1);
 

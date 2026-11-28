@@ -16,8 +16,8 @@ The work is split in two:
 - The agent holds the wiring: seed storage, planting at start, the hourly refresh, metadata
   matching, the allow list and decoy registration
   ([`apps/agent/src/deception.rs`](../../apps/agent/src/deception.rs)), and the detection path in
-  [`CanaryGate`](../../apps/agent/src/sink/canary.rs), whose findings
-  [`DetectionSink`](../../apps/agent/src/sink/mod.rs) records.
+  [`CanaryGate`](../../crates/pipeline/src/sink/canary.rs), whose findings
+  [`DetectionSink`](../../crates/pipeline/src/sink/mod.rs) records.
 
 ## Configuration
 
@@ -117,7 +117,7 @@ agent warns that a stolen decoy will not raise an alarm for this host.
 
 ## Detection path
 
-[`CanaryGate::on_event`](../../apps/agent/src/sink/canary.rs) runs on every event, before the
+[`CanaryGate::on_event`](../../crates/pipeline/src/sink/canary.rs) runs on every event, before the
 per-type dispatch. It returns the touches to report; `DetectionSink` records them and reports
 each to the ransomware join.
 
@@ -208,5 +208,5 @@ hold, never kills, because its pid may already belong to another process.
   table, against a faked process lookup.
 - [`apps/agent/src/deception.rs`](../../apps/agent/src/deception.rs) tests: seed handling, the `/proc`
   lookups, the registration retry schedule.
-- Sink tests in [`sink/tests.rs`](../../apps/agent/src/sink/tests.rs) (`another_process_opening_a_canary_raises_a_deception_detection`
+- Sink tests in [`sink/tests.rs`](../../crates/pipeline/src/sink/tests.rs) (`another_process_opening_a_canary_raises_a_deception_detection`
   and the `held` and cooldown families) drive real events through `on_event`.

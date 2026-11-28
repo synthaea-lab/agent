@@ -211,7 +211,7 @@ also checks:
   ([`TransportClient::get_bytes`](../crates/transport/src/client.rs)). Caps:
   `MAX_RELEASE_ARTIFACT_BYTES` (256 MiB) in [`release.rs`](../crates/delivery/src/release.rs),
   `MAX_CONTENT_ARTIFACT_BYTES` (100 MiB) in [`content.rs`](../crates/delivery/src/content.rs), and
-  the snapshot cap in [`snapshot_fetch.rs`](../apps/agent/src/snapshot_fetch.rs).
+  the snapshot cap in [`snapshot_fetch.rs`](../crates/pipeline/src/snapshot_fetch.rs).
 
 ## Secret handling
 

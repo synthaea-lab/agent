@@ -3051,35 +3051,42 @@ fn a_high_severity_yara_match_raises_an_escalation_alert() {
     assert!(alerts.contains("778:dropper"), "{alerts}");
 }
 
-/// Maps one page of anonymous read-write-execute memory holding `payload`: the shape
-/// of shellcode or a reflectively loaded image. `None` when the host refuses RWX
-/// mappings (`SELinux` `execmem` denial, a hardened kernel), so the test can skip.
-#[cfg(target_os = "linux")]
-fn plant_in_executable_memory(payload: &[u8]) -> Option<*mut libc::c_void> {
-    assert!(payload.len() <= 4096);
-    // SAFETY: a fresh private anonymous page, checked against MAP_FAILED before use,
-    // and `payload` fits inside it (asserted above).
-    unsafe {
-        let page = libc::mmap(
-            std::ptr::null_mut(),
-            4096,
-            libc::PROT_READ | libc::PROT_WRITE | libc::PROT_EXEC,
-            libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
-            -1,
-            0,
-        );
-        if page == libc::MAP_FAILED {
-            return None;
-        }
-        std::ptr::copy_nonoverlapping(payload.as_ptr(), page.cast::<u8>(), payload.len());
-        Some(page)
+/// A process whose only memory is one anonymous read-write-execute page holding `content`:
+/// the shape of shellcode or a reflectively loaded image. Reading a real process is the
+/// sensor's mechanism and is tested there; the sink only needs something to scan.
+struct ExecutablePage {
+    content: Vec<u8>,
+}
+
+impl ExecutablePage {
+    const START: u64 = 0x7000_0000;
+
+    fn holding(content: &[u8]) -> Arc<Self> {
+        Arc::new(Self {
+            content: content.to_vec(),
+        })
+    }
+}
+
+impl ::yara::MemorySource for ExecutablePage {
+    fn regions(&self, _pid: u32) -> std::io::Result<Vec<::yara::MemoryRegion>> {
+        Ok(vec![::yara::MemoryRegion {
+            start: Self::START,
+            end: Self::START + self.content.len() as u64,
+            perms: ::yara::RegionPerms::parse("rwxp"),
+            kind: ::yara::RegionKind::Anonymous,
+        }])
+    }
+
+    fn read(&self, _pid: u32, start: u64, len: usize) -> std::io::Result<Vec<u8>> {
+        let from = usize::try_from(start - Self::START).unwrap_or(usize::MAX);
+        let bytes = self.content.get(from..).unwrap_or_default();
+        Ok(bytes[..len.min(bytes.len())].to_vec())
     }
 }
 
 /// A fileless exec: the process image is a `/dev/fd/N` path and the comm says memfd,
-/// which is what the T1620 rule keys on. `pid` is a real, readable process so the
-/// memory scan it triggers is a real one.
-#[cfg(target_os = "linux")]
+/// which is what the T1620 rule keys on.
 fn memfd_exec_of(pid: u32) -> Event {
     Event::Exec(ExecEvent {
         meta: EventMeta {
@@ -3094,48 +3101,30 @@ fn memfd_exec_of(pid: u32) -> Event {
     })
 }
 
-/// Held by every test that scans this test process's own memory. The tests run in
-/// parallel in one process, so a marker one of them plants in an executable page is
-/// visible to a scan another one requests: the "clean" test then failed 17 times out
-/// of 30 on a `YARA-MEM` it never planted.
-#[cfg(target_os = "linux")]
-static OWN_PROCESS_MEMORY: Mutex<()> = Mutex::new(());
-
-/// Serializes the tests that scan `std::process::id()`. Poison-tolerant: one test's
-/// failed assertion must not fail the others on a poisoned lock.
-#[cfg(target_os = "linux")]
-fn own_process_memory() -> std::sync::MutexGuard<'static, ()> {
-    OWN_PROCESS_MEMORY
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-}
-
-/// #85 end to end, no mocks: a payload that exists only in executable anonymous
-/// memory of a real process is found by the scan the memfd-exec alert triggers.
-#[test]
-#[cfg(target_os = "linux")]
-fn a_payload_present_only_in_executable_memory_is_found_after_a_memfd_exec_alert() {
-    let _own_memory = own_process_memory();
-    let dir = tmp("memscan-e2e");
+/// A sink in `dir` whose YARA content is the response marker rule at `severity`.
+fn sink_with_marker_rule(dir: &std::path::Path, severity: &str) -> Arc<DetectionSink> {
     let yara_dir = dir.join("content").join("rules").join("yara");
     std::fs::create_dir_all(&yara_dir).unwrap();
     std::fs::write(
         yara_dir.join("marker.yar"),
-        RESPONSE_MARKER_RULE.replace("severity = \"low\"", "severity = \"high\""),
+        RESPONSE_MARKER_RULE.replace("severity = \"low\"", &format!("severity = \"{severity}\"")),
     )
     .unwrap();
-    let sink = sink_in(&dir);
-    sink.enable_memory_scanning(Arc::new(crate::memscan::ProcMemSource));
+    let sink = sink_in(dir);
     assert_eq!(sink.reload_content().yara_rule_count, Some(1));
+    sink
+}
 
-    let Some(page) = plant_in_executable_memory(b"..RESPONSE-SCENARIO-MARKER..") else {
-        eprintln!("skipped: this host refuses RWX anonymous mappings");
-        return;
-    };
-    sink.on_event(memfd_exec_of(std::process::id()));
+/// #85 through the sink: a payload that exists only in executable anonymous memory is
+/// found by the scan the memfd-exec alert triggers.
+#[test]
+fn a_payload_present_only_in_executable_memory_is_found_after_a_memfd_exec_alert() {
+    let dir = tmp("memscan-e2e");
+    let sink = sink_with_marker_rule(&dir, "high");
+    sink.enable_memory_scanning(ExecutablePage::holding(b"..RESPONSE-SCENARIO-MARKER.."));
+
+    sink.on_event(memfd_exec_of(4242));
     let alerts = wait_for_alert(&dir, "YARA-MEM");
-    // SAFETY: `page` is the one-page mapping created above and is not used again.
-    unsafe { libc::munmap(page, 4096) };
 
     assert!(alerts.contains("T1620"), "the trigger is audited: {alerts}");
     assert!(
@@ -3149,18 +3138,12 @@ fn a_payload_present_only_in_executable_memory_is_found_after_a_memfd_exec_alert
 }
 
 #[test]
-#[cfg(target_os = "linux")]
 fn a_memfd_exec_of_a_clean_process_triggers_a_scan_that_finds_nothing() {
-    let _own_memory = own_process_memory();
     let dir = tmp("memscan-clean");
-    let yara_dir = dir.join("content").join("rules").join("yara");
-    std::fs::create_dir_all(&yara_dir).unwrap();
-    std::fs::write(yara_dir.join("marker.yar"), RESPONSE_MARKER_RULE).unwrap();
-    let sink = sink_in(&dir);
-    sink.enable_memory_scanning(Arc::new(crate::memscan::ProcMemSource));
-    assert_eq!(sink.reload_content().yara_rule_count, Some(1));
+    let sink = sink_with_marker_rule(&dir, "low");
+    sink.enable_memory_scanning(ExecutablePage::holding(b"nothing a rule looks for"));
 
-    sink.on_event(memfd_exec_of(std::process::id()));
+    sink.on_event(memfd_exec_of(4242));
     let stats_done = || {
         sink.memscan
             .lock()
@@ -3177,16 +3160,11 @@ fn a_memfd_exec_of_a_clean_process_triggers_a_scan_that_finds_nothing() {
 }
 
 #[test]
-#[cfg(target_os = "linux")]
 fn a_sink_given_no_memory_source_scans_no_memory() {
     let dir = tmp("memscan-no-source");
-    let yara_dir = dir.join("content").join("rules").join("yara");
-    std::fs::create_dir_all(&yara_dir).unwrap();
-    std::fs::write(yara_dir.join("marker.yar"), RESPONSE_MARKER_RULE).unwrap();
-    let sink = sink_in(&dir);
-    assert_eq!(sink.reload_content().yara_rule_count, Some(1));
+    let sink = sink_with_marker_rule(&dir, "low");
 
-    sink.on_event(memfd_exec_of(std::process::id()));
+    sink.on_event(memfd_exec_of(4242));
 
     assert!(sink.memscan.lock().unwrap().is_none());
     assert!(
@@ -3196,12 +3174,11 @@ fn a_sink_given_no_memory_source_scans_no_memory() {
 }
 
 #[test]
-#[cfg(target_os = "linux")]
 fn without_yara_content_a_memfd_exec_requests_no_scan() {
     let dir = tmp("memscan-no-content");
     let sink = sink_in(&dir);
-    sink.enable_memory_scanning(Arc::new(crate::memscan::ProcMemSource));
-    sink.on_event(memfd_exec_of(std::process::id()));
+    sink.enable_memory_scanning(ExecutablePage::holding(b"..RESPONSE-SCENARIO-MARKER.."));
+    sink.on_event(memfd_exec_of(4242));
     assert!(sink.memscan.lock().unwrap().is_none());
     assert!(
         alerts_in(&dir).contains("T1620"),
@@ -3868,18 +3845,6 @@ fn a_marked_signed_file_run_does_not_alert() {
     mark_then_run(&sink, image);
     let alerts = alerts_in(&dir);
     assert!(!alerts.contains("T1204.002"), "{alerts}");
-}
-
-/// #688: the identity the ETW sensor records and the one enrichment reads are the same
-/// token for the same file; the gate compares them as strings, so a format drift between
-/// the two crates (they share no code) would silently turn every gated alert on.
-#[cfg(windows)]
-#[test]
-fn the_sensor_and_enrichment_agree_on_a_files_identity() {
-    let exe = std::env::current_exe().unwrap();
-    let sensor = sensor_windows::image_file_id(&exe);
-    assert!(sensor.is_some(), "an ordinary file has an identity");
-    assert_eq!(sensor, enrich::path_identity(&exe));
 }
 
 /// #688: the image that ran was moved aside and a signed file took its path before the

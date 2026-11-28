@@ -155,7 +155,7 @@ the `--alerts` file:
 
 | Directory | Segment size | Content | Why |
 |---|---|---|---|
-| `spool/` | 1024 records | redacted events, pushed by the enrichment worker in [`sink/mod.rs`](../apps/agent/src/sink/mod.rs) | batching |
+| `spool/` | 1024 records | redacted events, pushed by the enrichment worker in [`sink/mod.rs`](../crates/pipeline/src/sink/mod.rs) | batching |
 | `detection-spool/` | 1 record | redacted detections | a detection the server refuses for good is skipped alone, without the valid detections beside it |
 
 Each spool is opened with `storage.spool_max_mb` as its cap

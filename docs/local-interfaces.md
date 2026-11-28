@@ -128,7 +128,7 @@ neutral formats; vendor SIEM connectors belong to the control plane's export, no
 
 In `agent run` the raw event log is written by the enrichment worker, after redaction, never by a
 capture thread, and is off unless requested: it grows without bound and only labs and ML calibration
-need it ([`DetectionSink::new`](../apps/agent/src/sink/mod.rs)).
+need it ([`DetectionSink::new`](../crates/pipeline/src/sink/mod.rs)).
 
 Syslog/CEF and OCSF/ECS mappings are planned additions to this crate.
 

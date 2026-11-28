@@ -64,6 +64,11 @@ class UtilityCrates(unittest.TestCase):
             with self.subTest(dependency=dependency):
                 self.assertNotIn(dependency, tool.allowed("delivery"))
 
+    def test_a_composition_crate_may_use_an_earlier_one_never_a_later_one(self) -> None:
+        self.assertIn("delivery", tool.allowed("pipeline"))
+        self.assertNotIn("pipeline", tool.allowed("delivery"))
+        self.assertNotIn("pipeline", tool.allowed("pipeline"))
+
     def test_no_crate_below_the_binaries_may_depend_on_a_composition_crate(self) -> None:
         for crate in ("updater", "transport", "rules", "verdict", "sensor-linux", "workers", "policy"):
             with self.subTest(crate=crate):

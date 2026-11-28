@@ -205,7 +205,7 @@ fn jittered(interval: Duration) -> Duration {
 /// Starts the loop when this build embeds a `snapshot` key and there is a control plane to ask.
 /// Detached like the other monitors: it dies with the process. Never panics the agent: a failed
 /// poll is logged and retried at the next interval.
-pub(crate) fn spawn_if_enabled(
+pub fn spawn_if_enabled(
     client: Arc<TransportClient>,
     content_root: PathBuf,
     sink: Arc<DetectionSink>,

@@ -10,6 +10,7 @@ use std::{
     time::Duration,
 };
 
+use pipeline::sink::DetectionSink;
 use schema::sensor::Sensor as _;
 use tamper::heartbeat::{SensorHeartbeat, SilenceMonitor};
 use workers::{
@@ -20,7 +21,6 @@ use workers::{
 use crate::{
     protected::ProtectedResourceGuard,
     silence::{PulsingSink, SourceStatus},
-    sink::DetectionSink,
 };
 
 /// Silence deadlines (#71) fed to `SilenceMonitor::register`. The eBPF sensor and
@@ -1094,7 +1094,7 @@ fn attach_lsm_hooks() -> Option<aya::Ebpf> {
 /// sensor). Platform-neutral by construction — other platforms join as their
 /// sensors land.
 pub(crate) fn cmd_capture_baseline(output: &std::path::Path) -> anyhow::Result<()> {
-    let sink = crate::sink::BaselineSink::new(seeded_rule_state(), output)?;
+    let sink = pipeline::sink::BaselineSink::new(seeded_rule_state(), output)?;
     eprintln!("Synthaea — baseline capture (Ctrl-C to stop)");
     eprintln!("Output: {}", output.display());
     eprintln!("Perform normal activity on a CLEAN host for ~10 minutes.");

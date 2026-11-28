@@ -72,8 +72,7 @@ impl DetectionSink {
     /// YARA match. Until it is called, every kill and quarantine path returns without
     /// acting or writing an audit line. The first call wins; a later one is ignored with a
     /// warning, so the policy in force cannot change under a running agent.
-    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-    pub(crate) fn enable_response(
+    pub fn enable_response(
         &self,
         policy: ResponsePolicy,
         terminate: impl Fn(u32) -> std::io::Result<()> + Send + Sync + 'static,
@@ -86,7 +85,7 @@ impl DetectionSink {
     /// has an arbitrary real pid that a fixed test pid can equal, and the kill gate then
     /// refuses that pid (agent#247, seen once on macOS CI).
     #[cfg(test)]
-    pub(crate) fn enable_response_as_pid(
+    pub fn enable_response_as_pid(
         &self,
         own_pid: u32,
         policy: ResponsePolicy,

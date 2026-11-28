@@ -1,0 +1,59 @@
+[package]
+name = "pipeline"
+version.workspace = true
+description = "The detection pipeline: an event in, the engines' findings, a verdict and its response out"
+license.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[features]
+default = ["dynamic-onnx"]
+dynamic-onnx = ["ml/dynamic-onnx"]
+# Seams for the tests of the binary that wires the pipeline.
+test-fixtures = []
+# The public test signing key set; see `delivery`.
+test-key = ["updater/test-key", "delivery/test-key"]
+
+[dependencies]
+anyhow = "1"
+config = { path = "../config" }
+correlator = { path = "../correlator" }
+deception = { path = "../deception" }
+delivery = { path = "../delivery" }
+enrich = { path = "../enrich" }
+getrandom = "0.4"
+health = { path = "../health" }
+intel = { path = "../intel" }
+ml = { path = "../ml", default-features = false }
+policy = { path = "../policy" }
+redact = { path = "../redact" }
+response = { path = "../response" }
+rules = { path = "../rules" }
+schema = { path = "../schema" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sigma = { path = "../sigma" }
+sinks = { path = "../sinks" }
+store = { path = "../store" }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+transport = { path = "../transport" }
+updater = { path = "../updater", default-features = false }
+verdict = { path = "../verdict" }
+workers = { path = "../workers" }
+yara = { path = "../yara" }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[dev-dependencies]
+deception = { path = "../deception", features = ["test-fixtures"] }
+proptest = "1"
+ring = { workspace = true }
+schema = { path = "../schema", features = ["test-fixtures"] }
+siblings = { path = "../siblings" }
+tempfile = "3"
+updater = { path = "../updater", features = ["test-key"] }

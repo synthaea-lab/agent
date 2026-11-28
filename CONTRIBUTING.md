@@ -142,7 +142,7 @@ between two copies of the same logic silently produces wrong verdicts.
   Rust (inference) must say so in a comment on *both* sides, and be locked by a shared test
   (golden file or mirrored test suites). See "Quality gates" above.
 - **One module, one responsibility.** A file that accumulates a second engine, a second layer,
-  or a second platform gets split (`apps/agent/src/commands/`, `apps/agent/src/sink/`,
+  or a second platform gets split (`apps/agent/src/commands/`, `crates/pipeline/src/sink/`,
   `crates/correlator/src/{event,bus,rules,behavior,bayes,engine}.rs`). Platform `cfg`s live in
   one designated module per crate, not scattered.
 - **Comments say *why*, and carry their evidence.** The best comments in this repository cite

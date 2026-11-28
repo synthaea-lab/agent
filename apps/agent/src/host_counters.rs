@@ -4,7 +4,7 @@
 //! eBPF probes lost to full ring buffers, and how many alerts `alerts.ndjson` did not get.
 //!
 //! What counts as a tamper event, stated plainly: an alert the agent's own monitors raise through
-//! [`crate::sink::DetectionSink::emit_tamper`] (a sensor confirmed silent, a shipped binary or its
+//! [`pipeline::sink::DetectionSink::emit_tamper`] (a sensor confirmed silent, a shipped binary or its
 //! signed manifest that no longer verifies), plus the self-protection events the watchdog reported
 //! (service definition drift, a binary that no longer matches its pinned hash). It does **not**
 //! include a rule detecting tampering with a protected resource (that is an ordinary detection),
@@ -17,8 +17,7 @@ use std::sync::Arc;
 
 use config::identity::{WATCHDOG_RESTARTS_ENV, WATCHDOG_TAMPER_EVENTS_ENV};
 use health::{HostCounters, HostCountersSource};
-
-use crate::sink::DetectionSink;
+use pipeline::sink::DetectionSink;
 
 /// What the watchdog told this agent at spawn. Zero when the agent runs without a watchdog, and
 /// for a variable that is missing or is not a number: a beacon must not fail over a bad variable.

@@ -45,7 +45,7 @@ use std::{
     time::Duration,
 };
 
-use crate::enrich_queue::EnrichQueue;
+use pipeline::EnrichQueue;
 
 const WATCHED_SIGNALS: [i32; 3] = [libc::SIGTERM, libc::SIGHUP, libc::SIGQUIT];
 
@@ -255,7 +255,9 @@ mod tests {
         assert!(pid >= 0, "fork failed");
         if pid == 0 {
             block_termination_signals();
-            let queue = EnrichQueue::start(enrich::Enricher::new(), |_, _| {});
+            let queue =
+                EnrichQueue::start_with_detections(enrich::Enricher::new(), |_, _| {}, |_| {})
+                    .expect("the enrichment worker starts");
             let hook = ready.with_extension("exit-hook");
             spawn_watcher(alerts, queue, move || {
                 std::fs::write(hook, "ran").expect("exit hook marker");

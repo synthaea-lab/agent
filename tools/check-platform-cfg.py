@@ -61,6 +61,8 @@ EXCEPTIONS: dict[str, tuple[int, str]] = {
         3, "the shipped default template carries Linux paths; other OSes write a neutral one"),
     "crates/delivery/src/lib.rs": (
         1, "the `release` module drives updater::layout, which exists on Linux only"),
+    "crates/pipeline/src/host.rs": (
+        8, "the one place the pipeline states what it knows about the OS it was built for"),
     "crates/enrich/src/lib.rs": (
         3, "code-signature and PE enrichment, FFI per OS; moving it to a sensor is #151"),
     "crates/enrich/src/pe_info.rs": (
