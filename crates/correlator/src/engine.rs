@@ -273,11 +273,16 @@ impl CorrelationEngine {
             self.record_pid_entity(event.meta());
             self.record_exec_flags(exec, event.meta());
         }
+        // The two events that change what an entity's processes add up to.
+        let changes_the_entity = matches!(event, Event::Exec(_) | Event::Connect(_));
 
         self.bus.push(event);
 
         let entity_key = self.entity_key_for(pid, generation, &comm);
         self.update_belief_for(pid, generation, &entity_key);
+        if changes_the_entity {
+            self.judge_entity_as_one_process(pid, generation, &entity_key);
+        }
 
         let mut web_alerts =
             web_shell_event.map_or_else(Vec::new, |shell_event| self.queue_web_shell(shell_event));
@@ -391,6 +396,48 @@ impl CorrelationEngine {
             // No ML LLR in internal path — external callers use `update_belief_with_ml`.
             update_belief(state, &bv, None, now_ns);
         }
+    }
+
+    /// Judges the entity on the events of all its processes together, as if one process
+    /// had made them.
+    ///
+    /// A beacon that respawns as a new process for each connection gives no process a
+    /// connection count: each child execs, connects once and exits. Together they are the
+    /// same behaviour as one process that reconnects, and are scored the same. The belief
+    /// keeps the stronger of this and of what a single process showed, so nothing is
+    /// counted twice.
+    ///
+    /// Only for a pid whose parent the engine knows (an `Exec` with a ppid was seen): the
+    /// fallback entity of an unknown process is that process alone. Only on `Exec` and
+    /// `Connect`, the events these features are made of, which keeps the second scan of
+    /// the window off the file-event path.
+    fn judge_entity_as_one_process(
+        &mut self,
+        pid: u32,
+        generation: Option<u64>,
+        entity_key: &EntityRef,
+    ) {
+        let known_parent = self
+            .pid_entities
+            .peek(&pid)
+            .is_some_and(|entry| entry.current(generation));
+        if !known_parent {
+            return;
+        }
+        let together: Vec<&Event> = self
+            .bus
+            .events_for_ppid_comm(
+                entity_key.ppid,
+                entity_key.parent_generation,
+                &entity_key.comm,
+            )
+            .collect();
+        let Some(vector) = BehaviorVector::from_window(&together) else {
+            return;
+        };
+        let now_ns = self.latest_timestamp_ns(pid, generation);
+        let state = self.belief_or_insert(entity_key, now_ns);
+        update_belief(state, &vector, None, now_ns);
     }
 
     /// Evaluates the correlation rules and the Bayesian alert for the pid.
