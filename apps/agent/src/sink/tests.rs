@@ -3120,6 +3120,7 @@ fn a_payload_present_only_in_executable_memory_is_found_after_a_memfd_exec_alert
     )
     .unwrap();
     let sink = sink_in(&dir);
+    sink.enable_memory_scanning(Arc::new(crate::memscan::ProcMemSource));
     assert_eq!(sink.reload_content().yara_rule_count, Some(1));
 
     let Some(page) = plant_in_executable_memory(b"..RESPONSE-SCENARIO-MARKER..") else {
@@ -3151,6 +3152,7 @@ fn a_memfd_exec_of_a_clean_process_triggers_a_scan_that_finds_nothing() {
     std::fs::create_dir_all(&yara_dir).unwrap();
     std::fs::write(yara_dir.join("marker.yar"), RESPONSE_MARKER_RULE).unwrap();
     let sink = sink_in(&dir);
+    sink.enable_memory_scanning(Arc::new(crate::memscan::ProcMemSource));
     assert_eq!(sink.reload_content().yara_rule_count, Some(1));
 
     sink.on_event(memfd_exec_of(std::process::id()));
@@ -3171,9 +3173,29 @@ fn a_memfd_exec_of_a_clean_process_triggers_a_scan_that_finds_nothing() {
 
 #[test]
 #[cfg(target_os = "linux")]
+fn a_sink_given_no_memory_source_scans_no_memory() {
+    let dir = tmp("memscan-no-source");
+    let yara_dir = dir.join("content").join("rules").join("yara");
+    std::fs::create_dir_all(&yara_dir).unwrap();
+    std::fs::write(yara_dir.join("marker.yar"), RESPONSE_MARKER_RULE).unwrap();
+    let sink = sink_in(&dir);
+    assert_eq!(sink.reload_content().yara_rule_count, Some(1));
+
+    sink.on_event(memfd_exec_of(std::process::id()));
+
+    assert!(sink.memscan.lock().unwrap().is_none());
+    assert!(
+        alerts_in(&dir).contains("T1620"),
+        "the rule itself still fires"
+    );
+}
+
+#[test]
+#[cfg(target_os = "linux")]
 fn without_yara_content_a_memfd_exec_requests_no_scan() {
     let dir = tmp("memscan-no-content");
     let sink = sink_in(&dir);
+    sink.enable_memory_scanning(Arc::new(crate::memscan::ProcMemSource));
     sink.on_event(memfd_exec_of(std::process::id()));
     assert!(sink.memscan.lock().unwrap().is_none());
     assert!(

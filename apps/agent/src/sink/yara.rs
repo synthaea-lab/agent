@@ -14,6 +14,28 @@ use workers::sync::LockExt as _;
 use super::{DetectionSink, Load, ResponseCell, escalate_if_warranted, techniques_from};
 
 impl DetectionSink {
+    /// Turns on YARA scanning of process memory (#85), reading processes through `source`,
+    /// and starts the scanner if `rules/yara` content is present. Until it is called a
+    /// fileless exec is alerted on but not scanned. The first call wins: the mechanism
+    /// cannot change under a running agent.
+    // Only the Linux wiring has a memory source to give (ADR-0023).
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    pub(crate) fn enable_memory_scanning(&self, source: Arc<dyn yara::MemorySource>) {
+        if self.memory_source.set(source).is_err() {
+            tracing::warn!(
+                "yara: memory scanning is already enabled; the second source is ignored"
+            );
+            return;
+        }
+        let started = start_memscan(
+            &self.content_root,
+            self.memory_source.get().cloned(),
+            self.alert_log.clone(),
+            self.verdict.clone(),
+        );
+        *self.memscan.lock_recovering() = started.into_option();
+    }
+
     /// Asks for a budgeted YARA scan of the memory of the process behind `event` (#85):
     /// the payload of a fileless exec exists only there. The scan queue applies the
     /// cooldown, the global cap and the per-scan budget; a shed request is counted there.
@@ -110,15 +132,19 @@ pub(super) fn start_yara(
 }
 
 /// Starts the memory scanner over the same `rules/yara` content as the file scanner
-/// (#85, ADR-0023). The rule set is compiled a second time because the file queue owns
-/// its copy; memory and file scanning share rules, not state. Linux only: reading
-/// another process's memory is the `sensor-linux-procmem` mechanism.
-#[cfg(target_os = "linux")]
+/// (#85, ADR-0023), reading processes through `source`. The rule set is compiled a second
+/// time because the file queue owns its copy; memory and file scanning share rules, not
+/// state. Without a `source` there is no scanner: reading another process's memory is a
+/// platform mechanism the caller provides (`sensor-linux-procmem` on Linux, none elsewhere).
 pub(super) fn start_memscan(
     content_root: &Path,
+    source: Option<Arc<dyn yara::MemorySource>>,
     alert_log: Arc<AlertLog>,
     verdict: Arc<Mutex<verdict::VerdictEngine>>,
 ) -> Load<yara::MemoryScanQueue> {
+    let Some(source) = source else {
+        return Load::Absent;
+    };
     let dir = content_root.join("rules/yara");
     if !dir.is_dir() {
         return Load::Absent;
@@ -126,7 +152,7 @@ pub(super) fn start_memscan(
     match yara::RuleSet::load_dir(&dir) {
         Ok(rules) => match yara::MemoryScanQueue::start(
             rules,
-            Arc::new(crate::memscan::ProcMemSource),
+            source,
             yara::MemoryBudget::default(),
             move |outcome| report_memory_matches(&alert_log, &verdict, &outcome),
         ) {
@@ -141,21 +167,10 @@ pub(super) fn start_memscan(
     }
 }
 
-/// No memory scanner off Linux (ADR-0023: Windows and macOS need their own mechanism).
-#[cfg(not(target_os = "linux"))]
-pub(super) fn start_memscan(
-    _content_root: &Path,
-    _alert_log: Arc<AlertLog>,
-    _verdict: Arc<Mutex<verdict::VerdictEngine>>,
-) -> Load<yara::MemoryScanQueue> {
-    Load::Absent
-}
-
 /// What a memory scan that matched produces: the match fused into the verdict of the
 /// process that was scanned (the same path as a file match), a `YARA-MEM` audit line per
 /// rule, and the escalation the fused severity warrants. A memory match does not
 /// quarantine anything: there is no file to move.
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 fn report_memory_matches(
     alert_log: &AlertLog,
     verdict: &Mutex<verdict::VerdictEngine>,
