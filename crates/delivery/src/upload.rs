@@ -32,7 +32,8 @@ use workers::{shutdown::ShutdownPlan, sync::LockExt};
 /// the configuration already rejects 0 at load, so the cap is never 0.
 ///
 /// Until #604 this was a hard-coded 64 MiB and the configured value was never read.
-pub(crate) fn spool_cap_bytes(spool_max_mb: u64) -> u64 {
+#[must_use]
+pub fn spool_cap_bytes(spool_max_mb: u64) -> u64 {
     spool_max_mb.saturating_mul(1024 * 1024)
 }
 
@@ -71,7 +72,11 @@ impl DetectionDrain for DetectionSpoolDrain {
 
 /// Creates the retry identity and persists it atomically with the detection.
 /// A recovered segment carries the same identity after a crash.
-pub(crate) fn persist_detection(
+///
+/// # Errors
+///
+/// The I/O error when no random identity can be drawn or the spool cannot be written.
+pub fn persist_detection(
     spool: &Mutex<EventSpool>,
     detection: schema::detection::Detection,
 ) -> std::io::Result<()> {
@@ -116,12 +121,13 @@ impl EventDrain for SpoolDrain {
 /// graceful shutdown (#316) can end it with one last drain (`finish_run`, all
 /// platforms since #147). A kill the agent cannot intercept loses nothing: the
 /// spool redelivers.
-pub(crate) struct TransportHandle {
-    pub(crate) spool: Arc<Mutex<EventSpool>>,
-    pub(crate) detection_spool: Arc<Mutex<EventSpool>>,
-    // Read by the health beacon, which macOS doesn't wire yet (#317).
-    #[cfg_attr(not(any(target_os = "linux", windows)), allow(dead_code))]
-    pub(crate) client: Arc<TransportClient>,
+pub struct TransportHandle {
+    /// The event spool the sink appends to.
+    pub spool: Arc<Mutex<EventSpool>>,
+    /// The detection spool beside it.
+    pub detection_spool: Arc<Mutex<EventSpool>>,
+    /// The client the health beacon posts its heartbeat with.
+    pub client: Arc<TransportClient>,
     upload_stop: Arc<AtomicBool>,
     upload_thread: JoinHandle<()>,
     detection_upload_stop: Arc<AtomicBool>,
@@ -131,7 +137,7 @@ pub(crate) struct TransportHandle {
 impl TransportHandle {
     /// Registers the upload thread with `plan`: stopping it makes the loop
     /// exit its poll/backoff sleep and attempt the final spool drain.
-    pub(crate) fn register_shutdown(self, plan: &mut ShutdownPlan) {
+    pub fn register_shutdown(self, plan: &mut ShutdownPlan) {
         let stop = self.upload_stop;
         plan.register(
             "transport-upload",
@@ -150,21 +156,24 @@ impl TransportHandle {
 /// is the only trust root (#658), and for one that requires mTLS the client certificate and
 /// key it presents.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct ControlPlane<'a> {
-    pub(crate) url: &'a str,
-    pub(crate) ca_cert: Option<&'a Path>,
+pub struct ControlPlane<'a> {
+    /// The control plane's base URL.
+    pub url: &'a str,
+    /// PEM bundle of the only CA(s) trusted for the server's certificate.
+    pub ca_cert: Option<&'a Path>,
     /// `(certificate, key)`, both PEM.
-    pub(crate) client_cert: Option<(&'a Path, &'a Path)>,
+    pub client_cert: Option<(&'a Path, &'a Path)>,
     /// `server.offline_fallback`: whether a failure to set the upload up (an unreadable
     /// client certificate, a missing CA) lets `run` start without it (see
     /// [`start_or_disable`]) or stops it.
-    pub(crate) offline_fallback: bool,
+    pub offline_fallback: bool,
 }
 
 /// A transport config for `url` that names the agent in its `User-Agent` with
 /// the identity's product token (#596). Every client the agent builds starts
 /// here, so the name is set in one place.
-pub(crate) fn transport_config_for(url: &str) -> TransportConfig {
+#[must_use]
+pub fn transport_config_for(url: &str) -> TransportConfig {
     TransportConfig::new(url).with_user_agent(format!(
         "{}/{}",
         config::identity::PRODUCT_TOKEN,
@@ -188,7 +197,7 @@ impl ControlPlane<'_> {
 /// Where `run` uploads, resolved from the command line and `agent.toml` and owned, so the
 /// borrowed [`ControlPlane`] can be taken from it.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct RunTarget {
+pub struct RunTarget {
     url: String,
     ca_cert: Option<PathBuf>,
     client_cert: Option<(PathBuf, PathBuf)>,
@@ -197,7 +206,8 @@ pub(crate) struct RunTarget {
 
 impl RunTarget {
     /// The borrowed form `start` takes.
-    pub(crate) fn control_plane(&self) -> ControlPlane<'_> {
+    #[must_use]
+    pub fn control_plane(&self) -> ControlPlane<'_> {
         ControlPlane {
             url: &self.url,
             ca_cert: self.ca_cert.as_deref(),
@@ -222,7 +232,8 @@ impl RunTarget {
 ///
 /// The CA is a trust anchor and not a credential, so `--ca-cert`, else `server.ca_cert`,
 /// applies to either server.
-pub(crate) fn resolve_run_target(
+#[must_use]
+pub fn resolve_run_target(
     server: Option<String>,
     standalone: bool,
     cert: Option<PathBuf>,
@@ -261,7 +272,12 @@ pub(crate) fn resolve_run_target(
 ///
 /// `spool_max_bytes` caps **each** of the two spools (events, and the detection
 /// spool beside it), so the worst case on disk is twice `storage.spool_max_mb`.
-pub(crate) fn start(
+///
+/// # Errors
+///
+/// When a spool cannot be opened, the transport client cannot be built from the
+/// certificates given, or an upload thread cannot be spawned.
+pub fn start(
     control_plane: &ControlPlane<'_>,
     alerts: &Path,
     spool_max_bytes: u64,
@@ -313,10 +329,11 @@ pub(crate) fn start(
 
 /// The health beacon's view of the spool (`spool_bytes`/`spool_dropped` in
 /// #134's beacon) — replaces `health::NoopSpoolStats` when transport is on.
-#[cfg_attr(not(any(target_os = "linux", windows)), allow(dead_code))] // no health beacon on macOS yet (#317)
-pub(crate) struct SpoolHealth {
-    pub(crate) events: Arc<Mutex<EventSpool>>,
-    pub(crate) detections: Arc<Mutex<EventSpool>>,
+pub struct SpoolHealth {
+    /// The event spool.
+    pub events: Arc<Mutex<EventSpool>>,
+    /// The detection spool.
+    pub detections: Arc<Mutex<EventSpool>>,
 }
 
 impl health::SpoolStatsSource for SpoolHealth {
@@ -332,7 +349,7 @@ impl health::SpoolStatsSource for SpoolHealth {
 }
 
 /// What [`start_or_disable`] came to.
-pub(crate) enum UploadStart {
+pub enum UploadStart {
     /// The spool and the upload threads are running.
     Running(TransportHandle),
     /// Upload could not be set up and the agent runs without it: why. The caller says so
@@ -354,7 +371,7 @@ pub(crate) enum UploadStart {
 /// # Errors
 ///
 /// The error of [`start`] when `offline_fallback` is off.
-pub(crate) fn start_or_disable(
+pub fn start_or_disable(
     control_plane: &ControlPlane<'_>,
     alerts: &Path,
     spool_max_bytes: u64,

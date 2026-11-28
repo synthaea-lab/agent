@@ -210,7 +210,7 @@ also checks:
   fetched, and the HTTP read is capped as well
   ([`TransportClient::get_bytes`](../crates/transport/src/client.rs)). Caps:
   `MAX_RELEASE_ARTIFACT_BYTES` (256 MiB) in [`release.rs`](../apps/agent/src/release.rs),
-  `MAX_CONTENT_ARTIFACT_BYTES` (100 MiB) in [`content.rs`](../apps/agent/src/content.rs), and
+  `MAX_CONTENT_ARTIFACT_BYTES` (100 MiB) in [`content.rs`](../crates/delivery/src/content.rs), and
   the snapshot cap in [`snapshot_fetch.rs`](../apps/agent/src/snapshot_fetch.rs).
 
 ## Secret handling

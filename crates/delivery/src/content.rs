@@ -61,16 +61,16 @@ pub(crate) struct ContentState {
     /// day zero for it, same as `ReleaseManifest::check_release_version`'s
     /// `None` case.
     #[serde(default)]
-    pub(crate) release_version: BTreeMap<String, u64>,
+    pub release_version: BTreeMap<String, u64>,
     /// path -> sha256 of every artifact currently applied.
     #[serde(default)]
-    pub(crate) entries: BTreeMap<String, String>,
+    pub entries: BTreeMap<String, String>,
 }
 
 impl ContentState {
     /// Loads the persisted state from `path`. A missing file is a fresh
     /// install, not an error — same posture as `updater::banlist::BannedVersions::load`.
-    pub(crate) fn load(path: &Path) -> Result<Self, std::io::Error> {
+    pub fn load(path: &Path) -> Result<Self, std::io::Error> {
         match std::fs::read(path) {
             Ok(bytes) => Ok(serde_json::from_slice(&bytes)?),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Self::default()),
@@ -90,15 +90,15 @@ impl ContentState {
 /// stale.
 #[derive(Debug, PartialEq)]
 pub(crate) struct FetchPlan {
-    pub(crate) release_version: u64,
-    pub(crate) to_fetch: Vec<ContentEntry>,
+    pub release_version: u64,
+    pub to_fetch: Vec<ContentEntry>,
     /// Applied paths this manifest no longer lists: deleted once the new entries have
     /// landed, so that a release which drops a file actually withdraws it (#666).
-    pub(crate) to_remove: Vec<String>,
+    pub to_remove: Vec<String>,
     /// Every path the manifest lists, so that removing a stale path can be refused when it
     /// is the same file as a listed one under another spelling (a case-only rename on a
     /// case-insensitive filesystem).
-    pub(crate) kept: Vec<String>,
+    pub kept: Vec<String>,
 }
 
 /// [`plan_with_key`] against the embedded `content` key, for the tests that do not rotate it.
@@ -187,7 +187,7 @@ pub(crate) fn plan_with_key(
 /// ring (an operator re-running the check sees this as "up to date", not a
 /// crash — see the caller's own message mapping, `commands::content` on the
 /// CLI side).
-pub(crate) fn cmd_check_content_manifest(
+pub fn cmd_check_content_manifest(
     server: &str,
     ring: &str,
     cert: Option<&Path>,
@@ -257,7 +257,7 @@ fn describe_unchanged_offer(ring: &str, offered: u64, current: u64) -> String {
 /// # Errors
 ///
 /// Returns an error if mTLS certificates are configured but cannot be loaded.
-pub(crate) fn build_client(
+pub fn build_client(
     server: &str,
     cert: Option<&Path>,
     key: Option<&Path>,
@@ -384,8 +384,8 @@ fn download_and_apply(
 /// remove (kept in the state, so the next run tries again).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct Applied {
-    pub(crate) removed: usize,
-    pub(crate) failed: usize,
+    pub removed: usize,
+    pub failed: usize,
 }
 
 /// Deletes the files in `to_remove` from `content_dir` and forgets them in `state`,
@@ -558,7 +558,8 @@ fn ensure_within_state_dir(path: &Path, state_dir: &Path, flag_name: &str) -> an
 /// Where applied content lives by default. The single definition shared by
 /// `apply-content-manifest` (writer) and `run` (reader): they must agree, or
 /// content that was downloaded and verified is never loaded.
-pub(crate) fn default_content_dir(state_dir: &Path) -> PathBuf {
+#[must_use]
+pub fn default_content_dir(state_dir: &Path) -> PathBuf {
     state_dir.join("content")
 }
 
@@ -572,7 +573,7 @@ pub(crate) fn default_content_dir(state_dir: &Path) -> PathBuf {
 ///
 /// Returns an error if an explicit `content_dir` or `state_path` does not
 /// resolve under `state_dir`.
-pub(crate) fn resolve_content_paths(
+pub fn resolve_content_paths(
     state_dir: &Path,
     content_dir: Option<PathBuf>,
     state_path: Option<PathBuf>,
@@ -597,12 +598,15 @@ pub(crate) fn resolve_content_paths(
 /// Where and how to reach the control plane, after `--server`/`--cert`/`--key`
 /// have been reconciled with `agent.toml` ([`resolve_endpoint`]).
 #[derive(Debug, PartialEq, Eq)]
-pub(crate) struct Endpoint {
-    pub(crate) server: String,
-    pub(crate) cert: Option<PathBuf>,
-    pub(crate) key: Option<PathBuf>,
+pub struct Endpoint {
+    /// The control plane's base URL.
+    pub server: String,
+    /// The client certificate presented for mTLS (PEM), if any.
+    pub cert: Option<PathBuf>,
+    /// The private key of `cert` (PEM).
+    pub key: Option<PathBuf>,
     /// PEM bundle of the only CA(s) trusted for the server's certificate.
-    pub(crate) ca_cert: Option<PathBuf>,
+    pub ca_cert: Option<PathBuf>,
 }
 
 /// Picks the control plane for `apply-content-manifest`. `--server` omitted
@@ -611,7 +615,8 @@ pub(crate) struct Endpoint {
 /// given means exactly that server, with mTLS only if the flags say so — the
 /// config's client certificate is never presented to a server the operator
 /// named by hand.
-pub(crate) fn resolve_endpoint(
+#[must_use]
+pub fn resolve_endpoint(
     server: Option<String>,
     cert: Option<PathBuf>,
     key: Option<PathBuf>,
@@ -638,7 +643,8 @@ pub(crate) fn resolve_endpoint(
 /// from `agent.toml`, else none (the built-in roots). A CA is a trust anchor and not a
 /// credential, so unlike the client certificate it applies to a server named by hand
 /// too; it can only make verification stricter.
-pub(crate) fn resolve_ca_cert(
+#[must_use]
+pub fn resolve_ca_cert(
     flag: Option<PathBuf>,
     configured: &config::ServerConfig,
 ) -> Option<PathBuf> {
@@ -652,7 +658,7 @@ pub(crate) fn resolve_ca_cert(
 /// # Errors
 ///
 /// Returns an error when neither the flag nor the config names a ring.
-pub(crate) fn resolve_ring(
+pub fn resolve_ring(
     flag: Option<String>,
     updates: &config::UpdatesConfig,
 ) -> anyhow::Result<String> {
@@ -670,11 +676,11 @@ pub(crate) fn resolve_ring(
 /// mistaken for a network or verification failure (exit 1). A halt is an
 /// intended, temporary state; a timer unit should list it under
 /// `SuccessExitStatus=` (docs/operations/content.md).
-pub(crate) const EXIT_RING_HALTED: i32 = 75;
+pub const EXIT_RING_HALTED: i32 = 75;
 
 /// How an `apply-content-manifest` run ended, when it did not fail.
 #[derive(Debug, PartialEq, Eq)]
-pub(crate) enum ApplyOutcome {
+pub enum ApplyOutcome {
     /// Applied, or already up to date.
     Done,
     /// The control plane halted the ring: nothing was fetched or changed.
@@ -714,7 +720,7 @@ fn halted_message(ring: &str, reason: &str) -> String {
 /// halted ring (`423`) is not an error: it prints the server's reason and
 /// returns [`ApplyOutcome::RingHalted`], leaving the state file and the
 /// content directory as they were (#667).
-pub(crate) fn cmd_apply_content_manifest(
+pub fn cmd_apply_content_manifest(
     endpoint: &Endpoint,
     ring: &str,
     content_dir: &Path,

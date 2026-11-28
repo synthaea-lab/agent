@@ -13,6 +13,9 @@ Rules (see CLAUDE.md):
     (`correlator`, `verdict`): what both sides share lives in `event-window`.
   - Leaf crates (response, transport, ipc, sinks, updater, config, store)
     depend only on the base tier.
+  - Composition crates (delivery) join crates that may not know each other. They may
+    depend on the base, detection, leaf and utility tiers, never on a sensor or a binary,
+    and nothing below the binaries depends on them.
   - Only the binaries (`agent`, `watchdog`, `cli`) may depend on anything.
   - Utility crates (`file-hash`, `workers`) depend on no workspace crate; any detection or leaf crate
     may use them. They exist so two tiers that may not depend on each other need not
@@ -39,6 +42,8 @@ DETECTION_CONSUMERS = {"correlator", "verdict"}
 DETECTION_SHARED = {"store", "event-window"}
 LEAF = {"response", "transport", "ipc", "sinks", "updater", "config", "store", "event-window",
         "tamper", "inventory", "redact", "health"}
+# Crates that join detection and leaf crates, which may not depend on each other.
+COMPOSITION = {"delivery"}
 BINARIES = {"agent", "watchdog", "cli", "release-tool"}
 # Crates shared by one platform's sensors, keyed to that platform's package prefix:
 # the wire crate (kernel<->userspace ABI) and the container-attribution runtime.
@@ -74,6 +79,8 @@ def allowed(crate: str) -> set[str] | None:
         return BASE | (DETECTION - DETECTION_CONSUMERS) | DETECTION_SHARED | UTILITY
     if crate in LEAF:
         return BASE | UTILITY
+    if crate in COMPOSITION:
+        return BASE | DETECTION | LEAF | UTILITY
     print(f"error: crate `{crate}` is not covered by the dependency rules — "
           f"add it to tools/check-deps.py")
     sys.exit(2)

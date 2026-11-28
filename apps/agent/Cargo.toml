@@ -37,6 +37,7 @@ tamper = { path = "../../crates/tamper" }
 inventory = { path = "../../crates/inventory" }
 response = { path = "../../crates/response" }
 store = { path = "../../crates/store" }
+delivery = { path = "../../crates/delivery" }
 health = { path = "../../crates/health" }
 workers = { path = "../../crates/workers" }
 transport = { path = "../../crates/transport" }
