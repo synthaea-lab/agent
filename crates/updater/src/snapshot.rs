@@ -1,4 +1,4 @@
-//! The signed manifest of the fleet common-set snapshot (ADR-0033, issue #76 box 2): the document
+//! The signed manifest of the fleet common-set snapshot (issue #76 box 2): the document
 //! that tells an agent which snapshot artifact to fetch and proves the control plane's own
 //! signing key made it. A manifest of its own, verified against the `snapshot` key alone: a
 //! content or release manifest signed by another key does not verify here, and this one does not
@@ -27,7 +27,7 @@ pub const KIND_COMMON_SET: &str = "common-set";
 pub const CLOCK_SKEW_TOLERANCE_SECS: u64 = 15 * 60;
 
 /// A snapshot older than this is treated as absent, so a server that stops publishing, or a
-/// blocked network, cannot keep a stale set in force (ADR-0033 decision 3). **Provisional**:
+/// blocked network, cannot keep a stale set in force. **Provisional**:
 /// three daily cadences, calibrated in slice 6 of
 /// `docs/detection/fleet-prevalence-snapshot-plan.md`.
 pub const DEFAULT_MAX_AGE_SECS: u64 = 3 * 24 * 60 * 60;
@@ -74,7 +74,7 @@ impl SignedDocument for SnapshotManifest {
 
 impl SnapshotManifest {
     /// Signs in place with `key_pair`, over the bytes [`Self::verify_signature`] checks. The
-    /// production signer is a key service the control plane asks (ADR-0033); this is what tests
+    /// production signer is a key service the control plane asks; this is what tests
     /// and the public test key use.
     pub fn sign(&mut self, key_pair: &ring::signature::Ed25519KeyPair) {
         self.sign_with_key_pair(key_pair);
@@ -279,7 +279,7 @@ mod tests {
     #[test]
     fn a_manifest_signed_by_the_content_or_release_key_is_not_a_snapshot_manifest() {
         // In the test set `release` and `content` are one key, the snapshot key another: role
-        // separation (ADR-0027, ADR-0033).
+        // separation.
         let mut m = manifest(NOW);
         m.sign(&crate::key::test_key_pair());
         assert!(matches!(

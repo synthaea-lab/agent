@@ -1,6 +1,6 @@
 //! # sensor-linux-procmem
 //!
-//! The mechanism behind process-memory scanning (issue #85, ADR-0023): list a process's
+//! The mechanism behind process-memory scanning (issue #85): list a process's
 //! mappings from `/proc/<pid>/maps` and read bytes from `/proc/<pid>/mem`. No policy lives
 //! here (which regions to read, how much, how often is `yara`'s `memory` module); the
 //! agent adapts the two.

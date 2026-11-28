@@ -1,17 +1,18 @@
 //! The updater's embedded trust set: four Ed25519 public keys, each with one job
-//! (ADR-0027, ADR-0033). `release` verifies binary release manifests, `content` verifies content
+//!. `release` verifies binary release manifests, `content` verifies content
 //! manifests, `snapshot` verifies the common-set snapshot manifest and nothing else (its custody
 //! is not decided, <https://github.com/synthaea-lab/agent/issues/43>), `recovery` is held offline and reserved for a key-rotation release
 //! ([`crate::rotation`]).
 //!
 //! A production build embeds the keys in `crates/updater/keys/*.pub` (hex). Since 2026-11-12 they
-//! hold TEMPORARY `release`, `content` and `recovery` keys, generated outside the ADR-0027 ceremony
+//! hold TEMPORARY `release`, `content` and `recovery` keys, generated outside the signing-key
+//! design ceremony
 //! and replaced when the real ones exist; `snapshot` stays `unprovisioned`. A file that says `unprovisioned` makes its static `None` and nothing verifies: the
 //! build fails closed instead of trusting a public seed.
 //!
 //! The public test set (a seed checked into the repository) exists only under the
 //! `test-key` cargo feature or `cfg(test)`, so a build without either cannot ship it by
-//! omission. In that set `release` and `content` are one key (ADR-0016's development
+//! omission. In that set `release` and `content` are one key (the content-ring design's development
 //! shortcut), `recovery` is a second one and `snapshot` a third, so a snapshot manifest never
 //! verifies as a content or release manifest or the other way round.
 
@@ -140,13 +141,13 @@ pub static RELEASE_PUBLIC_KEY: LazyLock<Option<[u8; 32]>> =
 pub static CONTENT_PUBLIC_KEY: LazyLock<Option<[u8; 32]>> =
     LazyLock::new(|| embedded(Role::Content, include_str!("../keys/content.pub")));
 
-/// Verifies the common-set snapshot manifest (ADR-0033) and nothing else. `None` when no key is
+/// Verifies the common-set snapshot manifest and nothing else. `None` when no key is
 /// provisioned, which also keeps the agent's snapshot fetch loop off (fail closed). Its custody is
 /// the open question of <https://github.com/synthaea-lab/agent/issues/43>; until then only the test set provides one.
 pub static SNAPSHOT_PUBLIC_KEY: LazyLock<Option<[u8; 32]>> =
     LazyLock::new(|| embedded(Role::Snapshot, include_str!("../keys/snapshot.pub")));
 
-/// The offline key that signs key rotations (ADR-0027) and nothing else:
+/// The offline key that signs key rotations and nothing else:
 /// [`crate::rotation::KeyRotationManifest`] verifies against it. `None` when no key is provisioned.
 pub static RECOVERY_PUBLIC_KEY: LazyLock<Option<[u8; 32]>> =
     LazyLock::new(|| embedded(Role::Recovery, include_str!("../keys/recovery.pub")));
@@ -195,7 +196,7 @@ mod tests {
                 std::fs::read_to_string(format!("{}/keys/{file}.pub", env!("CARGO_MANIFEST_DIR")))
                     .unwrap();
             // `snapshot` stays `unprovisioned` on purpose: a key there turns the agent's snapshot
-            // fetch loop on (ADR-0033), which is gated on tenant binding and an undecided custody.
+            // fetch loop on, which is gated on tenant binding and an undecided custody.
             let Some(key) = parse_key_file(&text) else {
                 assert_eq!(file, "snapshot", "{file}.pub does not hold one 64-hex key");
                 continue;
@@ -246,7 +247,7 @@ mod tests {
 
     #[test]
     fn committed_keys_are_distinct_per_role_and_not_all_zero() {
-        // Identical files would silently collapse the role separation (ADR-0027): a
+        // Identical files would silently collapse the role separation: a
         // content signer could then sign releases. Vacuous for a file that is `unprovisioned`.
         let keys: Vec<(&str, [u8; 32])> = ["release", "content", "snapshot", "recovery"]
             .into_iter()

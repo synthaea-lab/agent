@@ -54,7 +54,7 @@ be replaced over the air by a rotation that only `recovery` can sign.
 
 **Production keys.** A build without the `test-key` feature reads the keys from
 `crates/updater/keys/*.pub` (one line of 64 hex characters). Since 2026-11-12 those files hold
-**temporary** keys (generated outside the ADR-0027 ceremony, no custody, to be replaced). A file
+**temporary** keys (generated outside the signing-key design ceremony, no custody, to be replaced). A file
 that says `unprovisioned` makes its static `None` and every verification of that role fails with
 [`SigningKeyUnprovisioned`](../crates/updater/src/error.rs): the build fails closed instead of
 trusting a public seed. A build that embeds the temporary keys refuses anything signed by the

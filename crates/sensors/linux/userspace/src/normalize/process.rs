@@ -35,7 +35,8 @@ pub fn exec(
         .position(|&b| b == 0)
         .unwrap_or(image_raw.len());
     let image_path = String::from_utf8_lossy(&image_raw[..image_end]).into_owned();
-    // ADR-0045's truth table: the flag is set exactly when bytes are known to be missing, from
+    // the argv-window design's truth table: the flag is set exactly when bytes are known to be
+    // missing, from
     // the probe's windows (`Some(n > 0)`) or from the budget cut, whose size is not measured.
     let budget_cut = schema::bound_argv(&mut argv);
     let argv_omitted_bytes = if budget_cut { None } else { argv_omitted_bytes };

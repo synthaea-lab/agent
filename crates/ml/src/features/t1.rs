@@ -1,7 +1,7 @@
 //! The T1 behavior vector: cmdline (9) + correlation (8) = 17 features, in that order.
 //! The Rust mirror of `ml/synthaea_ml/features/t1.py` (issue #617).
 //!
-//! **No lineage block** (ADR-0034): six lineage columns were measured on real lab captures
+//! **No lineage block**: six lineage columns were measured on real lab captures
 //! and made the forest worse for the attacks whose parent is ordinary. The parent is judged
 //! by rules (`rules::check_web_server_spawns_shell`); [`lineage`](crate::features::lineage)
 //! stays as an extractor.
@@ -124,7 +124,7 @@ mod tests {
         assert!(FEATURE_NAMES.iter().all(|n| !n.is_empty()));
         assert!(
             !FEATURE_NAMES.contains(&lineage::FEATURE_NAMES[0]),
-            "the parent is judged by rules, not by the forest (ADR-0034)"
+            "the parent is judged by rules, not by the forest"
         );
     }
 

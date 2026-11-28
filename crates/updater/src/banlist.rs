@@ -1,4 +1,4 @@
-//! The local ban list (ADR-0015 Decision 6): release versions that failed a
+//! The local ban list: release versions that failed a
 //! previous health check on this install and must be refused even if offered
 //! again. A bare JSON array — no signature needed, since it only ever narrows
 //! what this specific install will accept, the same trust boundary as the

@@ -152,13 +152,13 @@ impl EventSink for SharedSink {
 /// crate from depending on the other (`sensor-*` crates depend only on
 /// `schema`; `policy` depends only on `schema` too) — the binary is the one
 /// place both types are in scope, so it is the one place allowed to bridge
-/// them (ADR-0006).
+/// them.
 fn eventlog_config(policy: &policy::EventLogPolicy) -> sensor_windows_eventlog::EventLogConfig {
     sensor_windows_eventlog::EventLogConfig {
         // Not yet policy-configurable (issue #322 v1): the transport defaults
         // to Polling — the pre-#322 behavior — so a version bump does not
         // silently change delivery mechanism on any host. A follow-up (same
-        // ADR-0006 cross-crate rewiring as the per-channel toggles) will
+        // the Event Log allowlist design cross-crate rewiring as the per-channel toggles) will
         // surface `transport` through `policy::EventLogPolicy` for host-by-host
         // rollout of `Subscribe`.
         transport: sensor_windows_eventlog::EventLogTransport::Polling,
@@ -168,7 +168,7 @@ fn eventlog_config(policy: &policy::EventLogPolicy) -> sensor_windows_eventlog::
         logon_events_enabled: policy.logon_events_enabled,
         // Not yet policy-configurable (issue #283 v1): the AppLocker EXE/DLL and
         // TaskScheduler-Operational channels are always on when this crate is
-        // enabled. A follow-up (see the same ADR-0006 note above) will surface
+        // enabled. A follow-up (see the same Event Log allowlist design note above) will surface
         // per-channel toggles through `policy::EventLogPolicy`.
         applocker_blocks_enabled: true,
         task_scheduler_op_enabled: true,

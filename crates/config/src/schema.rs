@@ -1,6 +1,6 @@
 //! Types describing what the on-disk `agent.toml` file carries.
 //!
-//! Every field mirrors an ADR-0013 decision or an obvious operational
+//! Every field mirrors a configuration design decision or an obvious operational
 //! setting. The struct layout **is** the file format — a new field is a
 //! schema-visible change; a rename is a breaking change that requires a
 //! [`SCHEMA_VERSION`] bump.
@@ -10,7 +10,7 @@
 //! Every sub-section is serde-required (no `#[serde(default)]` on the
 //! top-level struct), so a missing section fails the parse with a precise
 //! error the operator can act on — silent defaults would defeat the
-//! fail-fast rule from ADR-0013 §5. Inside a section, primitive fields that
+//! fail-fast rule from the configuration design. Inside a section, primitive fields that
 //! do have a documented default value use `#[serde(default = "...")]` so
 //! the template stays short without making the type ambiguous.
 
@@ -21,7 +21,7 @@ use serde::Deserialize;
 use crate::secret::SecretRef;
 
 /// The schema version this build understands; a mismatching file fails the load
-/// rather than being half-read (ADR-0013). Bump only on a breaking change; additive fields with
+/// rather than being half-read. Bump only on a breaking change; additive fields with
 /// `#[serde(default)]` do not require a bump.
 pub const SCHEMA_VERSION: u32 = 1;
 
@@ -47,12 +47,12 @@ pub struct AgentConfig {
     pub ipc: IpcConfig,
     /// Boot-time resource ceilings.
     pub resources: ResourcesConfig,
-    /// Content-distribution assignment (ADR-0016, issue #30). The one
+    /// Content-distribution assignment (issue #30). The one
     /// optional section: an absent `[updates]` table means "no ring
     /// assigned", never a default ring.
     #[serde(default)]
     pub updates: UpdatesConfig,
-    /// Service logs the agent reads (ADR-0022, issue #478). Optional: an
+    /// Service logs the agent reads (issue #478). Optional: an
     /// absent `[logs]` table means no source, never a discovered one.
     #[serde(default)]
     pub logs: LogsConfig,
@@ -138,7 +138,7 @@ pub struct DeceptionConfig {
 /// text an attacker chooses, so the set is declared, bounded and small.
 pub const MAX_LOG_SOURCES: usize = 16;
 
-/// The `[logs]` table: service logs declared by the operator (ADR-0022 §1).
+/// The `[logs]` table: service logs declared by the operator.
 ///
 /// Not to be confused with `[log]` ([`LogConfig`]), which is where the agent
 /// writes *its own* log.
@@ -156,11 +156,11 @@ pub struct LogsConfig {
 pub struct LogSourceConfig {
     /// Absolute path of the log file. The agent reads it; it never creates it.
     pub path: PathBuf,
-    /// Which preset parses it. Explicit, never auto-detected (ADR-0022 §2).
+    /// Which preset parses it. Explicit, never auto-detected.
     pub kind: LogSourceKind,
 }
 
-/// The presets ADR-0022 §1 puts in v1. There is no free-form pattern: a custom
+/// The presets the log-ingestion design puts in v1. There is no free-form pattern: a custom
 /// `LogFormat` is reported as a misparsing source, not guessed at.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -173,7 +173,7 @@ pub enum LogSourceKind {
     MysqlError,
 }
 
-/// Rings a content manifest can target (ADR-0016). A plain list rather than
+/// Rings a content manifest can target. A plain list rather than
 /// an enum: the wire format carries the ring as a string and the server owns
 /// the set, so this only rejects typos before a fetch is attempted.
 pub const CONTENT_RINGS: [&str; 4] = ["canary_0", "canary_1", "canary_2", "prod"];
@@ -185,7 +185,7 @@ pub struct UpdatesConfig {
     /// One of [`CONTENT_RINGS`]. Absent means unassigned: `agent
     /// apply-content-manifest` then needs `--ring` and refuses to guess,
     /// because silently landing an agent in `prod` would defeat the canary
-    /// rollout (ADR-0013 §5, fail fast).
+    /// rollout (fail fast).
     #[serde(default)]
     pub ring: Option<String>,
 }
@@ -204,7 +204,7 @@ pub struct ServerConfig {
     /// secret and lives in [`Self::mtls_passphrase`] as a reference.
     pub mtls_key: PathBuf,
     /// Reference to the private-key passphrase. Never a cleartext literal;
-    /// see [`SecretRef`] and ADR-0013 §7.
+    /// see [`SecretRef`] and the configuration design.
     pub mtls_passphrase: SecretRef,
     /// Path to a PEM bundle of the CA(s) that sign the control plane's server
     /// certificate, for a control plane on a private CA (#658). When set, **only**

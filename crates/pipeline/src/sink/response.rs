@@ -47,12 +47,13 @@ pub(super) fn crosses_kill_gate(technique: &str) -> bool {
     technique == "BAYES"
 }
 
-/// Why the kill gate refuses a system service's main process (#652, ADR-0028).
+/// Why the kill gate refuses a system service's main process (#652).
 // Review of #755 (2026-10-19): it states only what `service_main_path_is_trusted` checks
 // (where the image lives, who started it), never "package-owned", which nothing verifies.
 const SERVICE_MAIN_REFUSAL: &str = "main process of a system service (image under a system path, started by init); escalated, not killed";
 
-/// Why the kill gate refuses the process holding a login session (<https://github.com/synthaea-lab/agent/issues/50>, ADR-0028).
+/// Why the kill gate refuses the process holding a login session
+/// (<https://github.com/synthaea-lab/agent/issues/50>).
 /// Same care as [`SERVICE_MAIN_REFUSAL`]: it states what was checked (the image and
 /// its parent's image), not that the session is legitimate, nor that the parent was
 /// started by init: the listener's exec is usually never seen.
@@ -115,14 +116,14 @@ impl DetectionSink {
 
     /// The kill for a high-confidence correlated verdict. `shield` is the correlator's
     /// provenance verdict for `pid` (a system service's main process, a login-session
-    /// holder): it refuses the kill, in observe mode too, whatever the evidence (ADR-0028).
+    /// holder): it refuses the kill, in observe mode too, whatever the evidence.
     /// See `docs/response.md`, "Shields: refusing by what the process is".
     pub(super) fn maybe_kill(&self, pid: u32, shield: Option<correlator::KillShield>) {
         self.kill_for(pid, "a high-confidence correlated verdict", shield);
     }
 
     /// The policy-gated kill behind every automated trigger; `reason` names which one, in
-    /// the audit line (`RESPONSE-KILL`). `shield` makes it refuse (ADR-0028); only the
+    /// the audit line (`RESPONSE-KILL`). `shield` makes it refuse; only the
     /// correlator's verdict sets it, a trigger with its own evidence (the ransomware reflex)
     /// passes `None`.
     fn kill_for(&self, pid: u32, reason: &str, shield: Option<correlator::KillShield>) {

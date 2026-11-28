@@ -283,7 +283,7 @@ fn public_key_prints_the_hex_on_stdout_only() {
 #[cfg(feature = "test-key")]
 #[test]
 fn a_key_file_that_is_not_a_public_test_key_is_refused() {
-    // `--key-file` is reserved to the checked-in test keys (ADR-0027): any other seed in a
+    // `--key-file` is reserved to the checked-in test keys: any other seed in a
     // file is not a production key and is turned away before anything is signed.
     let dir = tempfile::tempdir().unwrap();
     let key_file = dir.path().join("release.key");

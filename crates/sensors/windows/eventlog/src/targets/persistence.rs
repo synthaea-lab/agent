@@ -12,7 +12,7 @@ use super::BlockOutcome;
 use crate::xml::{self};
 
 /// The meta shape shared by the three persistence-artifact targets, which all
-/// reuse [`FileOpenEvent`] (see ADR-0004) rather than defining event types of
+/// reuse [`FileOpenEvent`] rather than defining event types of
 /// their own.
 pub(crate) fn persistence_file_open(pid: u32, comm: String, path: String, flags: u32) -> Event {
     Event::FileOpen(FileOpenEvent {

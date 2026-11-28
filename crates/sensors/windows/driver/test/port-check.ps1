@@ -1,7 +1,7 @@
 <#
 .SYNOPSIS
     Milestone 2a check for SynthaeaFilter's communication port (#136,
-    ADR-0012 guardrails 2 and 5). Lab VM only, with the filter loaded.
+    the minifilter driver guardrails guardrails 2 and 5). Lab VM only, with the filter loaded.
 
 .DESCRIPTION
     Calls fltlib!FilterConnectCommunicationPort through P/Invoke (no build
@@ -10,7 +10,7 @@
       2. refuses a second client while the first is connected;
       3. refuses a missing context, a wrong size, a wrong magic, a wrong version.
     Those checks need the agent's identity (NT SERVICE\SynthaEDR in the
-    token, ADR-0012 guardrail 5): run this script through run-as-agent.ps1.
+    token): run this script through run-as-agent.ps1.
 
     Run directly, it checks the two refusals instead:
       - elevated, not the agent: refused by the connect callback (guardrail 5);

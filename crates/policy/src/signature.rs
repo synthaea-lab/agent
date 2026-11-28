@@ -1,7 +1,7 @@
 //! Ed25519 signing and verification for [`crate::Policy`] documents.
 //!
 //! Uses `ring::signature::{ED25519, Ed25519KeyPair, UnparsedPublicKey}` —
-//! the algorithm from ADR-0010 §3, the crate substitution from ADR-0015
+//! the algorithm from the policy model, the crate substitution from the updater design
 //! §Decision 3 (`ring` chosen over `ed25519-dalek` because `ring` is already
 //! a transitive dep via `rustls`, avoiding a second Ed25519 implementation
 //! in the workspace).
@@ -22,7 +22,7 @@
 //!
 //! - Key management. Where the public key comes from (compiled-in constant?
 //!   file on disk? env variable?), how it rotates, how a compromised key is
-//!   revoked — all deferred by ADR-0010's own Deferred section. This crate
+//!   revoked — all deferred by the policy model's own Deferred section. This crate
 //!   is the verification mechanism; the caller supplies the key.
 //! - Key generation. `ring` can generate keypairs; that lives in whatever
 //!   test binary needs a keypair (see the `#[cfg(test)]` helper below).

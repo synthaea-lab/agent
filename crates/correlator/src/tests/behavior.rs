@@ -785,10 +785,10 @@ fn interpreters_the_blocklist_used_to_miss_are_now_excluded() {
     ));
     assert!(engine.is_service_main_process(819, None));
 
-    // Documented, not fixed by this PR (ADR-0028 Consequences): a network tool
+    // Documented, not fixed by this PR (the kill-gate design Consequences): a network tool
     // run directly by a unit is not a known shell/interpreter/daemon name, so
     // it still passes as a "service main". Pinning this is deliberate — it is
-    // the unbounded-tail gap the ADR now names explicitly, not a regression to
+    // the unbounded-tail gap the kill-gate design names explicitly, not a regression to
     // catch, and a future narrowing of the blocklist should not close it by
     // accident without updating that documentation.
     engine.on_event(exec_with_meta(

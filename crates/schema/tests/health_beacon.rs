@@ -1,4 +1,4 @@
-//! The health beacon's wire shape beyond what the transport test pins (ADR-0020, issue #76):
+//! The health beacon's wire shape beyond what the transport test pins (issue #76):
 //! the rarity counters are additive, so a beacon from an agent that predates them still parses.
 
 use schema::HealthBeacon;

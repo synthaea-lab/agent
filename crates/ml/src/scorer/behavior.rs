@@ -1,6 +1,6 @@
 //! On-device T1 behavior scoring: runs the 17-feature Isolation Forest (ONNX) over one
 //! process incarnation's [`crate::features::t1`] vector (cmdline 9 + correlation 8,
-//! no lineage: ADR-0034), issue #617.
+//! no lineage: The lineage decision), issue #617.
 //!
 //! Where [`super::CmdlineScorer`] (T0) reads one command line and
 //! [`super::correlation::CorrelationScorer`] (T2) reads one window of counts, this scores

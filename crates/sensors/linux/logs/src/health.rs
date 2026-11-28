@@ -1,4 +1,4 @@
-//! Detects a log source that is being read but not understood (ADR-0022 §2).
+//! Detects a log source that is being read but not understood.
 //!
 //! A site with a custom `LogFormat`, or a server version that words a line differently,
 //! leaves the sensor blind while it looks healthy: every line fails to parse and nothing

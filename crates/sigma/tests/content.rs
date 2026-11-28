@@ -5,7 +5,7 @@
 //! can trigger is dead content and fails here.
 //!
 //! The samples are data, not test code: `<rule>.yml` has a sibling `<rule>.samples.json`
-//! holding one matching and one non-matching event (ADR-0031). A rule file alone is then
+//! holding one matching and one non-matching event. A rule file alone is then
 //! enough for these suites to judge it, which is what lets a tool emit a complete draft.
 
 use std::path::{Path, PathBuf};

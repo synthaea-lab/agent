@@ -1,4 +1,4 @@
-//! The common-set snapshot as the agent reads it (ADR-0020, issue #76): a Bloom filter of the
+//! The common-set snapshot as the agent reads it (issue #76): a Bloom filter of the
 //! image hashes seen on at least K hosts of this tenant, implementing [`CommonSet`] for the
 //! rarity feature.
 //!

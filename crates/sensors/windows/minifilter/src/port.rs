@@ -137,7 +137,7 @@ impl DriverPort {
     /// stripped), or `Ok(None)` once `stop` is set: the pending read is then cancelled and
     /// awaited, so no read is ever left writing into `buffer` after this returns.
     ///
-    /// The kernel side never waits on this (ADR-0012 guardrail 6): a slow reader only fills
+    /// The kernel side never waits on this: a slow reader only fills
     /// the driver's bounded queue, which drops and counts.
     ///
     /// # Errors

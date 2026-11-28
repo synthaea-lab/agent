@@ -17,9 +17,9 @@ const TRUNCATED_CMDLINE_QUOTE_BYTES: usize = 256;
 /// and tail) can guarantee the payload is kept; the cut itself is the signal. Two
 /// causes, graded and worded apart:
 ///
-/// - **The bytes between the Linux probe's head and tail windows** (ADR-0045,
-///   `argv_omitted_bytes = Some(n > 0)`): any argument block over 1 KiB. **Low**, as
-///   ADR-0045 fixed it: in #1112's sample at most 3 of 3,451 execs exceed 1 KiB, and
+/// - **The bytes between the Linux probe's head and tail windows**
+///   (`argv_omitted_bytes = Some(n > 0)`): any argument block over 1 KiB. **Low**, as
+///   the argv-window design fixed it: in #1112's sample at most 3 of 3,451 execs exceed 1 KiB, and
 ///   none of 1,592 lab execs did, but both samples are small and from lab hosts.
 /// - **Any other cut** (`argv_omitted_bytes = None`): the 32 KiB budget of #1112
 ///   (Alpine sample: p99.9 347 B, max 1,661 B, none over 4 KiB), or a sensor that
@@ -88,7 +88,7 @@ pub(crate) fn check_truncated_cmdline(event: &ExecEvent) -> Option<Alert> {
 /// that evidence today. Other legitimate stream producers (backup tools,
 /// some antivirus quarantine formats, older Office OLE property sets) are a
 /// known, accepted gap until one is actually observed and named, the same
-/// unbounded-tail trade-off ADR-0028 documents for `policy`'s interpreter
+/// unbounded-tail trade-off the kill-gate design documents for `policy`'s interpreter
 /// blocklist. Severity is Medium, not High, for the same reason: a named
 /// stream alone is a weak, easily-legitimate signal without more context.
 #[must_use]

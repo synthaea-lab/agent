@@ -84,13 +84,13 @@ worker_threads = 0
 max_reconnect_backoff_ms = 60000
 
 [updates]
-# Content ring this install is assigned to (ADR-0016): canary_0, canary_1,
+# Content ring this install is assigned to: canary_0, canary_1,
 # canary_2 or prod. Optional, and there is deliberately no default: without
 # it `agent apply-content-manifest` requires `--ring`. Assign new installs to
 # a canary ring first; `prod` receives content only after the canaries.
 # ring = "canary_0"                                  # CHANGE ME
 
-# Service logs the agent reads (ADR-0022): web access logs and the MySQL/MariaDB
+# Service logs the agent reads: web access logs and the MySQL/MariaDB
 # error log. Optional; nothing is discovered, every source is declared here, at
 # most 16. Not the same as [log] above, which is the agent's own log.
 # `kind` is one of: access_common (Apache common), access_combined (Apache or
@@ -103,7 +103,7 @@ max_reconnect_backoff_ms = 60000
 # agent), and one summary per minute (counts, top failing clients); no per-request
 # event. The query-string value of the matched parameter is the only value that
 # leaves the host, cut to 128 characters; the value of a parameter named like a secret
-# (token, password, api_key, ...) is replaced by REDACTED (ADR-0018, best effort).
+# (token, password, api_key, ...) is replaced by REDACTED (best effort).
 # `mysql_error` needs the error log to be a FILE: Debian/Ubuntu MariaDB logs to the
 # journal by default, so set `log_error` in the server first.
 # MySQL 8 writes the failed-login lines only at `log_error_verbosity = 3` (its default

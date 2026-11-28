@@ -1,4 +1,4 @@
-//! On-device IOC matching, wired (issue #60, ADR-0038): loads the indicator feeds in the
+//! On-device IOC matching, wired (issue #60): loads the indicator feeds in the
 //! content directory and turns a match on an exec image's hash or on a connect's destination
 //! address into a finding.
 //!

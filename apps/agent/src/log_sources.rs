@@ -1,5 +1,5 @@
 //! Tails the service logs declared in `[logs]` and turns what they say into events
-//! (ADR-0022, issue #478 level 2).
+//! (issue #478 level 2).
 //!
 //! One thread polls every source once a second. Each source keeps a persisted
 //! [`Position`] in a file derived from the alerts path (same convention as
@@ -13,14 +13,14 @@
 //!   becomes a `schema::HttpRequestEvent` (at most [`sensor_linux_logs::PER_SIGNATURE_PER_WINDOW`]
 //!   per signature per window, the rest counted and logged), and every request is counted
 //!   in one `schema::HttpSummaryEvent` per 60 s window. Nothing is emitted per ordinary
-//!   request (ADR-0022 §3).
+//!   request.
 //!
 //! Every event goes through [`deliver`], the one place it leaves this module: the
-//! credential redaction of an `HttpRequest`'s evidence value belongs there (ADR-0018, no
+//! credential redaction of an `HttpRequest`'s evidence value belongs there (no
 //! second redaction path).
 //!
-//! No silence alert and no heartbeat: a quiet log is normal on a quiet site (ADR-0022,
-//! decision 4). A line that does not parse is counted and sampled in the log, never
+//! No silence alert and no heartbeat: a quiet log is normal on a quiet site. A line
+//! that does not parse is counted and sampled in the log, never
 //! skipped silently, and a source whose lines mostly fail raises the `LOG-SOURCE` alert.
 
 use std::{
@@ -280,7 +280,7 @@ pub(crate) fn spawn(
     Ok(())
 }
 
-/// The one place an event leaves this module for the sink. ADR-0018's credential
+/// The one place an event leaves this module for the sink. The URL redaction design's credential
 /// redaction of an `HttpRequest`'s evidence value is applied here and nowhere else.
 fn deliver(sink: &DetectionSink, mut event: schema::Event) {
     redact::event::redact_event(&mut event);
@@ -541,7 +541,7 @@ mod tests {
     /// Runs one access-log line through `poll_source` into a real `DetectionSink` and
     /// returns what reached the raw event log (`events.jsonl`). This is the path an
     /// `HttpRequest` takes in the agent, so it pins that [`deliver`] really is the one
-    /// choke point where the evidence is redacted (ADR-0018), not a convention.
+    /// choke point where the evidence is redacted, not a convention.
     fn raw_events_after_polling(name: &str, request_target: &str) -> String {
         let dir = std::env::temp_dir().join(format!("log-sources-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);

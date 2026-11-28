@@ -1,4 +1,4 @@
-//! Content check for `rules/ioc/` (#934, ADR-0038): every `*.txt` there is one feed, and the
+//! Content check for `rules/ioc/` (#934): every `*.txt` there is one feed, and the
 //! engine must take every line of it. A line it refuses is dropped silently on a device (the
 //! loader counts it and goes on), so this is where a bad line in shipped content is caught. The
 //! server's `tests/unit/ioc-content.test.ts` adds the public-suffix check the engine cannot make.

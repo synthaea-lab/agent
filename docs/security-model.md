@@ -130,12 +130,12 @@ flowchart TD
   have their own.
 - **Temporary keys (2026-11-12).** `crates/updater/keys/*.pub` hold three **temporary** keys
   (`release`, `content`, `recovery`), generated on a developer machine outside the
-  ADR-0027 ceremony. They have no custody and no named holders; the private halves are plain files
+  the signing-key design ceremony. They have no custody and no named holders; the private halves are plain files
   on that machine, and `release-tool --key-file` refuses them (it takes only the public test
   keys), so signing with them needs a PKCS#11 token holding the key. They are replaced when the
   real keys exist ([#43](https://github.com/synthaea-lab/agent/issues/43)); do not ship a build
   that embeds them to a customer. `snapshot.pub` stays `unprovisioned` on purpose: a snapshot key
-  turns the agent's snapshot fetch loop on (ADR-0033), which waits on tenant binding and on a
+  turns the agent's snapshot fetch loop on, which waits on tenant binding and on a
   custody decision.
 - **Unprovisioned.** A key file that says `unprovisioned` makes its static `None`, so a build
   embeds no key for that role and every verify returns

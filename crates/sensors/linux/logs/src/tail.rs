@@ -1,5 +1,5 @@
 //! Follows one log file: new complete lines only, a persistable position, and
-//! rotation handled by file identity (ADR-0022 §2).
+//! rotation handled by file identity.
 //!
 //! - **First start** (no saved position) begins at the end of the file, like the
 //!   journal tail begins at "now": replaying a log's history would flood the case

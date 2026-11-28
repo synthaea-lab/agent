@@ -1,17 +1,17 @@
 # ONNX Runtime Static Linking Guide
 
-**Status:** Implementation of ADR-0002 decision #2 (static linking for single-binary deployment)
+**Status:** Implementation of the model-delivery design decision #2 (static linking for single-binary deployment)
 **Issue:** #110
 **Platform:** Linux (Ubuntu 24.04+ tested; Alpine/musl tested but not a target platform) and Windows MSVC (see the Windows section below)
 
 ## Background
 
-ADR-0002 requires onnxruntime statically linked into the agent binary to support:
+the model-delivery design requires onnxruntime statically linked into the agent binary to support:
 - Single-binary deployment (no runtime .so dependencies)
 - Updater integrity guarantees
 - Root/SYSTEM execution security posture
 
-The workspace `ort` dependency (v2.0.0-rc.13) now has `default-features = false` to disable `download-binaries` and `copy-dylibs`, which were previously downloading and using dynamic libraries in violation of ADR-0002.
+The workspace `ort` dependency (v2.0.0-rc.13) now has `default-features = false` to disable `download-binaries` and `copy-dylibs`, which were previously downloading and using dynamic libraries in violation of the model-delivery design.
 
 ## Build onnxruntime from Source
 
@@ -134,7 +134,7 @@ Should report `static-pie linked` or similar (no `dynamically linked` mention fo
 
 ## Binary Size Impact
 
-**TODO (ADR-0002 §3):** Measure and document the binary size delta:
+**TODO:** Measure and document the binary size delta:
 - Before: dynamic onnxruntime (baseline)
 - After: static onnxruntime
 
@@ -249,7 +249,7 @@ changes that can break the link, not on every PR.
 ## Platform Support
 
 **Currently tested:**
-- ✅ Ubuntu 24.04 (glibc) - ADR-0002 target platform
+- ✅ Ubuntu 24.04 (glibc) - the model-delivery design target platform
 - ✅ Alpine 3.x (musl) - Not a target platform, but confirms approach works cross-libc
 - ✅ Windows 11 (MSVC, CPU only) - `cargo test -p ml` passes, no `onnxruntime.dll`, no
   `directml.dll`, no `d3d12.dll` (see above)

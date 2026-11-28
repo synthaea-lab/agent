@@ -173,7 +173,7 @@ pub struct CorrelationEngine {
 }
 
 /// Why the kill gate must not terminate a process on a Bayesian crossing alone: what
-/// the process *is*, not how much evidence there is (ADR-0028). The verdict still
+/// the process *is*, not how much evidence there is. The verdict still
 /// escalates; only the kill is refused.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum KillShield {
@@ -687,7 +687,7 @@ impl CorrelationEngine {
     }
 
     /// Adds the "this process's image is not in the fleet's common set" evidence to its
-    /// entity's belief (ADR-0020, issue #76). Weak and capped: it adds
+    /// entity's belief (issue #76). Weak and capped: it adds
     /// [`crate::bayes::RARITY_LLR`] within an allowance of
     /// [`crate::bayes::RARITY_MAX_TOTAL_LLR`] that decays with the belief, so on its own it can
     /// never approach the alert threshold. It does not raise an alert itself: the belief is

@@ -241,7 +241,7 @@ fn wire_run_pipeline(
     )?);
     sink.start_correlator_ticker()?;
     // Reading another process's memory is `sensor-linux-procmem`'s mechanism; no other
-    // OS has one yet (ADR-0023).
+    // OS has one yet.
     #[cfg(target_os = "linux")]
     sink.enable_memory_scanning(Arc::new(crate::memscan::ProcMemSource));
     // The agent's own control-plane traffic is not an IOC finding (https://github.com/synthaea-lab/agent/issues/47), and only that
@@ -255,7 +255,7 @@ fn wire_run_pipeline(
         );
     }
 
-    // The fleet common-set snapshot (ADR-0033): off unless this build embeds a `snapshot` key.
+    // The fleet common-set snapshot: off unless this build embeds a `snapshot` key.
     if let Some(handle) = &transport {
         pipeline::snapshot_fetch::spawn_if_enabled(
             Arc::clone(&handle.client),

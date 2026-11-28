@@ -1,7 +1,8 @@
 //! The rarity feature: is the executed image on this fleet's common set? The Rust mirror of
-//! `ml/synthaea_ml/features/rarity.py` (issue #640, ADR-0020).
+//! `ml/synthaea_ml/features/rarity.py` (issue #640).
 //!
-//! ADR-0020: the server publishes, per tenant, a **common-set snapshot** (the image hashes seen
+//! The fleet-prevalence design: the server publishes, per tenant, a **common-set snapshot** (the
+//! image hashes seen
 //! on at least K hosts) and the device checks an executed image against it locally. The model
 //! input is a small ordinal derived from that snapshot, never a host count (a count is not
 //! something the device can compute). Two numbers, because "rare" must be distinguishable from
@@ -23,7 +24,7 @@
 //! the server ships it. The Bloom-filter format the server publishes is read by
 //! [`super::common_set::CommonSetSnapshot`]; nothing in the agent loads one yet. K, the minimum
 //! coverage, the cadence and the filter's false-positive rate are left to calibration on lab
-//! data (ADR-0020).
+//! data.
 
 /// Feature names, in vector order. See `rarity.py::FEATURE_NAMES` -- keep in sync.
 pub const FEATURE_NAMES: [&str; 2] = ["rarity_known", "image_in_common_set"];

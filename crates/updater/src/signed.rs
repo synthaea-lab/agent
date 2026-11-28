@@ -2,7 +2,7 @@
 //! [`crate::content::ContentManifest`], [`crate::snapshot::SnapshotManifest`] and
 //! [`crate::rotation::KeyRotationManifest`].
 //!
-//! All four sign the same way (ADR-0015 decision 2, reused by ADR-0016): the document as
+//! All four sign the same way (reused by the content-ring design): the document as
 //! 2-space-indented JSON with `signature` forced to `""`, fields in the alphabetical order they are
 //! declared in the struct, an Ed25519 signature over those bytes, lowercase hex in `signature`. The
 //! trait is crate-private: each document keeps its own public `sign`, `sign_with`,

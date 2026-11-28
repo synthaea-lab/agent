@@ -14,7 +14,7 @@ use std::{path::PathBuf, sync::Arc, time::Duration};
 use crate::sink::DetectionSink;
 
 /// Whether a failed manifest verification says anything about the file: a build with no
-/// release key (ADR-0027, `crates/updater/keys` unprovisioned) cannot verify any manifest, so
+/// release key (`crates/updater/keys` unprovisioned) cannot verify any manifest, so
 /// reporting that as "the manifest may have been tampered with" would be a false detection on
 /// every pass. Everything else (a bad signature, an unsupported schema) is about the file.
 fn signature_failure_is_tamper(error: &updater::UpdaterError) -> bool {
@@ -68,7 +68,7 @@ fn state_dir(layout: &updater::layout::Layout) -> std::path::PathBuf {
 }
 
 /// One verification pass. `None` from [`updater::layout::Layout::current_release_version`]
-/// (bootstrap / day 0, ADR-0015 Decision 7 — nothing has ever been promoted) is the
+/// (bootstrap / day 0, the updater design — nothing has ever been promoted) is the
 /// honest no-op case: the package-installed bootstrap binaries carry no
 /// updater-signed manifest by design, so there is nothing to check yet.
 fn check_once(layout: &updater::layout::Layout, sink: &DetectionSink) {

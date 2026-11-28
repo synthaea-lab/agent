@@ -1,4 +1,4 @@
-//! Signing with a key held on a PKCS#11 token (ADR-0027 decision 2): a PIV token or an HSM,
+//! Signing with a key held on a PKCS#11 token: a PIV token or an HSM,
 //! through the vendor's module (`opensc-pkcs11.so`, `libsofthsm2.so` for tests, an HSM client).
 //!
 //! The private key stays on the device (`CKA_SENSITIVE`, not extractable): the tool sends the

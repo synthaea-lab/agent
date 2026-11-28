@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """List the DLLs a Windows executable imports, and fail on the ones a static ONNX
-Runtime build must not need (#337, ADR-0002).
+Runtime build must not need (#337).
 
 `dumpbin /dependents` needs a Visual Studio developer prompt; this reads the PE
 import tables directly (regular and delay-load) with the standard library, so it

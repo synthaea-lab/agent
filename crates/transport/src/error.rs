@@ -75,7 +75,7 @@ impl TransportError {
     }
 
     /// The server's reason when it answered `423 Locked`: the resource is
-    /// deliberately withheld (a halted content ring, ADR-0016), which is an
+    /// deliberately withheld (a halted content ring), which is an
     /// intended, temporary state rather than a failure.
     #[must_use]
     pub fn locked_reason(&self) -> Option<&str> {

@@ -381,7 +381,7 @@ fn bracket_class(pattern: &[char], open: usize, c: char) -> Option<(bool, usize)
 /// verbs, and for the same reasons: it reads the command, an administrator can do the same,
 /// and an empty `argv` (<https://github.com/synthaea-lab/agent/issues/48>) blinds it.
 ///
-/// Not covered, by choice (ADR-0046): the **ancestor slice** (`systemctl freeze system.slice`,
+/// Not covered, by choice: the **ancestor slice** (`systemctl freeze system.slice`,
 /// `set-property system.slice MemoryMax=...`, a write to `system.slice/cgroup.freeze`), which
 /// acts on every service of the host and is ordinary administration far more often than an
 /// attack on a tool; and moving the tool's pid into a cgroup the attacker froze or limited
@@ -501,7 +501,7 @@ fn prlimit_target_pid(args: &[String]) -> Option<u32> {
 /// `prlimit`, from its manual page, not checked against a build), the short forms attach their
 /// value (`-t1:1`). Not exhaustive: an option clustered with another short one (`-tp`) is not
 /// read. That is the
-/// argv-reading limit of ADR-0006.
+/// argv-reading limit of the Event Log allowlist design.
 fn prlimit_sets_cpu_or_as_on_a_pid(args: &[String]) -> bool {
     let names_pid = args.iter().any(|a| match a.strip_prefix("--") {
         Some(long) => is_pid_long_option(long.split_once('=').map_or(long, |(name, _)| name)),

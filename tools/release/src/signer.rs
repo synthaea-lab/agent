@@ -1,6 +1,6 @@
 //! Who signs. A [`Signer`] holds a key that can sign the canonical bytes of a manifest and
 //! name its public half; the tool never needs the private half itself, which is what lets the
-//! production key live on a token (ADR-0027 decision 2, [`crate::pkcs11`]).
+//! production key live on a token ([`crate::pkcs11`]).
 //!
 //! [`FileKey`] is the other implementation: the 32-byte seed in a file, for the public test key
 //! and for lab releases.

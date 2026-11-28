@@ -15,7 +15,7 @@ const DECAY_TAU_S: f32 = 300.0;
 /// Alert threshold: `log_odds` > 2.0 → P(compromised) ≈ 88%.
 pub(crate) const BAYES_THRESHOLD: f32 = 2.0;
 
-/// Weight of one "this image is not in the fleet's common set" observation (ADR-0020, #76).
+/// Weight of one "this image is not in the fleet's common set" observation (#76).
 /// Deliberately weak: the weakest hand-calibrated feature above is ~0.1 and the strongest
 /// 3.6, and rarity alone says "new here", not "malicious". **Provisional**: slice 6 of the
 /// plan (`docs/detection/fleet-prevalence-snapshot-plan.md`) sets it on lab data, and the

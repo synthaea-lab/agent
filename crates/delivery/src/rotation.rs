@@ -1,4 +1,4 @@
-//! `apply-key-rotation` (ADR-0027): fetch the key-rotation manifest the control plane offers (or
+//! `apply-key-rotation`: fetch the key-rotation manifest the control plane offers (or
 //! read one from a file), verify it against the embedded `recovery` key and the keys this install
 //! trusts now, and record it under the state directory so every later `apply-release`,
 //! `apply-content-manifest` and integrity pass verifies against the rotated keys.

@@ -1,9 +1,9 @@
 //! Integration test: the committed `data/default-agent.toml` template MUST
 //! remain a valid `AgentConfig` after every schema change.
 //!
-//! Per ADR-0013 §Deferred, the template is a hand-written committed file,
+//! Per the configuration design, the template is a hand-written committed file,
 //! not generated from Rust literals. A drift between the schema and the
-//! template is exactly the kind of silent misconfig source the ADR wants
+//! template is exactly the kind of silent misconfig source that design wants
 //! to prevent — CI catches it here.
 //!
 //! Runs on Linux only: the committed template carries Linux paths and a

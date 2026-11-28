@@ -1,4 +1,4 @@
-//! The Linux side of process-memory scanning (issue #85, ADR-0023): adapts
+//! The Linux side of process-memory scanning (issue #85): adapts
 //! `sensor-linux-procmem` (the `/proc` mechanism) to `yara::MemorySource` (the budget
 //! and trigger policy). Linux-only; the sink starts no memory scanner elsewhere.
 

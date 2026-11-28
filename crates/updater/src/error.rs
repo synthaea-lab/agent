@@ -10,7 +10,7 @@ use thiserror::Error;
 #[derive(Debug, Error)]
 pub enum UpdaterError {
     /// The manifest's `schema_version` is not one this build understands
-    /// (ADR-0015 Decision 2: readers reject an unknown value outright).
+    /// (the updater design: readers reject an unknown value outright).
     #[error("manifest schema_version {found} is not supported (expected {expected})")]
     SchemaVersionUnsupported {
         /// The `schema_version` the manifest carries.
@@ -25,12 +25,13 @@ pub enum UpdaterError {
     SignatureInvalid,
 
     /// This build embeds no production signing key for the manifest's kind, so nothing can
-    /// be verified (ADR-0027: the key files under `crates/updater/keys/` are unprovisioned).
-    #[error("this build embeds no production signing key for this manifest (ADR-0027)")]
+    /// be verified (the signing-key design: the key files under `crates/updater/keys/` are
+    /// unprovisioned).
+    #[error("this build embeds no production signing key for this manifest")]
     SigningKeyUnprovisioned,
 
     /// `release_version` is not strictly greater than the currently installed
-    /// one (ADR-0015 Decision 2: anti-rollback-attack check).
+    /// one (the updater design: anti-rollback-attack check).
     #[error("release {offered} is not newer than the installed release {current}")]
     ReleaseNotNewer {
         /// The `release_version` the manifest offers.
@@ -63,7 +64,7 @@ pub enum UpdaterError {
     },
 
     /// `release_version` is on the local ban list — a previous install of this
-    /// exact release failed its health check (ADR-0015 Decision 6).
+    /// exact release failed its health check.
     #[error("release {0} is banned on this install (failed a previous health check)")]
     ReleaseBanned(u64),
 
@@ -98,7 +99,8 @@ pub enum UpdaterError {
         actual: String,
     },
 
-    /// A snapshot manifest's `kind` is not one this build knows (ADR-0033: only `common-set`).
+    /// A snapshot manifest's `kind` is not one this build knows (the snapshot-delivery design: only
+    /// `common-set`).
     #[error("snapshot manifest kind `{found}` is not supported")]
     SnapshotKindUnsupported {
         /// The `kind` the snapshot manifest declares.
@@ -106,7 +108,7 @@ pub enum UpdaterError {
     },
 
     /// A snapshot manifest's `built_at` is not later than the snapshot in force: a replay or a
-    /// rollback of the server's own state. The snapshot in force stays (ADR-0033 decision 3).
+    /// rollback of the server's own state. The snapshot in force stays.
     #[error("snapshot built at {offered} is not newer than the one in force ({current})")]
     SnapshotNotNewer {
         /// The `built_at` of the offered snapshot.
@@ -130,7 +132,7 @@ pub enum UpdaterError {
     #[error("snapshot artifact does not match its manifest: {0}")]
     SnapshotArtifactMismatch(String),
 
-    /// A key-rotation manifest is not well formed (ADR-0027): it names no key, half a pair, a key
+    /// A key-rotation manifest is not well formed: it names no key, half a pair, a key
     /// that is not canonical hex, a window that is empty or too long, or its result would break
     /// the split between roles. Checked before its signature is trusted for anything.
     #[error("key-rotation manifest is malformed: {0}")]

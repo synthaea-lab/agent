@@ -13,7 +13,7 @@
 //! policy and audit rules; splitting them invited two enforcement paths.
 //!
 //! Issue #25 ships the first two automated actions: [`kill`] and [`quarantine`].
-//! [`isolation`] holds the platform-neutral half of host isolation (ADR-0037); the
+//! [`isolation`] holds the platform-neutral half of host isolation; the
 //! firewall itself is injected by the binary. [`live`] (blocked on
 //! `transport`/server-side analyst auth) is follow-up scope.
 

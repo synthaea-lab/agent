@@ -17,7 +17,7 @@
 /// variant — `flags` already exists and is already an opaque, per-platform `u32`),
 /// so this does not bump [`SCHEMA_VERSION`](crate::SCHEMA_VERSION): consumers that ignore the flag see the
 /// event pass through unchanged, and the top bits can never collide with a real
-/// open disposition. Pragmatic solution, not the final one (ADR-0004): a dedicated
+/// open disposition. Pragmatic solution, not the final one: a dedicated
 /// `Persistence`/`Registry` event family stays an option once the schema needs one
 /// for other reasons too.
 pub const FLAG_PERSISTENCE_ARTIFACT: u32 = 0x1000_0000;
@@ -108,7 +108,7 @@ pub const FLAG_PERSISTENCE_BTM_ARTIFACT: u32 = 0x0400_0000;
 /// reassigned to another technique — a stale reader must not misread it.
 ///
 /// Historically reused [`FileOpenEvent`](crate::FileOpenEvent) like the other Windows persistence
-/// flags (see ADR-0004): `path` carried `FilePath` from the event's
+/// flags: `path` carried `FilePath` from the event's
 /// `RuleAndFileData` section, `meta::comm` its leaf name.
 ///
 /// Not a persistence-family flag — the executable never ran, so nothing was

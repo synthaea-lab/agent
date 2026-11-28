@@ -54,7 +54,7 @@ jobs:
         run: python3 tools/check-ps1-ascii.py
       - name: shell scripts with a shebang are executable in git
         run: python3 tools/check-exec-bits.py
-      - name: packaged build carries no test signing key (ADR-0027)
+      - name: packaged build carries no test signing key
         run: tools/check-no-test-key.sh
       - name: updater trust set without the test key (production code path)
         # Unit tests always compile under cfg(test), where the test seed exists; the
@@ -145,7 +145,7 @@ jobs:
         run: cargo clippy --workspace --exclude sensor-linux-ebpf --all-targets -- -D warnings
       - name: test
         run: cargo test --workspace --exclude sensor-linux-ebpf
-      # release-tool signs from a PKCS#11 token (ADR-0027): the test needs a software token, and
+      # release-tool signs from a PKCS#11 token: the test needs a software token, and
       # `cargo test` above skips it without one. The script makes a skip fatal.
       - name: release-tool PKCS#11 signing, against SoftHSM (Linux)
         if: runner.os == 'Linux'

@@ -59,7 +59,7 @@ pub enum KerberosDelegationFailureKind {
     UnconstrainedDelegationDenied,
     /// EID 202: this host's own process asked to export its TGT's session key, and the
     /// client's own Kerberos stack refused — on a Credential Guard host, a TGT's key can
-    /// never leave the isolated LSA, by design (ADR: this is the client-side half of the
+    /// never leave the isolated LSA, by design (this is the client-side half of the
     /// same protection PKINIT key-export denials, EID 203/204, also report).
     TgtSessionKeyExportDenied,
 }
@@ -117,7 +117,7 @@ pub struct KerberosDelegationFailureEvent {
 /// 4672, `sensor-windows-eventlog`) and Linux authentication (sshd accept/failure,
 /// `su`/`sudo`, PAM sessions — `sensor-linux-journal`, not yet implemented) both
 /// normalize into this one shape rather than each inventing its own type
-/// (ADR-0005).
+///.
 ///
 /// Deliberately narrower than either platform's native audit record: only the
 /// fields a cross-platform lateral-movement/privilege-escalation rule can

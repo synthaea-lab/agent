@@ -16,7 +16,7 @@
 //! Reading another process's memory is OS-specific and privileged, so it sits behind
 //! [`MemorySource`]: this crate holds the policy (what to read, how much, how often), a
 //! platform sensor holds the mechanism (`/proc/<pid>/mem` on Linux, which needs
-//! `CAP_SYS_PTRACE` for a process the agent does not own; see ADR-0023).
+//! `CAP_SYS_PTRACE` for a process the agent does not own; see the memory-scanning design).
 
 use std::{
     collections::VecDeque,

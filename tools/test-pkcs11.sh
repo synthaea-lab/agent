@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Runs release-tool's PKCS#11 test against SoftHSM with a throwaway token directory (ADR-0027).
+# Runs release-tool's PKCS#11 test against SoftHSM with a throwaway token directory.
 #   RELEASE_TOOL_SOFTHSM_MODULE=/path/to/libsofthsm2.so tools/test-pkcs11.sh
 # Without the variable the usual SoftHSM locations are tried. No real key is involved: the
 # token is created by the test in a temporary directory removed on exit.

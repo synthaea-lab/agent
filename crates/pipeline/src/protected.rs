@@ -6,7 +6,7 @@
 //!
 //! Scope is deliberately limited to paths this agent process can know for certain at
 //! its own runtime: its own executable (`std::env::current_exe`), its config file
-//! (the path `config::discover` resolved at startup — the same file ADR-0013 makes
+//! (the path `config::discover` resolved at startup — the same file the configuration design makes
 //! the agent fail fast over if it's missing, so it is worth protecting even though
 //! operator-edited, not updater-managed), plus the alerts/events/heartbeat files it
 //! was launched with. It does **not** cover the watchdog binary or the systemd
@@ -20,7 +20,7 @@
 //!
 //! #71 originally called for treating `updater` as the one legitimate non-self writer
 //! of these paths, since no updater existed yet to name. #30 shipped it since, and
-//! turns out not to need the exception: `delivery::release::cmd_apply_release` (ADR-0015)
+//! turns out not to need the exception: `delivery::release::cmd_apply_release`
 //! downloads and verifies a new release into its own `versions/<N>/` directory and only
 //! then swaps the `current` symlink — it never writes into the version directory the
 //! running process's `current_exe` already resolves to, and it does not touch the

@@ -14,7 +14,7 @@ use super::{
 
 /// Redacts well-known command-line credential forms without reformatting the line.
 /// Detection must consume the original event; call this only on copies at output
-/// boundaries (ADR-0034). Unsupported positional/encoded forms are documented there.
+/// boundaries. Unsupported positional/encoded forms are documented there.
 #[must_use]
 pub fn redact_command_line<'a>(image: &str, cmdline: &'a str) -> Cow<'a, str> {
     redact_command_line_inner(image, cmdline, 0, 0, redacted_keeping_quotes)

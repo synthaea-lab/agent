@@ -76,7 +76,7 @@ pub mod time;
 /// snapshot (every golden fixture, not only the new `Auth` ones), matching the
 /// precedent already established by versions 2 through 12. Originally claimed as
 /// 10 → 11 while this branch was open; rebased to 13 once #189 (`NetworkFlow`,
-/// 11 → 12) merged into `main` first — same coordination note as ADR-0005.
+/// 11 → 12) merged into `main` first — same coordination note as the shared auth-event design.
 ///
 /// Bumped 13 → 14 for [`Event::TlsCapture`] and [`Event::ReadlineInput`] (#90):
 /// two new enum variants for uprobes-based TLS plaintext capture and shell readline
@@ -108,7 +108,7 @@ pub mod time;
 /// variants; same serialization-visible reasoning as v13-v19. Originally
 /// claimed as 18 → 19 while #95's branch was open; renumbered once #263's
 /// `SocketAccept` (18 → 19) merged into `main` first — the same coordination
-/// note as v13 and ADR-0005.
+/// note as v13 and the shared auth-event design.
 ///
 /// Bumped 20 → 21 for [`Event::FileQuarantine`], [`Event::Mount`],
 /// [`Event::Signal`], and [`Event::XpcConnect`] (#96, the macOS
@@ -125,7 +125,7 @@ pub mod time;
 /// telemetry (`setxattr(2)`/`removexattr(2)`). Same reasoning as v13-v21.
 /// Originally claimed as 19 → 20 while this branch was open; renumbered once
 /// the macOS stack (#95/#96) took v19-v21 on `main` first — same coordination
-/// note as v13 and ADR-0005.
+/// note as v13 and the shared auth-event design.
 ///
 /// Bumped 22 → 23 for [`Event::PolicyDenial`] (#297): one new enum variant
 /// for OS-security-mechanism denials, first emitted by `sensor-linux-audit`
@@ -137,7 +137,7 @@ pub mod time;
 /// no detection rule ships with this bump, see the issue for why. Same
 /// serialization-visible reasoning as v13-v22. Originally claimed as 21 → 22
 /// while this branch was open; renumbered once #262 Phase 3's xattr telemetry
-/// took v22 on `main` first — same coordination note as v13 and ADR-0005.
+/// took v22 on `main` first — same coordination note as v13 and the shared auth-event design.
 ///
 /// Bumped 23 → 24 for [`Event::KernelModule`] and [`Event::BpfOperation`]
 /// (#264: kernel module load/unload and eBPF program/map lifecycle
@@ -182,7 +182,7 @@ pub mod time;
 /// so the widening is serialization-visible even though every value below
 /// 2^32 still serializes identically. 28 was claimed by #469 (ATT&CK technique
 /// ids) while both branches were open; #457 merged first, so #469 renumbers
-/// below — same coordination note as v13 and ADR-0005.
+/// below — same coordination note as v13 and the shared auth-event design.
 ///
 /// Bumped 29 → 30 for [`PolicyDenialEvent::object_path`] (#427, Linux half:
 /// filled from the AVC record's `path=`/`name=`; the Windows `AppLocker` half —
@@ -193,7 +193,7 @@ pub mod time;
 /// ATT&CK technique identifiers on a detection, additive `Vec<String>`
 /// alongside `attributions`, no new variant. 30 was claimed by #469 while
 /// both branches were open; #427/#490 merged first, so #469 renumbers here —
-/// same coordination note as v13, v28→29, and ADR-0005. Same
+/// same coordination note as v13, v28→29, and the shared auth-event design. Same
 /// serialization-visible reasoning as every field addition since v13.
 ///
 /// Bumped 31 → 32 for [`FileRenameEvent::executable_path`] (#459 part 1): the
@@ -228,10 +228,10 @@ pub mod time;
 /// events the sensor could not stamp), the same serialization-visible reasoning
 /// as v13-v34.
 ///
-/// Bumped 35 → 36 for [`Event::HttpRequest`] and [`Event::HttpSummary`] (#478, ADR-0022):
+/// Bumped 35 → 36 for [`Event::HttpRequest`] and [`Event::HttpSummary`] (#478):
 /// what the agent derives from a web server's access log — one event for a request
 /// that matches a detection signature, one summary per source per window. Neither
-/// reuses an existing variant (ADR-0022 §6); both carry a `meta` with `pid`/`ppid` 0,
+/// reuses an existing variant; both carry a `meta` with `pid`/`ppid` 0,
 /// since a log line names no process. Same serialization-visible reasoning as v13-v35.
 ///
 /// Bumped 36 → 37 for [`Event::AmsiContent`] (#282): the post-decoding buffer
@@ -358,12 +358,14 @@ pub mod time;
 ///
 /// Bumped 66 → 67 for [`Event::RemoteThread`] and [`Event::ProcessAccess`] (<https://github.com/synthaea-lab/agent/issues/41>): a thread
 /// created in another process and a memory-reading open of LSASS, from the driver-free ETW
-/// providers ADR-0026's lab capture (#715) confirmed, as the native equivalents of Sysmon 8
+/// providers the Sysmon decision's lab capture (#715) confirmed, as the native equivalents of
+/// Sysmon 8
 /// and 10. Windows only. [`ProcessAccessEvent::caller_image_path`] carries the caller's
 /// full image, for the LSASS rule's expected readers (<https://github.com/synthaea-lab/agent/issues/45>). First claimed 63, then 64; #1112 and #1103 merged first and took 65
 /// and 66, so this takes 67.
 ///
-/// Bumped 67 → 68 for [`ExecEvent::argv_omitted_bytes`] (<https://github.com/synthaea-lab/agent/issues/48>, ADR-0045): the
+/// Bumped 67 → 68 for [`ExecEvent::argv_omitted_bytes`]
+/// (<https://github.com/synthaea-lab/agent/issues/48>): the
 /// Linux exec probe reads a head and a tail window of the argument block and says
 /// how much of it lies between them. First claimed 67;
 /// <https://github.com/synthaea-lab/agent/issues/41> merged first and took it, so this takes 68.

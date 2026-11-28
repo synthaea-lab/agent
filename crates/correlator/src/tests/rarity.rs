@@ -1,4 +1,4 @@
-//! The "image is not in the fleet's common set" evidence (ADR-0020, issue #76): a weak,
+//! The "image is not in the fleet's common set" evidence (issue #76): a weak,
 //! capped term on an entity's belief. It can never be a verdict on its own.
 
 use super::*;

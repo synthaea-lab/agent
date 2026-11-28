@@ -129,12 +129,13 @@ pub(crate) fn read_wire<T: WireRecord>(record: &[u8]) -> Option<T> {
     Some(unsafe { core::ptr::read_unaligned(record.as_ptr().cast::<T>()) })
 }
 
-/// Exec records refused (ADR-0045): lengths that are not a shape the probe writes, or a record
+/// Exec records refused: lengths that are not a shape the probe writes, or a record
 /// shorter than they announce. Counted, the first one and every thousandth logged; the record
 /// is dropped, never read past its end.
 static EXEC_RECORDS_REFUSED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
-/// The exec event and its argv windows (ADR-0045: the record's size is not fixed), or `None`,
+/// The exec event and its argv windows (the argv-window design: the record's size is not fixed), or
+/// `None`,
 /// counted in [`EXEC_RECORDS_REFUSED`], for a record that does not parse.
 pub(crate) fn exec_record(
     record: &[u8],

@@ -1,5 +1,5 @@
 //! The keys an install trusts now: the embedded set, then every key rotation it applied, in
-//! order (ADR-0027). The embedded keys are compile-time statics, so a rotation cannot change
+//! order. The embedded keys are compile-time statics, so a rotation cannot change
 //! them; what an install records is **the signed rotation manifests themselves**, not the keys
 //! they produced. Every load replays the record from the embedded keys and re-verifies each
 //! manifest under the embedded `recovery` key, so the record cannot introduce a key that
@@ -265,7 +265,7 @@ impl TrustState {
     /// Nothing is written: the caller saves the record, and the keys apply from the next load.
     ///
     /// `installed_release` is the installed binary release (`None` on bootstrap): the rotation
-    /// must be newer than it and than every recorded rotation, one counter for both (ADR-0027).
+    /// must be newer than it and than every recorded rotation, one counter for both.
     ///
     /// # Errors
     ///
@@ -309,7 +309,7 @@ impl TrustState {
     }
 }
 
-/// The keys this install trusts now (ADR-0027): the embedded ones, then the key rotations it
+/// The keys this install trusts now: the embedded ones, then the key rotations it
 /// applied, replayed and re-verified from the record under the state directory
 /// ([`TrustState`]). Loaded where the verification happens, never cached across
 /// commands, so a rotation applied by another process is in force at the next check.
@@ -461,7 +461,8 @@ mod tests {
 
     #[test]
     fn an_empty_record_does_not_judge_the_embedded_set() {
-        // The public test set has release and content on one key (ADR-0016's shortcut).
+        // The public test set has release and content on one key (the content-ring design's
+        // shortcut).
         let shared = TrustedKeys {
             release: public(0x42),
             content: public(0x42),

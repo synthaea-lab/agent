@@ -1,6 +1,6 @@
 //! Stages, signs, and promotes a one-file demo release under a given base
 //! directory — for manually exercising `agent::integrity`'s live detection path
-//! (issue #30/#71) against a real running `agent` process, since ADR-0015's actual
+//! (issue #30/#71) against a real running `agent` process, since the updater design's actual
 //! download/staging flow ("the agent binary's job") is not built yet. Signs with
 //! `updater::key::test_key_pair` — the same test-only key the unit tests use, never
 //! a production key — so this only ever produces a manifest the workspace's own
@@ -8,7 +8,7 @@
 //!
 //! Usage: `cargo run -p updater --example stage_demo_release -- <base_dir>`
 //!
-//! Linux only, like the rest of `updater::layout` (ADR-0015's Linux-first slice —
+//! Linux only, like the rest of `updater::layout` (the updater design's Linux-first slice —
 //! see that module's doc): the `current` symlink swap this stages is POSIX-shaped,
 //! and there is no Windows/macOS layout to demo yet. Compiles to an inert stub
 //! elsewhere, same "empty stub outside its platform" posture `updater` itself
@@ -19,7 +19,9 @@
 
 #[cfg(not(target_os = "linux"))]
 fn main() {
-    eprintln!("stage_demo_release: Linux only (ADR-0015's layout is a Linux-first slice)");
+    eprintln!(
+        "stage_demo_release: Linux only (the updater design's layout is a Linux-first slice)"
+    );
     std::process::exit(1);
 }
 

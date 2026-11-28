@@ -1,4 +1,4 @@
-//! Per-window summary of one access-log source (ADR-0022 §3).
+//! Per-window summary of one access-log source.
 //!
 //! The server sees requests that matched no signature only through this: counters and
 //! the clients with the most failing requests. Bounded by construction: the tracked
@@ -11,7 +11,7 @@ use schema::{EventMeta, HttpClientCount, HttpSummaryEvent, User};
 
 use crate::{AccessRecord, http::HTTP_LOG_COMM};
 
-/// Window length, in seconds, ADR-0022 §3.
+/// Window length, in seconds, the log-ingestion design.
 pub const WINDOW_SECS: u32 = 60;
 /// Distinct client addresses tracked per window; further ones are counted in
 /// `requests` but not in `distinct_clients` or the ranking.
@@ -73,7 +73,7 @@ impl Summarizer {
 
     /// Ends the window and returns its summary once `now_ns` is a full window past
     /// its first request; `None` otherwise, and for a window with no request (a quiet
-    /// log is normal, ADR-0022 decision 4, and an empty summary says nothing).
+    /// log is normal, and an empty summary says nothing).
     pub fn tick(&mut self, now_ns: u64) -> Option<HttpSummaryEvent> {
         let start = self.window_start_ns?;
         if now_ns.saturating_sub(start) < self.window_ns {

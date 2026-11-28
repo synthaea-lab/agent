@@ -1,4 +1,4 @@
-//! Cross-language golden test for the common-set snapshot wire format (ADR-0020, #76).
+//! Cross-language golden test for the common-set snapshot wire format (#76).
 //!
 //! Consumes `ml/tests/fixtures/common_set_snapshot_golden.json`, written by
 //! `ml/tests/fixtures/generators/gen_common_set_snapshot_golden.py` from the spec in

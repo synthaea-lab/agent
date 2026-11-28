@@ -1,6 +1,6 @@
 //! Externally-referenced secrets.
 //!
-//! Per ADR-0013 §7 ("Secrets: external references only"), secret fields in
+//! Per the configuration design ("Secrets: external references only"), secret fields in
 //! the on-disk config file never carry cleartext values. Instead, they carry
 //! a reference to a provider that the load-time code resolves against the
 //! running process's environment or filesystem. If a field declared as a
@@ -16,7 +16,7 @@
 //! The set of providers below is closed at v1; adding one (e.g. `HashiCorp`
 //! Vault, AWS Secrets Manager, Windows Credential Store) is an
 //! implementation change (a new [`SecretRef`] variant and its resolve arm),
-//! not a schema change, per ADR-0013 §Deferred.
+//! not a schema change, per the configuration design.
 
 use std::path::PathBuf;
 

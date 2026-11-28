@@ -2,7 +2,7 @@
 //!
 //! Every variant carries enough context for a review-time reader to know
 //! which document, which field, and what expectation failed — matching the
-//! "precise errors" contract [ADR-0010 §8] borrows from ADR-0013.
+//! "precise errors" contract [the policy model] borrows from the configuration design.
 
 /// Anything that can go wrong loading, parsing, verifying, or merging a
 /// [`crate::Policy`] document.
@@ -12,7 +12,7 @@
 #[derive(Debug, thiserror::Error)]
 pub enum PolicyError {
     /// The document's `schema_version` is unknown to this build. Readers
-    /// reject rather than parse-strict-with-drop (ADR-0010 §Deferred:
+    /// reject rather than parse-strict-with-drop (the policy model:
     /// today's decision on cross-version co-existence is "reject").
     #[error("unsupported schema_version {found}: this build only accepts {expected}")]
     SchemaVersionMismatch {
@@ -59,7 +59,7 @@ pub enum PolicyError {
     },
 
     /// An override document contains a partial version of a sub-object
-    /// that ADR-0011 declared safety-critical (present in the hardcoded
+    /// that the policy override design declared safety-critical (present in the hardcoded
     /// [`crate::SAFETY_CRITICAL_PATHS`] list). The override is refused at
     /// parse time; the agent keeps its current effective policy.
     #[error(

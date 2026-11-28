@@ -1,7 +1,7 @@
 //! The committed default configuration template, and the one operation that
 //! puts it on disk (`cli config init`).
 //!
-//! Per ADR-0013 §5 the template is a hand-written committed file
+//! Per the configuration design the template is a hand-written committed file
 //! (`data/default-agent.toml`), not generated from Rust literals: this module
 //! only embeds it verbatim and writes it out. `tests/default_template.rs`
 //! keeps it loadable against the current schema.
@@ -22,14 +22,14 @@ pub const DEFAULT_TEMPLATE: &str = include_str!("../data/default-agent.toml");
 ///
 /// Refuses to replace an existing file unless `force` is set: an installed
 /// config is operator state, and silently resetting it to placeholder values
-/// is exactly the kind of silent misconfiguration ADR-0013 exists to prevent.
+/// is exactly the kind of silent misconfiguration the configuration design exists to prevent.
 /// Without `force` the file is created with `create_new`, so a file appearing
 /// between the check and the write is still never clobbered. With `force` the
 /// template goes to a sibling temp file first and is renamed over `path`, so a
 /// crash mid-write never leaves a truncated config behind.
 ///
 /// The file is created `0644`: it holds no secrets (secret fields are
-/// `envvar:`/`file:` references, ADR-0013 §7), and `cli`, which reads it for
+/// `envvar:`/`file:` references), and `cli`, which reads it for
 /// `ipc.endpoint`, may run as a non-root admin.
 ///
 /// # Errors

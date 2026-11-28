@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Generates the RUSTFLAGS needed to statically link onnxruntime into `ml`
-# (ADR-0002) on Linux — a workaround for `ort-sys` v2.0.0-rc.13's hardcoded
+# on Linux — a workaround for `ort-sys` v2.0.0-rc.13's hardcoded
 # static-link library list, which is incomplete for onnxruntime 1.30.0 built
 # from source (issue #110).
 #

@@ -2,7 +2,7 @@
 .SYNOPSIS
     Prints the RUSTFLAGS needed to statically link a source-built onnxruntime
     into the `ml` crate on Windows (MSVC). Windows counterpart of
-    ort-static-link-flags.sh (#337, ADR-0002).
+    ort-static-link-flags.sh (#337).
 
 .DESCRIPTION
     `ort-sys` v2.0.0-rc.13 hardcodes the list of static libraries it links, and

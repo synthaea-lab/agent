@@ -81,7 +81,8 @@ fn exec_keeps_argv_and_joins_cmdline() {
     );
 }
 
-/// ADR-0045's truth table, the probe rows: bytes known to lie between the windows set the
+/// The argv-window design's truth table, the probe rows: bytes known to lie between the windows set
+/// the
 /// flag; a whole block or an unknown count does not.
 #[test]
 fn omitted_argv_bytes_set_the_truncation_flag_only_when_known_to_be_missing() {
@@ -123,7 +124,7 @@ fn exec_cuts_a_padded_argv_and_flags_it() {
     assert!(e.cmdline_truncated);
     assert_eq!(
         e.argv_omitted_bytes, None,
-        "a budget cut does not measure what it dropped (ADR-0045)"
+        "a budget cut does not measure what it dropped"
     );
     assert_eq!(e.argv[..2], ["sh", "-c"], "the head is kept");
     assert!(e.cmdline.len() < schema::ARGV_CAPTURE_BUDGET);

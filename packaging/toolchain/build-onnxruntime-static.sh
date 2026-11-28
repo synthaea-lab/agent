@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
 # Builds onnxruntime v1.30.0 from source as static libraries for Linux and macOS,
-# implementing ADR-0002 decision #2 (static linking for single-binary deployment).
+# implementing the model-delivery design decision #2 (static linking for single-binary deployment).
 #
 # Issue #110 tracks the full static-linking integration; this script automates
 # the onnxruntime build portion only — you still need to run the companion
 # ort-static-link-flags.sh script and set RUSTFLAGS before building the ml crate.
 #
 # Tested on:
-# - Ubuntu 24.04 (glibc) — ADR-0002 target platform
+# - Ubuntu 24.04 (glibc) — the model-delivery design target platform
 # - Alpine 3.x (musl) — not a target, but confirms cross-libc viability
 # - macOS (#338): Apple Silicon and Intel (hosted runners macos-15 and macos-15-intel, 2026-10-12:
 #   built, linked, tested; see onnxruntime-static-build-macos.md for the measurements). The macOS
@@ -87,7 +87,7 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-echo "[onnxruntime] Building static libraries for ADR-0002 (issue #110)"
+echo "[onnxruntime] Building static libraries for the model-delivery design (issue #110)"
 echo "  Version: $ONNX_VERSION"
 echo "  Jobs: $JOBS"
 

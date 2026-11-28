@@ -24,7 +24,7 @@ ExecStart=/var/lib/synthaea/current/watchdog run \
 Restart=always
 RestartSec=5s
 
-# Capabilities (#559, ADR-0014, amended for CAP_AUDIT_READ #780): the agent runs as the
+# Capabilities (#559, amended for CAP_AUDIT_READ #780): the agent runs as the
 # unprivileged `synthaea` user and is granted only these, as ambient capabilities so the
 # watchdog's agent child inherits them across exec. Everything else is dropped from the
 # bounding set, so a bug in a sensor is not a root bug. Granted, each for a feature
@@ -49,7 +49,7 @@ AmbientCapabilities=CAP_BPF CAP_PERFMON CAP_SYS_RESOURCE CAP_DAC_READ_SEARCH CAP
 NoNewPrivileges=true
 ProtectSystem=strict
 # Events carry host paths and the agent opens them by path (YARA, hashing), so it must see
-# the host's /tmp, /var/tmp and /home (#594, ADR-0014). `PrivateTmp=true` and
+# the host's /tmp, /var/tmp and /home (#594). `PrivateTmp=true` and
 # `ProtectHome=true` hid all three, so payloads dropped there were never scanned or hashed.
 # Homes are read-only; quarantining a file out of them is the opt-in drop-in in
 # docs/operations/response.md.

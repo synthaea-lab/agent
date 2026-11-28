@@ -1,11 +1,12 @@
-//! The key-rotation release (ADR-0027 decision 1): a signed manifest that names a replacement
+//! The key-rotation release: a signed manifest that names a replacement
 //! `release` and/or `content` key and the key it retires, signed by the offline `recovery` key and
 //! by nothing else. A manifest signed by `release` or `content` cannot change the trust set, which
 //! is what lets a compromised `release` key be replaced without touching the endpoints by hand.
 //!
-//! The shape is the one ADR-0027 decision 5 chose over TUF's metadata: one signed payload, roles
+//! The shape is the one the signing-key design chose over TUF's metadata: one signed payload, roles
 //! by key, a root of trust (`recovery`) that can rotate the other two. Where it differs from TUF's
-//! threshold and expiry rules, and why, is written in ADR-0027 ("The key-rotation release").
+//! threshold and expiry rules, and why, is written in the signing-key design ("The key-rotation
+//! release").
 //!
 //! Verification only, like [`crate::content`] and [`crate::snapshot`]: fetching the manifest,
 //! remembering the rotated keys across restarts and feeding them to the verifiers is the agent
@@ -23,8 +24,8 @@ pub const ROTATION_SCHEMA_VERSION: u32 = 1;
 
 /// The longest a rotation may stay applicable after it is issued: 30 days. **Provisional**: long
 /// enough for an offline fleet to come back and for the recovery holders to meet again, short
-/// enough that a rotation held back by an attacker stops being applicable (the freeze case the
-/// ADR compares with TUF's expiry). Calibrate with the first lab drill.
+/// enough that a rotation held back by an attacker stops being applicable (the freeze case
+/// TUF answers with an expiry). Calibrate with the first lab drill.
 pub const MAX_VALIDITY_SECS: u64 = 30 * 24 * 60 * 60;
 
 /// How far past "now" `issued_at` may be before the manifest is refused: a few minutes of clock
@@ -36,7 +37,7 @@ pub const MAX_REASON_BYTES: usize = 256;
 
 /// The two keys a rotation can change: what an agent trusts to sign releases and content.
 /// `recovery` is not in it: no rotation changes `recovery` (a lost one needs a reinstall,
-/// ADR-0027 consequences).
+/// the signing-key design consequences).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TrustedKeys {
     /// Verifies binary release manifests.
@@ -74,7 +75,7 @@ pub struct KeyRotationManifest {
     pub new_release_key: Option<String>,
     /// Why, for the audit trail (`scheduled`, `suspected exposure of the release key`, ...).
     pub reason: String,
-    /// Like any release (ADR-0015 decision 2): strictly greater than the highest release or
+    /// Like any release: strictly greater than the highest release or
     /// rotation the agent applied, see [`Self::check_release_version`].
     pub release_version: u64,
     /// The `content` key this replaces: it must be the one the agent trusts now.
@@ -204,7 +205,7 @@ impl KeyRotationManifest {
         self.verify_against(recovery)
     }
 
-    /// Anti-rollback (ADR-0015 decision 2, ADR-0027 decision 5): rejects a rotation whose
+    /// Anti-rollback: rejects a rotation whose
     /// `release_version` is not strictly greater than `current`. A rotation is a release like any
     /// other, so `current` is the greater of the installed release and the last rotation applied
     /// (`None`: neither exists), and the next release or rotation must go above this one.

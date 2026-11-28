@@ -93,7 +93,7 @@ for binary in agent watchdog cli; do
     fi
 done
 
-# The shipped artifacts, not a nearby build product: no public test signing key (ADR-0027).
+# The shipped artifacts, not a nearby build product: no public test signing key.
 "$REPO_ROOT/tools/assert-no-test-key.sh" \
     "$REPO_ROOT/target/$TARGET/release/agent" \
     "$REPO_ROOT/target/$TARGET/release/watchdog" \

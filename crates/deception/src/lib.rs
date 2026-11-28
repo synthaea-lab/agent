@@ -45,7 +45,7 @@
 //!   else.
 //!
 //! Not built here: honeypot listeners. The agent wiring, the decoy credentials and their
-//! server-side alarm live in the agent and the control plane (ADR-0029, ADR-0030). This crate
+//! server-side alarm live in the agent and the control plane. This crate
 //! does no I/O except through [`plant`], [`verify`], [`refresh`] and [`remove`], and holds no
 //! platform branches.
 

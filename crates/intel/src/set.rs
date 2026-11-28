@@ -27,7 +27,7 @@ pub const MAX_DOMAIN_BYTES: usize = 253;
 const MAX_LABEL_BYTES: usize = 63;
 /// Fewest labels of a listed domain. `com` is a single label and would cover a whole TLD;
 /// `example.com` is the shortest indicator. Two labels is a floor, not a guarantee: `co.uk` has
-/// two and is still a public suffix, which only a public-suffix list can tell (ADR-0038).
+/// two and is still a public suffix, which only a public-suffix list can tell.
 pub const MIN_INDICATOR_LABELS: usize = 2;
 /// Most labels of a listed domain, which bounds a lookup: a name is probed against its
 /// suffixes of 2 to this many labels, at most [`MAX_DOMAIN_PROBES`] searches, whatever its

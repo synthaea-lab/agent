@@ -23,7 +23,7 @@ rings: `TLS_CAPTURE_EVENTS`, `READLINE_EVENTS`, `DNS_QUERY_EVENTS` (256 KiB each
 `--enable-dns-capture` are read once and the sensor reads its configuration once, so the set of
 captures cannot change while the agent runs. This is a decision (agent#157): a `CaptureSet` that
 could be widened at run time, and a supervisor thread that restarted the sensor when it changed,
-were written for the posture overlay (#62, ADR-0035, third slice) and had no caller, so they were
+were written for the posture overlay (#62, third slice) and had no caller, so they were
 deleted under the "no dead code" rule. The overlay slice brings them back with its caller. What
 that slice has to solve is a restart of the sensor, which unloads and loads the eBPF object and
 leaves a capture gap, in both directions; a live attach and detach on the running sensor would
