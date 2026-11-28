@@ -68,8 +68,8 @@ rewrite its argument region before it.
 So the probe reads the argument block itself, using `task->mm->arg_start..arg_end` at BTF-derived
 offsets ([`read_exec_argv`](../../../crates/sensors/linux/ebpf/src/exec.rs)):
 
-- the whole block when it is at most 1024 bytes;
-- otherwise the first 768 bytes and the last 256. The tail exists so padding placed in front of a
+- the whole block when it is at most 4096 bytes;
+- otherwise the first 3,072 bytes and the last 1,024. The tail exists so padding placed in front of a
   payload at the end of the command line does not hide it. A payload in the middle of a padded
   block is still omitted; the omitted count is the signal for that case.
 
@@ -89,8 +89,8 @@ splitting the windows on NUL:
 
 | Situation | `argv` | `cmdline_truncated` | `argv_omitted_bytes` |
 | --- | --- | --- | --- |
-| Probe read, block ≤ 1024 B | whole block | false | `Some(0)` |
-| Probe read, block > 1024 B | head + tail | true | `Some(total - 1024)` |
+| Probe read, block ≤ 4096 B | whole block | false | `Some(0)` |
+| Probe read, block > 4096 B | head + tail | true | `Some(total - 4096)` |
 | Head read, tail read failed | head | true | `Some(total - head)` |
 | No probe read, process alive | from `/proc` | true only if the 32 KiB budget cut it | `Some(0)`, or `None` if cut |
 | No probe read, process gone | empty | false | `None` |

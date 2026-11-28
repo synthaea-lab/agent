@@ -133,7 +133,7 @@ pub use self::{
 /// v27 (#1036) added `FileSetTimeEvent` — new `file_set_time` mapping function below, to the
 /// platform-neutral `schema::FileSetTimeEvent` (requested Unix times converted to `FILETIME`
 /// units, only the fields the caller chose set); no existing mapping changed shape.
-const _: () = assert!(wire::WIRE_VERSION == 28);
+const _: () = assert!(wire::WIRE_VERSION == 29);
 
 /// Same, but an empty buffer means "not captured" rather than the empty string —
 /// the probe leaves `pcomm` zeroed when the fork-lineage map had no entry.

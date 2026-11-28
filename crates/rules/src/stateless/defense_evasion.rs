@@ -18,9 +18,10 @@ const TRUNCATED_CMDLINE_QUOTE_BYTES: usize = 256;
 /// causes, graded and worded apart:
 ///
 /// - **The bytes between the Linux probe's head and tail windows**
-///   (`argv_omitted_bytes = Some(n > 0)`): any argument block over 1 KiB. **Low**, as
-///   the argv-window design fixed it: in #1112's sample at most 3 of 3,451 execs exceed 1 KiB, and
-///   none of 1,592 lab execs did, but both samples are small and from lab hosts.
+///   (`argv_omitted_bytes = Some(n > 0)`): any argument block over 4 KiB. **Low**. The
+///   window was 1 KiB at first, sized on samples where at most 3 of 3,451 execs exceeded it;
+///   a host that compiles exceeds it at every link (`collect2`, `ld`), so it grew to 4 KiB,
+///   which no command line in those samples reached (the largest was 1,661 bytes).
 /// - **Any other cut** (`argv_omitted_bytes = None`): the 32 KiB budget of #1112
 ///   (Alpine sample: p99.9 347 B, max 1,661 B, none over 4 KiB), or a sensor that
 ///   keeps a bounded number of arguments (macOS ES). **Medium**: none was benign in
