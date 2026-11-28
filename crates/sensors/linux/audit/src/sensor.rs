@@ -720,9 +720,23 @@ mod tests {
         });
         let tid = tid_rx.recv().unwrap();
         assert!(!before.tids.contains(&tid));
-        sensor.refresh_marker();
-        let after = crate::killrec::read_marker(dir.path()).unwrap();
-        assert!(after.tids.contains(&tid));
+        // Listing `/proc/self/task` while other threads exit can skip a live one (the kernel
+        // walks the list by position), and the other tests of this binary end threads all the
+        // time. The sensor refreshes every few seconds for that reason; so does this.
+        let listed = |marker: &crate::killrec::Marker| marker.tids.contains(&tid);
+        let mut after = before;
+        for _ in 0..50 {
+            sensor.refresh_marker();
+            after = crate::killrec::read_marker(dir.path()).unwrap();
+            if listed(&after) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(
+            listed(&after),
+            "the new thread is in the marker after a refresh"
+        );
         // `kill -9 <worker tid>` of that process, replayed by its successor (another pid).
         std::fs::write(&log, format!("{}\n", kill_line(&format!("{tid:x}")))).unwrap();
         let mut previous = after;
