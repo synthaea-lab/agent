@@ -454,24 +454,7 @@ mod tests {
 
     /// A gate watching one freshly planted canary, and that canary's path.
     fn gate_watching_canary(dir: &std::path::Path) -> (CanaryGate, String) {
-        let planted = dir.join("canaries");
-        std::fs::create_dir_all(&planted).unwrap();
-        let tripwires = crate::deception::start(
-            &config::DeceptionConfig {
-                canary_dirs: vec![planted.clone()],
-                ..Default::default()
-            },
-            &dir.join("state"),
-        )
-        .unwrap();
-        let canary = std::fs::read_dir(&planted)
-            .unwrap()
-            .next()
-            .unwrap()
-            .unwrap()
-            .path()
-            .display()
-            .to_string();
+        let (tripwires, canary) = crate::sink::tests::planted_canary(dir);
         let gate = CanaryGate::new();
         gate.set_tripwires(tripwires);
         (gate, canary)

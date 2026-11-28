@@ -656,18 +656,23 @@ fn run_response_scenario(
     (payload, killed)
 }
 
-/// A sink watching the one canary a plant into `dir/canaries` produced.
-fn sink_watching_canary(dir: &std::path::Path) -> (Arc<DetectionSink>, String) {
+/// Plants the canaries of one directory, `dir/canaries`, and returns the tripwires over them
+/// with the path of one canary.
+pub(super) fn planted_canary(dir: &std::path::Path) -> (deception::Tripwires, String) {
     let planted = dir.join("canaries");
     std::fs::create_dir_all(&planted).unwrap();
-    let tripwires = crate::deception::start(
-        &config::DeceptionConfig {
-            canary_dirs: vec![planted.clone()],
-            ..Default::default()
-        },
-        &dir.join("state"),
-    )
-    .unwrap();
+    let canaries = deception::plan(
+        &deception::Seed::from_bytes([7; 32]),
+        &[deception::Placement {
+            dir: planted.clone(),
+            kinds: deception::Kind::ALL.to_vec(),
+        }],
+    );
+    let inventory = dir.join("state").join("inventory.json");
+    std::fs::create_dir_all(dir.join("state")).unwrap();
+    deception::plant(&canaries, &inventory).unwrap();
+    let tripwires =
+        deception::Tripwires::from_inventory(&deception::Inventory::load(&inventory).unwrap());
     let canary = std::fs::read_dir(&planted)
         .unwrap()
         .next()
@@ -676,6 +681,12 @@ fn sink_watching_canary(dir: &std::path::Path) -> (Arc<DetectionSink>, String) {
         .path()
         .display()
         .to_string();
+    (tripwires, canary)
+}
+
+/// A sink watching the canaries a plant into `dir/canaries` produced, and one of their paths.
+fn sink_watching_canary(dir: &std::path::Path) -> (Arc<DetectionSink>, String) {
+    let (tripwires, canary) = planted_canary(dir);
     let sink = sink_in(dir);
     sink.set_tripwires(tripwires);
     (sink, canary)
