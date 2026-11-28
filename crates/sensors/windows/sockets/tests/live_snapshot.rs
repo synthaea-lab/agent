@@ -20,15 +20,26 @@ use sensor_windows_sockets::{
 /// by chance (review of #1008). With both on one address, nothing else can hold the TCP
 /// side, so the count of this process's entries at that address is exact.
 fn tcp_and_udp_on_one_port() -> (TcpListener, UdpSocket, SocketAddr) {
-    for _ in 0..16 {
-        let listener = TcpListener::bind("127.0.0.1:0").expect("bind ephemeral listener");
-        let addr = listener.local_addr().unwrap();
-        // The UDP side of that number may already be taken by someone else: try another.
-        if let Ok(socket) = UdpSocket::bind(addr) {
-            return (listener, socket, addr);
+    // Windows keeps excluded port ranges per protocol (Hyper-V and WinNAT reserve blocks of
+    // them), so a number the system hands out for one protocol can be refused for the other
+    // every time: a CI runner refused the UDP side of 16 TCP ports in a row. Asking for the
+    // UDP port first, then for the TCP one, draws from the other protocol's range as well.
+    for attempt in 0..64 {
+        if attempt % 2 == 0 {
+            let listener = TcpListener::bind("127.0.0.1:0").expect("bind ephemeral listener");
+            let addr = listener.local_addr().unwrap();
+            if let Ok(socket) = UdpSocket::bind(addr) {
+                return (listener, socket, addr);
+            }
+        } else {
+            let socket = UdpSocket::bind("127.0.0.1:0").expect("bind ephemeral socket");
+            let addr = socket.local_addr().unwrap();
+            if let Ok(listener) = TcpListener::bind(addr) {
+                return (listener, socket, addr);
+            }
         }
     }
-    panic!("no 127.0.0.1 port free for both TCP and UDP after 16 tries");
+    panic!("no 127.0.0.1 port free for both TCP and UDP after 64 tries");
 }
 
 /// A UDP socket on `127.0.0.1` at a fixed port below [`EPHEMERAL_UDP_PORTS`], the way a
