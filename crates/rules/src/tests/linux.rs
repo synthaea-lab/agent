@@ -1183,6 +1183,93 @@ fn a_listen_call_whose_address_the_sensor_did_not_resolve_is_not_judged() {
     assert!(state.on_socket_listen(&listen_call(None)).is_empty());
 }
 
+fn svchost_listener(protocol: u8, port: u16) -> ListenPortEvent {
+    ListenPortEvent {
+        protocol,
+        ..listen_port_event_full(500, "svchost.exe", [0, 0, 0, 0], port, 0)
+    }
+}
+
+#[test]
+fn a_windows_service_opening_its_own_port_after_boot_does_not_alert() {
+    // Seen on every boot in the lab (2026-11-28): Connected Devices Platform and
+    // Delivery Optimization start after the agent took its baseline.
+    let mut state = RuleState::new();
+    for (protocol, port) in [
+        (schema::IPPROTO_TCP, 5040),
+        (schema::IPPROTO_UDP, 5050),
+        (schema::IPPROTO_TCP, 7680),
+    ] {
+        assert!(
+            state
+                .on_listen_port(&svchost_listener(protocol, port))
+                .is_empty(),
+            "{protocol}/{port}"
+        );
+    }
+}
+
+#[test]
+fn the_service_host_opening_any_other_port_still_alerts() {
+    let mut state = RuleState::new();
+    assert_eq!(
+        state
+            .on_listen_port(&svchost_listener(schema::IPPROTO_TCP, 4444))
+            .len(),
+        1
+    );
+    assert_eq!(
+        state
+            .on_listen_port(&svchost_listener(schema::IPPROTO_UDP, 7680))
+            .len(),
+        1,
+        "the port is a service's only with its protocol"
+    );
+}
+
+#[test]
+fn a_program_named_like_the_service_host_but_run_from_elsewhere_still_alerts() {
+    let mut state = RuleState::new();
+    state.seed_processes([(
+        500,
+        "svchost.exe".to_owned(),
+        Some(r"C:\Users\Public\svchost.exe".to_owned()),
+        None,
+    )]);
+    assert_eq!(
+        state
+            .on_listen_port(&svchost_listener(schema::IPPROTO_TCP, 7680))
+            .len(),
+        1
+    );
+}
+
+#[test]
+fn the_service_host_known_by_its_system_image_does_not_alert() {
+    let mut state = RuleState::new();
+    state.seed_processes([(
+        500,
+        "svchost.exe".to_owned(),
+        Some(r"C:\Windows\System32\svchost.exe".to_owned()),
+        None,
+    )]);
+    assert!(
+        state
+            .on_listen_port(&svchost_listener(schema::IPPROTO_TCP, 7680))
+            .is_empty()
+    );
+}
+
+#[test]
+fn another_program_on_a_windows_service_port_still_alerts() {
+    let mut state = RuleState::new();
+    let event = ListenPortEvent {
+        protocol: schema::IPPROTO_TCP,
+        ..listen_port_event_full(4242, "nc.exe", [0, 0, 0, 0], 7680, 0)
+    };
+    assert_eq!(state.on_listen_port(&event).len(), 1);
+}
+
 #[test]
 fn listen_port_seeded_at_startup_does_not_alert() {
     // The exact scenario seed_listen_ports exists for: a listener already up

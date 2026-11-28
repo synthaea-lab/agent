@@ -173,6 +173,10 @@ LISTENER-DRIFT and POLICY-DENIAL-DRIFT alert on a *new shape*, not on volume:
   `listen(2)` call itself (`SocketListen`), which is what catches a listener that takes one
   connection and exits before the next poll. They share the key, so a listener raises one alert
   whichever saw it first. Only a `listen` whose address the probe resolved is judged.
+  Three ports are not judged when the Windows service host opens them (TCP 5040, UDP 5050,
+  TCP 7680): Connected Devices Platform and Delivery Optimization start after the agent took
+  its baseline, so they looked like new listeners on every boot. The owner must be the system
+  `svchost.exe` by its image when the agent knows it, by its name otherwise.
 - **Policy denials** are keyed per mechanism. SELinux keys on
   `(scontext, tcontext, class, normalised permissions)`; the permission set is sorted and
   deduplicated by `normalized_permissions`. AppLocker and WDAC events carry no object context,

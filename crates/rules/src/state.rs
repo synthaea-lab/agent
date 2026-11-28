@@ -921,8 +921,13 @@ impl RuleState {
     /// To be called for every `ListenPortEvent` in the stream (Linux `sock_diag`
     /// polling, issue #92) — see [`DriftState::check_listen_port_drift`].
     pub fn on_listen_port(&mut self, event: &ListenPortEvent) -> Vec<Alert> {
+        let image = PidFact::current(
+            &self.pid_image_path,
+            event.meta.pid,
+            event.meta.process_generation,
+        );
         self.drift
-            .check_listen_port_drift(event)
+            .check_listen_port_drift(event, image)
             .into_iter()
             .collect()
     }

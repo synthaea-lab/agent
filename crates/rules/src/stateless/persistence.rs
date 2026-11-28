@@ -132,6 +132,60 @@ const TASK_HIJACK_ACTION_PATTERNS: &[&str] = &[
     "regsvr32",
 ];
 
+/// The two patterns of [`TASK_HIJACK_ACTION_PATTERNS`] that name a program whose argument is
+/// the code it runs.
+fn is_dll_loader(pattern: &str) -> bool {
+    matches!(pattern, "rundll32" | "regsvr32")
+}
+
+/// Where Windows keeps its own DLLs, as a task action writes it (lowercase).
+const SYSTEM_DLL_DIRECTORIES: &[&str] = &[
+    r"%windir%\system32\",
+    r"%systemroot%\system32\",
+    r"c:\windows\system32\",
+    r"%windir%\syswow64\",
+    r"%systemroot%\syswow64\",
+    r"c:\windows\syswow64\",
+];
+
+/// Whether every `rundll32`/`regsvr32` in the (lowercase) action loads a DLL from the system
+/// directory. Windows' own tasks do exactly that and are rewritten by Windows itself: the
+/// Program Compatibility Assistant updates `PcaPatchDbTask`
+/// (`rundll32.exe %windir%\system32\PcaSvc.dll,PcaPatchSdbTask`) after a boot (lab,
+/// 2026-11-28). A hijack points the loader at a DLL somewhere a user can write; writing into
+/// the system directory needs the rights that make a task unnecessary.
+///
+/// A loader with no argument, or one this cannot read, is not excused.
+fn loads_only_system_dlls(action_lower: &str) -> bool {
+    let mut loaders = 0;
+    for loader in ["rundll32", "regsvr32"] {
+        for (at, _) in action_lower.match_indices(loader) {
+            loaders += 1;
+            if !loaded_dll(&action_lower[at + loader.len()..]).is_some_and(|dll| {
+                SYSTEM_DLL_DIRECTORIES
+                    .iter()
+                    .any(|dir| dll.starts_with(dir))
+            }) {
+                return false;
+            }
+        }
+    }
+    loaders > 0
+}
+
+/// The DLL a loader is given: the first argument after the program name that is not a
+/// switch, up to the comma that separates it from an export.
+fn loaded_dll(after_loader: &str) -> Option<&str> {
+    let arguments = after_loader.strip_prefix(".exe").unwrap_or(after_loader);
+    let arguments = arguments.strip_prefix('"').unwrap_or(arguments);
+    arguments
+        .split_whitespace()
+        .map(|argument| argument.trim_matches('"'))
+        .find(|argument| !argument.starts_with('/') && !argument.starts_with('-'))
+        .map(|argument| argument.split(',').next().unwrap_or(argument))
+        .filter(|dll| !dll.is_empty())
+}
+
 /// T1053.005 — Scheduled Task/Job: Scheduled Task, task-hijack sub-case: an
 /// *existing* scheduled task's action was rewritten (Security log event 4702, "A
 /// scheduled task was updated"). Sibling of [`check_scheduled_task_persistence`]
@@ -141,7 +195,8 @@ const TASK_HIJACK_ACTION_PATTERNS: &[&str] = &[
 /// tasks routinely, and `schtasks /create` itself emits 4702 as part of its
 /// registration (lab, 2026-09-22) — alerting on every 4702 would bury the signal.
 /// The rule therefore also requires the new action path to match
-/// `TASK_HIJACK_ACTION_PATTERNS`. A benign creation that also matches still fires
+/// `TASK_HIJACK_ACTION_PATTERNS`, and does not count a DLL loader that loads only from the
+/// system directory ([`loads_only_system_dlls`]). A benign creation that also matches still fires
 /// the 4698 rule on its own event, so the pair can double-report one `schtasks
 /// /create` pointed at a suspicious path — accepted: correlation groups them.
 ///
@@ -163,6 +218,7 @@ pub(crate) fn check_scheduled_task_update_persistence(event: &FileOpenEvent) -> 
         let path_lower = event.path.to_ascii_lowercase().replace('/', r"\");
         *TASK_HIJACK_ACTION_PATTERNS
             .iter()
+            .filter(|pattern| !(is_dll_loader(pattern) && loads_only_system_dlls(&path_lower)))
             .find(|pattern| path_lower.contains(*pattern))?
     } else {
         "action unreadable"
