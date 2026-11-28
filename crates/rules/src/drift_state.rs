@@ -6,7 +6,7 @@ use std::net::IpAddr;
 
 use schema::{
     ListenPortEvent, POLICY_MECHANISM_APPLOCKER, POLICY_MECHANISM_SELINUX, POLICY_MECHANISM_WDAC,
-    PolicyDenialEvent, detection::Severity,
+    PolicyDenialEvent, SocketListenEvent, detection::Severity,
 };
 use store::BoundedMap;
 
@@ -113,7 +113,37 @@ impl DriftState {
     /// against (a dev server or `docker-proxy` binding a fresh port after
     /// startup will alert; a documented, known noise source, not a bug).
     pub(crate) fn check_listen_port_drift(&mut self, event: &ListenPortEvent) -> Option<Alert> {
-        let key = (event.local_addr, event.local_port, event.protocol);
+        self.new_listener(
+            &event.meta,
+            event.local_addr,
+            event.local_port,
+            event.protocol,
+        )
+    }
+
+    /// LISTENER-DRIFT from the `listen(2)` call itself. The poll above sees a listener only
+    /// if it is still open at the next cycle, ten seconds apart: a bind shell that takes one
+    /// connection and exits is missed more often than not. The call is seen when it happens.
+    /// Both sources share one memory, so a listener raises one alert whichever saw it first.
+    ///
+    /// Only a listener the sensor resolved an address for is judged (a Unix-domain socket
+    /// has none), and `listen(2)` on an address family the probe resolves is a TCP listener.
+    pub(crate) fn check_socket_listen_drift(&mut self, event: &SocketListenEvent) -> Option<Alert> {
+        let (Some(local_addr), Some(local_port)) = (event.local_addr, event.local_port) else {
+            return None;
+        };
+        self.new_listener(&event.meta, local_addr, local_port, schema::IPPROTO_TCP)
+    }
+
+    /// The alert for a listener not in the startup baseline and not yet alerted on.
+    fn new_listener(
+        &mut self,
+        meta: &schema::EventMeta,
+        local_addr: IpAddr,
+        local_port: u16,
+        protocol: u8,
+    ) -> Option<Alert> {
+        let key = (local_addr, local_port, protocol);
         if self.known_listeners.get(&key).is_some() {
             return None;
         }
@@ -123,11 +153,11 @@ impl DriftState {
             severity: Severity::Medium,
             message: format!(
                 "pid={} comm={} new {} listener on {}:{} — not seen at agent startup",
-                event.meta.pid,
-                event.meta.comm,
-                protocol_label(event.protocol),
-                event.local_addr,
-                event.local_port,
+                meta.pid,
+                meta.comm,
+                protocol_label(protocol),
+                local_addr,
+                local_port,
             ),
         })
     }

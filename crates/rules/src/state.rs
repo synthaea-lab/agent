@@ -927,6 +927,15 @@ impl RuleState {
             .collect()
     }
 
+    /// To be called for every `SocketListenEvent` in the stream (the Linux probe on
+    /// `listen(2)`) — see [`DriftState::check_socket_listen_drift`].
+    pub fn on_socket_listen(&mut self, event: &schema::SocketListenEvent) -> Vec<Alert> {
+        self.drift
+            .check_socket_listen_drift(event)
+            .into_iter()
+            .collect()
+    }
+
     /// To be called for every `PolicyDenialEvent` in the stream (`SELinux` AVC
     /// on Linux issue #297, AppLocker/WDAC on Windows issue #283) — see
     /// [`DriftState::check_policy_denial_drift`].
