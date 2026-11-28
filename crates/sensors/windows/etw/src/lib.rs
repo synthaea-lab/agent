@@ -1,8 +1,10 @@
 //! # sensor-windows
 //!
 //! Windows user-mode sensor built on one ETW real-time session over the
-//! kernel and user-mode providers in `providers`. Identity (the real command
-//! line from the PEB, user SID and integrity level, container) is attached and
+//! kernel and user-mode providers in `providers`, and a second one that only
+//! delivers the command line the kernel recorded with each process creation.
+//! Identity (the real command line, from the PEB or else from that record, user
+//! SID and integrity level, container) is attached and
 //! NT paths are normalized to one DOS form before an event leaves the crate.
 //! Compiles to a stub off Windows. See `docs/sensors/windows/etw.md` and
 //! `docs/sensors/windows/etw-enrichment.md`.
@@ -14,6 +16,8 @@ pub mod bits;
 mod bounded_lru;
 #[cfg(any(windows, test))]
 mod budget;
+#[cfg(any(windows, test))]
+mod creation_cmdlines;
 #[cfg(any(windows, test))]
 mod cross_process;
 #[cfg(windows)]

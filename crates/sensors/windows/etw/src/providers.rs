@@ -2,12 +2,15 @@
 //! Lab notes: `TcpClient` emits no EID 42 (2026-08-25: 42 is a UDP v4 send, #253 review),
 //! PID recycling prunes on `ProcessEnd`, canary events are filtered from emission.
 
-use std::sync::{Arc, atomic::Ordering};
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
 
 use ferrisetw::{
     EventRecord, GUID,
     parser::{Parser, Pointer},
-    provider::{EventFilter, Provider, ProviderBuilder},
+    provider::{EventFilter, Provider, ProviderBuilder, kernel_providers},
     schema_locator::SchemaLocator,
 };
 use schema::{
@@ -17,9 +20,12 @@ use schema::{
 
 use crate::{
     amsi,
+    creation_cmdlines::CreationCmdlines,
     cross_process::{self, ThreadOrigin},
     kernel_network::{self, NetworkEvent},
-    kernel_process::{self, ExecContext, KernelProcessEvent, ProcessStart, UNKNOWN_IMAGE},
+    kernel_process::{
+        self, CommandLine, ExecContext, KernelProcessEvent, ProcessStart, UNKNOWN_IMAGE,
+    },
     normalize, payload,
     registry_keys::RegistryOperation,
     sensor::{SharedState, find_lsass},
@@ -252,6 +258,52 @@ pub(crate) const BITS_CLIENT: ProviderConfig = ProviderConfig {
     event_ids: &BITS_EVENTS,
 };
 
+/// The opcode of the classic kernel "Process" class's Start record
+/// (`EVENT_TRACE_TYPE_START`). The class also writes ends (2) and a rundown of the
+/// processes already running (3, 4), which the sensor has no use for: it reads those
+/// processes' command lines from the processes themselves.
+const PROCESS_CLASS_START: u8 = 1;
+
+/// The classic kernel "Process" class (`EVENT_TRACE_FLAG_PROCESS`), read for one thing:
+/// its Start record carries the command line, so a process that exits before its PEB can
+/// be read still has one. It is a system-logger provider and so needs a session of its own.
+///
+/// Field note: `ProcessId` (the created process; the record's header names the creator)
+/// and `CommandLine`, the names of the `Process_TypeGroup1` MOF class, decode on
+/// Windows 11 (lab, 2026-11-28). A record that does not decode is reported, since another
+/// build may name them differently.
+pub(crate) fn creation_cmdline_provider(cmdlines: Arc<CreationCmdlines>) -> Provider {
+    let undecoded_reported = AtomicBool::new(false);
+    let callback = move |record: &EventRecord, locator: &SchemaLocator| {
+        if record.opcode() != PROCESS_CLASS_START {
+            return;
+        }
+        if let Some((pid, cmdline)) = created_process(record, locator) {
+            let created_ns = normalize::filetime_to_ns(record.raw_timestamp());
+            cmdlines.record(pid, created_ns, cmdline);
+        } else if !undecoded_reported.swap(true, Ordering::Relaxed) {
+            // Once: every record of a build whose fields differ would fail the same way.
+            tracing::warn!(
+                version = record.version(),
+                "a process creation record could not be decoded; \
+                 command lines may come from the PEB read alone"
+            );
+        }
+    };
+    Provider::kernel(&kernel_providers::PROCESS_PROVIDER)
+        .add_callback(callback)
+        .build()
+}
+
+/// The pid and command line a "Process" class Start record names.
+fn created_process(record: &EventRecord, locator: &SchemaLocator) -> Option<(u32, String)> {
+    let schema = locator.event_schema(record).ok()?;
+    let parser = Parser::create(record, &schema);
+    let pid = parser.try_parse::<u32>("ProcessId").ok()?;
+    let cmdline = parser.try_parse::<String>("CommandLine").ok()?;
+    Some((pid, cmdline))
+}
+
 pub(crate) fn process_provider(sink: Arc<dyn EventSink>, state: Arc<SharedState>) -> Provider {
     let callback = move |record: &EventRecord, locator: &SchemaLocator| {
         let Some(event) = KernelProcessEvent::from_id(record.event_id()) else {
@@ -313,7 +365,10 @@ fn on_process_start(
     let parent_image_path = remember_process(&process, state);
     // Read the PEB command line and the image identity (#688) before `meta`: both race the
     // process (a short-lived one exits, a dropper renames itself), `meta` does not.
-    let cmdline = winapi::read_process_cmdline(pid);
+    let cmdline = CommandLine::choose(winapi::read_process_cmdline(pid), || {
+        creation_cmdline(&process, state)
+    });
+    cmdline.count_into(&state.cmdlines);
     let image_file_id = image_file_id(&process.image_path);
     let meta = state.meta(
         pid,
@@ -324,10 +379,19 @@ fn on_process_start(
     let context = ExecContext {
         meta,
         parent_image_path,
-        cmdline,
+        cmdline: cmdline.into_text(),
         image_file_id,
     };
     sink.on_event(Event::Exec(process.exec_event(context)));
+}
+
+/// The command line the kernel recorded when it created `process`, when the creation
+/// session runs and delivers the record in time.
+fn creation_cmdline(process: &ProcessStart, state: &SharedState) -> Option<String> {
+    state
+        .creation_cmdlines
+        .get()?
+        .cmdline_of(process.pid, process.timestamp_ns)
 }
 
 /// Puts a started process in the pid store, with the server silo it runs in, and returns
@@ -366,6 +430,9 @@ fn on_process_end(pid: u32, state: &SharedState) {
         return;
     }
     state.pids.lock_or_recover().remove(pid);
+    if let Some(creation_cmdlines) = state.creation_cmdlines.get() {
+        creation_cmdlines.forget(pid);
+    }
     state.threads.lock_or_recover().process_ended(pid);
     // LSASS does not end short of a crash (and reboot): look it up again rather than leave
     // the slot empty. A copy's end changes nothing.

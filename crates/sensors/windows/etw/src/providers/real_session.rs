@@ -394,3 +394,108 @@ mod kernel_network_ids {
         );
     }
 }
+
+mod process_creation {
+    use ferrisetw::trace::KernelTrace;
+
+    use super::*;
+    use crate::{
+        creation_cmdlines::{CREATION_CMDLINE_WAIT, CreationCmdlines, OnDemandCmdlines},
+        normalize,
+        providers::creation_cmdline_provider,
+        shed::ShedCounter,
+    };
+
+    /// Short-lived processes judged once the session is past its first delivery.
+    const STEADY_PROBES: usize = 20;
+
+    fn now_ns() -> u64 {
+        let since_1970 = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock before Unix epoch");
+        u64::try_from(since_1970.as_nanos()).expect("nanoseconds since 1970 fit in 64 bits")
+    }
+
+    /// Starts a process that exits at once and returns its pid and when it was started.
+    fn run_a_short_lived_process(marker: &str) -> (u32, u64) {
+        let started_ns = now_ns();
+        let mut child = Command::new("cmd.exe")
+            .args(["/c", "rem", marker])
+            .spawn()
+            .expect("start cmd.exe");
+        let pid = child.id();
+        child.wait().expect("wait for cmd.exe");
+        (pid, started_ns)
+    }
+
+    /// What one probe process got: its command line as the sensor would have read it, or
+    /// how late its record was.
+    enum Probe {
+        InTime { cmdline: String, after: Duration },
+        Late { after: Duration },
+        NeverDelivered,
+    }
+
+    /// Asks for an exited process's command line the way `on_process_start` does, and when
+    /// that gives up, measures how long the record really takes.
+    fn probe(source: &OnDemandCmdlines, records: &CreationCmdlines, marker: &str) -> Probe {
+        let (pid, started_ns) = run_a_short_lived_process(marker);
+        let asked_at = Instant::now();
+        if let Some(cmdline) = source.cmdline_of(pid, started_ns) {
+            return Probe::InTime {
+                cmdline,
+                after: asked_at.elapsed(),
+            };
+        }
+        match records.take_within(pid, started_ns, DELIVERY_TIMEOUT) {
+            Some(_) => Probe::Late {
+                after: asked_at.elapsed(),
+            },
+            None => Probe::NeverDelivered,
+        }
+    }
+
+    #[test]
+    #[ignore = "requires an elevated Windows process to start a system logger session"]
+    fn a_process_that_already_exited_gets_its_command_line_within_the_sensors_wait() {
+        let marker = unique_marker("SynthaeaCreationProbe");
+        let records = Arc::new(CreationCmdlines::counting(64, ShedCounter::default()));
+        let session = normalize::random_session_name("SynthaeaCreationProbe-", 0, 0);
+        let trace = KernelTrace::new()
+            .named(session.clone())
+            .enable(creation_cmdline_provider(Arc::clone(&records)))
+            .start_and_process()
+            .expect("start a system logger session (elevated? another kernel logger?)");
+        let source = OnDemandCmdlines::flushing_session(Arc::clone(&records), session);
+
+        // The first record of a session that has just started takes about 250 ms to be
+        // delivered (Windows 11 lab, 2026-11-28), whatever is flushed. The sensor's session
+        // has been running since start-up, so that one is not judged.
+        let _ = probe(&source, &records, &marker);
+
+        let mut slowest = Duration::ZERO;
+        let mut misses = Vec::new();
+        for _ in 0..STEADY_PROBES {
+            match probe(&source, &records, &marker) {
+                Probe::InTime { cmdline, after } => {
+                    assert!(cmdline.contains(&marker), "{cmdline}");
+                    slowest = slowest.max(after);
+                }
+                Probe::Late { after } => {
+                    misses.push(format!("delivered {after:?} after it was asked for"));
+                }
+                Probe::NeverDelivered => {
+                    misses.push(format!("not delivered within {DELIVERY_TIMEOUT:?}"));
+                }
+            }
+        }
+        trace.stop().expect("stop the ETW test session");
+
+        assert!(
+            misses.is_empty(),
+            "creation records missed the sensor's wait of {CREATION_CMDLINE_WAIT:?} after a \
+             flush: {misses:?}"
+        );
+        println!("slowest of {STEADY_PROBES} creation records: {slowest:?} after it was asked for");
+    }
+}

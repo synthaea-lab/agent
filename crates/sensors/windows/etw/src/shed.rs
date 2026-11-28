@@ -27,6 +27,8 @@ impl ShedCounter {
 
 /// Cumulative totals since the sensor was built, one per place where the sensor sheds
 /// information. A counter that shows no loss is not here: the long-path cache refills itself.
+/// The one exception is [`Self::cmdlines_from_creation`], which is what gives
+/// [`Self::cmdlines_lost`] its scale.
 #[derive(Debug, Clone, Default)]
 pub struct EtwShedding {
     pub(crate) pid_cache_evicted: ShedCounter,
@@ -34,6 +36,15 @@ pub struct EtwShedding {
     pub(crate) marks_dropped: ShedCounter,
     pub(crate) quarantine_unremembered: ShedCounter,
     pub(crate) registry_keys: RegistryKeyShedding,
+    pub(crate) cmdlines: CmdlineShedding,
+}
+
+/// What becomes of a process start whose command line could not be read from the process.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct CmdlineShedding {
+    pub(crate) from_creation: ShedCounter,
+    pub(crate) lost: ShedCounter,
+    pub(crate) creation_records_shed: ShedCounter,
 }
 
 /// What the registry key table loses: each count is a value write reported with less of its
@@ -89,6 +100,27 @@ impl EtwShedding {
     pub fn registry_names_truncated(&self) -> u64 {
         self.registry_keys.names_truncated.get()
     }
+
+    /// Process starts whose command line could not be read from the process and was taken
+    /// from the kernel's creation record instead: reported in full.
+    #[must_use]
+    pub fn cmdlines_from_creation(&self) -> u64 {
+        self.cmdlines.from_creation.get()
+    }
+
+    /// Process starts reported with their image path as command line: neither the process
+    /// nor its creation record gave one.
+    #[must_use]
+    pub fn cmdlines_lost(&self) -> u64 {
+        self.cmdlines.lost.get()
+    }
+
+    /// Creation records the command-line store dropped at its cap: a process start that
+    /// needed one is counted in [`Self::cmdlines_lost`].
+    #[must_use]
+    pub fn creation_cmdlines_shed(&self) -> u64 {
+        self.cmdlines.creation_records_shed.get()
+    }
 }
 
 #[cfg(test)]
@@ -116,8 +148,11 @@ mod tests {
                 shedding.registry_unresolved_writes(),
                 shedding.registry_keys_evicted(),
                 shedding.registry_names_truncated(),
+                shedding.cmdlines_from_creation(),
+                shedding.cmdlines_lost(),
+                shedding.creation_cmdlines_shed(),
             ],
-            [0; 7]
+            [0; 10]
         );
     }
 }

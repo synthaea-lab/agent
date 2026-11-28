@@ -107,6 +107,18 @@ pub fn random_session_name(prefix: &str, seed_ns: u128, pid: u32) -> String {
     format!("{prefix}{:016x}", mix.wrapping_mul(0xBF58_476D_1CE4_E5B9))
 }
 
+/// An ETW session listing (one session per line, its name first) without `session`. The
+/// agent's own second session is under its prefix too, and left in the listing it would be
+/// counted as another instance's by [`describe_silent_session`].
+#[must_use]
+pub fn listing_without_session(session_listing: &str, session: &str) -> String {
+    session_listing
+        .lines()
+        .filter(|line| line.split_whitespace().next() != Some(session))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 /// Parses `logman query -ets`' stdout and returns every session name under
 /// `prefix`: every session a previous unclean shutdown may have orphaned.
 ///
@@ -567,6 +579,20 @@ mod tests {
         );
         assert_eq!(result, Err("enable failed"));
         assert_eq!(stopped, vec!["wtrace-0123456789abcdef"]);
+    }
+
+    #[test]
+    fn the_agents_second_session_is_not_counted_as_another_instance() {
+        let output = "Data Collector Set                      Type                          Status\n\
+             wtrace-aaaaaaaaaaaaaaaa                  Trace                         Running\n\
+             wtrace-aaaaaaaaaaaaaaab                  Trace                         Running\n\
+             wtrace-cccccccccccccccc                  Trace                         Running\n";
+        let listing = listing_without_session(output, "wtrace-aaaaaaaaaaaaaaab");
+        let text = describe_silent_session("wtrace-aaaaaaaaaaaaaaaa", PREFIX, Some(&listing));
+        assert!(
+            text.ends_with("other wtrace- sessions running: 1"),
+            "{text}"
+        );
     }
 
     #[test]
