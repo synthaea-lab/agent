@@ -112,7 +112,14 @@ impl DriftState {
     /// `STANDARD_PORTS`, there is no lab capture here to calibrate one honestly
     /// against (a dev server or `docker-proxy` binding a fresh port after
     /// startup will alert; a documented, known noise source, not a bug).
-    pub(crate) fn check_listen_port_drift(&mut self, event: &ListenPortEvent) -> Option<Alert> {
+    pub(crate) fn check_listen_port_drift(
+        &mut self,
+        event: &ListenPortEvent,
+        image: Option<&str>,
+    ) -> Option<Alert> {
+        if is_windows_service_port(&event.meta.comm, image, event.protocol, event.local_port) {
+            return None;
+        }
         self.new_listener(
             &event.meta,
             event.local_addr,
@@ -324,6 +331,39 @@ fn selinux_type_triple(context: Option<&str>) -> Option<String> {
 /// `event.protocol`'s IP protocol number, as a word for the LISTENER-DRIFT alert
 /// (<https://github.com/synthaea-lab/agent/issues/40>) — `tcp`/`udp` for the two values every snapshot source reports
 /// today, the bare number for anything else rather than guessing a name.
+/// Ports Windows services open on their own, after the agent took its baseline: the services
+/// are delayed- or trigger-started, so on every boot they looked like new listeners. Each
+/// entry was seen in the lab (Windows 11 build 26200, 2026-11-28), owned by `svchost.exe`:
+/// Connected Devices Platform (TCP 5040, UDP 5050) and Delivery Optimization (TCP 7680).
+/// Not a list of every Windows port: one is added when a capture shows it.
+const WINDOWS_SERVICE_PORTS: &[(u8, u16)] = &[
+    (schema::IPPROTO_TCP, 5040),
+    (schema::IPPROTO_UDP, 5050),
+    (schema::IPPROTO_TCP, 7680),
+];
+
+/// The service host's image, as the sensor reports it (lowercase, `\` separators).
+const WINDOWS_SERVICE_HOST_IMAGE: &str = r"\windows\system32\svchost.exe";
+const WINDOWS_SERVICE_HOST_COMM: &str = "svchost.exe";
+
+/// Whether a listener is one of [`WINDOWS_SERVICE_PORTS`] opened by the Windows service
+/// host. The owner is judged on its image when the agent knows it, which must then be the
+/// system `svchost.exe`: a program of that name elsewhere is not excused. With no image the
+/// name is all there is (`policy::name_exclusion_applies`: a sensor limitation is not
+/// evidence of masquerade).
+fn is_windows_service_port(comm: &str, image: Option<&str>, protocol: u8, port: u16) -> bool {
+    if !WINDOWS_SERVICE_PORTS.contains(&(protocol, port)) {
+        return false;
+    }
+    match image {
+        Some(path) if !path.is_empty() => path
+            .to_ascii_lowercase()
+            .replace('/', r"\")
+            .ends_with(WINDOWS_SERVICE_HOST_IMAGE),
+        _ => comm.eq_ignore_ascii_case(WINDOWS_SERVICE_HOST_COMM),
+    }
+}
+
 fn protocol_label(protocol: u8) -> std::borrow::Cow<'static, str> {
     match protocol {
         schema::IPPROTO_TCP => "tcp".into(),
