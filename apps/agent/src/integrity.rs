@@ -291,7 +291,7 @@ mod tests {
             signature: String::new(),
         };
         rotation.sign(&updater::key::test_recovery_key_pair());
-        crate::rotation::apply(&rotation, dir, None, 1_999_990_100).unwrap();
+        delivery::rotation::apply(&rotation, dir, None, 1_999_990_100).unwrap();
     }
 
     #[test]

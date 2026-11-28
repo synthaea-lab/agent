@@ -15,7 +15,6 @@ use updater::{
 #[derive(Clone, Copy)]
 pub(crate) enum Manifest {
     /// Only `apply-release` builds this, and that command is Linux-only.
-    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     Release,
     Content,
     /// A key rotation, verified against the `recovery` key.
@@ -97,8 +96,7 @@ pub(crate) fn ensure_key_trusted(
 /// # Errors
 ///
 /// As [`ensure_key_trusted`], or the record of rotations cannot be trusted ([`keys_in_force`]).
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-pub(crate) fn ensure_release_key_trusted(
+pub fn ensure_release_key_trusted(
     state_dir: &Path,
     allow_test_key: bool,
 ) -> anyhow::Result<KeysInForce> {
@@ -118,7 +116,7 @@ pub(crate) fn ensure_release_key_trusted(
 /// # Errors
 ///
 /// As [`ensure_key_trusted`], or the record of rotations cannot be trusted ([`keys_in_force`]).
-pub(crate) fn ensure_content_key_trusted(
+pub fn ensure_content_key_trusted(
     state_dir: &Path,
     allow_test_key: bool,
 ) -> anyhow::Result<KeysInForce> {

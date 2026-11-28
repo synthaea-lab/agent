@@ -9,6 +9,10 @@ publish.workspace = true
 [lints]
 workspace = true
 
+[features]
+# The public test signing key set and the acknowledgement that goes with it; see `trust`.
+test-key = ["updater/test-key"]
+
 [dependencies]
 anyhow = "1"
 config = { path = "../config" }
@@ -28,3 +32,5 @@ workers = { path = "../workers" }
 [dev-dependencies]
 schema = { path = "../schema", features = ["test-fixtures"] }
 tempfile = "3"
+ring = { workspace = true }
+updater = { path = "../updater", features = ["test-key"] }

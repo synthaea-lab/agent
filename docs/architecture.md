@@ -124,7 +124,7 @@ The detection sink ([`sink/mod.rs`](../apps/agent/src/sink/mod.rs)) has no platf
 | [`shutdown`](../crates/workers/src/shutdown.rs) | `ShutdownPlan`, a bounded join of the registered workers. |
 | [`kill_loudness`](../apps/agent/src/kill_loudness.rs) | Attributes SIGTERM/SIGHUP/SIGQUIT to their sender before exiting (Linux). |
 | [`redact::event`](../crates/redact/src/event.rs) | `RedactingSink` and `redact_event`, which redact data at the point where events leave the process. |
-| [`delivery::content`](../crates/delivery/src/content.rs) (crate), [`release`](../apps/agent/src/release.rs), [`rotation`](../apps/agent/src/rotation.rs), [`trust`](../apps/agent/src/trust.rs) | Signed content, release and key-rotation commands. |
+| [`delivery::content`](../crates/delivery/src/content.rs), [`release`](../crates/delivery/src/release.rs), [`rotation`](../crates/delivery/src/rotation.rs), [`trust`](../crates/delivery/src/trust.rs) (crate `delivery`) | Signed content, release and key-rotation commands, and the refusal to act on a manifest only the test key can verify. |
 | [`protected`](../apps/agent/src/protected.rs), [`integrity`](../apps/agent/src/integrity.rs), [`inventory`](../apps/agent/src/inventory.rs) | Linux self-protection and inventory monitors. |
 
 ## Known gaps
