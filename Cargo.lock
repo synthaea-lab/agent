@@ -1636,8 +1636,12 @@ name = "intel"
 version = "0.0.1"
 dependencies = [
  "proptest",
+ "schema",
  "siblings",
+ "store",
  "thiserror 2.0.21",
+ "tracing",
+ "workers",
 ]
 
 [[package]]

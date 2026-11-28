@@ -10,6 +10,10 @@ publish.workspace = true
 workspace = true
 
 [dependencies]
+schema = { path = "../schema" }
+store = { path = "../store" }
+tracing = { workspace = true }
+workers = { path = "../workers" }
 thiserror = { workspace = true }
 
 [dev-dependencies]

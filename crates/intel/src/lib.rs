@@ -27,6 +27,7 @@
 
 mod engine;
 mod filter;
+pub mod matcher;
 mod set;
 
 pub use engine::Intel;

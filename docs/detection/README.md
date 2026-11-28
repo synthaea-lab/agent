@@ -115,7 +115,7 @@ has a hard cap. Reaching the cap sheds work, and the shedding is counted, never 
 | Enrichment queue | 4,096 events ([enrich_queue.rs](../../apps/agent/src/enrich_queue.rs)) | event not enriched, gated finding raised unverified |
 | Enrichment cache | 16,384 files ([lib.rs](../../crates/enrich/src/lib.rs)) | LRU |
 | IOC set | 64 MiB budget ([set.rs](../../crates/intel/src/set.rs)) | the whole set is refused |
-| IOC cooldown | 4,096 indicators ([ioc.rs](../../apps/agent/src/ioc.rs)) | LRU |
+| IOC cooldown | 4,096 indicators ([matcher.rs](../../crates/intel/src/matcher.rs)) | LRU |
 | Canary hold | 256 touches ([sink/mod.rs](../../apps/agent/src/sink/mod.rs)) | judged at once, counted |
 
 [`store::BoundedMap`](../../crates/store/src/bounded.rs) is the LRU used throughout. It is a

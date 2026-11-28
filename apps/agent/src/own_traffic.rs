@@ -27,6 +27,7 @@ use std::{
     time::Duration,
 };
 
+use intel::matcher::AgentOrigin;
 use workers::sync::{LockExt, RwLockExt};
 
 /// Addresses of the control-plane host kept at once. A host behind a CDN resolves to a handful.
@@ -35,15 +36,6 @@ const MAX_CONTROL_PLANE_ADDRS: usize = 32;
 const REFRESH_INTERVAL: Duration = Duration::from_secs(60);
 /// Sibling processes remembered at once; the oldest are forgotten first (a forgotten one raises).
 const MAX_SIBLINGS: usize = 64;
-
-/// Who made a skipped match, for the counters and the log.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub(crate) enum AgentOrigin {
-    /// This process.
-    Own,
-    /// A second process on the agent's executable.
-    Sibling,
-}
 
 /// The configured control plane: its host as written and the addresses it last resolved to.
 struct ControlPlane {
