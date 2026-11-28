@@ -22,7 +22,7 @@ store = { path = "../store" }
 tokio = { workspace = true }
 tracing = { workspace = true }
 transport = { path = "../transport" }
-updater = { path = "../updater" }
+updater = { path = "../updater", default-features = false }
 workers = { path = "../workers" }
 
 [dev-dependencies]
