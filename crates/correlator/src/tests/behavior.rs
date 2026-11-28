@@ -321,6 +321,66 @@ fn a_respawned_process_inherits_the_belief_of_its_entity() {
     );
 }
 
+const SECOND_NS: u64 = 1_000_000_000;
+
+/// Six connections to one public address, one a second, by `beacon`: either one process
+/// that reconnects, or a new child of pid 50 for each connection.
+fn six_connections(respawning: bool) -> CorrelationEngine {
+    let mut engine = CorrelationEngine::new();
+    if !respawning {
+        engine.on_event(exec_with_meta(
+            meta_full(600, 50, "beacon", 0),
+            "/usr/bin/beacon",
+        ));
+    }
+    for i in 0..6u64 {
+        let pid = if respawning { 600 + i as u32 } else { 600 };
+        let at = i * SECOND_NS;
+        if respawning {
+            engine.on_event(exec_with_meta(
+                meta_full(pid, 50, "beacon", at),
+                "/usr/bin/beacon",
+            ));
+        }
+        engine.on_event(connect_to(
+            meta_full(pid, 50, "beacon", at + 100_000_000),
+            [185, 220, 101, 1],
+            4444,
+        ));
+    }
+    engine
+}
+
+#[test]
+fn a_beacon_that_respawns_for_each_connection_is_scored_like_one_that_reconnects() {
+    let reconnecting = six_connections(false).belief_for_pid(600).unwrap().log_odds;
+    let respawning = six_connections(true).belief_for_pid(605).unwrap().log_odds;
+    assert!(
+        (respawning - reconnecting).abs() < 0.05,
+        "one process: {reconnecting}; a child per connection: {respawning}"
+    );
+}
+
+#[test]
+fn respawning_adds_up_to_more_than_any_one_child_shows() {
+    let mut one_child = CorrelationEngine::new();
+    one_child.on_event(exec_with_meta(
+        meta_full(600, 50, "beacon", 0),
+        "/usr/bin/beacon",
+    ));
+    one_child.on_event(connect_to(
+        meta_full(600, 50, "beacon", 100_000_000),
+        [185, 220, 101, 1],
+        4444,
+    ));
+    let alone = one_child.belief_for_pid(600).unwrap().log_odds;
+    let together = six_connections(true).belief_for_pid(605).unwrap().log_odds;
+    assert!(
+        together > alone + 1.0,
+        "six children together ({together}) must weigh more than one ({alone})"
+    );
+}
+
 #[test]
 fn the_same_evidence_seen_again_does_not_raise_the_belief() {
     let mut engine = CorrelationEngine::new();

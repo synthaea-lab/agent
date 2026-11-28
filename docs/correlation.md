@@ -284,6 +284,15 @@ A vector is a statement about a process, so seeing it again adds nothing: the be
 not grow with the number of events an entity produces, and events of a sibling with a
 quieter vector take nothing away.
 
+On an `Exec` or a `Connect`, the entity is also judged on the events of all its processes
+together, as if one process had made them
+([`judge_entity_as_one_process`](../crates/correlator/src/engine.rs)). A beacon that respawns
+as a new process for each connection gives no single process a connection count; together its
+children are the same behaviour as one process that reconnects, and score the same. The
+belief keeps the stronger of the two judgements. It is done only for a pid whose parent the
+engine knows, and only on those two events, which keeps the second scan of the window off the
+file-event path.
+
 It was not always so. Until November 2026 the feature sum was added to the belief at every
 event, so the belief followed the event count and the order of unrelated events. On the
 Linux lab machine the same beaconing process crossed the threshold in one run of five, and
