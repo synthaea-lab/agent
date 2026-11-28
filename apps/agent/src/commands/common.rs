@@ -366,6 +366,8 @@ pub(crate) fn health_collector(
                 alerts_dropped = beacon.alerts_dropped,
                 ring_dropped = beacon.ring_dropped,
                 exec_ring_dropped = beacon.exec_ring_dropped,
+                reorder_late = beacon.reorder_late,
+                reorder_forced = beacon.reorder_forced,
                 etw_pid_cache_evicted = beacon.etw_pid_cache_evicted,
                 etw_silo_evicted = beacon.etw_silo_evicted,
                 etw_marks_dropped = beacon.etw_marks_dropped,

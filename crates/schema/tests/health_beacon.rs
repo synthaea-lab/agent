@@ -203,3 +203,19 @@ fn the_etw_shedding_counters_round_trip() {
         serde_json::from_str(&serde_json::to_string(&beacon).unwrap()).unwrap();
     assert_eq!(back, beacon);
 }
+
+#[test]
+fn a_beacon_from_an_agent_without_the_reorder_counters_parses_with_zero() {
+    let beacon: HealthBeacon = serde_json::from_str(&beacon_json("")).unwrap();
+    assert_eq!((beacon.reorder_late, beacon.reorder_forced), (0, 0));
+}
+
+#[test]
+fn the_reorder_counters_round_trip() {
+    let beacon: HealthBeacon =
+        serde_json::from_str(&beacon_json(r#","reorder_late":31,"reorder_forced":32"#)).unwrap();
+    assert_eq!((beacon.reorder_late, beacon.reorder_forced), (31, 32));
+    let back: HealthBeacon =
+        serde_json::from_str(&serde_json::to_string(&beacon).unwrap()).unwrap();
+    assert_eq!(back, beacon);
+}
