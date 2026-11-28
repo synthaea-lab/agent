@@ -16,14 +16,6 @@ use workers::sync::LockExt as _;
 
 use super::{DetectionSink, entity_key, recording::Finding, response::crosses_kill_gate};
 
-/// The ML correlation model family of this platform.
-#[cfg(target_os = "linux")]
-const MODEL_FAMILY: &str = "correlation-iforest-linux";
-#[cfg(target_os = "windows")]
-const MODEL_FAMILY: &str = "correlation-iforest-windows";
-#[cfg(target_os = "macos")]
-const MODEL_FAMILY: &str = "correlation-iforest-macos";
-
 /// Why the ML correlation scorer could not be loaded.
 #[derive(Debug, thiserror::Error)]
 pub(super) enum ScorerLoadError {
@@ -71,7 +63,10 @@ pub(super) fn locate_model_dir(roots: &[&Path], family: &str) -> PathBuf {
 /// loaded: the agent then runs on the hand-calibrated features alone. Where it looks
 /// and why: `docs/detection/ml.md`, "Loading and degraded mode".
 pub(super) fn load_correlation_scorer(model_root: &Path) -> Option<ml::CorrelationScorer> {
-    let model_dir = locate_model_dir(&[model_root, Path::new("ml/registry")], MODEL_FAMILY);
+    let model_dir = locate_model_dir(
+        &[model_root, Path::new("ml/registry")],
+        crate::host::MODEL_FAMILY,
+    );
     match try_load_scorer(&model_dir) {
         Ok(scorer) => {
             tracing::info!(

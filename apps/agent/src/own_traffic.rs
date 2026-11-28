@@ -209,19 +209,12 @@ impl OwnTraffic {
     }
 }
 
-/// Whether `user` is the account the agent runs as. Only Unix has a uid to compare; elsewhere no
-/// sibling is the agent.
+/// Whether `user` is the account the agent runs as. Where the platform has no uid to
+/// compare, no sibling is the agent.
 fn runs_as_the_agent(user: &schema::User) -> bool {
-    #[cfg(unix)]
-    {
-        // SAFETY: `geteuid` takes no arguments, touches no memory and cannot fail.
-        let own = unsafe { libc::geteuid() };
-        matches!(user, schema::User::Unix { uid, .. } if *uid == own)
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = user;
-        false
+    match (user, crate::host::own_uid()) {
+        (schema::User::Unix { uid, .. }, Some(own)) => *uid == own,
+        _ => false,
     }
 }
 
