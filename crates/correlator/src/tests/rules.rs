@@ -114,19 +114,53 @@ fn complete_dropper_chain_alerts() {
     );
 }
 
+/// Alerts for a process named `comm` at `image_path` that starts, then connects out.
+fn alerts_for_spawn_then_connect(comm: &str, image_path: &str) -> Vec<CorrelationAlert> {
+    let mut engine = CorrelationEngine::new();
+    let mut exec = exec_event(99, 1_000_000_000);
+    exec_set_comm_and_path(&mut exec, comm, image_path);
+    engine.on_event(exec);
+    let mut connect = connect_event(99, 2_000_000_000);
+    if let Event::Connect(c) = &mut connect {
+        c.meta.comm = comm.to_string();
+    }
+    engine.on_event(connect)
+}
+
+#[test]
+fn windows_own_updaters_connecting_after_boot_raise_nothing() {
+    for (comm, image_path) in [
+        (
+            "MicrosoftEdgeUpdate.exe",
+            r"C:\Program Files (x86)\Microsoft\EdgeUpdate\MicrosoftEdgeUpdate.exe",
+        ),
+        (
+            "AppHostRegistrationVerifier.exe",
+            r"C:\Windows\System32\AppHostRegistrationVerifier.exe",
+        ),
+    ] {
+        let alerts = alerts_for_spawn_then_connect(comm, image_path);
+        assert!(alerts.is_empty(), "{comm}: {alerts:?}");
+    }
+}
+
+#[test]
+fn a_payload_named_like_the_edge_updater_outside_its_directory_is_still_correlated() {
+    let alerts = alerts_for_spawn_then_connect(
+        "MicrosoftEdgeUpdate.exe",
+        r"C:\Users\Public\MicrosoftEdgeUpdate.exe",
+    );
+    assert!(
+        alerts.iter().any(|a| a.technique == "T1059/T1071"),
+        "{alerts:?}"
+    );
+}
+
 #[test]
 fn masqueraded_ignored_name_is_still_correlated() {
     // A payload renamed `svchost.exe` in /tmp must not inherit the IGNORED-list
     // exclusion (name-only exclusions are a trivial bypass).
-    let mut engine = CorrelationEngine::new();
-    let mut exec = exec_event(99, 1_000_000_000);
-    exec_set_comm_and_path(&mut exec, "svchost.exe", "/tmp/svchost.exe");
-    engine.on_event(exec);
-    let mut connect = connect_event(99, 2_000_000_000);
-    if let Event::Connect(c) = &mut connect {
-        c.meta.comm = "svchost.exe".to_string();
-    }
-    let alerts = engine.on_event(connect);
+    let alerts = alerts_for_spawn_then_connect("svchost.exe", "/tmp/svchost.exe");
     assert!(
         alerts.iter().any(|a| a.technique == "T1059/T1071"),
         "masqueraded svchost must still correlate: {alerts:?}"
