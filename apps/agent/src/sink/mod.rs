@@ -64,7 +64,7 @@ pub(crate) struct DetectionSink {
     /// On-device IOC matching (#60, ADR-0038) over `<content_root>/ioc/`: exec image hashes on the
     /// enrichment worker, connect destinations on the capture thread. Shared with the worker,
     /// which is the only place an exec's hash is known.
-    ioc: Arc<crate::ioc::IocMatcher>,
+    ioc: Arc<intel::matcher::IocMatcher>,
     /// What tells the agent's own control-plane traffic from everything else (<https://github.com/synthaea-lab/agent/issues/47>).
     own_traffic: Arc<crate::own_traffic::OwnTraffic>,
     /// What became of the rarity judgements, for the health beacon.
@@ -204,7 +204,7 @@ const VERDICT_DEDUP_WINDOW_NS: u64 = 30_000_000_000; // 30s
 /// real ATT&CK ids and fold to an empty list, same as
 /// `tools/attack-coverage.py`'s own `BAYES_SENTINEL` skip.
 fn techniques_from(technique: &str) -> Vec<String> {
-    if technique == "BAYES" || technique == "Sigma" || technique == crate::ioc::IOC_TECHNIQUE {
+    if technique == "BAYES" || technique == "Sigma" || technique == intel::matcher::IOC_TECHNIQUE {
         Vec::new()
     } else {
         technique.split('/').map(str::to_string).collect()
@@ -254,7 +254,7 @@ impl DetectionSink {
         let rarity_stats = Arc::new(RarityStats::default());
         let (rarity_correlator, rarity_common_set, worker_rarity_stats) =
             (correlator.clone(), common_set.clone(), rarity_stats.clone());
-        let ioc = Arc::new(crate::ioc::IocMatcher::new(&content_root));
+        let ioc = Arc::new(intel::matcher::IocMatcher::new(&content_root));
         let worker_ioc = ioc.clone();
         let (gate_verdict, gate_alert_log) = (verdict.clone(), alert_log.clone());
         let (gate_spool, worker_spool) = (detection_spool.clone(), detection_spool.clone());
@@ -519,7 +519,7 @@ impl DetectionSink {
     }
 
     /// An IOC match found on the capture thread (a connect's destination, #60).
-    fn record_ioc(&self, event: &Event, hit: crate::ioc::IocHit) {
+    fn record_ioc(&self, event: &Event, hit: intel::matcher::IocHit) {
         let message = hit.message(&event.meta().comm);
         let entity = entity_key(event.meta());
         self.record(Finding::ioc(&entity, &message, hit), event, Vec::new());
@@ -860,7 +860,7 @@ impl DetectionSink {
         &self,
         meta: &schema::EventMeta,
         address: std::net::IpAddr,
-    ) -> crate::ioc::OwnMatch {
+    ) -> intel::matcher::OwnMatch {
         if !self.own_traffic.is_control_plane_address(address) {
             return None;
         }
@@ -870,7 +870,7 @@ impl DetectionSink {
     }
 
     /// Whether a lookup of `name` is the agent's own control-plane traffic.
-    fn own_dns_query(&self, meta: &schema::EventMeta, name: &str) -> crate::ioc::OwnMatch {
+    fn own_dns_query(&self, meta: &schema::EventMeta, name: &str) -> intel::matcher::OwnMatch {
         if !self.own_traffic.is_control_plane_name(name) {
             return None;
         }

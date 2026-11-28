@@ -3,7 +3,7 @@
 //! address into a finding.
 //!
 //! Feeds are files in `<content_root>/ioc/`: each `*.txt` is one feed, named by its file stem
-//! and written as the line format of [`intel::SetBuilder::add_lines`]; an optional `VERSION`
+//! and written as the line format of [`SetBuilder::add_lines`]; an optional `VERSION`
 //! file names the release they came from (`unversioned` without one). Signed delivery of these
 //! files through the content manifest is not built yet (it waits on the production signing keys,
 //! <https://github.com/synthaea-lab/agent/issues/43>), so today a feed is a file somebody put there, which is why a match is Medium or High
@@ -23,15 +23,14 @@ use std::{
     },
 };
 
-use intel::{DEFAULT_MEMORY_BUDGET_BYTES, FeedId, IndicatorKind, IndicatorSet, SetBuilder};
 use schema::detection::{IocKind, Severity};
 use workers::sync::LockExt;
 
-use crate::own_traffic::AgentOrigin;
+use crate::{DEFAULT_MEMORY_BUDGET_BYTES, FeedId, IndicatorKind, IndicatorSet, SetBuilder};
 
 /// The label an IOC finding carries where other engines carry an ATT&CK technique. Not a
 /// technique: an indicator says a thing is known bad, not which tactic it served.
-pub(crate) const IOC_TECHNIQUE: &str = "IOC";
+pub const IOC_TECHNIQUE: &str = "IOC";
 
 const FEED_DIR: &str = "ioc";
 const VERSION_FILE: &str = "VERSION";
@@ -56,9 +55,10 @@ struct Loaded {
 }
 
 /// What reading the content directory yielded.
-pub(crate) enum LoadOutcome {
+pub enum LoadOutcome {
     /// No `ioc/` directory: not an error, and it unloads.
     Absent,
+    /// A set was read and is now the one in force.
     Loaded,
     /// Present but unusable (already logged): the previous set stays.
     Failed,
@@ -66,15 +66,21 @@ pub(crate) enum LoadOutcome {
 
 /// A confirmed match, ready to become a finding.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct IocHit {
-    pub(crate) kind: IocKind,
-    pub(crate) indicator: String,
-    pub(crate) feed: String,
-    pub(crate) feed_version: String,
+pub struct IocHit {
+    /// What kind of indicator matched.
+    pub kind: IocKind,
+    /// The indicator as the feed lists it.
+    pub indicator: String,
+    /// The feed that lists it.
+    pub feed: String,
+    /// That feed's version, or `unversioned`.
+    pub feed_version: String,
 }
 
 impl IocHit {
-    pub(crate) fn severity(&self) -> Severity {
+    /// How severe the finding is: a known-bad file that ran outranks an address or a name.
+    #[must_use]
+    pub fn severity(&self) -> Severity {
         match self.kind {
             // A known-bad file ran.
             IocKind::Sha256 | IocKind::Sha1 | IocKind::Md5 => Severity::High,
@@ -83,7 +89,9 @@ impl IocHit {
         }
     }
 
-    pub(crate) fn message(&self, comm: &str) -> String {
+    /// The finding's message for a process named `comm`.
+    #[must_use]
+    pub fn message(&self, comm: &str) -> String {
         let what = match self.kind {
             IocKind::Sha256 => "executed image hash",
             IocKind::Ip => "connection to address",
@@ -99,22 +107,34 @@ impl IocHit {
 
 /// Counters for health reporting.
 #[derive(Debug, Default)]
-pub(crate) struct IocStats {
+pub struct IocStats {
     /// Matches that raised a finding.
-    pub(crate) raised: AtomicU64,
+    pub raised: AtomicU64,
     /// Matches absorbed by the per-indicator cooldown.
-    pub(crate) cooled_down: AtomicU64,
+    pub cooled_down: AtomicU64,
     /// Address and domain matches to the control plane made by this process, skipped (<https://github.com/synthaea-lab/agent/issues/47>).
-    pub(crate) own_skipped: AtomicU64,
+    pub own_skipped: AtomicU64,
     /// The same, made by a second process on the agent's executable (`apply-content-manifest`).
-    pub(crate) sibling_skipped: AtomicU64,
+    pub sibling_skipped: AtomicU64,
 }
 
 /// Who made a match skipped as the agent's own control-plane traffic, and its pid (for the log).
-pub(crate) type OwnMatch = Option<(AgentOrigin, u32)>;
+/// Which agent process made a match that is skipped as the agent's own traffic, for the
+/// counters and the log. The caller establishes it; the matcher only counts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum AgentOrigin {
+    /// This process.
+    Own,
+    /// A second process on the agent's executable.
+    Sibling,
+}
+
+/// The agent process a match belongs to and its pid, or `None` when the match is not the
+/// agent's own traffic.
+pub type OwnMatch = Option<(AgentOrigin, u32)>;
 
 /// The agent's IOC matcher.
-pub(crate) struct IocMatcher {
+pub struct IocMatcher {
     current: Mutex<Option<Arc<Loaded>>>,
     cooldown: Mutex<store::BoundedMap<String, u64>>,
     /// (origin, indicator) pairs already logged as skipped, so each distinct one is said once.
@@ -127,7 +147,8 @@ const SKIPS_LOGGED: usize = 64;
 
 impl IocMatcher {
     /// A matcher with whatever `<content_root>/ioc/` holds now.
-    pub(crate) fn new(content_root: &Path) -> Self {
+    #[must_use]
+    pub fn new(content_root: &Path) -> Self {
         let matcher = Self {
             current: Mutex::new(None),
             cooldown: Mutex::new(store::BoundedMap::new(COOLDOWN_KEYS)),
@@ -139,7 +160,7 @@ impl IocMatcher {
     }
 
     /// Re-reads the feeds: present replaces, absent unloads, unusable keeps what is loaded.
-    pub(crate) fn reload(&self, content_root: &Path) -> LoadOutcome {
+    pub fn reload(&self, content_root: &Path) -> LoadOutcome {
         let outcome = load(&content_root.join(FEED_DIR));
         let (loaded, count) = match outcome {
             Ok(Some(loaded)) => (Some(Arc::new(loaded)), LoadOutcome::Loaded),
@@ -152,7 +173,7 @@ impl IocMatcher {
     }
 
     /// Indicators in force, `0` while none is loaded.
-    pub(crate) fn indicator_count(&self) -> usize {
+    pub fn indicator_count(&self) -> usize {
         self.current
             .lock_recovering()
             .as_ref()
@@ -160,12 +181,12 @@ impl IocMatcher {
     }
 
     /// The counters the health beacon reports.
-    pub(crate) fn stats(&self) -> &IocStats {
+    pub fn stats(&self) -> &IocStats {
         &self.stats
     }
 
     /// An executed image's hash, as enrichment reports it, against the hash indicators.
-    pub(crate) fn check_exec_image(&self, sha256: Option<&str>, now_ns: u64) -> Option<IocHit> {
+    pub fn check_exec_image(&self, sha256: Option<&str>, now_ns: u64) -> Option<IocHit> {
         let sha256 = sha256?.to_ascii_lowercase();
         let loaded = self.current.lock_recovering().clone()?;
         let found = loaded.set.lookup_sha256_hex(&sha256)?;
@@ -175,7 +196,7 @@ impl IocMatcher {
     /// A queried name against the domain indicators. A listed domain covers its subdomains, so
     /// the finding names the listed domain that matched, not the name the host asked for.
     /// `own` is asked on a match only (see [`Self::check_connect`]).
-    pub(crate) fn check_dns_query(
+    pub fn check_dns_query(
         &self,
         name: &str,
         now_ns: u64,
@@ -184,7 +205,7 @@ impl IocMatcher {
         let loaded = self.current.lock_recovering().clone()?;
         // One lookup rejects almost every name; the suffix walk below runs on a hit only.
         loaded.set.lookup_domain(name)?;
-        let (indicator, found) = listed_domain(&loaded.set, &intel::normalize_domain(name).ok()?)?;
+        let (indicator, found) = listed_domain(&loaded.set, &crate::normalize_domain(name).ok()?)?;
         self.hit(&loaded, found, IocKind::Domain, indicator, now_ns, own)
     }
 
@@ -196,7 +217,7 @@ impl IocMatcher {
     /// make every agent alert on itself at each fetch and upload, and, worse, its connection
     /// would start the indicator's cooldown and silence a real process reaching the same
     /// address within it (<https://github.com/synthaea-lab/agent/issues/47>). So that match is skipped before the cooldown and counted.
-    pub(crate) fn check_connect(
+    pub fn check_connect(
         &self,
         address: IpAddr,
         now_ns: u64,
@@ -211,7 +232,7 @@ impl IocMatcher {
     fn hit(
         &self,
         loaded: &Loaded,
-        found: intel::Match,
+        found: crate::Match,
         kind: IocKind,
         indicator: String,
         now_ns: u64,
@@ -286,7 +307,7 @@ impl IocMatcher {
 /// since nothing shorter is, with the match of that suffix. Indicator and feed come from the same
 /// suffix: `lookup_domain` on the whole name reports the lowest feed id among every listed suffix,
 /// which can be another indicator's feed. Runs on a hit only, at most one lookup per label.
-fn listed_domain(set: &IndicatorSet, name: &str) -> Option<(String, intel::Match)> {
+fn listed_domain(set: &IndicatorSet, name: &str) -> Option<(String, crate::Match)> {
     let suffixes: Vec<&str> =
         std::iter::successors(Some(name), |s| s.split_once('.').map(|(_, rest)| rest)).collect();
     suffixes.iter().rev().find_map(|suffix| {

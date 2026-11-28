@@ -51,11 +51,11 @@ impl<'a> Finding<'a> {
     pub(super) fn ioc(
         entity: &'a verdict::EntityKey,
         message: &'a str,
-        hit: crate::ioc::IocHit,
+        hit: intel::matcher::IocHit,
     ) -> Self {
         Self {
             entity,
-            technique: crate::ioc::IOC_TECHNIQUE,
+            technique: intel::matcher::IOC_TECHNIQUE,
             message,
             severity: hit.severity(),
             source: schema::detection::DetectionSource::Ioc {
@@ -212,7 +212,7 @@ pub(super) fn record_ioc_hit(
     verdict: &Mutex<verdict::VerdictEngine>,
     alert_log: &AlertLog,
     event: &Event,
-    hit: crate::ioc::IocHit,
+    hit: intel::matcher::IocHit,
     persist: Option<&dyn Fn(schema::detection::Detection)>,
 ) {
     let message = hit.message(&event.meta().comm);

@@ -2,8 +2,8 @@
 
 The [`intel`](../../crates/intel/src/lib.rs) crate answers one question quickly and within a
 fixed memory budget: is this SHA-256, IP address or domain on a loaded indicator list?
-[`apps/agent/src/ioc.rs`](../../apps/agent/src/ioc.rs) wires it to the event stream and turns a match
-into a detection.
+Its [`matcher`](../../crates/intel/src/matcher.rs) module checks each event against the loaded
+lists and turns a match into a detection.
 
 Behavioural indicators (IOAs) are deliberately not part of this crate. They are what `rules`,
 Sigma and the correlator already express, and an IOA feed is converted into rule content on
@@ -17,7 +17,7 @@ the server. This crate handles set membership of atomic values only.
 | [`IndicatorSet`](../../crates/intel/src/set.rs) | immutable; a Bloom pre-filter in front of exact sorted arrays; lookup counters |
 | [`Bloom`](../../crates/intel/src/filter.rs) | the pre-filter: 10 bits per entry, 7 positions, about 1% false positives |
 | [`Intel`](../../crates/intel/src/engine.rs) | the handle: `RwLock<Arc<IndicatorSet>>`, swapped whole on reload |
-| [`IocMatcher`](../../apps/agent/src/ioc.rs) | agent side: feed loading, cooldown, own-traffic skip, counters |
+| [`IocMatcher`](../../crates/intel/src/matcher.rs) | matcher (`intel::matcher`): feed loading, cooldown, own-traffic skip, counters |
 
 ## Feed format
 
@@ -100,7 +100,7 @@ restart is needed. Counters belong to a set, so they restart at a reload.
 
 ### Loading
 
-[`IocMatcher`](../../apps/agent/src/ioc.rs) reads `<content_root>/ioc/`:
+[`IocMatcher`](../../crates/intel/src/matcher.rs) reads `<content_root>/ioc/`:
 
 - each `*.txt` file is one feed, named by its file stem. Files over 512 MiB are refused;
 - feed ids follow the sorted file names, so two agents with the same files agree on which feed
@@ -130,7 +130,7 @@ file someone put there, which is one reason a match never kills or quarantines.
 A match becomes a `DetectionSource::Ioc` detection carrying the normalised indicator, the feed
 name and the feed version. For a domain, the indicator is the *listed* domain that matched,
 not the subdomain the host asked for. Its technique label is `IOC`
-([`IOC_TECHNIQUE`](../../apps/agent/src/ioc.rs)) and it carries no ATT&CK technique: an indicator
+([`IOC_TECHNIQUE`](../../crates/intel/src/matcher.rs)) and it carries no ATT&CK technique: an indicator
 says a thing is known bad, not which tactic it served.
 
 File writes are not matched. A `FileWriteEvent` carries a descriptor and a byte count, with no
@@ -189,4 +189,4 @@ filter false positives and hits.
 | [`tests/feed_golden.rs`](../../crates/intel/tests/feed_golden.rs) | every line of the server feed builder's golden output loads unchanged (sibling `server` repo) |
 | [`tests/content.rs`](../../crates/intel/tests/content.rs) | every line of every shipped feed in the `rules` sibling repo loads (a refused line would be dropped silently on a device) |
 | [`tests/draft_golden.rs`](../../crates/intel/tests/draft_golden.rs) | the draft indicator set the server's hunt graduation writes loads whole and every line matches (sibling `server` repo) |
-| [`apps/agent/src/ioc.rs`](../../apps/agent/src/ioc.rs) unit tests | feed loading, version labels, cooldown, own-traffic and sibling skips |
+| [`crates/intel/src/matcher.rs`](../../crates/intel/src/matcher.rs) unit tests | feed loading, version labels, cooldown, own-traffic and sibling skips |
