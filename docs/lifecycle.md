@@ -47,6 +47,7 @@ Before an event reaches `DetectionSink`, it passes through these wrappers:
 | Wrapper | Where | Purpose |
 | --- | --- | --- |
 | [`PulsingSink`](../crates/pipeline/src/silence.rs) | Linux primary and uprobes. Windows ETW. | Pulses the sensor's `SensorHeartbeat` on every event, so the silence monitor can tell a silent sensor apart. Pollers pulse on each successful poll instead, whether or not it returned events. |
+| [`ReorderingSink`](../crates/pipeline/src/reorder.rs) | Linux primary only | Passes events on in timestamp order, 100 ms later. The probes write one ring buffer per event type, so events arrive in the order the buffers were drained: in the lab about one in thirteen arrives after a later one, by up to 34 ms. Without it a file open can be judged before the `exec` that precedes it, against the process's previous image. An event later than the hold is passed on as it is and counted; a full window (65,536 events) releases its oldest early and counts that too. |
 | [`ProtectedResourceGuard`](../crates/pipeline/src/protected.rs) | Linux primary only | Raises an alert when a foreign process writes to the agent's own files: config, alerts file, events file. |
 | [`RedactingSink`](../crates/redact/src/event.rs) | Windows and macOS, all commands. Linux capture commands. | Redacts URL secrets and similar fields at the boundary. In `run` mode (`redact_commands = false`), events that carry command text (`Exec`, `ReadlineInput`, `ScriptBlock`, `AmsiContent`, `WmiActivity`) pass through unredacted, because the rules must read the raw command line. The capture commands redact everything. |
 
@@ -134,6 +135,7 @@ With a control plane configured, [`upload::start`](../crates/delivery/src/upload
 | `heartbeat` | all | `wire_run_pipeline` | With the process |
 | `ipc-server` | all | [`ipc_handler::spawn`](../crates/pipeline/src/ipc_handler.rs) (current-thread tokio) | With the process. A failure there is logged and never stops detection. |
 | `snapshot-fetch`, `ioc-control-plane`, `decoy-register`, `deception-refresh` | all, when enabled | `wire_run_pipeline` / `plant_canaries` | With the process |
+| `event-reorder` | Linux | [`ReorderingSink::start`](../crates/pipeline/src/reorder.rs). Releases what a quiet stream left held, every 100 ms. | When the sensor's run ends (`finish`) |
 | `sensor-silence` | Linux, Windows | [`silence::spawn_monitor`](../crates/pipeline/src/silence.rs). Polls every 10 s and turns each confirmed stall into a T1562 alert. | With the process |
 | `health-beacon` | Linux, Windows | `health_collector(...).spawn()` | `ShutdownPlan` through `finish_run` (Linux, Windows) |
 | `kill-loudness` | Linux | [`kill_loudness::spawn_watcher`](../apps/agent/src/kill_loudness.rs) | Ends the process itself |

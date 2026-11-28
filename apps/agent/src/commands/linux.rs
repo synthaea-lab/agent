@@ -514,7 +514,15 @@ pub(crate) fn cmd_run(opts: super::RunOptions) -> anyhow::Result<()> {
     // never see one.
     let protected = pipeline::protected::protected_paths(alerts, events, config_path);
     let guarded = ProtectedResourceGuard::new(sink.clone(), protected, sink.clone());
-    let result = sensor.run(Box::new(PulsingSink::new(guarded, primary_heartbeat)));
+    // The probes write one ring buffer per event type, so their events arrive out of order;
+    // detection reads them in timestamp order, a hold later. The heartbeat is pulsed on
+    // arrival, before the hold: it measures the sensor, not the pipeline.
+    let ordered = pipeline::reorder::ReorderingSink::new(guarded).start()?;
+    let result = sensor.run(Box::new(PulsingSink::new(
+        ordered.clone(),
+        primary_heartbeat,
+    )));
+    ordered.finish();
 
     // `sensor.run` returned (Ctrl-C or a sensor failure): flush the enrichment queue, then
     // wind the workers down, the upload loop getting one last spool drain (`finish_run`,
