@@ -36,7 +36,7 @@ pub struct HealthBeacon {
     /// Cumulative events dropped from enrichment queue (backpressure).
     pub enrich_dropped: u64,
     /// Cumulative executed images the fleet's common set called rare whose evidence reached
-    /// a process belief (ADR-0020, issue #76). Absent in a beacon from an older agent: zero.
+    /// a process belief (issue #76). Absent in a beacon from an older agent: zero.
     #[serde(default)]
     pub rarity_applied: u64,
     /// Cumulative executions the rarity evidence could not judge: no snapshot, one covering

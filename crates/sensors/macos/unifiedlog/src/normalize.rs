@@ -1,6 +1,6 @@
 //! Maps classified unified-log records into `schema` events: sudo →
 //! [`schema::AuthEvent`] (the shared shape Windows logons and Linux journal
-//! auth normalize into, ADR-0005 — the sudo mapping semantics deliberately
+//! auth normalize into, the shared auth-event design — the sudo mapping semantics deliberately
 //! mirror `sensor-linux-journal::auth` so the same real action produces the
 //! same event on both platforms), TCC pairs → [`schema::TccDecisionEvent`],
 //! Gatekeeper scans → [`schema::GatekeeperVerdictEvent`].

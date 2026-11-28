@@ -163,14 +163,14 @@ impl TransportConfig {
     }
 
     /// Returns the full URL for the content manifest endpoint for `ring`
-    /// (ADR-0016 §3, issue #30/#73).
+    /// (issue #30/#73).
     #[must_use]
     pub fn content_manifest_url(&self, ring: &str) -> String {
         format!("{}/api/content/manifest/{ring}", self.server_url)
     }
 
     /// Returns the base URL for the content artifact download endpoint
-    /// (ADR-0016 §3, issue #30/#73's download/apply slice). `path` and
+    /// (issue #30/#73's download/apply slice). `path` and
     /// `sha256` are query parameters a caller adds via
     /// [`crate::TransportClient::get_bytes`], not baked in here — that's
     /// where percent-encoding of the (attacker-influenced-until-verified)
@@ -180,14 +180,14 @@ impl TransportConfig {
         format!("{}/api/content/artifact", self.server_url)
     }
 
-    /// Returns the full URL for the signed common-set snapshot manifest (ADR-0033). Like the
+    /// Returns the full URL for the signed common-set snapshot manifest. Like the
     /// release manifest it carries no path parameter: the tenant is the agent's mTLS identity's.
     #[must_use]
     pub fn snapshot_manifest_url(&self) -> String {
         format!("{}/api/snapshot/manifest", self.server_url)
     }
 
-    /// Returns the base URL for the common-set snapshot artifact (ADR-0033); a caller adds the
+    /// Returns the base URL for the common-set snapshot artifact; a caller adds the
     /// expected `sha256` as a query parameter via [`crate::TransportClient::get_bytes`].
     #[must_use]
     pub fn snapshot_artifact_url(&self) -> String {
@@ -195,7 +195,7 @@ impl TransportConfig {
     }
 
     /// Returns the full URL for the signed binary-release manifest endpoint
-    /// (ADR-0015, issue #30's update trigger). Unlike the content manifest it
+    /// (issue #30's update trigger). Unlike the content manifest it
     /// carries no ring in the path: which release an agent is offered is the
     /// server's call, made from the agent's mTLS identity.
     #[must_use]
@@ -204,7 +204,7 @@ impl TransportConfig {
     }
 
     /// Returns the full URL of the key-rotation manifest the control plane offers this agent
-    /// (ADR-0027): a manifest signed by the offline `recovery` key, or 404 when none is pending.
+    ///: a manifest signed by the offline `recovery` key, or 404 when none is pending.
     /// The control-plane side is a separate slice; the agent verifies whatever it is given.
     #[must_use]
     pub fn key_rotation_url(&self) -> String {

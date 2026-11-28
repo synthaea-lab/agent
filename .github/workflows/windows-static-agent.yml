@@ -1,6 +1,6 @@
 name: Windows static agent
 
-# The release posture of ADR-0002 on Windows (#337, #746): onnxruntime built from source
+# The release posture of the model-delivery design on Windows (#337, #746): onnxruntime built from source
 # and linked statically, so the agent imports neither onnxruntime.dll nor the DirectML
 # DLLs the prebuilt download pulls in. The default `dynamic-onnx` build that ci.yml runs
 # never exercises this link, so without this job a forbidden import could come back
@@ -123,7 +123,7 @@ jobs:
       - name: Build the agent with static onnxruntime
         run: cargo build -j 2 --release --no-default-features -p agent
 
-      # The packaged build must not carry the public test signing key (ADR-0027, https://github.com/synthaea-lab/agent/issues/43).
+      # The packaged build must not carry the public test signing key (https://github.com/synthaea-lab/agent/issues/43).
       - name: Check the agent carries no test signing key
         shell: bash
         run: bash tools/assert-no-test-key.sh target/release/agent.exe

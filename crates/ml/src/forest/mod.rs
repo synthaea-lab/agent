@@ -3,7 +3,7 @@
 //!
 //! ## Why the structure is parsed at all
 //!
-//! Inference runs through onnxruntime (ADR-0002), which executes the graph as a black
+//! Inference runs through onnxruntime, which executes the graph as a black
 //! box and returns only the score. The "explanations at detection time" commitment
 //! (`docs/detection/ml.md`) needs the *walk*, not just the result — so this module
 //! reads the tree structure back out of the model file itself: an `ai.onnx.ml`

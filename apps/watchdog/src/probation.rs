@@ -1,4 +1,4 @@
-//! Post-promotion health gate (ADR-0015 Decision 6, issue #30): a release that
+//! Post-promotion health gate (issue #30): a release that
 //! `updater` has just promoted is on *probation* until its agent proves it is
 //! alive. The proof is the progress-backed heartbeat (#102) advancing within
 //! [`PROBATION_DEADLINE`] of the watchdog starting; if it never does, the
@@ -10,13 +10,13 @@
 //! path and never guesses from `current`: a watchdog started from `bootstrap/`
 //! (day 0, or after a full reset) has no probation — `bootstrap/` is the floor
 //! rollback lands on, and nothing is rolled back past it. Linux-only, like the
-//! `updater` layout it drives (ADR-0015 Deferred: Windows/macOS self-update).
+//! `updater` layout it drives (the updater design: Windows/macOS self-update).
 
 use std::time::Duration;
 
 /// How long a freshly promoted release has to show a heartbeat advance. The same
 /// 120s every other sensor gets before it is called silent
-/// (`agent::commands::linux::NO_CANARY_SILENCE_DEADLINE_NS`, cited by ADR-0015
+/// (`agent::commands::linux::NO_CANARY_SILENCE_DEADLINE_NS`, cited by the updater design
 /// Decision 6) — deliberately not a new number.
 pub(crate) const PROBATION_DEADLINE: Duration = Duration::from_secs(120);
 
@@ -169,7 +169,7 @@ mod linux {
 
         /// The release passed: remember it, and delete everything older than the
         /// release it would roll back to so exactly two trees stay on disk
-        /// (ADR-0015 Decision 8).
+        ///.
         ///
         /// # Errors
         ///

@@ -1,4 +1,4 @@
-//! Host isolation (ADR-0037): block every connection in and out of the host except
+//! Host isolation: block every connection in and out of the host except
 //! loopback, DHCP and the agent's own path to its control plane.
 //!
 //! Platform-neutral, the same split as [`crate::kill`]: this module owns the plan, the
@@ -47,7 +47,7 @@ pub enum PlanError {
 }
 
 /// What an isolation lets through besides loopback and DHCP: the control-plane endpoints
-/// the agent itself may still reach, pinned when the isolation is applied (ADR-0037 §3).
+/// the agent itself may still reach, pinned when the isolation is applied.
 ///
 /// Sorted and deduplicated, so two plans for the same endpoints compare equal whatever
 /// order the resolver returned them in. Deserializing goes through [`IsolationPlan::new`]
@@ -374,7 +374,7 @@ pub enum LiftOutcome {
     },
 }
 
-/// Lifts the isolation. **Never policy-gated** (ADR-0037 §4): lifting is the safe
+/// Lifts the isolation. **Never policy-gated**: lifting is the safe
 /// direction, and refusing it would turn a policy mistake into a host nobody can recover.
 /// An unreadable intent does not stop it either: it is overwritten. Nor does a lock that
 /// cannot be taken: the lift then runs unserialized rather than not at all.
@@ -433,7 +433,7 @@ pub enum Reconciliation {
     /// The host should not be isolated and the agent's block was still there; it is gone.
     RemovedLeftover,
     /// The intent or the firewall could not be read or changed, so the firewall was left
-    /// as it was found; the caller audits it like drift (ADR-0037 §7).
+    /// as it was found; the caller audits it like drift.
     Failed {
         /// The cause, rendered.
         error: String,

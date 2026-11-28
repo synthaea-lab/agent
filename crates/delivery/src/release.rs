@@ -1,4 +1,4 @@
-//! The binary self-update trigger (ADR-0015, issue #30): fetch the signed release
+//! The binary self-update trigger (issue #30): fetch the signed release
 //! manifest, verify it, stage the release, promote it, and restart the service
 //! onto it. The watchdog's post-promotion health gate (`watchdog::probation`)
 //! then decides whether the release stays.
@@ -19,7 +19,7 @@
 //! Nothing is promoted until every artifact has been downloaded, hash-checked
 //! against the signed manifest, written into a hidden staging directory and
 //! re-verified from disk; `current` moves only after that. Linux-only, like
-//! `updater::layout` (ADR-0015 Deferred).
+//! `updater::layout`.
 
 use std::path::{Path, PathBuf};
 
@@ -165,13 +165,13 @@ fn apply_release_with(
 ) -> anyhow::Result<Outcome> {
     anyhow::ensure!(
         layout.bootstrap_dir().is_dir(),
-        "{} does not exist: not a packaged install (ADR-0015 Decision 7)",
+        "{} does not exist: not a packaged install",
         layout.bootstrap_dir().display()
     );
     std::fs::create_dir_all(layout.versions_dir())?;
 
     // The release key in force, which is the embedded one until a rotation replaced it, and
-    // the counter releases share with rotations (ADR-0027): a release numbered at or below
+    // the counter releases share with rotations: a release numbered at or below
     // an applied rotation is a rollback of it.
     let keys = updater::trust_state::keys_in_force(&state_dir(layout))?;
     let manifest: ReleaseManifest = client.get_json(&client.config().release_manifest_url())?;

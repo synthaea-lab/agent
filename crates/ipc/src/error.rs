@@ -54,7 +54,7 @@ pub enum ServerError {
     Protocol(String),
 
     /// The client did not present credentials that pass the peer-auth
-    /// check (per ADR-0010, only root/Administrators are authorized on
+    /// check (per the policy model, only root/Administrators are authorized on
     /// v1). The server sends a [`crate::protocol::WireError::Unauthorized`]
     /// and closes the connection.
     #[error("peer authentication failed: {reason}")]
@@ -97,7 +97,7 @@ pub enum ClientError {
     /// The agent is running but will not talk to this process: the OS
     /// refused to open its endpoint (the pipe's DACL on Windows, the
     /// socket's permissions on Unix) or the agent's peer-auth check
-    /// answered `Unauthorized`. Per ADR-0010 only root / an elevated
+    /// answered `Unauthorized`. Per the policy model only root / an elevated
     /// Administrators token may connect (#421: this used to read "Is the
     /// agent running?" or a bare `Unauthorized`).
     #[error(

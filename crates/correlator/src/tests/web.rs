@@ -1,4 +1,4 @@
-//! Web request + web-server shell pairing (#478, ADR-0022): `Event::HttpRequest` from
+//! Web request + web-server shell pairing (#478): `Event::HttpRequest` from
 //! an access log, joined to a shell spawned by a web server by time, in either order.
 
 use proptest::prelude::*;

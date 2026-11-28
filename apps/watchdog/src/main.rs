@@ -120,7 +120,7 @@ fn run_cli() -> anyhow::Result<()> {
         return recovery::recover_if_current_is_unexecutable(base_dir);
     }
 
-    // Load the local install configuration eagerly. Per ADR-0013 §5 the
+    // Load the local install configuration eagerly. Per the configuration design the
     // watchdog fails fast with a copy-pasteable message if the config is
     // missing or invalid — the alternative (silently falling back on
     // hard-coded paths) would let a mis-installed watchdog respawn an

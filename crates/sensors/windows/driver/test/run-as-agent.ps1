@@ -1,7 +1,7 @@
 <#
 .SYNOPSIS
     Runs a PowerShell script with the agent's identity (NT SERVICE\SynthaEDR),
-    for lab checks of SynthaeaFilter's port (#136, ADR-0012 guardrail 5).
+    for lab checks of SynthaeaFilter's port (#136).
     Lab VM only, elevated.
 
 .DESCRIPTION

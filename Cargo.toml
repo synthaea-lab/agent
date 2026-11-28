@@ -163,7 +163,7 @@ private_intra_doc_links = "allow"
 # Shared dependency versions are declared here as crates gain real code.
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-# TOML parser used by `crates/config` (ADR-0013: TOML for on-disk agent
+# TOML parser used by `crates/config` (the configuration design: TOML for on-disk agent
 # config, strict types, no silent coercion). Also usable by any future
 # crate that reads a TOML-shaped input.
 toml = "1.1"
@@ -178,16 +178,16 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # framing, `sync` for shutdown signaling, `macros` for `#[tokio::main]` /
 # `#[tokio::test]`.
 tokio = { version = "1.53.3", features = ["rt-multi-thread", "net", "io-util", "sync", "macros"] }
-# Ed25519 signature verification for signed policy documents (ADR-0010) and
-# updater manifests (ADR-0015). `ring` chosen over `ed25519-dalek` because it
+# Ed25519 signature verification for signed policy documents and
+# updater manifests. `ring` chosen over `ed25519-dalek` because it
 # is already a transitive dep via `rustls`, avoiding a second signature
 # implementation in the workspace.
 ring = "0.17"
-# ONNX Runtime for on-device inference (ADR-0002). Pinned RC — ort 2.0 is the first
+# ONNX Runtime for on-device inference. Pinned RC — ort 2.0 is the first
 # line to support the ai.onnx.ml tree ops our models use; used only by `crates/ml`.
 # Workspace config: default-features = false (no auto-download).
 # The ml crate's default "dynamic-onnx" feature re-enables download-binaries for dev builds.
-# Production builds: cargo build --no-default-features (static linking per ADR-0002).
+# Production builds: cargo build --no-default-features (static linking per the model-delivery design).
 ort = { version = "=2.0.0-rc.15", default-features = false }
 
 [workspace.metadata.deb]

@@ -1,9 +1,9 @@
 //! Redaction at the event boundary: what an event may carry once it leaves detection.
 //!
 //! `FileQuarantine`'s `origin_url`/`referrer_url`, a `BitsJob`'s `url` (#284), and an
-//! `HttpRequest`'s evidence value (#478, ADR-0022 §4) are redacted here before any
+//! `HttpRequest`'s evidence value (#478) are redacted here before any
 //! consumer sees the event — see [`redact_event`]'s doc for exactly what each path
-//! covers. `Exec` command lines/argv (#705, ADR-0034) and the command text of `ReadlineInput`,
+//! covers. `Exec` command lines/argv (#705) and the command text of `ReadlineInput`,
 //! `ScriptBlock`, `AmsiContent` and `WmiActivity` (#895) go through the same boundary,
 //! via the pure functions of this crate; [`RedactingSink::redact_commands`] controls
 //! whether a given sink sees them raw (live detection pipelines) or redacted
@@ -38,7 +38,7 @@ impl<S: EventSink> EventSink for RedactingSink<S> {
     }
 }
 
-/// Events whose command text detection reads raw (ADR-0034): a live pipeline must not
+/// Events whose command text detection reads raw: a live pipeline must not
 /// redact them before the rules run, only the copies that leave the process.
 fn carries_command_text(event: &Event) -> bool {
     matches!(
@@ -64,10 +64,10 @@ pub fn redacting(sink: Box<dyn EventSink>, redact_commands: bool) -> Arc<dyn Eve
 /// Redacts sensitive fields on an event copy immediately before output. Run-mode
 /// sensor wrappers preserve Exec until detection; capture-mode wrappers redact it
 /// at their output boundary. The agent's log sources also use this for Linux HTTP
-/// evidence (ADR-0018/0022).
+/// evidence (0022).
 ///
 /// An `HttpRequest`'s evidence is the one query parameter a signature matched on,
-/// and its value is what leaves the host (ADR-0022 §4). When that parameter's *name*
+/// and its value is what leaves the host. When that parameter's *name*
 /// marks it as a secret (`?token=…`, `?password=…`), the whole value is replaced by
 /// [`REDACTED`], the name is kept so the finding still reads. A parameter that is not
 /// named like a secret (`?id=1 union select 1`) keeps its value: it is the evidence.

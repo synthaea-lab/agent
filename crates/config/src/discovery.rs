@@ -1,6 +1,6 @@
 //! Where the agent looks for its config file, and in what order.
 //!
-//! Per ADR-0013 §3 ("Discovery order"), the order is
+//! Per the configuration design ("Discovery order"), the order is
 //! `--config <path>` (caller-supplied) > `SYNTHAEA_CONFIG` env variable >
 //! the default OS path from [`DEFAULT_CONFIG_PATH`]. Exactly one file is
 //! loaded per binary invocation — no merging.
@@ -19,7 +19,7 @@ pub const ENV_CONFIG_PATH: &str = "SYNTHAEA_CONFIG";
 
 /// Absolute path the agent falls back to when no `--config` and no
 /// `SYNTHAEA_CONFIG` are set. Chosen for consistency with EDR industry
-/// conventions (ADR-0013).
+/// conventions.
 #[cfg(target_os = "linux")]
 pub const DEFAULT_CONFIG_PATH: &str = "/etc/synthaea/agent.toml";
 
@@ -39,7 +39,7 @@ pub const DEFAULT_CONFIG_PATH: &str = "/Library/Application Support/Synthaea/age
 pub const DEFAULT_CONFIG_PATH: &str = "/etc/synthaea/agent.toml";
 
 /// Return the path the agent would read for its configuration, resolving
-/// the discovery order from ADR-0013 §3.
+/// the discovery order from the configuration design.
 ///
 /// - `cli_arg` is `Some(path)` when the caller passed `--config <path>`
 ///   on the command line. Set: `path` wins outright — the caller took

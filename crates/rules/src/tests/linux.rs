@@ -64,7 +64,7 @@ fn a_padded_command_line_that_hides_its_payload_from_the_content_rules_still_ale
     assert!(alert.message.contains("cut at capture"));
 }
 
-/// ADR-0045: a padded `sh -c` read by the Linux probe as a head and a tail window. The
+/// The argv-window design: a padded `sh -c` read by the Linux probe as a head and a tail window. The
 /// payload at the end is in the tail, so the content rule sees it, and the omitted middle
 /// raises T1027.010 at Low, worded by its cause.
 #[test]

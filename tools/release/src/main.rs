@@ -1,6 +1,6 @@
 //! # release-tool
 //!
-//! Offline release tooling for the updater (ADR-0015, ADR-0016): build the manifest
+//! Offline release tooling for the updater: build the manifest
 //! of a release directory and sign the manifests the agents verify. Nothing here
 //! runs on an endpoint or on the control plane; the server never holds the private
 //! key and does not verify signatures, every agent does.
@@ -13,7 +13,7 @@
 //! release-tool public-key --key-file release.key
 //! ```
 //!
-//! A key rotation (ADR-0027) is signed by the offline `recovery` key and by nothing else:
+//! A key rotation is signed by the offline `recovery` key and by nothing else:
 //!
 //! ```text
 //! release-tool rotation --release-version 9 --reason "scheduled" \
@@ -21,7 +21,7 @@
 //! release-tool sign --kind rotation --pkcs11 ... rotation.json --out rotation-signed.json
 //! ```
 //!
-//! Production keys sign from a PKCS#11 token (ADR-0027 decision 2): the private key never
+//! Production keys sign from a PKCS#11 token: the private key never
 //! leaves the device and the tool only sends it the bytes to sign.
 //!
 //! ```text
@@ -33,7 +33,7 @@
 //! `--key-file` (a file of 64 hex characters, a 32-byte Ed25519 seed) and `--test-key` (the
 //! public, checked-in test key) are for lab and dev releases: a key that can be read from a
 //! file is not a production key. Who holds the token and who approves a release are decisions
-//! of the owner (ADR-0027), not of this tool.
+//! of the owner, not of this tool.
 
 mod keyfile;
 mod manifest_dir;
@@ -66,7 +66,7 @@ enum Command {
     /// Hash a directory of release files into an unsigned release manifest.
     Manifest(ManifestArgs),
     /// Rebuild an earlier content manifest as a newer, unsigned one: the corrective release that
-    /// withdraws content from agents that already applied a later release (ADR-0032).
+    /// withdraws content from agents that already applied a later release.
     RollForward(RollForwardArgs),
     /// Build an unsigned key-rotation manifest: a new `release` and/or `content` key and the key
     /// each replaces, to be signed with the `recovery` key (`sign --kind rotation`).

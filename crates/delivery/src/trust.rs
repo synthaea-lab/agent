@@ -1,5 +1,4 @@
-//! The refusal to act on a manifest the build cannot really verify (ADR-0015 Deferred,
-//! ADR-0027): a build that trusts the public test key acts only on an explicit acknowledgement
+//! The refusal to act on a manifest the build cannot really verify: a build that trusts the public test key acts only on an explicit acknowledgement
 //! (`--allow-test-key`, which exists only in a `test-key` build), and a build that embeds no
 //! production key yet cannot verify anything, so it says so instead of failing at the
 //! signature.
@@ -61,7 +60,7 @@ pub(crate) fn ensure_key_trusted(
 ) -> anyhow::Result<()> {
     if !provisioned {
         anyhow::bail!(
-            "this build embeds no production signing key for {} (ADR-0027: \
+            "this build embeds no production signing key for {} (the signing-key design: \
              crates/updater/keys is unprovisioned), so it cannot verify them; refusing",
             manifest.noun()
         );
@@ -71,10 +70,10 @@ pub(crate) fn ensure_key_trusted(
     }
     if !allow_test_key {
         let how = if cfg!(feature = "test-key") {
-            "Pass --allow-test-key to acknowledge this in a lab (ADR-0015 Deferred)"
+            "Pass --allow-test-key to acknowledge this in a lab"
         } else {
             "This build has no --allow-test-key; rebuild the agent with its `test-key` feature \
-             for a lab (ADR-0027)"
+             for a lab"
         };
         anyhow::bail!(
             "this build verifies {} against the public test key, so {}; refusing. {how}",
@@ -91,7 +90,7 @@ pub(crate) fn ensure_key_trusted(
 }
 
 /// [`ensure_key_trusted`] for the release key in force under `state_dir`. Used by
-/// `apply-release`, which is Linux-only (ADR-0015 Deferred). Returns the keys it checked.
+/// `apply-release`, which is Linux-only. Returns the keys it checked.
 ///
 /// # Errors
 ///

@@ -1358,7 +1358,7 @@ SynthaeaFreeQueuedEvents (
 
 
 /*************************************************************************
-    Communication port (milestone 2a, ADR-0012 guardrails 2 and 5).
+    Communication port (milestone 2a, the minifilter driver guardrails guardrails 2 and 5).
 *************************************************************************/
 
 NTSTATUS

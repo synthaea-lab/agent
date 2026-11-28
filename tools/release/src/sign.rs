@@ -10,11 +10,11 @@ use crate::signer::{Signer, sign_checked};
 /// wrong file be signed without notice.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
 pub(crate) enum Kind {
-    /// A binary release (`agent apply-release`, ADR-0015).
+    /// A binary release (`agent apply-release`).
     Release,
-    /// A content release for one ring (`agent apply-content-manifest`, ADR-0016).
+    /// A content release for one ring (`agent apply-content-manifest`).
     Content,
-    /// A key rotation, signed by the offline `recovery` key only (ADR-0027).
+    /// A key rotation, signed by the offline `recovery` key only.
     Rotation,
 }
 

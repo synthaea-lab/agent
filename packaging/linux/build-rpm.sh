@@ -19,7 +19,7 @@ echo "Version: $VERSION"
 echo "Building release binaries..."
 cargo build --release --bins -p agent -p watchdog -p cli --no-default-features --features agent/dynamic-onnx
 
-# The shipped artifacts: no public test signing key (ADR-0027).
+# The shipped artifacts: no public test signing key.
 tools/assert-no-test-key.sh target/release/agent target/release/watchdog target/release/cli
 
 # Create source tarball

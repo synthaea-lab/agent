@@ -44,7 +44,7 @@ step "tests"
 # SYNTHAEA_REQUIRE_SIBLINGS=1 to make a missing sibling fail, as CI does.
 cargo test --workspace --exclude sensor-linux-ebpf
 
-step "updater trust set without the test key (production code path, ADR-0027)"
+step "updater trust set without the test key (production code path)"
 cargo test -p updater --no-default-features
 
 step "cargo deny (licenses, advisories, bans, sources)"

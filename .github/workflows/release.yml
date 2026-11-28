@@ -12,8 +12,8 @@ name: Release
 # titled "vX.Y.Z — Alpha (unsigned)" with a warning at the top of its notes, and the
 # `signing-policy` job refuses that for any version above 0.0.x.
 #
-# What this does NOT do (ADR-0015, ADR-0027): it signs no updater release or content manifest.
-# Those are signed offline from a hardware token by the holders ADR-0027 names, never in CI.
+# What this does NOT do: it signs no updater release or content manifest.
+# Those are signed offline from a hardware token by the holders the signing-key design names, never in CI.
 on:
   push:
     tags: ["v*"]
@@ -198,7 +198,7 @@ jobs:
             echo "::warning::not every platform can sign: $VERSION is published as an UNSIGNED alpha pre-release"
           fi
 
-  # The same ADR-0027 guard ci.yml runs on every push, on the exact tagged tree: the
+  # The same signing-key design guard ci.yml runs on every push, on the exact tagged tree: the
   # packaged feature set must leave updater/test-key off on every target.
   test-key-guard:
     needs: meta
@@ -212,10 +212,10 @@ jobs:
       - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable branch
         with:
           toolchain: stable
-      - name: Packaged build carries no test signing key (ADR-0027)
+      - name: Packaged build carries no test signing key
         run: tools/check-no-test-key.sh
 
-  # ADR-0027: the keys committed on 2026-11-12 are temporary (no custody, no holders). A release
+  # The signing-key design: the keys committed on 2026-11-12 are temporary (no custody, no holders). A release
   # must not embed them. Only a manual dispatch can override, on purpose, for a lab build; a tag
   # push and the release-please call cannot.
   temporary-key-guard:
@@ -227,7 +227,7 @@ jobs:
         with:
           persist-credentials: false
           ref: ${{ needs.meta.outputs.ref }}
-      - name: The updater keys are not the temporary ones (ADR-0027)
+      - name: The updater keys are not the temporary ones
         env:
           ALLOW: ${{ github.event_name == 'workflow_dispatch' && inputs.allow-temporary-keys == true }}
         run: |
@@ -541,7 +541,7 @@ jobs:
       # Each build job already scanned what it built; this scans what is about to be
       # published, after the artifact store and the signing jobs, so a mix-up between jobs
       # cannot ship the key.
-      - name: Check no published binary carries the test signing key (ADR-0027)
+      - name: Check no published binary carries the test signing key
         run: |
           set -euo pipefail
           scan="$RUNNER_TEMP/scan"

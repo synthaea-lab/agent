@@ -28,7 +28,7 @@ ML-based anomaly detection, and response capabilities.
 %build
 # Only the packaged binaries, and without the agent's default `test-key` feature: a
 # `--workspace` build unifies features, so release-tool (which keeps the public test key for
-# lab releases) would put that key into the agent (ADR-0027; tools/check-no-test-key.sh).
+# lab releases) would put that key into the agent (tools/check-no-test-key.sh).
 # Honour CARGO_TARGET_DIR (a small build host may keep its target directory elsewhere);
 # %install reads the same variable.
 cargo build --release --bins -p agent -p watchdog -p cli --no-default-features --features agent/dynamic-onnx
@@ -61,7 +61,7 @@ install -D -m 0644 packaging/linux/systemd/synthaea.tmpfiles \
 install -d -m 0750 %{buildroot}/var/lib/synthaea/versions
 install -d -m 0750 %{buildroot}/var/log/synthaea
 
-# Config directory + the same template `cli config init` writes (ADR-0013): the
+# Config directory + the same template `cli config init` writes: the
 # agent fails fast without a valid agent.toml, and the RPM shipped none (#861,
 # the RPM side of #675's .deb fix). Every control-plane field is a `# CHANGE ME`
 # placeholder, but `offline_fallback = true` lets the agent start and run on it

@@ -1,4 +1,4 @@
-//! The corrective release that withdraws content (ADR-0032).
+//! The corrective release that withdraws content.
 //!
 //! An agent never goes to a lower release number, so content a later release added cannot be
 //! taken off an agent that already applied it by serving it an older release. It is withdrawn

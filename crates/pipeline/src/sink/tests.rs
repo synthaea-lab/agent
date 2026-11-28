@@ -3326,7 +3326,7 @@ fn mark_then_run_as(sink: &DetectionSink, image: &str, ran: Option<String>) {
     );
 }
 
-// ── the common-set snapshot (ADR-0020, issue #76) ───────────────────────
+// ── the common-set snapshot (issue #76) ───────────────────────
 
 /// The shared common-set golden file in the `ml` sibling repo (the same bytes the
 /// server's builder and the `ml` reader are tested against). Tests that need it read it
@@ -3471,7 +3471,7 @@ fn a_directory_where_the_common_set_file_belongs_is_a_failure_not_a_crash() {
     assert!(sink.common_set().is_none());
 }
 
-// ── rarity evidence (ADR-0020, issue #76) ───────────────────────────────
+// ── rarity evidence (issue #76) ───────────────────────────────
 
 /// A hash the snapshot built in a golden case does not contain.
 fn golden_non_member(golden: &str, case: &str) -> String {
@@ -3637,7 +3637,7 @@ fn rarity_counts_withheld_with_no_snapshot_at_all() {
 }
 
 /// The same non-member judged at two instants: inside the maximum age it is evidence, past
-/// it the snapshot counts as absent and the judgement is withheld (ADR-0033 decision 3).
+/// it the snapshot counts as absent and the judgement is withheld.
 #[test]
 fn a_snapshot_past_its_maximum_age_withholds_the_evidence() {
     use health::RarityStatsSource as _;
@@ -3704,7 +3704,7 @@ fn snapshot_holding(hashes: &[&str], hosts_covered: u32) -> Vec<u8> {
     out.extend(u32::try_from(hashes.len()).unwrap().to_le_bytes());
     out.extend(BITS.to_le_bytes());
     // Built just now: the worker judges against the real clock, and a snapshot past its
-    // maximum age is withheld (ADR-0033).
+    // maximum age is withheld.
     out.extend(super::unix_now_secs().to_le_bytes());
     out.extend(body);
     out

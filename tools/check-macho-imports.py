@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """List the dynamic libraries a macOS executable loads, and fail on the ones a static ONNX
-Runtime build must not need (#338, ADR-0002).
+Runtime build must not need (#338).
 
 `otool -L` exists only on a Mac with the command line tools; this reads the Mach-O load
 commands directly with the standard library (thin and universal binaries, 32 and 64 bit,
@@ -17,7 +17,7 @@ A library is accepted only if its install name starts with `/usr/lib/` or
 `/System/Library/` (the OS: libSystem, libc++, the frameworks). Anything else fails, and
 that is deliberate: an `@rpath/libonnxruntime.dylib` is the shared build this check exists
 to catch, but so is any other dylib that would have to be shipped, signed and versioned
-next to the agent (ADR-0002: one binary, no library to hijack). A name containing
+next to the agent (the model-delivery design: one binary, no library to hijack). A name containing
 `onnxruntime` fails even under an allowed prefix.
 
 Exits 1 if any slice of any file loads a library that is not accepted. Exits 2 on a file

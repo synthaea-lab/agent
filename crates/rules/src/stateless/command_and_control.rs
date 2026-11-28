@@ -107,7 +107,7 @@ const DOH_DOT_EXPECTED_COMMS: &[&str] = &[
 /// blend into "normal" `DoH` traffic rather than running its own) is most likely
 /// to pick. Deliberately short and not exhaustive: a private/enterprise `DoH`
 /// endpoint, a self-hosted one, or a public provider not on this list is a real
-/// gap this rule accepts, the same unbounded-tail trade-off ADR-0028 documents
+/// gap this rule accepts, the same unbounded-tail trade-off the kill-gate design documents
 /// for `policy`'s interpreter blocklist — this is detection content, meant to be
 /// widened as real `DoH` C2 traffic is observed, not a complete inventory.
 const KNOWN_DOH_RESOLVERS: &[IpAddr] = &[

@@ -1,4 +1,4 @@
-//! Building the unsigned key-rotation manifest (ADR-0027): the operator names the keys, this
+//! Building the unsigned key-rotation manifest: the operator names the keys, this
 //! refuses a manifest the agents would refuse whatever its signature, and `sign --kind rotation`
 //! then signs it with the `recovery` key.
 

@@ -41,13 +41,13 @@ pub const FEATURE_NAMES: [&str; 8] = [
 ];
 
 /// Event variants this vector is built from — process spawn, outbound connect, file
-/// open, netlink-observed flow (ADR-0008). `span_s` and `event_count` are computed
+/// open, netlink-observed flow. `span_s` and `event_count` are computed
 /// over these only: the Python aggregator (`aggregate_correlation._flatten`,
 /// `RAW_EVENT_TYPES`) drops every other category before windowing, so counting e.g. a
 /// `DnsQuery` here would silently inflate both features relative to the training
 /// vectors.
 ///
-/// ADR-0008 side effect: gating the whole vector on this filter means `event_count`
+/// The correlation-vector design side effect: gating the whole vector on this filter means `event_count`
 /// and `span_s` grow for any process with netlink traffic, not just the two fields
 /// `NetworkFlow` feeds below. `connect_count` (T1's `BehaviorVector`) is unaffected —
 /// it filters on `Event::Connect` explicitly, independent of this gate.
@@ -78,7 +78,7 @@ pub fn extract_features(bus: &EventBus, pid: u32, generation: Option<u64>) -> [f
         .count();
     let filewrite_count = events.iter().filter(|e| is_file_write(e)).count();
 
-    // ADR-0008: NetworkFlow (netlink) and Connect are absorbed into the same
+    // the correlation-vector design: NetworkFlow (netlink) and Connect are absorbed into the same
     // daddr/dport sets — one count of "distinct destinations touched", regardless of
     // which sensor captured them (mirrors BEACON's check_beacon/check_beacon_flow
     // convergence on shared state).
@@ -215,7 +215,7 @@ mod tests {
 
     #[test]
     fn network_flow_absorbed_into_same_daddr_dport_sets_as_connect() {
-        // ADR-0008: Connect and NetworkFlow share one "distinct destinations" count —
+        // the correlation-vector design: Connect and NetworkFlow share one "distinct destinations" count —
         // an attacker whose traffic is seen only by netlink still shows up here.
         let mut bus = EventBus::new(Duration::from_secs(60));
         bus.push(connect(7, 0, 4444));

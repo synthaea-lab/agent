@@ -288,7 +288,7 @@ pub const fn syscall_nr_from_i32(syscall_nr: i32) -> Option<u32> {
 ///   time the caller chose, not the kernel's own "now" update). Carries the raw `timespec64`
 ///   (seconds and nanoseconds, so the probe does no arithmetic); userspace normalises it to
 ///   `schema::FileSetTimeEvent`. No existing struct changed.
-/// - v28: the exec record is variable-length (<https://github.com/synthaea-lab/agent/issues/48>, ADR-0045). `ExecEvent` gains `argv_total`,
+/// - v28: the exec record is variable-length (<https://github.com/synthaea-lab/agent/issues/48>). `ExecEvent` gains `argv_total`,
 ///   `argv_head_len` and `argv_tail_len`, and the record carries that many bytes of the argument
 ///   block after the fixed part: the head window, then the tail window. Exec-time, so a process
 ///   that exits before the drain or rewrites its argv region afterwards keeps the argv it was
@@ -508,7 +508,7 @@ pub const SIGNAL_SENDER_UNRELIABLE: u32 = 0x8000_0000;
 /// Capacity in bytes of every path buffer in the wire events; longer paths are truncated by the probe.
 pub const MAX_PATH_LEN: usize = 256;
 /// Bytes of the argument block (`mm->arg_start .. mm->arg_end`) the exec probe captures at most
-/// (ADR-0045): the whole block when it fits, else [`ARGV_HEAD_BYTES`] from the start and
+///: the whole block when it fits, else [`ARGV_HEAD_BYTES`] from the start and
 /// [`ARGV_TAIL_BYTES`] from the end.
 pub const ARGV_WINDOW_BYTES: usize = 1024;
 /// The tail window of a block over [`ARGV_WINDOW_BYTES`]: padding put in front of a payload at the
@@ -642,7 +642,7 @@ pub struct ExecEvent {
 
 /// The exec probe's per-CPU scratch: the fixed [`ExecEvent`] and room for both argv windows. Only
 /// `size_of::<ExecEvent>() + argv_head_len + argv_tail_len` bytes of it are emitted, so a short
-/// command line costs the ring only its own bytes (ADR-0045, "Wire and ring").
+/// command line costs the ring only its own bytes ("Wire and ring").
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct ExecRecord {
@@ -668,7 +668,7 @@ pub struct ExecArgv<'a> {
 }
 
 /// Why an exec record was refused. The record comes from the kernel, but its lengths describe
-/// bytes a process chose, so every one is checked before any is used (ADR-0045).
+/// bytes a process chose, so every one is checked before any is used.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ExecRecordError {
     /// Shorter than the fixed [`ExecEvent`].

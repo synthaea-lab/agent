@@ -90,7 +90,7 @@ pub fn parse_mysql_error_line(line: &str) -> Result<Option<MysqlLoginFailure>, P
 /// error-log line carries no pid, so [`to_auth_event`] sets `pid` and `ppid` to 0.
 pub const MYSQL_LOG_COMM: &str = "mysql-error-log";
 
-/// A failed login as the shared logon event (ADR-0022 §3, ADR-0005), so the existing
+/// A failed login as the shared logon event, so the existing
 /// brute-force rule (T1110, keyed on target user and source address) covers it.
 ///
 /// `timestamp_ns` is when the agent read the line, not the line's own time: `MariaDB`

@@ -1,6 +1,6 @@
 //! The persistence rules that flow through `FileOpenEvent` with a high-bit
 //! `flags` marker rather than a dedicated `Event::Persistence` variant (see
-//! ADR-0004): the Windows trio `check_scheduled_task_persistence` (T1053.005,
+//! the Event Log persistence design): the Windows trio `check_scheduled_task_persistence` (T1053.005,
 //! event 4698), `check_service_install_persistence` (T1543.003, event 7045),
 //! `check_account_creation_persistence` (T1136.001, event 4720) — plus the
 //! Linux sibling `check_systemd_service_persistence` (T1543.002, issue #93)

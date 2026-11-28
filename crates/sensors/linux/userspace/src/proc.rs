@@ -77,7 +77,7 @@ fn read_capped(path: &str, limit: usize) -> std::io::Result<Vec<u8>> {
 }
 
 /// The argv of an exec event and how many bytes of its argument block were not captured
-/// (<https://github.com/synthaea-lab/agent/issues/48>, ADR-0045's truth table).
+/// (<https://github.com/synthaea-lab/agent/issues/48>, the argv-window design's truth table).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ExecArgvCapture {
     pub(crate) argv: Vec<String>,
@@ -87,9 +87,9 @@ pub(crate) struct ExecArgvCapture {
 }
 
 /// argv of an exec event (<https://github.com/synthaea-lab/agent/issues/48>): the probe's exec-time windows when it read them, else
-/// [`read_proc_cmdline`] now (the fallback rows of ADR-0045's table). A block over the window
+/// [`read_proc_cmdline`] now (the fallback rows of the argv-window design's table). A block over the window
 /// is never completed from `/proc`: that read is not exec-time, and a process can rewrite its
-/// argument region before it (ADR-0045, Consequences).
+/// argument region before it (Consequences).
 pub(crate) fn exec_argv(
     event: &sensor_linux_wire::ExecEvent,
     windows: &sensor_linux_wire::ExecArgv<'_>,
@@ -407,7 +407,7 @@ mod tests {
         assert_eq!(got.omitted_bytes, Some(0));
     }
 
-    /// ADR-0045's padding case: a payload at the end of a long `sh -c` argument is still seen,
+    /// The argv-window design's padding case: a payload at the end of a long `sh -c` argument is still seen,
     /// and the cut argument is kept as two partial tokens instead of being dropped.
     #[test]
     fn a_payload_after_padding_is_kept_in_the_tail_and_the_middle_is_counted() {

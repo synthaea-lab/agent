@@ -1,6 +1,6 @@
-# Static onnxruntime on macOS (ADR-0002, issue #338)
+# Static onnxruntime on macOS (issue #338)
 
-ADR-0002 asks for one statically linked agent binary on every platform: no
+the model-delivery design asks for one statically linked agent binary on every platform: no
 `libonnxruntime.dylib` to ship, sign and version beside it, and no library path an attacker
 could hijack in a privileged process. Linux (`onnxruntime-static-build.md`) and Windows
 (`build-onnxruntime-static.ps1`, #337) have it. This is the macOS recipe.

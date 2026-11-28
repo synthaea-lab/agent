@@ -1,6 +1,6 @@
 //! Applying a per-host override document on top of a baseline policy.
 //!
-//! Implements the three merge granularities ADR-0011 declares:
+//! Implements the three merge granularities the policy override design declares:
 //!
 //! 1. **Flat sections** (non-map: `response`, `compliance_mode`, `rules`,
 //!    `models`, `thresholds`) — whole-section replace: `overrides.section`
@@ -17,7 +17,7 @@
 //!
 //! ## Safety-critical enforcement — where it actually happens
 //!
-//! ADR-0011 §Decision 2 requires that a safety-critical sub-object
+//! The policy override design requires that a safety-critical sub-object
 //! present in an override be **complete** (every schema-declared field
 //! must be supplied, or the override is rejected at parse time). The
 //! naive implementation is a runtime walker over
@@ -36,7 +36,7 @@
 //! [`SAFETY_CRITICAL_PATHS`] is kept as a **declarative constant** —
 //! it documents the intent, prevents a future contributor from adding
 //! `#[serde(default)]` to one of these fields without noticing, and
-//! matches the reference form ADR-0011 §Decision 3 called for. The
+//! matches the reference form the policy override design called for. The
 //! module's regression test `safety_critical_paths_field_are_serde_required`
 //! guards the "no `#[serde(default)]`" invariant so a schema evolution
 //! that would silently relax safety-critical to admissible-partial fails
@@ -46,7 +46,7 @@ use std::collections::BTreeMap;
 
 use crate::document::{Policy, PolicyPayload, SensorSection};
 
-/// Dot-paths of sub-objects ADR-0011 declares safety-critical.
+/// Dot-paths of sub-objects the policy override design declares safety-critical.
 ///
 /// **Declarative** — not walked at merge time. See the module doc's
 /// "Safety-critical enforcement" section for why. Its role is to hold
@@ -68,7 +68,7 @@ pub const SAFETY_CRITICAL_PATHS: &[&str] = &["compliance_mode", "sensors.*.redac
 /// **`metadata` uses `overrides`'s identity in full**. This is the
 /// override's raison d'être: it carries its own `policy_version` and
 /// signature, and the agent applies it iff its `policy_version` is
-/// strictly greater than the currently-active one (ADR-0010 §2). Merging
+/// strictly greater than the currently-active one. Merging
 /// metadata field-by-field would let a stale override poison a fresh
 /// baseline's identity, which is not what "per-host override" means.
 #[must_use]
@@ -81,7 +81,7 @@ pub fn apply_overrides(baseline: &Policy, overrides: &Policy) -> Policy {
 
 fn apply_payload(baseline: &PolicyPayload, overrides: &PolicyPayload) -> PolicyPayload {
     PolicyPayload {
-        // sensors is map-typed (ADR-0011 §1): merge per key.
+        // sensors is map-typed: merge per key.
         sensors: apply_sensors(&baseline.sensors, &overrides.sensors),
 
         // Flat sections: whole-section replace if override speaks, else
@@ -117,7 +117,7 @@ fn apply_payload(baseline: &PolicyPayload, overrides: &PolicyPayload) -> PolicyP
 /// touch e.g. `service_installs_enabled` silently reset `redaction` to
 /// `None` just by not mentioning it — `redaction: Option<RedactionPolicy>`
 /// is `#[serde(default)]`, so an override JSON that omits the field
-/// entirely parses fine. That is exactly the #178 regression ADR-0011
+/// entirely parses fine. That is exactly the #178 regression the policy override design
 /// exists to close ("operator overrides `sensors.windows_eventlog` and
 /// forgets `redaction`, silently turning PII scrub off"): the parse-time
 /// safety-critical check only rejects a *present-but-incomplete*
@@ -302,7 +302,7 @@ mod tests {
 
     #[test]
     fn windows_eventlog_override_omitting_redaction_inherits_baseline_redaction() {
-        // The actual #178 regression this ADR exists to close: an operator
+        // The actual #178 regression the override design exists to close: an operator
         // overrides windows_eventlog to change an unrelated toggle and
         // simply doesn't think about redaction. Omitting the field (not
         // sending a partial object — the parse-time check already rejects
@@ -366,7 +366,7 @@ mod tests {
     fn partial_redaction_override_fails_at_parse_not_at_merge() {
         // The safety-critical mechanism lives in serde, not in this
         // module. A `redaction: {}` override — the exact "partial" case
-        // ADR-0011 wants rejected — fails to parse as RedactionPolicy
+        // the policy override design wants rejected — fails to parse as RedactionPolicy
         // because `pii_scrub_enabled` is serde-required. If this test
         // ever succeeds at parsing (e.g. someone adds `#[serde(default)]`
         // to `pii_scrub_enabled`), safety-critical enforcement is
@@ -378,7 +378,7 @@ mod tests {
     #[test]
     fn safety_critical_paths_are_documented() {
         // Regression guard: if this list changes shape, the module doc
-        // that quotes it and ADR-0011 both need to be revisited.
+        // that quotes it and the policy override design both need to be revisited.
         assert_eq!(
             SAFETY_CRITICAL_PATHS,
             &["compliance_mode", "sensors.*.redaction"]

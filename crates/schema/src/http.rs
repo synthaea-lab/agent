@@ -2,7 +2,7 @@
 
 use super::*;
 
-/// Which detection signature an [`HttpRequestEvent`] matched (ADR-0022 §3). A small
+/// Which detection signature an [`HttpRequestEvent`] matched. A small
 /// fixed set: the agent never emits one event per request, only for these.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -18,19 +18,19 @@ pub enum HttpSignature {
 }
 
 /// The one parameter value a signature matched on, the only value of a request that
-/// leaves the host (ADR-0022 §4).
+/// leaves the host.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HttpEvidence {
     /// Name of the matched query parameter.
     pub param: String,
     /// The value, cut to 128 characters by the producer. Credential redaction
-    /// (ADR-0018) is not the producer's job: the agent's sink boundary applies it,
+    /// is not the producer's job: the agent's sink boundary applies it,
     /// so a consumer downstream of that sink sees the redacted form.
     pub value: String,
 }
 
 /// A web request that matched a detection signature, derived from an access-log line
-/// by the agent (issue #478, ADR-0022). Not one event per request: a request that
+/// by the agent (issue #478). Not one event per request: a request that
 /// matches nothing never becomes an event. The URL arrives reduced: the path and the
 /// query parameter *names*, never the values, except [`Self::evidence`].
 ///
@@ -77,7 +77,7 @@ pub struct HttpClientCount {
     pub failures: u32,
 }
 
-/// The access log of one source over one window (issue #478, ADR-0022 §3): counters
+/// The access log of one source over one window (issue #478): counters
 /// and the clients with the most failing requests, the only thing the server sees of
 /// requests that matched no signature. Emitted once per source per window that saw at
 /// least one request: a quiet log is normal and an empty summary says nothing.

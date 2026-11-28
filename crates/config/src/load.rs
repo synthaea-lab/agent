@@ -336,7 +336,7 @@ fn validate_updates(updates: &UpdatesConfig, origin: &str) -> Result<(), ConfigE
 }
 
 /// `logs.sources` — each one is a file the agent tails and a parser fed by
-/// attacker-controlled text (ADR-0022): a bounded, absolute, duplicate-free
+/// attacker-controlled text: a bounded, absolute, duplicate-free
 /// list, so a typo fails at boot instead of silently reading nothing.
 fn validate_logs(logs: &LogsConfig, origin: &str) -> Result<(), ConfigError> {
     if logs.sources.len() > MAX_LOG_SOURCES {
@@ -638,7 +638,7 @@ fn parse_env_u32(env_var: &str, field: &str, raw: &str) -> Result<u32, ConfigErr
 
 fn parse_env_bool(env_var: &str, field: &str, raw: &str) -> Result<bool, ConfigError> {
     // Accept the operator-familiar spellings AND fail-fast on anything
-    // else — the ADR §Decision 1 explicitly rules out TOML's own
+    // else — the configuration design explicitly rules out TOML's own
     // `no`/`off`/`on`, so we don't accept them here either.
     match raw {
         "true" => Ok(true),

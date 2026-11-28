@@ -24,7 +24,7 @@ command_user="synthaea:synthaea"
 pidfile="/run/${RC_SVCNAME}.pid"
 
 # Same set, same reasoning as the systemd unit's CapabilityBoundingSet/
-# AmbientCapabilities (ADR-0014, amended for CAP_AUDIT_READ #780):
+# AmbientCapabilities (amended for CAP_AUDIT_READ #780):
 #   cap_bpf cap_perfmon      load programs, attach tracepoints/kprobes (eBPF sensor)
 #   cap_sys_resource         raise RLIMIT_MEMLOCK for the BPF maps
 #   cap_dac_read_search      read /proc/<pid>/* and files of other users (hashing, cmdline)

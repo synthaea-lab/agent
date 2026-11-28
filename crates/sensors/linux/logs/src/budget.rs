@@ -1,4 +1,4 @@
-//! Emission budget of one access-log source (ADR-0022 §3): a per-source rate cap with a
+//! Emission budget of one access-log source: a per-source rate cap with a
 //! drop counter, so a flood of matching requests cannot fill the shared spool.
 //!
 //! The budget is **per signature**, not per source. A scanner that sends a thousand SQL

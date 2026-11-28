@@ -1,6 +1,6 @@
 //! # sensor-linux-logs
 //!
-//! Parsers for the service logs ADR-0022 puts in scope for issue #478 level 2: web
+//! Parsers for the service logs the log-ingestion design puts in scope for issue #478 level 2: web
 //! **access logs** (Apache `common`/`combined`, nginx `combined`) and the
 //! **MySQL/MariaDB error log** (failed logins). Pure functions from one line of text
 //! to a typed record, with no I/O, no schema types and no policy.
@@ -24,7 +24,7 @@
 //!
 //! **Status:** everything here is pure and tested; nothing writes or sends an event, the
 //! agent does (`apps/agent/src/log_sources.rs`). The credential redaction of an event's
-//! evidence value is not here either: ADR-0018 puts it at the agent's sink boundary
+//! evidence value is not here either: The URL redaction design puts it at the agent's sink boundary
 //! (`log_sources::deliver`), so the evidence leaves this crate cut but raw.
 
 mod access;

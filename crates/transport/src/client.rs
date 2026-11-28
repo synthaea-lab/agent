@@ -136,7 +136,7 @@ impl TransportClient {
     }
 
     /// Fetches an arbitrary JSON resource via GET — used for the content
-    /// manifest fetch (ADR-0016, issue #30/#73). Generic over the response
+    /// manifest fetch (issue #30/#73). Generic over the response
     /// type rather than a concrete `updater::ContentManifest`: `transport` and
     /// `updater` are both LEAF crates and may not depend on each other
     /// (`tools/check-deps.py`), so the binary composing them supplies the
@@ -156,7 +156,7 @@ impl TransportClient {
     }
 
     /// Fetches a raw byte payload via GET — used for content artifact
-    /// download (ADR-0016, issue #30/#73's download/apply slice). `query`
+    /// download (issue #30/#73's download/apply slice). `query`
     /// pairs are percent-encoded by `ureq` before being appended, so a
     /// caller passes a content path's raw string, not a pre-encoded one.
     /// `max_bytes` bounds how much of the body is read *before* any hash

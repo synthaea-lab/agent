@@ -81,7 +81,7 @@ jobs:
 
               # abuild refuses to run as root; a throwaway signing key is
               # enough to let it produce and index a package in this
-              # ephemeral container (not the ADR-0027 agent-update key,
+              # ephemeral container (not the signing-key design agent-update key,
               # which this never touches, and not meant to be trusted
               # beyond this one job). NOPASSWD for everything, not just
               # apk: alpine-toolchain.sh also uses sudo to symlink

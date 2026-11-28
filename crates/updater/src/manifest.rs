@@ -1,4 +1,4 @@
-//! The signed release manifest (ADR-0015 Decision 2): the payload the updater
+//! The signed release manifest: the payload the updater
 //! verifies before staging or promoting a release. Wraps the same `(path,
 //! sha256)` shape `tamper::integrity::Manifest` consumes at runtime, plus the
 //! version counter and signature that make it trustworthy in the first place.
@@ -10,14 +10,14 @@ use serde::{Deserialize, Serialize};
 
 use crate::{error::UpdaterError, key::RELEASE_PUBLIC_KEY, signed::SignedDocument};
 
-/// The only `schema_version` this build accepts (ADR-0015 Decision 2: readers
+/// The only `schema_version` this build accepts (the updater design: readers
 /// reject an unknown value outright rather than parsing leniently).
 pub const MANIFEST_SCHEMA_VERSION: u32 = 1;
 
 /// A signed release manifest.
 ///
 /// Field order is alphabetical and fixed by declaration — canonicalization
-/// (ADR-0015 Decision 2: "canonical JSON serialization ... sorted keys") relies on
+/// (the updater design: "canonical JSON serialization ... sorted keys") relies on
 /// it, so do not reorder these fields without checking [`Self::canonical_bytes`].
 /// `entries`' `BTreeMap` iterates in sorted path order on its own regardless of
 /// field order.
@@ -39,7 +39,7 @@ pub struct ReleaseManifest {
     pub signature: String,
 }
 
-/// The canonical bytes keep `entries` in its `BTreeMap`'s natural sorted key order (ADR-0015
+/// The canonical bytes keep `entries` in its `BTreeMap`'s natural sorted key order (the updater design
 /// decision 2).
 impl SignedDocument for ReleaseManifest {
     fn signature(&self) -> &str {
@@ -66,7 +66,7 @@ impl ReleaseManifest {
 
     /// Signs this manifest in place with `key_pair`, replacing whatever
     /// `signature` currently holds. Production signing happens out of band
-    /// (ADR-0015 Deferred: production key generation and custody) — this is used
+    /// (the updater design: production key generation and custody) — this is used
     /// by the test/dev release tooling and this crate's own tests, always against
     /// [`crate::key::test_key_pair`] today.
     pub fn sign(&mut self, key_pair: &Ed25519KeyPair) {
@@ -75,7 +75,7 @@ impl ReleaseManifest {
 
     /// Signs this manifest in place with `sign`, which receives the canonical bytes
     /// [`Self::verify_signature`] checks and returns the 64-byte Ed25519 signature over them. For
-    /// a key that cannot leave its device (a PKCS#11 token, ADR-0027 decision 2): the caller
+    /// a key that cannot leave its device (a PKCS#11 token): the caller
     /// never holds the private half. `signature` is left empty if `sign` fails.
     ///
     /// # Errors
@@ -146,9 +146,9 @@ impl ReleaseManifest {
         Ok(())
     }
 
-    /// Anti-rollback-attack check (ADR-0015 Decision 2): rejects a manifest whose
+    /// Anti-rollback-attack check: rejects a manifest whose
     /// `release_version` is not strictly greater than `current` — `None` means no
-    /// release is installed yet (day 0, still on `bootstrap`; ADR-0015 Decision 7),
+    /// release is installed yet (day 0, still on `bootstrap`),
     /// which always accepts.
     ///
     /// # Errors

@@ -2,7 +2,7 @@
 //!
 //! Every variant carries enough context for an operator reading the process's
 //! stderr to know **which** field was wrong, **what** was expected, and
-//! **where** the file that produced the error lives — per ADR-0013 §8
+//! **where** the file that produced the error lives — per the configuration design
 //! ("Validation: at-load, fail-fast, precise errors").
 
 use std::path::PathBuf;
@@ -16,7 +16,7 @@ pub enum ConfigError {
     /// Discovery walked every location in `--config` > `SYNTHAEA_CONFIG` >
     /// default OS path order and found nothing. The `searched` list is
     /// exactly what was tried, in order, so the operator can copy-paste one
-    /// of these paths as a `--config` argument. Per ADR-0013 §5, the binary
+    /// of these paths as a `--config` argument. Per the configuration design, the binary
     /// refuses to start rather than fall back on invented defaults.
     #[error(
         "no configuration file found. Searched (in discovery order):\n{}\n\
@@ -132,7 +132,7 @@ pub enum ConfigError {
     },
 
     /// A field declared as a secret is not a supported provider reference
-    /// (`envvar:` or `file:`). Per ADR-0013 §7, the load fails rather than
+    /// (`envvar:` or `file:`). Per the configuration design, the load fails rather than
     /// accepting a literal cleartext secret with a "looks like a literal"
     /// heuristic. The offending value is deliberately absent: it is most
     /// likely the cleartext secret itself, and this message reaches stderr

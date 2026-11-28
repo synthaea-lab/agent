@@ -4,12 +4,12 @@
 //! resource budgets, logging. Loaded and validated once at startup, shared by
 //! the `agent`, `watchdog`, and `cli` binaries. Distinct from `policy`, which
 //! is versioned, signed, and distributed by the control plane at runtime
-//! (ADR-0010 / ADR-0011). This crate is the single source of local truth: no
+//!. This crate is the single source of local truth: no
 //! binary parses its own dialect.
 //!
 //! ## Contract
 //!
-//! Per ADR-0013 ("Agent local configuration"):
+//! Per the configuration design ("Agent local configuration"):
 //!
 //! - **Format**: TOML.
 //! - **Discovery**: `--config <path>` (caller-supplied) > `SYNTHAEA_CONFIG`

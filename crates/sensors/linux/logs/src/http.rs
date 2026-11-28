@@ -1,5 +1,5 @@
 //! Detection signatures over a parsed access-log line, and the event they yield
-//! (ADR-0022 §3, §4).
+//! (§4).
 //!
 //! A request becomes an event only when it matches one of a small fixed set of
 //! signatures. Matching runs on a normalized copy (percent-decoded twice, lower-cased,
@@ -9,7 +9,7 @@
 //! - the query parameter *names*, never their values;
 //! - the one value that matched, cut to [`EVIDENCE_MAX_CHARS`], as evidence.
 //!
-//! **Redaction is not done here.** ADR-0018 puts credential redaction at the agent's
+//! **Redaction is not done here.** The URL redaction design puts credential redaction at the agent's
 //! sink boundary so no producer carries a second path; the evidence value leaves this
 //! crate raw (cut, not redacted) and the agent's `redact::redact_event`, called by
 //! `log_sources::deliver`, is what sees it before anything is stored or sent. Nothing in

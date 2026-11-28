@@ -7,15 +7,15 @@
 //!
 //! ## Two coexisting shapes (v1)
 //!
-//! - **Pre-ADR-0010 pure functions and flat structs** — the masquerade
+//! - **Pre-policy-model pure functions and flat structs** — the masquerade
 //!   helpers ([`is_trusted_system_path`], [`name_exclusion_applies`],
 //!   [`expected_parents`], [`parent_exclusion_applies`]) and the two flat
 //!   policy structs ([`EventLogPolicy`], [`ResponsePolicy`]) shipped before
 //!   there was a shared policy document. They stay: masquerade helpers are
 //!   compile-time truth (not distributed configuration), and the two flat
 //!   structs are the concrete state the agent's binaries consume today, kept
-//!   as-is per ADR-0010 §Consequences as a stepping stone.
-//! - **Post-ADR-0010 signed policy document** — [`Policy`],
+//!   as-is per the policy model as a stepping stone.
+//! - **Post-the policy model signed policy document** — [`Policy`],
 //!   [`PolicyMetadata`], [`PolicyPayload`] and the sections in [`document`],
 //!   with canonical JSON via [`to_canonical_bytes`], signature verification
 //!   via [`verify`], and layered override merge via [`apply_overrides`].
@@ -24,7 +24,7 @@
 //!
 //! Wiring `PolicyPayload.sensors.windows_eventlog` into the sensor's own
 //! `EventLogConfig` (replacing the `EventLogPolicy` glue in
-//! `apps/agent/src/commands/windows.rs`) is a follow-up per ADR-0010
+//! `apps/agent/src/commands/windows.rs`) is a follow-up per the policy model
 //! §Consequences.
 
 pub mod canonical;
@@ -95,7 +95,7 @@ pub fn name_exclusion_applies(image_path: Option<&str>) -> bool {
 /// than [`is_trusted_system_path`], and for a different question. That check asks
 /// "is this a legitimate place for a *named* process to live" (ruling out a
 /// masquerade); this one asks "should a process started here, by init, ever be
-/// exempted from a correlator kill on Bayesian evidence alone" (#652, ADR-0028).
+/// exempted from a correlator kill on Bayesian evidence alone" (#652).
 /// Two gaps a masquerade check doesn't need to care about matter a lot here
 /// (review of #755, Sollykhan 2026-10-19, each reproduced with a probe at the
 /// time):
@@ -107,7 +107,7 @@ pub fn name_exclusion_applies(image_path: Option<&str>) -> bool {
 ///   /var/tmp/x.py`) has that interpreter, not the script, as its own trusted
 ///   image — so without this exclusion, every payload run through a system
 ///   interpreter would be permanently immune to the BAYES kill gate. Same
-///   list `config::load::is_interpreter` rejects for `allow_exe` (ADR-0029);
+///   list `config::load::is_interpreter` rejects for `allow_exe`;
 ///   duplicated rather than shared because `correlator` (a detection crate)
 ///   cannot depend on `config` (a leaf crate — the dependency only runs the
 ///   other way, see `tools/check-deps.py`). Keep the two lists in sync by
@@ -144,7 +144,7 @@ fn file_name(lower: &str) -> &str {
 }
 
 /// A shell or script runner: the image a unit that runs a script has, so never the service
-/// itself. Same list `config::load::is_interpreter` rejects for `allow_exe` (ADR-0029), see
+/// itself. Same list `config::load::is_interpreter` rejects for `allow_exe`, see
 /// [`service_main_path_is_trusted`]. `name` is a lowercased file name.
 fn is_shell_or_interpreter(name: &str) -> bool {
     SHELL_AND_INTERPRETER_NAMES.contains(&name) || is_interpreter_family_member(name)
@@ -358,7 +358,7 @@ pub fn parent_exclusion_applies(comm: &str, parent_comm: Option<&str>) -> bool {
 /// on `schema` (`tools/check-deps.py`), so this type cannot be read by the
 /// sensor directly: the `agent` binary (unrestricted deps) reads it here and
 /// converts it into the sensor's own `EventLogConfig` at construction time
-/// (`apps/agent/src/commands/windows.rs`; ADR-0006).
+/// (`apps/agent/src/commands/windows.rs`).
 ///
 /// The first struct this crate has ever held (previously pure functions
 /// only) — deliberately without a `serde` derive: there is no policy-loading
@@ -409,7 +409,7 @@ pub struct ResponsePolicy {
     pub kill_enabled: bool,
     /// Automated quarantine of a payload a scan confirms malicious.
     pub quarantine_enabled: bool,
-    /// Host isolation, from any trigger (ADR-0037). Gates applying an isolation only:
+    /// Host isolation, from any trigger. Gates applying an isolation only:
     /// lifting one is never refused.
     pub isolate_enabled: bool,
 }

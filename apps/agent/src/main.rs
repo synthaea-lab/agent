@@ -57,7 +57,7 @@ fn cmd_apply_release(
     _restart: bool,
     _allow_test_key: bool,
 ) -> anyhow::Result<()> {
-    anyhow::bail!("binary self-update is Linux-only (ADR-0015 Deferred)")
+    anyhow::bail!("binary self-update is Linux-only")
 }
 
 #[derive(Parser)]
@@ -167,7 +167,7 @@ enum Command {
         #[arg(long, default_value = "events.jsonl")]
         output: std::path::PathBuf,
     },
-    /// Fetches and verifies the content manifest for a ring (ADR-0016, issue
+    /// Fetches and verifies the content manifest for a ring (issue
     /// #30/#73): reports which rules/models/policy entries have changed since
     /// this agent's last applied release. Does not download artifacts or apply
     /// anything — a first, real, testable slice of content distribution, not
@@ -198,7 +198,7 @@ enum Command {
         state: std::path::PathBuf,
     },
     /// Fetches, verifies, downloads, and applies the content manifest for a
-    /// ring (ADR-0016, issue #30/#73): everything `check-content-manifest`
+    /// ring (issue #30/#73): everything `check-content-manifest`
     /// does, plus actually downloading each missing/stale entry from
     /// `/api/content/artifact`, verifying its SHA-256, and writing it under
     /// `--content-dir`. Does not reload anything into a running
@@ -244,7 +244,7 @@ enum Command {
         #[arg(long)]
         state: Option<std::path::PathBuf>,
         /// Acknowledge that this build verifies content against the public test key,
-        /// so anyone who can serve the content routes can weaken detection (ADR-0027).
+        /// so anyone who can serve the content routes can weaken detection.
         /// Exists only in a `test-key` build, for lab and development use.
         #[cfg(feature = "test-key")]
         #[arg(long)]
@@ -252,7 +252,7 @@ enum Command {
     },
     /// Fetches the signed binary release the server offers, verifies it, stages it
     /// under `<state_dir>/versions/vN`, repoints `current` at it, and restarts the
-    /// service onto it (ADR-0015, issue #30). The new release starts on
+    /// service onto it (issue #30). The new release starts on
     /// probation: the watchdog rolls it back and bans it if the agent never shows
     /// progress. Linux only.
     ApplyRelease {
@@ -276,7 +276,7 @@ enum Command {
         no_restart: bool,
         /// Acknowledge that this build verifies releases against the public test
         /// key, so anyone who can serve the release routes can get code run as
-        /// root (ADR-0015 Deferred). Exists only in a `test-key` build; for lab and
+        /// root. Exists only in a `test-key` build; for lab and
         /// development use only.
         #[cfg(feature = "test-key")]
         #[arg(long)]
@@ -285,7 +285,7 @@ enum Command {
     /// Fetches the key rotation the control plane offers (or reads one with `--file`), verifies
     /// it against the embedded `recovery` key and the keys this install trusts now, and records
     /// it under `storage.state_dir`: from then on `apply-release`, `apply-content-manifest` and
-    /// the integrity check verify against the rotated keys (ADR-0027). Nothing is recorded unless
+    /// the integrity check verify against the rotated keys. Nothing is recorded unless
     /// every check passes.
     ApplyKeyRotation {
         /// A rotation manifest file, instead of asking the control plane (offline and lab
@@ -308,7 +308,7 @@ enum Command {
         ca_cert: Option<std::path::PathBuf>,
         /// Acknowledge that this build verifies rotations against the public test `recovery`
         /// key, so anyone who can serve the rotation route could replace the keys releases are
-        /// verified against (ADR-0027). Exists only in a `test-key` build, for lab and
+        /// verified against. Exists only in a `test-key` build, for lab and
         /// development use.
         #[cfg(feature = "test-key")]
         #[arg(long)]
@@ -378,7 +378,7 @@ fn try_main() -> anyhow::Result<std::process::ExitCode> {
 
     // Load the local install configuration BEFORE anything else — logging
     // level, spool paths, and (soon) transport URLs all come from here, and
-    // per ADR-0013 §5 the agent fails fast if the file is missing or
+    // per the configuration design the agent fails fast if the file is missing or
     // invalid rather than fall back on invented defaults. `config::load`
     // returns a `ConfigError` whose Display already lists the paths it
     // tried, so `anyhow` propagates a copy-pasteable error message.

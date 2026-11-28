@@ -19,7 +19,7 @@ serde_json = { workspace = true }
 sinks = { path = "../../crates/sinks" }
 # The progress heartbeat file: the agent writes it, the watchdog reads it, one definition.
 tamper = { path = "../../crates/tamper" }
-# Post-promotion health gate (ADR-0015 Decision 6, issue #30): the watchdog rolls a
+# Post-promotion health gate (issue #30): the watchdog rolls a
 # release that never proves itself back, via the updater's layout + ban list.
 updater = { path = "../../crates/updater", default-features = false }
 
@@ -68,7 +68,7 @@ assets = [
     ["../../packaging/linux/systemd/synthaea.sysusers", "usr/lib/sysusers.d/synthaea.conf", "644"],
     ["../../packaging/linux/systemd/synthaea.tmpfiles", "usr/lib/tmpfiles.d/synthaea.conf", "644"],
 
-    # Config (ADR-0013): the agent fails fast without a valid agent.toml, so the
+    # Config: the agent fails fast without a valid agent.toml, so the
     # package ships the same template `cli config init` writes, not a placeholder
     # (#675). Every control-plane field is a `# CHANGE ME` the operator must fill
     # in, but `offline_fallback = true` lets the agent start and run on it as-is.

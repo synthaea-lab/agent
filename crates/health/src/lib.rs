@@ -30,7 +30,7 @@ pub trait DroppedCounter: Send + Sync {
     fn dropped(&self) -> u64;
 }
 
-/// Cumulative counts of the rarity evidence (ADR-0020, issue #76): what the fleet's common set
+/// Cumulative counts of the rarity evidence (issue #76): what the fleet's common set
 /// let the correlator learn about executed images, and what it could not.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct RarityCounts {
@@ -443,7 +443,7 @@ mod tests {
                 beacon.rarity_unapplied
             ),
             (7, 11, 2),
-            "the rarity evidence counters ride the beacon (ADR-0020, #76)"
+            "the rarity evidence counters ride the beacon (#76)"
         );
         assert_eq!(
             (

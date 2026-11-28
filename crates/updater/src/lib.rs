@@ -5,13 +5,13 @@
 //! rings. Must keep working when everything else is degraded — an agent that cannot
 //! update is an agent an attacker gets to keep.
 //!
-//! This first slice implements ADR-0015's Linux-first scope: binary self-update —
+//! This first slice implements the updater design's Linux-first scope: binary self-update —
 //! manifest signing/verification ([`manifest`]), the `bootstrap`/`current`/`versions`
 //! layout and its atomic symlink swap (`layout`, Linux-only), and the local ban
 //! list ([`banlist`]) that `rollback` (Linux-only) reads and writes. Windows/macOS
-//! binary self-update is out of scope — see the ADR's Deferred section.
+//! binary self-update is out of scope: neither has a layout yet.
 //!
-//! Content distribution (rules/models via canary rings, ADR-0016, issues #73/#49)
+//! Content distribution (rules/models via canary rings, issues #73/#49)
 //! adds [`content`]: verification of a signed [`ContentManifest`] against the
 //! same embedded key, and per-entry hash comparison against what's already
 //! applied. Fetching the manifest over the network, downloading artifacts, and
@@ -61,7 +61,7 @@ pub fn installed_release_version(state_dir: &std::path::Path) -> Option<u64> {
     }
 }
 
-/// Rolls back from a release that failed its health check (ADR-0015 Decision 6):
+/// Rolls back from a release that failed its health check:
 /// repoints `current` at `previous` (or `bootstrap` if `previous` is `None` — the
 /// very first release after `bootstrap` failed), then bans `failed` so it is
 /// refused even if offered again.
@@ -121,7 +121,7 @@ mod integration_tests {
 
     /// End-to-end happy path: sign a manifest, stage a release, verify it,
     /// promote it, then roll it back and confirm the failed version is banned
-    /// and refused on a second offer — the full ADR-0015 Decision 2/5/6 chain in
+    /// and refused on a second offer — the full the updater design/5/6 chain in
     /// one test, not just its parts in isolation.
     #[test]
     fn sign_stage_verify_promote_then_rollback_and_ban() {

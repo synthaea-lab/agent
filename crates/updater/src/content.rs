@@ -1,4 +1,4 @@
-//! The signed content manifest (ADR-0016): detection rules, ML models, and
+//! The signed content manifest: detection rules, ML models, and
 //! policy distributed via canary rings, independent of a binary release. Same
 //! Ed25519 signing/verification discipline as [`crate::manifest::ReleaseManifest`]
 //! — a distinct type, not a variant of it, because the two manifests carry
@@ -22,7 +22,7 @@ use crate::{error::UpdaterError, key::CONTENT_PUBLIC_KEY, signed::SignedDocument
 /// two manifest kinds version independently.
 pub const CONTENT_MANIFEST_SCHEMA_VERSION: u32 = 1;
 
-/// One artifact in a content manifest (ADR-0016 §1).
+/// One artifact in a content manifest.
 ///
 /// Field order is alphabetical and fixed by declaration, same reasoning as
 /// [`ContentManifest`] — canonicalization depends on it.
@@ -41,7 +41,7 @@ pub struct ContentEntry {
     pub sha256: String,
     /// Size in bytes — lets a caller budget a download before fetching it.
     pub size: u64,
-    /// `rule` | `model` | `policy` | `ioc` (ADR-0016 §1, ADR-0038). Kept as a plain string, not a
+    /// `rule` | `model` | `policy` | `ioc`. Kept as a plain string, not a
     /// Rust enum: this crate only ever forwards the value to a caller that
     /// decides what to do with each type, and a string can't fail to
     /// deserialize just because the server added a fourth type this build
@@ -136,7 +136,7 @@ impl ContentEntry {
     }
 }
 
-/// A signed content manifest for one ring (ADR-0016 §1).
+/// A signed content manifest for one ring.
 ///
 /// Field order is alphabetical and fixed by declaration — canonicalization
 /// relies on it, exactly like [`crate::manifest::ReleaseManifest`].
@@ -175,7 +175,7 @@ impl SignedDocument for ContentManifest {
 impl ContentManifest {
     /// Signs this manifest in place with `key_pair`, replacing whatever
     /// `signature` holds, over the same canonical bytes [`Self::verify_signature`]
-    /// checks. Production signing is offline (ADR-0015); `release-tool sign` is the
+    /// checks. Production signing is offline; `release-tool sign` is the
     /// operator-facing way to call this.
     pub fn sign(&mut self, key_pair: &ring::signature::Ed25519KeyPair) {
         self.sign_with_key_pair(key_pair);
@@ -183,7 +183,7 @@ impl ContentManifest {
 
     /// Signs this manifest in place with `sign`, which receives the canonical bytes
     /// [`Self::verify_signature`] checks and returns the 64-byte Ed25519 signature over them. For
-    /// a key that cannot leave its device (a PKCS#11 token, ADR-0027 decision 2): the caller
+    /// a key that cannot leave its device (a PKCS#11 token): the caller
     /// never holds the private half. `signature` is left empty if `sign` fails.
     ///
     /// # Errors

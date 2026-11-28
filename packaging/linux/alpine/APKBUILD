@@ -142,7 +142,7 @@ build() {
 		cargo build --locked --release --target "$target" \
 		--no-default-features -p agent -p watchdog -p cli
 
-	# The shipped artifacts: no public test signing key (ADR-0027).
+	# The shipped artifacts: no public test signing key.
 	"$builddir/tools/assert-no-test-key.sh" \
 		"$target_dir/$target/release/agent" \
 		"$target_dir/$target/release/watchdog" \

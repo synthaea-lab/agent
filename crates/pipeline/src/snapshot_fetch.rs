@@ -1,4 +1,4 @@
-//! Keeps the fleet common-set snapshot fresh (ADR-0033 decision 4, issue #76 box 2): a loop
+//! Keeps the fleet common-set snapshot fresh (issue #76 box 2): a loop
 //! inside `agent run` that polls the control plane for the signed snapshot manifest at a
 //! jittered interval, downloads the artifact only when `built_at` moved, verifies it, writes
 //! `snapshots/common-set.bin` atomically and asks the sink to reload just that file.
@@ -29,7 +29,7 @@ use updater::{
 
 use crate::sink::{DetectionSink, MAX_COMMON_SET_BYTES};
 
-/// How often the manifest is polled. A starting point for a daily snapshot (ADR-0033), calibrated
+/// How often the manifest is polled. A starting point for a daily snapshot, calibrated
 /// in slice 6. `SYNTHAEA_SNAPSHOT_POLL_SECS` overrides it for a lab run; it is not a security
 /// setting (the signature, freshness and size checks do not depend on it).
 const POLL_INTERVAL: Duration = Duration::from_secs(6 * 60 * 60);
@@ -212,7 +212,7 @@ pub fn spawn_if_enabled(
 ) {
     if updater::key::SNAPSHOT_PUBLIC_KEY.is_none() {
         tracing::info!(
-            "snapshot fetch: off, this build embeds no snapshot key (ADR-0033; key custody: https://github.com/synthaea-lab/agent/issues/43)"
+            "snapshot fetch: off, this build embeds no snapshot key (key custody: https://github.com/synthaea-lab/agent/issues/43)"
         );
         return;
     }

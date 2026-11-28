@@ -1,6 +1,5 @@
-//! The on-disk layout: `bootstrap`/`current`/`versions` (ADR-0015 Decision 5,
-//! extending `packaging/linux/README.md`'s existing convention). Linux-only — see
-//! `CLAUDE.md`'s platform-code exception for `updater` and ADR-0015's Deferred
+//! The on-disk layout: `bootstrap`/`current`/`versions` (extending `packaging/linux/README.md`'s existing convention). Linux-only — see
+//! `CLAUDE.md`'s platform-code exception for `updater` and the updater design's
 //! section (Windows/macOS self-update need their own design).
 
 use std::{
@@ -32,7 +31,7 @@ const BOOTSTRAP_DIR: &str = "bootstrap";
 /// directory.
 const VERSIONS_DIR: &str = "versions";
 /// Name of the marker file a release writes into its own directory once it has
-/// passed its post-promotion health check (ADR-0015 Decision 6).
+/// passed its post-promotion health check.
 const HEALTHY_MARKER: &str = ".healthy";
 
 /// The `bootstrap`/`current`/`versions` layout rooted at one base directory
@@ -78,7 +77,7 @@ impl Layout {
 
     /// Resolves `current`'s target, falling back to [`Self::bootstrap_dir`] if the
     /// symlink is missing, unreadable, or resolves outside the expected
-    /// `bootstrap`/`versions` set (ADR-0015 Decision 9). Never fails — this is the
+    /// `bootstrap`/`versions` set. Never fails — this is the
     /// fallback path a crashed or tampered install still has to start from.
     #[must_use]
     pub fn resolve_active_dir(&self) -> PathBuf {
@@ -98,7 +97,7 @@ impl Layout {
     }
 
     /// The `release_version` `current` points at, or `None` if it points at
-    /// `bootstrap` (day 0, ADR-0015 Decision 7) or the link was corrupt and fell
+    /// `bootstrap` (day 0) or the link was corrupt and fell
     /// back to `bootstrap` (see [`Self::resolve_active_dir`]).
     #[must_use]
     pub fn current_release_version(&self) -> Option<u64> {
@@ -197,7 +196,7 @@ impl Layout {
     }
 
     /// Atomically repoints `current` at `version_dir(release_version)`
-    /// (ADR-0015 Decision 5).
+    ///.
     ///
     /// # Errors
     ///
@@ -206,7 +205,7 @@ impl Layout {
         self.swap_current_to(&self.version_dir(release_version))
     }
 
-    /// Repoints `current` back at `bootstrap` (ADR-0015 Decision 9's fallback,
+    /// Repoints `current` back at `bootstrap` (the updater design's fallback,
     /// used deliberately here rather than only automatically — e.g. when every
     /// known version directory is gone).
     ///
@@ -219,7 +218,7 @@ impl Layout {
 
     /// Builds the new symlink at a temp path beside `current`, then `rename(2)`s
     /// it over the real one — a crash mid-swap leaves either the old or the new
-    /// target, never a half-written one (ADR-0015 Decision 5).
+    /// target, never a half-written one.
     fn swap_current_to(&self, target: &Path) -> Result<(), UpdaterError> {
         let tmp = self.base_dir.join(format!(".{CURRENT_LINK}.tmp"));
         // A leftover from a crash mid-swap, before the rename below ever ran —
@@ -278,7 +277,7 @@ impl Layout {
             .find(|&v| v < release_version && !banned.is_banned(v) && self.is_healthy(v))
     }
 
-    /// Records that `release_version` passed its health check (ADR-0015
+    /// Records that `release_version` passed its health check (the updater design
     /// Decision 6), so a later start of the same release is not put on probation
     /// again. Written through a same-directory temp file and `rename` like every
     /// other file this crate persists.
@@ -382,7 +381,7 @@ impl Layout {
         fchown(&versions, Some(uid), Some(gid)).map_err(|e| errno_at(&versions_path, e))
     }
 
-    /// Deletes a superseded release's directory entirely (ADR-0015 Decision 8:
+    /// Deletes a superseded release's directory entirely (the updater design:
     /// called once the *new* release has passed its health check, keeping exactly
     /// two release trees on disk at steady state). Never call this on the release
     /// `current` still points at. Idempotent — an already-gone directory is not

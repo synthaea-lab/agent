@@ -1,7 +1,7 @@
 # Synthaea — project conventions
 
 Multi-platform EDR/XDR (Windows/Linux/macOS) with on-device ML. Rust agent workspace +
-Python training pipeline (`ml/`) + control plane (`server/`: Next.js + PostgreSQL, ADR-0001).
+Python training pipeline (`ml/`) + control plane (`server/`: Next.js + PostgreSQL).
 Everything — code, comments, docs, commits — is in **English**.
 
 The previous iteration lived in a local `old/` clone during migration (now deleted).
@@ -65,17 +65,17 @@ New crate? Add it to the rules in `tools/check-deps.py` in the same change.
 - Platform-specific code (`#[cfg(target_os = ...)]`, platform-only deps) is allowed
   **only inside `crates/sensors/*`, `crates/updater`, and the narrow filesystem
   permission and descriptor helpers in `crates/response/src/quarantine/`**. Sensors and updater compile to empty
-  stubs elsewhere. `updater`'s exception is scoped narrowly: ADR-0015 is a
+  stubs elsewhere. `updater`'s exception is scoped narrowly: the updater is a
   Linux-first slice (the `bootstrap`/`current`/`versions` layout and its atomic
-  symlink swap are POSIX-shaped by nature); ADR-0039 (proposed) is the
+  symlink swap are POSIX-shaped by nature); the Windows self-update design (not built) is the
   Windows slice this led to (its own layout, marker swap and DACL — not shared
   with Linux's trait or module; the SCM orchestration stays in the `watchdog`
-  binary); its code lands once the ADR is
+  binary); its code lands once that design is
   accepted, not before. macOS self-update still needs its own design
-  before it gets a stub worth writing (ADR-0015 Deferred) — this
+  before it gets a stub worth writing — this
   is not a general invitation for leaf crates to grow platform branches. The
   quarantine exception is limited to mode/ACL enforcement and to opening and moving the
-  source by descriptor at the privileged response boundary; see ADR-0021.
+  source by descriptor at the privileged response boundary; the quarantine directory must stay owner-only on every OS.
   Platform deps must be target-gated: `[target.'cfg(windows)'.dependencies]`, never
   unconditional.
 - `tools/check-platform-cfg.py` enforces this in CI (`lint` job). It counts source lines with a
@@ -117,12 +117,12 @@ New crate? Add it to the rules in `tools/check-deps.py` in the same change.
 - Logging: `tracing`, structured fields; never log event payload contents at info level.
 - Visibility: `pub(crate)` by default; a crate's `pub` surface is its contract — keep it
   minimal and deliberate.
-- Config: TOML `agent.toml` per ADR-0013 — the agent **fails fast** on a missing or
+- Config: TOML `agent.toml` — the agent **fails fast** on a missing or
   invalid file (`config::load`, discovery order in `crates/config`); `RUST_LOG` still
   overrides the configured log level for ad-hoc debugging.
-- Cross-cutting decisions get an ADR at the time they're made. ADRs are not in this
-  repo: a code comment may cite `ADR-00xx`, but must state the reason itself — never
-  "see ADR-00xx for why", never a path or link to one.
+- A decision is recorded, with its reasons, in the docs page of the area it concerns. A code
+  comment states the reason itself; it never points at a document a reader of this
+  repository cannot open.
 
 ## Code quality
 

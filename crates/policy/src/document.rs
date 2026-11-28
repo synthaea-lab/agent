@@ -4,7 +4,7 @@
 //! (future) control plane exchange. A change here is a schema-visible change;
 //! a rename is a breaking change that requires a [`SCHEMA_VERSION`] bump.
 //!
-//! ## Structure (per ADR-0010)
+//! ## Structure
 //!
 //! ```text
 //! Policy
@@ -21,13 +21,13 @@
 //! the payload, and the payload can grow without touching the metadata's
 //! fixed shape.
 //!
-//! ## What v1 ships vs. what ADR-0010 lists
+//! ## What v1 ships vs. what the policy model lists
 //!
-//! ADR-0010 §Payload sections declares six top-level sections
+//! The policy model declares six top-level sections
 //! (`sensors`, `rules`, `models`, `response`, `thresholds`, `compliance_mode`)
 //! plus a reserved `experimental` namespace. v1 ships **four** of them, in
 //! the minimum-viable subset that lets an implementation of `Policy = baseline
-//! ⊕ overrides` exercise every merge granularity ADR-0011 declares:
+//! ⊕ overrides` exercise every merge granularity the policy override design declares:
 //! `sensors` (map-typed), `response` (flat), `compliance_mode` (flat +
 //! safety-critical), and `experimental` (open-ended). `rules`, `models`, and
 //! `thresholds` are placeholders (empty types in this file, one line each) —
@@ -74,12 +74,12 @@ pub struct PolicyMetadata {
     /// Monotone identifier assigned by the issuer on each publish. The
     /// agent applies a policy iff its `policy_version` is strictly greater
     /// than the currently active one — prevents rollback attacks and
-    /// duplicate-apply (ADR-0010 §2).
+    /// duplicate-apply.
     pub policy_version: u64,
     /// When the issuer produced this document. Nanoseconds since the Unix
     /// epoch (UTC), matching `schema::EventMeta`'s timestamp unit across
     /// the workspace. Not used for freshness enforcement in v1 (that
-    /// belongs to the distribution mechanism ADR-0010 defers) but recorded
+    /// belongs to the distribution mechanism the policy model defers) but recorded
     /// so audit trails and post-mortems have a definitive "issued at"
     /// value.
     pub issued_at_ns: u64,
@@ -88,58 +88,58 @@ pub struct PolicyMetadata {
     /// characters. During canonicalization for signing, this field is set
     /// to `""` (the empty string, not omitted or null) so the schema shape
     /// stays fixed regardless of whether the document is signed or being
-    /// signed — same convention ADR-0015 fixes for updater manifests.
+    /// signed — same convention the updater design fixes for updater manifests.
     pub signature: String,
 }
 
 /// The actionable content of a policy: sections growing additively as new
 /// sensors, rules, and response tiers land.
 ///
-/// Every section is optional so an override document (per ADR-0010 §5) can
+/// Every section is optional so an override document can
 /// carry only the sections it changes. A baseline document typically
 /// carries every section; a per-host override typically carries one or
 /// two.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PolicyPayload {
-    /// Per-sensor toggles and knobs. Map-typed section per ADR-0011 §1:
+    /// Per-sensor toggles and knobs. Map-typed section per the policy override design:
     /// each key of this struct is treated as a map key at merge time (an
     /// override that touches `windows_eventlog` leaves `linux_uprobes`
     /// alone). Serialized as `{"windows_eventlog": {...}, ...}` at the JSON
-    /// level, matching the "map<string, sub-document>" shape ADR-0011
+    /// level, matching the "map<string, sub-document>" shape the policy override design
     /// describes.
     #[serde(default, skip_serializing_if = "SensorSection::is_empty")]
     pub sensors: SensorSection,
 
     /// Which response actions are permitted at each verdict tier (kill,
-    /// quarantine, isolate, `live_session`). Flat section per ADR-0011 §1:
+    /// quarantine, isolate, `live_session`). Flat section per the policy override design:
     /// present in override → replaces baseline as a whole. `deny`-by-default
-    /// for every action until explicitly enabled (ADR-0010 §Payload
+    /// for every action until explicitly enabled (the policy model
     /// sections).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub response: Option<ResponseSection>,
 
     /// Gates built-in redaction and retention rules. Flat section AND
-    /// safety-critical per ADR-0011: partial override is refused at parse
+    /// safety-critical per the policy override design: partial override is refused at parse
     /// time. Marker enum today; expands to `PciDss`, `Hipaa`, etc. as those
     /// modes gain real behaviour.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub compliance_mode: Option<ComplianceMode>,
 
-    /// Placeholder for ADR-0010's `rules` section — allowlist/denylist of
+    /// Placeholder for the policy model's `rules` section — allowlist/denylist of
     /// rule identifiers, per-rule overrides. No consumer yet; landing this
     /// today would ship a shape whose real consumer would change. Serialized
     /// only when non-empty.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rules: Option<RulesSection>,
 
-    /// Placeholder for ADR-0010's `models` section — ONNX model
+    /// Placeholder for the policy model's `models` section — ONNX model
     /// registry+version authorisation. Empty in v1; real fields land with a
     /// consumer.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub models: Option<ModelsSection>,
 
-    /// Placeholder for ADR-0010's `thresholds` section — global scoring
+    /// Placeholder for the policy model's `thresholds` section — global scoring
     /// cut-offs. Empty in v1; bounded ranges added as consumers land.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub thresholds: Option<ThresholdsSection>,
@@ -158,16 +158,16 @@ pub struct PolicyPayload {
 /// Per-sensor policy sub-documents. Struct-with-Option-fields rather than
 /// `BTreeMap<String, dyn SensorPolicy>` because each sensor's schema is a
 /// distinct type; the JSON shape is still a map (thanks to
-/// `skip_serializing_if = "Option::is_none"`) so the ADR-0011 §1 map-typed
+/// `skip_serializing_if = "Option::is_none"`) so the policy override design map-typed
 /// merge rule applies naturally.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "snake_case")]
 pub struct SensorSection {
     /// The four channel-group toggles of the Windows Event Log poll target
     /// (`sensor-windows-eventlog`), plus an optional safety-critical
-    /// [`RedactionPolicy`]. Absorbs the pre-ADR-0010 in-code
+    /// [`RedactionPolicy`]. Absorbs the pre-policy-model in-code
     /// [`crate::EventLogPolicy`] flat struct — the two coexist during v1 as
-    /// ADR-0010's Consequences explicitly instruct.
+    /// the policy model's Consequences explicitly instruct.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub windows_eventlog: Option<WindowsEventlogSensorPolicy>,
     // Future entries — `linux_ebpf`, `linux_uprobes`, `macos_endpointsecurity`,
@@ -187,7 +187,7 @@ impl SensorSection {
 
 /// `sensors.windows_eventlog` sub-document — supersedes today's
 /// [`crate::EventLogPolicy`] as the canonical shape of this sensor's policy
-/// slice, without deleting the older type (ADR-0010 §Consequences: "give
+/// slice, without deleting the older type (the policy model: "give
 /// callers a stepping stone").
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -200,7 +200,7 @@ pub struct WindowsEventlogSensorPolicy {
     pub account_creations_enabled: bool,
     /// Events 4624/4625/4648/4672 poll target (logon/session, #94).
     pub logon_events_enabled: bool,
-    /// Sensor-side redaction policy. Safety-critical per ADR-0011: an
+    /// Sensor-side redaction policy. Safety-critical per the policy override design: an
     /// override that carries this field must supply every documented
     /// [`RedactionPolicy`] field, or the whole override is rejected at
     /// parse time. Absent in v1 for a fresh install (baseline has redaction
@@ -228,20 +228,20 @@ pub struct RedactionPolicy {
 // ── response section ─────────────────────────────────────────────────────
 
 /// `response` section — which automated actions the agent may take at each
-/// verdict tier. Flat section (not map-typed), per ADR-0011 §1. Every action
+/// verdict tier. Flat section (not map-typed), per the policy override design. Every action
 /// defaults to `deny` (`false`) until explicitly enabled — the "policy off =
 /// observe-only" contract from issue #25.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ResponseSection {
     /// Automated process termination on a high-confidence correlated
-    /// verdict. Mirrors the pre-ADR-0010 [`crate::ResponsePolicy`] flat
+    /// verdict. Mirrors the pre-policy-model [`crate::ResponsePolicy`] flat
     /// struct.
     pub kill_enabled: bool,
     /// Automated quarantine of a payload a scan confirms malicious. Mirrors
-    /// the pre-ADR-0010 [`crate::ResponsePolicy`] flat struct.
+    /// the pre-policy-model [`crate::ResponsePolicy`] flat struct.
     pub quarantine_enabled: bool,
-    /// Host isolation (ADR-0037). Absent means `false`, and `false` is not serialized,
+    /// Host isolation. Absent means `false`, and `false` is not serialized,
     /// so the canonical bytes of a document written before this field are unchanged.
     #[serde(default, skip_serializing_if = "is_false")]
     pub isolate_enabled: bool,
@@ -257,7 +257,7 @@ fn is_false(value: &bool) -> bool {
 /// `compliance_mode` — gates built-in redaction and retention rules
 /// according to a named regulatory profile.
 ///
-/// Safety-critical per ADR-0011 §2: an override that carries this section
+/// Safety-critical per the policy override design: an override that carries this section
 /// must carry the entire enum value; a partial override never made sense
 /// here (a section is either present or absent, and a variant is what it is).
 /// Enumeration extends additively as profiles land — adding `Gdpr` is a
@@ -277,25 +277,25 @@ pub enum ComplianceMode {
 
 // ── placeholder sections ─────────────────────────────────────────────────
 //
-// These three exist so `PolicyPayload` matches ADR-0010's declared shape at
+// These three exist so `PolicyPayload` matches the policy model's declared shape at
 // the type level. They are deliberately empty in v1 — landing real fields
 // today would ship a schema without a consumer, and the first real consumer
 // would inevitably ask for a different shape. Empty structs serialize as
 // `{}` and deserialize round-trip clean.
 
-/// Placeholder for ADR-0010's `rules` section — allowlist/denylist +
+/// Placeholder for the policy model's `rules` section — allowlist/denylist +
 /// per-rule overrides. Real fields land with a consumer.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RulesSection {}
 
-/// Placeholder for ADR-0010's `models` section — ONNX model authorisation.
+/// Placeholder for the policy model's `models` section — ONNX model authorisation.
 /// Real fields land with a consumer.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ModelsSection {}
 
-/// Placeholder for ADR-0010's `thresholds` section — global scoring
+/// Placeholder for the policy model's `thresholds` section — global scoring
 /// cut-offs. Real fields land with a consumer.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]

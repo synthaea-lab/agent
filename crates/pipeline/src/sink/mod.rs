@@ -56,13 +56,13 @@ pub struct DetectionSink {
     /// freshly loaded engine while the agent keeps running, the same reason
     /// every other mutable field on this struct is a `Mutex`.
     sigma: Mutex<Option<sigma::SigmaEngine>>,
-    /// The fleet's common-set snapshot (ADR-0020, issue #76) from
+    /// The fleet's common-set snapshot (issue #76) from
     /// `<content_root>/snapshots/common-set.bin`, or `None` while there is none: the
     /// "not in the common set" evidence is withheld without one. Swapped whole on
     /// `reload_content`, like the engines above, so a reader never sees a half-loaded
     /// filter; nothing reads it on the capture path yet (the lookup is the next slice).
     common_set: Arc<Mutex<Option<Arc<ml::features::common_set::CommonSetSnapshot>>>>,
-    /// On-device IOC matching (#60, ADR-0038) over `<content_root>/ioc/`: exec image hashes on the
+    /// On-device IOC matching (#60) over `<content_root>/ioc/`: exec image hashes on the
     /// enrichment worker, connect destinations on the capture thread. Shared with the worker,
     /// which is the only place an exec's hash is known.
     ioc: Arc<intel::matcher::IocMatcher>,
@@ -81,7 +81,7 @@ pub struct DetectionSink {
     /// `<content_root>/rules/yara` is absent. `Mutex`-wrapped for the same
     /// reload reason as `sigma`.
     yara: Mutex<Option<(::yara::ScanQueue, usize)>>,
-    /// Budgeted YARA scanning of one process's memory (#85, ADR-0023), requested by a
+    /// Budgeted YARA scanning of one process's memory (#85), requested by a
     /// detection about that process (today the memfd-exec rule, T1620), never swept.
     /// `None` when `<content_root>/rules/yara` is absent, and until the caller provides a
     /// memory source (only the Linux wiring has one). `Mutex`-wrapped for the same reload
@@ -255,7 +255,7 @@ impl DetectionSink {
             VERDICT_DEDUP_WINDOW_NS,
         )));
         // Shared with the enrichment worker, which learns an exec's hash after it was correlated
-        // and feeds the rarity evidence back (ADR-0020, #76).
+        // and feeds the rarity evidence back (#76).
         let correlator = Arc::new(Mutex::new(correlator::CorrelationEngine::new()));
         let common_set = Arc::new(Mutex::new(
             load_common_set(&content_root).into_option().map(Arc::new),
@@ -963,7 +963,7 @@ impl DetectionSink {
         drop(old);
     }
 
-    /// Re-reads only the snapshot file, after the fetch loop wrote a new one (ADR-0033): the
+    /// Re-reads only the snapshot file, after the fetch loop wrote a new one: the
     /// rule directories and models are untouched, so a daily snapshot does not rebuild the
     /// detection engines.
     pub fn reload_common_set(&self) {
@@ -977,7 +977,7 @@ impl DetectionSink {
         self.common_set.lock_recovering().clone()
     }
 
-    /// The rarity evidence counters, for the health beacon (ADR-0020, #76).
+    /// The rarity evidence counters, for the health beacon (#76).
     pub fn rarity_stats(&self) -> Arc<RarityStats> {
         Arc::clone(&self.rarity_stats)
     }
@@ -1073,8 +1073,8 @@ fn load_sigma_rules(content_root: &Path) -> Load<sigma::SigmaEngine> {
 }
 
 /// How many hosts a snapshot must cover before "not in the common set" counts as evidence
-/// (ADR-0020): on a fleet that has just enrolled the snapshot is empty or thin, and every
-/// binary would look rare. **Provisional**: ADR-0020 leaves it to calibration on lab data
+///: on a fleet that has just enrolled the snapshot is empty or thin, and every
+/// binary would look rare. **Provisional**: The fleet-prevalence design leaves it to calibration on lab data
 /// (slice 6 of `docs/detection/fleet-prevalence-snapshot-plan.md`).
 const RARITY_MIN_HOSTS_COVERED: u64 = 10;
 
@@ -1088,7 +1088,7 @@ fn unix_now_secs() -> u64 {
         .map_or(0, |d| d.as_secs())
 }
 
-/// What became of the rarity judgements since start, for the health beacon (ADR-0020, #76).
+/// What became of the rarity judgements since start, for the health beacon (#76).
 /// Plain atomics: bumped on the enrichment worker, read by the beacon thread.
 #[derive(Default)]
 pub struct RarityStats {
@@ -1153,7 +1153,7 @@ fn note_image_rarity(
     now_secs: u64,
 ) {
     // A snapshot past its maximum age counts as absent: the evidence is withheld, so a server
-    // that stopped publishing cannot keep a stale set in force (ADR-0033 decision 3).
+    // that stopped publishing cannot keep a stale set in force.
     let snapshot = common_set.lock_recovering().clone().filter(|s| {
         !updater::snapshot::is_expired(s.header().built_at, now_secs, MAX_SNAPSHOT_AGE_SECS)
     });
@@ -1191,7 +1191,7 @@ fn note_image_rarity(
 pub const MAX_COMMON_SET_BYTES: u64 = 64 * 1024 * 1024;
 
 /// Loads `<content_root>/snapshots/common-set.bin`, the file the signed content manifest
-/// delivers (ADR-0020). Absent is "no snapshot yet", not an error; unreadable, too large or
+/// delivers. Absent is "no snapshot yet", not an error; unreadable, too large or
 /// not a snapshot is [`Load::Failed`] (logged with the reason, never the bytes).
 fn load_common_set(content_root: &Path) -> Load<ml::features::common_set::CommonSetSnapshot> {
     load_common_set_capped(content_root, MAX_COMMON_SET_BYTES)

@@ -25,7 +25,7 @@
 //! [`PeerCreds::check_authorized`] returns `Ok(())` iff the peer is
 //! "privileged": `uid == 0` on Unix, `TokenIsElevated == true` on
 //! Windows. Any other peer is rejected. This is stricter than what
-//! ADR-0010 mandates for the eventual UI (which will need a
+//! the policy model mandates for the eventual UI (which will need a
 //! per-capability check via `policy`), and deliberately: v1 has no
 //! mutating commands, so read-only-for-root is a safe starting point.
 //! Widening this to "any local user" is a policy change, not a code

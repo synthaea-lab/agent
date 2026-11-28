@@ -364,9 +364,9 @@ pub enum UploadStart {
 /// that cannot be opened. If that stopped `run`, an agent without its certificates would
 /// detect nothing at all (a day-0 install from `bootstrap/` loops on restart forever), and
 /// the watchdog, which only sees that the heartbeat never advances, would roll back and ban
-/// a release that is otherwise healthy (ADR-0015 probation). So with `offline_fallback`
+/// a release that is otherwise healthy (the updater design probation). So with `offline_fallback`
 /// (the default) the agent keeps detecting locally and reports that it is not uploading;
-/// with it off, the failure stays fatal, as ADR-0013 describes.
+/// with it off, the failure stays fatal, as the configuration design describes.
 ///
 /// # Errors
 ///

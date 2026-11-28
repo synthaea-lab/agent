@@ -86,7 +86,7 @@ If a release run fails, fix the cause on `main` and run `release.yml` by hand
 same name and replaces the notes above the changelog. The `draft` input leaves the release
 unpublished for a manual check.
 
-While `crates/updater/keys/*.pub` holds the temporary keys of 2026-11-12 (no custody, ADR-0027),
+While `crates/updater/keys/*.pub` holds the temporary keys of 2026-11-12 (no custody),
 the `temporary-key-guard` job fails every release, whether the key file still says `TEMPORARY` or
 only its key line is one of those keys, and the Windows and macOS signing jobs wait for it. Only a
 manual run with the `allow-temporary-keys` input passes (with a warning), for a lab build that

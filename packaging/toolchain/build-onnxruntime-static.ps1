@@ -1,7 +1,7 @@
 <#
 .SYNOPSIS
     Builds onnxruntime v1.30.0 from source as static .lib files for Windows
-    (MSVC), implementing ADR-0002 decision #2 (static linking, single-binary
+    (MSVC), implementing the model-delivery design decision #2 (static linking, single-binary
     deployment). Windows counterpart of build-onnxruntime-static.sh (#337).
 
 .DESCRIPTION
@@ -97,7 +97,7 @@ if (-not (Get-Command cmake -ErrorAction SilentlyContinue)) {
     $env:PATH = "$vsCmake;$env:PATH"
 }
 
-Write-Host '[onnxruntime] Building static libraries for ADR-0002 (issue #337)'
+Write-Host '[onnxruntime] Building static libraries for the model-delivery design (issue #337)'
 Write-Host "  Version: $OnnxVersion"
 Write-Host "  Visual Studio: $vsPath"
 Write-Host "  Jobs: $Jobs"

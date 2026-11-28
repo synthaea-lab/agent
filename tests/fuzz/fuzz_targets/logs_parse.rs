@@ -1,4 +1,4 @@
-//! Coverage-guided fuzzing for the service-log parsers (ADR-0022). Log lines are
+//! Coverage-guided fuzzing for the service-log parsers. Log lines are
 //! attacker-controlled text; same contract as the other targets: an `Err` is fine,
 //! a panic is a bug.
 #![no_main]

@@ -1,6 +1,5 @@
 //! The agent's observable identity: the names someone on the host (or on the
-//! wire) can see and hardcode to find, stop, or blind the agent (#596,
-//! ADR-0044).
+//! wire) can see and hardcode to find, stop, or blind the agent (#596).
 //!
 //! Every such name the user-mode binaries and leaf crates use is a constant
 //! here, never a literal at the call site. Sensor crates cannot depend on this

@@ -220,7 +220,7 @@ fn a_freeze_by_unit_pattern_alerts_when_it_matches_a_listed_tool() {
 
 #[test]
 fn an_ancestor_slice_is_left_silent_on_purpose() {
-    // A pinned, documented gap (ADR-0046): a slice acts on every service of the host.
+    // A pinned, documented gap: a slice acts on every service of the host.
     for command in [
         "systemctl freeze system.slice",
         "systemctl set-property system.slice MemoryMax=1M",

@@ -54,7 +54,7 @@ impl DetectionSink {
                 timestamp_ns: meta.timestamp_ns,
                 // The #594 gate is about reading a path the requester named, as the agent
                 // with `CAP_DAC_READ_SEARCH`. A memory scan reads no named path: it reads
-                // `/proc/<pid>/mem`, which the kernel gates by `ptrace_may_access` (ADR-0023).
+                // `/proc/<pid>/mem`, which the kernel gates by `ptrace_may_access`.
                 requester: None,
             }),
         );
@@ -130,7 +130,7 @@ pub(super) fn start_yara(
 }
 
 /// Starts the memory scanner over the same `rules/yara` content as the file scanner
-/// (#85, ADR-0023), reading processes through `source`. The rule set is compiled a second
+/// (#85), reading processes through `source`. The rule set is compiled a second
 /// time because the file queue owns its copy; memory and file scanning share rules, not
 /// state. Without a `source` there is no scanner: reading another process's memory is a
 /// platform mechanism the caller provides (`sensor-linux-procmem` on Linux, none elsewhere).

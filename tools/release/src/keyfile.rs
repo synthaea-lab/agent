@@ -2,8 +2,8 @@
 //! characters (`openssl rand -hex 32 > release.key`).
 //!
 //! The tool never generates, stores or transports a key; where the production key
-//! lives and who may use it is ADR-0015's open question, not this tool's. It refuses the
-//! obvious mistake of a key file other users can read, and, per ADR-0027, a key file that does
+//! lives and who may use it is the updater design's open question, not this tool's. It refuses the
+//! obvious mistake of a key file other users can read, and, per the signing-key design, a key file that does
 //! not hold one of the public test keys: a key that can be read from a file is not a production
 //! key, so the file path signs the test set and nothing else (production signs from a PKCS#11
 //! token).
@@ -51,7 +51,7 @@ pub(crate) fn load(path: &Path) -> anyhow::Result<Ed25519KeyPair> {
     Ok(key)
 }
 
-/// ADR-0027 decision 2: `--key-file` stays reserved to the public test keys. Anything else is a
+/// The signing-key design: `--key-file` stays reserved to the public test keys. Anything else is a
 /// key that sat in a file, which is what custody exists to prevent, and a lab that wants a
 /// throwaway key of its own generates it on a `SoftHSM` token and signs with `--pkcs11`.
 #[cfg(feature = "test-key")]
@@ -68,7 +68,7 @@ fn ensure_test_key(key: &Ed25519KeyPair, path: &Path) -> anyhow::Result<()> {
     anyhow::ensure!(
         is_test_key,
         "{} does not hold one of the public test keys: --key-file is reserved to them \
-         (ADR-0027); sign from a PKCS#11 token with --pkcs11 (a SoftHSM token for a lab)",
+; sign from a PKCS#11 token with --pkcs11 (a SoftHSM token for a lab)",
         path.display()
     );
     Ok(())
@@ -78,7 +78,7 @@ fn ensure_test_key(key: &Ed25519KeyPair, path: &Path) -> anyhow::Result<()> {
 #[cfg(not(feature = "test-key"))]
 fn ensure_test_key(_key: &Ed25519KeyPair, path: &Path) -> anyhow::Result<()> {
     anyhow::bail!(
-        "{}: this build has no test key, so --key-file is not accepted (ADR-0027); sign from a \
+        "{}: this build has no test key, so --key-file is not accepted; sign from a \
          PKCS#11 token with --pkcs11",
         path.display()
     )

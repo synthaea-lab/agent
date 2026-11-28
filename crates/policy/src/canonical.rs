@@ -2,11 +2,11 @@
 //!
 //! Two operations that both need the SAME byte sequence — signing and
 //! verifying — live here so exactly one canonicalizer exists in the
-//! workspace, per ADR-0010 §4 and ADR-0015 §Decision 2. Updater manifests
-//! (ADR-0015) will call this same function once their implementation lands
+//! workspace, per the policy model and the updater design. Updater manifests
+//! will call this same function once their implementation lands
 //! (issue #30).
 //!
-//! ## Contract (ADR-0010 §3)
+//! ## Contract
 //!
 //! The canonical form is a **deterministic pretty-printed JSON** with:
 //!
@@ -14,7 +14,7 @@
 //! - **Keys sorted lexicographically** at every object level
 //! - No trailing whitespace on any line
 //! - `metadata.signature` set to the empty string `""` (not omitted, not
-//!   null) — ADR-0015 §Decision 2 pins the placeholder value; ADR-0010
+//!   null) — the updater design pins the placeholder value; the policy model
 //!   originally left it unspecified.
 //!
 //! The output is UTF-8 bytes; callers hash/sign the raw bytes without any
@@ -172,7 +172,7 @@ mod tests {
 
     #[test]
     fn signature_field_present_as_empty_string() {
-        // Blanking is `""`, not omission — ADR-0015 §2 pins this.
+        // Blanking is `""`, not omission — the updater design pins this.
         let p = minimal_policy(&"f".repeat(128));
         let bytes = to_canonical_bytes(&p).unwrap();
         let s = std::str::from_utf8(&bytes).unwrap();
