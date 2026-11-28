@@ -28,6 +28,7 @@
 mod commands;
 mod deception;
 mod enrich_queue;
+mod host;
 #[cfg_attr(
     not(any(target_os = "linux", target_os = "macos", windows)),
     allow(dead_code)

@@ -183,7 +183,7 @@ fn image_signature(event: &Event) -> rules::ImageSignature {
             Event::Exec(e) => e.signature,
             _ => None,
         },
-        chain_verified: cfg!(windows),
+        chain_verified: crate::host::SIGNATURE_CHAIN_VERIFIED,
     }
 }
 
@@ -488,7 +488,7 @@ impl DetectionSink {
 
     /// Installs the executables allowed to touch a canary (#81). Called once, with the
     /// tripwires.
-    pub(crate) fn set_canary_allow(&self, allow: crate::deception::CanaryAllow) {
+    pub(crate) fn set_canary_allow(&self, allow: deception::CanaryAllow) {
         self.canary.set_allow(allow);
     }
 
@@ -621,7 +621,7 @@ impl DetectionSink {
             let requester = match meta.user {
                 schema::User::Unix { uid, gid } => Some(::yara::Requester { uid, gid }),
                 // No uid to check on this platform: scanned as before.
-                _ if !cfg!(unix) => None,
+                _ if !crate::host::USERS_HAVE_UID => None,
                 // On unix a user the sensor could not resolve must not fall through to
                 // the unrestricted read, which runs with `CAP_DAC_READ_SEARCH` (#594).
                 _ => {

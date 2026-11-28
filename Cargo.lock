@@ -1011,12 +1011,15 @@ dependencies = [
 name = "deception"
 version = "0.0.1"
 dependencies = [
+ "policy",
  "schema",
  "serde",
  "serde_json",
  "sha2 0.11.1",
+ "store",
  "tempfile",
  "thiserror 2.0.21",
+ "tracing",
 ]
 
 [[package]]

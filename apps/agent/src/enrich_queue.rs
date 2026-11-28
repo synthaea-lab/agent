@@ -106,7 +106,11 @@ impl EnrichQueue {
                                 Event::Exec(e) => e.image_file_id.as_deref(),
                                 _ => None,
                             };
-                            if image_confirmed(ran, verified.as_deref(), IDENTITY_CAPTURED) {
+                            if image_confirmed(
+                                ran,
+                                verified.as_deref(),
+                                crate::host::EXEC_IDENTITY_CAPTURED,
+                            ) {
                                 gated
                             } else {
                                 gated.unconfirmed_image()
@@ -262,11 +266,6 @@ fn enrich_event(enricher: &mut Enricher, event: &mut Event, gated: bool) -> Opti
     }
     None
 }
-
-/// Whether the platform's sensor records the image's identity at exec time. Only
-/// the Windows ETW sensor does (#688); elsewhere there is nothing to compare, and
-/// the gate behaves as it did before.
-const IDENTITY_CAPTURED: bool = cfg!(windows);
 
 /// Is the file that was verified the image that ran? `ran`: identity recorded at
 /// exec; `verified`: identity of the file the verdict was read from. Where
