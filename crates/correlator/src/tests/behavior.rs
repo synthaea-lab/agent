@@ -297,35 +297,68 @@ fn bayes_alerts_only_once_per_crossing() {
 }
 
 #[test]
-fn bayes_survives_respawn() {
-    // Two different processes (pid 400 then 401) with the same (ppid=50, comm)
-    // → the belief must accumulate across the two.
+fn a_respawned_process_inherits_the_belief_of_its_entity() {
+    // Two processes (pid 400, then 401) with the same (ppid=50, comm): one entity.
     let mut engine = CorrelationEngine::new();
-
-    // First process pid=400, ppid=50
     engine.on_event(exec_event_with_ppid(400, 50, 0));
     engine.on_event(connect_event_external(400, 100_000_000));
-    let log_odds_after_pid400 = engine
+    let after_the_first = engine
         .belief_for_pid(400)
         .expect("belief for pid 400 expected")
         .log_odds;
 
-    // Respawn: pid=401, same ppid=50, same comm (empty in our tests)
+    // The respawn has only executed: its own vector says nothing yet.
     engine.on_event(exec_event_with_ppid(401, 50, 200_000_000));
-    engine.on_event(connect_event_external(401, 300_000_000));
-
-    // pid=401 must have the same entity key (ppid=50, comm="") as pid=400
-    // → log_odds must keep rising, not restart from the prior
-    let log_odds_after_pid401 = engine
+    let after_the_respawn = engine
         .belief_for_pid(401)
         .expect("belief for pid 401 expected")
         .log_odds;
 
     assert!(
-        log_odds_after_pid401 > log_odds_after_pid400,
-        "the belief must accumulate after a respawn: {} → {}",
-        log_odds_after_pid400,
-        log_odds_after_pid401
+        (after_the_respawn - after_the_first).abs() < 0.01,
+        "the respawn starts from what its entity already showed, not from the prior: \
+         {after_the_first} then {after_the_respawn}"
+    );
+}
+
+#[test]
+fn the_same_evidence_seen_again_does_not_raise_the_belief() {
+    let mut engine = CorrelationEngine::new();
+    engine.on_event(exec_event_with_ppid(400, 50, 0));
+    engine.on_event(connect_event_external(400, 100_000_000));
+    let judged_once = engine.belief_for_pid(400).unwrap().log_odds;
+
+    // Events that change nothing in the process's vector: the same destination again
+    // would change the count, so these are file opens.
+    for i in 0..50u64 {
+        engine.on_event(file_read_event(400, 200_000_000 + i * 1_000_000));
+    }
+    let judged_again = engine.belief_for_pid(400).unwrap().log_odds;
+
+    assert!(
+        judged_again <= judged_once,
+        "fifty more events of the same behaviour are not fifty more pieces of evidence: \
+         {judged_once} then {judged_again}"
+    );
+}
+
+#[test]
+fn a_quiet_sibling_of_the_same_name_does_not_lower_the_belief() {
+    let mut engine = CorrelationEngine::new();
+    engine.on_event(exec_event_with_ppid(400, 50, 0));
+    engine.on_event(connect_event_external(400, 100_000_000));
+    let suspect_alone = engine.belief_for_pid(400).unwrap().log_odds;
+
+    // A second child of the same parent, same comm, that only opens files.
+    engine.on_event(exec_event_with_ppid(402, 50, 150_000_000));
+    for i in 0..50u64 {
+        engine.on_event(file_read_event(402, 200_000_000 + i * 1_000_000));
+    }
+    let with_the_sibling = engine.belief_for_pid(400).unwrap().log_odds;
+
+    assert!(
+        (with_the_sibling - suspect_alone).abs() < 0.01,
+        "a process cannot hide behind a busy harmless sibling: {suspect_alone} then {with_the_sibling}"
     );
 }
 

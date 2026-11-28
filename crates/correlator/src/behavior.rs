@@ -156,12 +156,22 @@ fn suspicious_path_feature(events: &[&Event]) -> f32 {
 }
 
 /// Returns true if the path contains a directory considered suspicious
-/// for an execution. Mirror of the suspicious-path feature in `crates/ml`.
+/// for an execution: where a dropper lands its payload, on Windows and on Linux. The Linux
+/// directories are the ones the lineage features of `crates/ml` list (`SUSPICIOUS_PATHS`).
 fn is_suspicious_image_path(path: &str) -> bool {
     let lower = path.to_ascii_lowercase();
-    ["appdata", "\\temp\\", "downloads", "desktop", "\\public\\"]
-        .iter()
-        .any(|s| lower.contains(s))
+    [
+        "appdata",
+        "\\temp\\",
+        "downloads",
+        "desktop",
+        "\\public\\",
+        "/tmp/",
+        "/var/tmp/",
+        "/dev/shm/",
+    ]
+    .iter()
+    .any(|s| lower.contains(s))
 }
 
 /// Loopback, unspecified, link-local (`fe80::/10`), unique-local (`fc00::/7`),

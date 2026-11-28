@@ -1425,6 +1425,12 @@ fn drive_bayes_crossing_from(sink: &DetectionSink, pid: u32, image_path: &str) {
 
 /// The connects of [`drive_bayes_crossing_from`], for a pid whose exec the test
 /// sends itself.
+///
+/// The behaviour alone crosses the threshold only for a binary in a drop directory:
+/// from a system path it stays below (1.76 against 2.0), which is the point of counting
+/// evidence once. The tests of the kill gate need a crossing whatever the path, so a
+/// correlation model's opinion is recorded after the first connect, as the sink does
+/// when a scorer is loaded.
 fn drive_bayes_connects(sink: &DetectionSink, pid: u32) {
     for i in 0..25u64 {
         sink.on_event(Event::Connect(ConnectEvent {
@@ -1436,8 +1442,18 @@ fn drive_bayes_connects(sink: &DetectionSink, pid: u32) {
             daddr: std::net::IpAddr::V4(std::net::Ipv4Addr::new(185, 220, 101, 1)),
             dport: 4444,
         }));
+        if i == 0 {
+            sink.correlator
+                .lock()
+                .unwrap()
+                .update_belief_with_ml(pid, None, Some(MODEL_FLAGS_IT_LLR))
+                .unwrap();
+        }
     }
 }
+
+/// A correlation model's log-likelihood ratio for a process it considers malicious.
+const MODEL_FLAGS_IT_LLR: f32 = 3.0;
 
 /// EGRESS-DOMAIN (#380) crosses two event kinds: the lookup is a `DnsQuery`, which the sink
 /// must hand to the rule state (it did not before), and the volume is a `NetworkFlow`.

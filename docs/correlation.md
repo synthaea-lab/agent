@@ -221,9 +221,11 @@ stamp was seen adopts the first one that arrives, so a later, different one is
 recognised. Pinned by
 [`tests/parent_generation.rs`](../crates/correlator/src/tests/parent_generation.rs).
 
-Because siblings share one belief, the evidence of every child of one parent with one
-name accumulates together. The pid the `BAYES` alert names, and that the kill gate
-acts on, is the one whose event made the shared belief cross.
+Siblings share one belief: every child of one parent with one name. The belief keeps the
+strongest evidence any of them gave, so a respawned beacon starts from what its
+predecessor showed, and a quiet sibling cannot lower what a suspicious one raised. The pid
+the `BAYES` alert names, and that the kill gate acts on, is the one whose event made the
+shared belief cross.
 
 ### Features
 
@@ -238,7 +240,7 @@ command-line vector the ML scorer uses; the two are never merged into one model.
 | 2 | `has_filewrite` | 0 (no empirical signal yet) |
 | 3 | `time_exec_to_connect_ms` | +1.90 under 2 s, -0.22 above, -0.09 absent |
 | 4 | `time_exec_to_filewrite_ms` | 0 |
-| 5 | `is_suspicious_path` (AppData, `\Temp\`, Downloads, Desktop, `\Public\`) | +3.60 / -0.20 |
+| 5 | `is_suspicious_path` (AppData, `\Temp\`, Downloads, Desktop, `\Public\`, `/tmp/`, `/var/tmp/`, `/dev/shm/`) | +3.60 / -0.20 |
 | 6 | `connect_count` | -0.96 (0), +0.41 (<5), +2.22 (<15), +0.87 (15+) |
 | 7 | `distinct_dports` | +0.02 (<=1), -0.54 (<=3), 0 otherwise |
 | 8 | `dest_is_external` | +1.23 / -0.44 |
@@ -265,30 +267,44 @@ aligned on them and `calibrate_llr.py` rerun before the weights are trusted.
 
 ### Update rule
 
+The belief is the prior plus three kinds of evidence, each counted once:
+`log_odds = PRIOR + behaviour + ML + rarity`. The prior is -4.6 (about 1 %).
+
 On every correlated event for a pid that has events in the window,
 [`update_belief`](../crates/correlator/src/bayes.rs) does, in order:
 
-1. **Decay toward the prior.** With `dt` the event-time gap since the last update,
-   `log_odds += (PRIOR - log_odds) * (1 - exp(-dt / 300 s))`. The prior is -4.6
-   (about 1 %).
-2. **Add the sum of the nine feature LLRs** for the pid's current vector (naive
-   independence).
+1. **Decay.** With `dt` the event-time gap since the last update, each of the three terms
+   is multiplied by `exp(-dt / 300 s)`: evidence nothing renews fades toward the prior.
+2. **Judge the pid's current vector.** The sum of its nine feature LLRs (naive
+   independence) is the evidence that process gives. It replaces the remembered behaviour
+   evidence only if it is stronger.
 3. Record the update time.
 
-The whole window's evidence is re-added on each event, damped only by the decay since
-the previous one. A belief therefore grows with the *rate* of suspicious activity, not
-only with which features are present, and benign events push it below the prior. There
-is no clamp in either direction.
+A vector is a statement about a process, so seeing it again adds nothing: the belief does
+not grow with the number of events an entity produces, and events of a sibling with a
+quieter vector take nothing away.
+
+It was not always so. Until November 2026 the feature sum was added to the belief at every
+event, so the belief followed the event count and the order of unrelated events. On the
+Linux lab machine the same beaconing process crossed the threshold in one run of five, and
+a busy system service could cross it by volume alone (enforce runs of the `response`
+scenario in October 2026 killed `NetworkManager` on one host and `sshd-session` processes
+on another). With evidence counted once, a binary in a system
+path that beacons to a public address scores 1.76 and does not cross; the same behaviour
+from a binary in a drop directory (`/tmp`, `/var/tmp`, `/dev/shm`, `AppData`, `Temp`) scores
+5.56 and does.
 
 Two more terms can be added on top of an already-updated belief. Neither re-runs the
-feature sum, which would count the same evidence twice:
+feature sum:
 
 - **ML score.** After `on_event`, the sink scores the pid with
   `ml::CorrelationScorer` over the same bus, converts the score with
   [`ml::score_to_llr`](../crates/ml/src/scorer/correlation.rs) (clamped to
   [-1.0, +3.0]: a behavior model exonerates more weakly than it accuses) and calls
   [`CorrelationEngine::update_belief_with_ml`](../crates/correlator/src/engine.rs),
-  which adds it through [`apply_ml_llr`](../crates/correlator/src/bayes.rs). `None`
+  which records it through [`apply_ml_llr`](../crates/correlator/src/bayes.rs): like the
+  behaviour evidence, a score is kept only if it is stronger than the one remembered, so
+  scoring an entity at each of its events does not add the model's opinion to itself. `None`
   (fewer than three events, a feature out of training bounds, a runtime error) means
   "no evidence", not "benign". The ML crate depends on the correlator for `EventBus`,
   so the correlator cannot call the scorer; the agent computes the term and injects it.
