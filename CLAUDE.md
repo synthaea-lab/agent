@@ -87,6 +87,8 @@ New crate? Add it to the rules in `tools/check-deps.py` in the same change.
   count is zero, except the core-crate files in the script's `EXCEPTIONS` table, which hold a ceiling
   that may go down, never up: the check fails when a count drops below its ceiling, until the
   number is lowered in the same change. The exceptions, each with its reason:
+  - `delivery` (`lib.rs`): the `release` module is compiled on Linux only, like the
+    `updater::layout` it drives.
   - `config`: default config path per OS (`discovery.rs`), the shape of `ipc.endpoint`
     (named pipe or socket path, `load.rs`), the Linux default template (`template.rs`).
   - `ipc` (`stream.rs`): the one place that picks a Unix socket or a Windows named pipe, with

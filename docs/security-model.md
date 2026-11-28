@@ -152,7 +152,7 @@ flowchart TD
 
 ### Runtime refusal
 
-[`ensure_key_trusted`](../apps/agent/src/trust.rs) runs before `apply-release`,
+[`ensure_key_trusted`](../crates/delivery/src/trust.rs) runs before `apply-release`,
 `apply-content-manifest` and key rotations act on a manifest:
 
 1. If no key is embedded for this kind of manifest, the command refuses and says why.
@@ -209,7 +209,7 @@ also checks:
 - **Bounded downloads.** A declared size over the cap is refused before anything is
   fetched, and the HTTP read is capped as well
   ([`TransportClient::get_bytes`](../crates/transport/src/client.rs)). Caps:
-  `MAX_RELEASE_ARTIFACT_BYTES` (256 MiB) in [`release.rs`](../apps/agent/src/release.rs),
+  `MAX_RELEASE_ARTIFACT_BYTES` (256 MiB) in [`release.rs`](../crates/delivery/src/release.rs),
   `MAX_CONTENT_ARTIFACT_BYTES` (100 MiB) in [`content.rs`](../crates/delivery/src/content.rs), and
   the snapshot cap in [`snapshot_fetch.rs`](../apps/agent/src/snapshot_fetch.rs).
 
@@ -480,7 +480,7 @@ They must fail closed when the target is wrong.
 | Packaged build has no test key | `tools/check-no-test-key.sh` (CI), [`unprovisioned_build.rs`](../crates/updater/tests/unprovisioned_build.rs) |
 | Unprovisioned key fails closed for every manifest kind | [`unprovisioned_build.rs`](../crates/updater/tests/unprovisioned_build.rs) |
 | Key roles distinct, key files well-formed | unit tests in [`key.rs`](../crates/updater/src/key.rs) |
-| Test-key refusal and its messages | unit tests in [`trust.rs`](../apps/agent/src/trust.rs) and [`release.rs`](../apps/agent/src/release.rs) |
+| Test-key refusal and its messages | unit tests in [`trust.rs`](../crates/delivery/src/trust.rs) and [`release.rs`](../crates/delivery/src/release.rs) |
 | Cleartext secret rejected | `cleartext_secret_is_rejected_as_secret_invalid` in [`load.rs`](../crates/config/src/load.rs); [`secret.rs`](../crates/config/src/secret.rs) tests |
 | Private CA pinning | [`transport/tests/private_ca.rs`](../crates/transport/tests/private_ca.rs) |
 | IPC authorization and framing cap | unit tests in [`stream.rs`](../crates/ipc/src/stream.rs) and [`frame.rs`](../crates/ipc/src/frame.rs). [`tests/e2e.rs`](../crates/ipc/tests/e2e.rs) skips when it runs unprivileged |

@@ -33,8 +33,8 @@ external scheduler runs them (a timer is tracked in
 
 The crate split mirrors the dependency rules: [`updater`](../crates/updater/src/lib.rs) is a leaf
 crate with verification, layout and state logic only, and cannot depend on `transport`. The
-fetch-verify-apply compositions live in the binary: [`release.rs`](../apps/agent/src/release.rs),
-[`content.rs`](../crates/delivery/src/content.rs), [`rotation.rs`](../apps/agent/src/rotation.rs),
+fetch-verify-apply compositions live in the binary: [`release.rs`](../crates/delivery/src/release.rs),
+[`content.rs`](../crates/delivery/src/content.rs), [`rotation.rs`](../crates/delivery/src/rotation.rs),
 [`snapshot_fetch.rs`](../apps/agent/src/snapshot_fetch.rs), with the post-promotion health gate in
 the watchdog ([`probation.rs`](../apps/watchdog/src/probation.rs)).
 
@@ -70,7 +70,7 @@ key, which a rotation refuses to reproduce. The feature also links a marker stri
 (`SYNTHAEA-PUBLIC-TEST-KEY-SET-V1`) into the binary, which the packaging and release checks look
 for (see [Packaging](packaging.md#test-key-exclusion)).
 
-**Refusal before contact.** [`trust::ensure_key_trusted`](../apps/agent/src/trust.rs) runs before any
+**Refusal before contact.** [`trust::ensure_key_trusted`](../crates/delivery/src/trust.rs) runs before any
 network or disk work: a test-key build acts only with `--allow-test-key` (a flag that exists only
 in such a build), and a build with no key says that nothing can be verified instead of failing
 later at the signature. The keys in force are loaded fresh from the state directory for every
@@ -104,7 +104,7 @@ A valid signature proves who signed a manifest, not that its paths are safe to w
 ## Binary self-update
 
 `agent apply-release --server URL [--cert --key] [--ca-cert] [--no-restart]` runs
-[`apply_release`](../apps/agent/src/release.rs). It is Linux-only; elsewhere it returns an error.
+[`apply_release`](../crates/delivery/src/release.rs). It is Linux-only; elsewhere it returns an error.
 
 ```mermaid
 sequenceDiagram
@@ -145,9 +145,9 @@ Points that are easy to miss:
   removed first, as a link if it is a symlink. An existing `vN` is complete by construction and is
   reused without downloading, but still re-verified.
 - **Size bound.** A release manifest has no signed per-entry size, so downloads are bounded by
-  the constant `MAX_RELEASE_ARTIFACT_BYTES` (256 MiB) in [`release.rs`](../apps/agent/src/release.rs).
+  the constant `MAX_RELEASE_ARTIFACT_BYTES` (256 MiB) in [`release.rs`](../crates/delivery/src/release.rs).
 - **SELinux.** Files written into `versions/vN/` inherit `var_lib_t`, which `init_t` may not
-  execute (the unit then dies with `203/EXEC`). [`restore_selinux_labels`](../apps/agent/src/release.rs)
+  execute (the unit then dies with `203/EXEC`). [`restore_selinux_labels`](../crates/delivery/src/release.rs)
   runs `restorecon -R` on the staged release. Under Enforcing, a missing or failing `restorecon`
   refuses the release and leaves `current` untouched; under Permissive it warns and promotes.
 - **Ownership.** `apply-release` usually runs as root, but the watchdog runs as the service user
@@ -293,7 +293,7 @@ at least 5 s), downloads the artifact only when `built_at` moved, verifies size 
 A [`KeyRotationManifest`](../crates/updater/src/rotation.rs) names a new `release` and/or `content`
 key and the key each one retires, and is signed only by `recovery`. `agent apply-key-rotation`
 fetches it from `/api/release/key-rotation` (404: nothing pending) or reads `--file`, verifies it and
-records it ([`rotation::apply`](../apps/agent/src/rotation.rs)).
+records it ([`rotation::apply`](../crates/delivery/src/rotation.rs)).
 
 [`KeyRotationManifest::verify`](../crates/updater/src/rotation.rs) checks, in order:
 
@@ -376,7 +376,7 @@ Key sources ([`KeySource`](../tools/release/src/main.rs)):
   `updater` contain `cfg(target_os)` code is scoped to this.
 - Content delivery, snapshot fetch and key rotation run on every OS. `apply-key-rotation` reads the
   installed release number from the layout on Linux only (`installed_release` in
-  [`rotation.rs`](../apps/agent/src/rotation.rs)).
+  [`rotation.rs`](../crates/delivery/src/rotation.rs)).
 
 ## Configuration
 
@@ -395,8 +395,8 @@ Key sources ([`KeySource`](../tools/release/src/main.rs)):
 | --- | --- |
 | [`updater` unit and integration tests](../crates/updater/src/lib.rs) | Sign/stage/verify/promote/rollback/ban end to end; anti-rollback; reported cleanup failure. |
 | [`tests/unprovisioned_build.rs`](../crates/updater/tests/unprovisioned_build.rs), [`tests/test_key_build.rs`](../crates/updater/tests/test_key_build.rs) | The packaged trust set fails closed; the test set is what test builds use (CI runs `cargo test -p updater --no-default-features`). |
-| Tests in [`apps/agent/src/release.rs`](../apps/agent/src/release.rs) | Against a local HTTP server: promotion, tampered artifact, mid-download failure, bad signature, escaping path, bans, rotations, SELinux cases, reuse of a staged release. |
+| Tests in [`crates/delivery/src/release.rs`](../crates/delivery/src/release.rs) | Against a local HTTP server: promotion, tampered artifact, mid-download failure, bad signature, escaping path, bans, rotations, SELinux cases, reuse of a staged release. |
 | Tests in [`apps/watchdog/src/probation.rs`](../apps/watchdog/src/probation.rs) and [`recovery.rs`](../apps/watchdog/src/recovery.rs) | Probation detection, rollback targets, bans, pruning, stale watchdog. |
 | Tests in [`crates/delivery/src/content.rs`](../crates/delivery/src/content.rs) | Plan, hash mismatch, progress preservation, removal, halted rings. |
-| Tests in [`apps/agent/src/rotation.rs`](../apps/agent/src/rotation.rs) and [`trust_state.rs`](../crates/updater/src/trust_state.rs) | Rotation survives restart, replay and forgery refused, corrupt vs missing record. |
+| Tests in [`crates/delivery/src/rotation.rs`](../crates/delivery/src/rotation.rs) and [`trust_state.rs`](../crates/updater/src/trust_state.rs) | Rotation survives restart, replay and forgery refused, corrupt vs missing record. |
 | [`tools/release/tests/pkcs11_softhsm.rs`](../tools/release/tests/pkcs11_softhsm.rs) | Signing through a SoftHSM token, wrong token/PIN/key refused (run by `tools/test-pkcs11.sh` in CI). |

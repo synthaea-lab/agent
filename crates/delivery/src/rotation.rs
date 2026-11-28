@@ -23,25 +23,32 @@ use anyhow::Context as _;
 use updater::{KeyRotationManifest, UpdaterError, trust_state::TrustState};
 
 /// Where the manifest comes from.
-pub(crate) enum Source<'a> {
+pub enum Source<'a> {
     /// A file, for an offline or lab install.
     File(&'a Path),
     /// The control plane.
-    Server(&'a delivery::content::Endpoint),
+    Server(&'a crate::content::Endpoint),
 }
 
 /// What [`apply`] did.
 #[derive(Debug, PartialEq, Eq)]
-pub(crate) enum Outcome {
+pub enum Outcome {
     /// The rotation was recorded; these roles now verify against their new key.
     Applied {
+        /// The rotation's position in the release counter.
         release_version: u64,
+        /// The roles whose key changed.
         roles: Vec<&'static str>,
     },
     /// The control plane has nothing pending.
     NothingPending,
     /// The rotation is not newer than what was applied (a replay, or already recorded).
-    AlreadyApplied { offered: u64, current: u64 },
+    AlreadyApplied {
+        /// The version the rotation carries.
+        offered: u64,
+        /// The version already recorded.
+        current: u64,
+    },
 }
 
 /// Subcommand `apply-key-rotation`.
@@ -50,7 +57,7 @@ pub(crate) enum Outcome {
 ///
 /// The key state or the manifest cannot be read, the rotation fails verification (nothing is
 /// recorded), or the record cannot be written.
-pub(crate) fn cmd_apply_key_rotation(
+pub fn cmd_apply_key_rotation(
     source: &Source<'_>,
     state_dir: &Path,
     allow_test_key: bool,
@@ -61,7 +68,12 @@ pub(crate) fn cmd_apply_key_rotation(
         println!("no key rotation pending");
         return Ok(Outcome::NothingPending);
     };
-    let outcome = apply(&rotation, state_dir, installed_release(state_dir), now()?)?;
+    let outcome = apply(
+        &rotation,
+        state_dir,
+        updater::installed_release_version(state_dir),
+        now()?,
+    )?;
     match &outcome {
         Outcome::Applied {
             release_version,
@@ -89,7 +101,7 @@ fn fetch(source: &Source<'_>) -> anyhow::Result<Option<KeyRotationManifest>> {
             ))
         }
         Source::Server(endpoint) => {
-            let client = delivery::content::build_client(
+            let client = crate::content::build_client(
                 &endpoint.server,
                 endpoint.cert.as_deref(),
                 endpoint.key.as_deref(),
@@ -111,7 +123,7 @@ fn fetch(source: &Source<'_>) -> anyhow::Result<Option<KeyRotationManifest>> {
 ///
 /// A record that cannot be trusted, a rotation that fails [`TrustState::adopt`] (other than not
 /// being newer, which is [`Outcome::AlreadyApplied`]), or a failed write.
-pub(crate) fn apply(
+pub fn apply(
     rotation: &KeyRotationManifest,
     state_dir: &Path,
     installed_release: Option<u64>,
@@ -138,19 +150,6 @@ pub(crate) fn apply(
         release_version: rotation.release_version,
         roles,
     })
-}
-
-/// The installed binary release: rotations share its counter. Linux only, like the layout.
-fn installed_release(state_dir: &Path) -> Option<u64> {
-    #[cfg(target_os = "linux")]
-    {
-        updater::layout::Layout::new(state_dir).current_release_version()
-    }
-    #[cfg(not(target_os = "linux"))]
-    {
-        let _ = state_dir;
-        None
-    }
 }
 
 fn now() -> anyhow::Result<u64> {

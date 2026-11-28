@@ -20,7 +20,7 @@
 //!
 //! #71 originally called for treating `updater` as the one legitimate non-self writer
 //! of these paths, since no updater existed yet to name. #30 shipped it since, and
-//! turns out not to need the exception: `agent::release::cmd_apply_release` (ADR-0015)
+//! turns out not to need the exception: `delivery::release::cmd_apply_release` (ADR-0015)
 //! downloads and verifies a new release into its own `versions/<N>/` directory and only
 //! then swaps the `current` symlink — it never writes into the version directory the
 //! running process's `current_exe` already resolves to, and it does not touch the

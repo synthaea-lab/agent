@@ -59,6 +59,8 @@ EXCEPTIONS: dict[str, tuple[int, str]] = {
         2, "ipc.endpoint has a different shape per OS (named pipe or absolute socket path)"),
     "crates/config/src/template.rs": (
         3, "the shipped default template carries Linux paths; other OSes write a neutral one"),
+    "crates/delivery/src/lib.rs": (
+        1, "the `release` module drives updater::layout, which exists on Linux only"),
     "crates/enrich/src/lib.rs": (
         3, "code-signature and PE enrichment, FFI per OS; moving it to a sensor is #151"),
     "crates/enrich/src/pe_info.rs": (

@@ -1028,6 +1028,7 @@ dependencies = [
  "getrandom 0.4.3",
  "health",
  "ipc",
+ "ring",
  "schema",
  "serde",
  "serde_json",

@@ -16,7 +16,7 @@ default = ["dynamic-onnx", "test-key"]
 dynamic-onnx = ["ml/dynamic-onnx"]
 # The public test signing key set (ADR-0027) and the `--allow-test-key` flag that
 # acknowledges it. A packaged build turns it off: it then embeds only the production keys.
-test-key = ["updater/test-key"]
+test-key = ["updater/test-key", "delivery/test-key"]
 
 [dependencies]
 schema = { path = "../../crates/schema" }

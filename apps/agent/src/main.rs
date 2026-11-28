@@ -61,9 +61,7 @@ mod memscan;
 mod own_traffic;
 mod protected;
 mod quarantine_cmd;
-mod release;
 mod replay;
-mod rotation;
 mod silence;
 #[cfg_attr(
     not(any(target_os = "linux", target_os = "macos", windows)),
@@ -71,14 +69,25 @@ mod silence;
 )]
 mod sink;
 mod snapshot_fetch;
-#[cfg_attr(
-    not(any(target_os = "linux", target_os = "macos", windows)),
-    allow(dead_code)
-)]
-mod trust;
 
 use clap::{Parser, Subcommand};
-use delivery::{content, upload};
+#[cfg(target_os = "linux")]
+use delivery::release::cmd_apply_release;
+use delivery::{content, rotation, trust, upload};
+
+/// `apply-release` on an OS where the agent has no self-update yet.
+#[cfg(not(target_os = "linux"))]
+fn cmd_apply_release(
+    _server: &str,
+    _cert: Option<&std::path::Path>,
+    _key: Option<&std::path::Path>,
+    _ca_cert: Option<&std::path::Path>,
+    _base_dir: &std::path::Path,
+    _restart: bool,
+    _allow_test_key: bool,
+) -> anyhow::Result<()> {
+    anyhow::bail!("binary self-update is Linux-only (ADR-0015 Deferred)")
+}
 
 #[derive(Parser)]
 #[command(name = "agent")]
@@ -587,7 +596,7 @@ fn try_main() -> anyhow::Result<std::process::ExitCode> {
             no_restart,
             #[cfg(feature = "test-key")]
             allow_test_key,
-        } => release::cmd_apply_release(
+        } => cmd_apply_release(
             &server,
             cert.as_deref(),
             key.as_deref(),

@@ -46,6 +46,21 @@ pub use manifest::ReleaseManifest;
 pub use rotation::KeyRotationManifest;
 pub use snapshot::SnapshotManifest;
 
+/// The binary release installed under `state_dir`, or `None` on day 0 and on the OSes
+/// that have no self-update layout yet. Key rotations share this counter.
+#[must_use]
+pub fn installed_release_version(state_dir: &std::path::Path) -> Option<u64> {
+    #[cfg(target_os = "linux")]
+    {
+        layout::Layout::new(state_dir).current_release_version()
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = state_dir;
+        None
+    }
+}
+
 /// Rolls back from a release that failed its health check (ADR-0015 Decision 6):
 /// repoints `current` at `previous` (or `bootstrap` if `previous` is `None` — the
 /// very first release after `bootstrap` failed), then bans `failed` so it is
