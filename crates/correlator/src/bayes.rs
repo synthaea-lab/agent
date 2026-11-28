@@ -1,10 +1,21 @@
 //! Naive Bayes filter — per-entity (ppid, comm) compromise belief.
 //!
-//! Each update starts from the current [`crate::behavior::BehaviorVector`]: the
-//! per-feature log-likelihood ratios (LLRs) are summed under the naive independence
-//! assumption, with an exponential decay toward the prior during periods of
-//! inactivity. The LLRs are calibrated empirically by the ML pipeline's LLR
-//! calibration (which regenerates the body of `log_likelihood_ratio`).
+//! The belief is the prior plus three kinds of evidence, each counted once:
+//!
+//! - the **behaviour** evidence: the per-feature log-likelihood ratios (LLRs) of a
+//!   [`crate::behavior::BehaviorVector`], summed under the naive independence assumption;
+//! - the **ML** evidence, when a correlation model scored the entity;
+//! - the **rarity** evidence, for images absent from the fleet's common set.
+//!
+//! A vector is a statement about a process, so its LLRs are the evidence that process
+//! gives, not something to add again at each of its events: the belief does not grow with
+//! the number of events an entity produces. An entity is `(ppid, comm)`, so several
+//! processes can share one belief (a respawned beacon, or unrelated siblings of the same
+//! name). The entity keeps the strongest evidence any of them gave: a quiet sibling cannot
+//! cancel what a suspicious one did. Every term decays toward zero while nothing renews it.
+//!
+//! The LLRs are calibrated empirically by the ML pipeline's LLR calibration (which
+//! regenerates the body of `log_likelihood_ratio`).
 
 use crate::behavior::BehaviorVector;
 
@@ -43,6 +54,12 @@ pub struct BeliefState {
     /// How much of `log_odds` is rarity evidence (<= [`RARITY_MAX_TOTAL_LLR`]), decayed with
     /// the belief so the allowance returns as the evidence fades.
     pub(crate) rarity_llr: f32,
+    /// The strongest behaviour evidence a process of this entity gave, decayed since.
+    /// `None` until a first vector was judged: an entity nothing was said about sits at the
+    /// prior, and a first vector that argues for "benign" is kept as such.
+    behavior_llr: Option<f32>,
+    /// The strongest ML evidence a scoring of this entity gave, decayed since.
+    ml_llr: Option<f32>,
 }
 
 impl BeliefState {
@@ -52,7 +69,27 @@ impl BeliefState {
             last_update_ns: now_ns,
             alerted: false,
             rarity_llr: 0.0,
+            behavior_llr: None,
+            ml_llr: None,
         }
+    }
+
+    /// Lets every term fade toward "no evidence" for the time since the last update.
+    fn decay_to(&mut self, now_ns: u64) {
+        let dt_s = (now_ns.saturating_sub(self.last_update_ns)) as f32 / 1e9;
+        let kept = (-dt_s / DECAY_TAU_S).exp();
+        self.rarity_llr *= kept;
+        self.behavior_llr = self.behavior_llr.map(|llr| llr * kept);
+        self.ml_llr = self.ml_llr.map(|llr| llr * kept);
+        self.last_update_ns = now_ns;
+    }
+
+    /// The prior plus each kind of evidence, once.
+    fn recompute(&mut self) {
+        self.log_odds = PRIOR_LOG_ODDS
+            + self.behavior_llr.unwrap_or(0.0)
+            + self.ml_llr.unwrap_or(0.0)
+            + self.rarity_llr;
     }
 
     /// Current compromise probability (0.0–1.0).
@@ -134,67 +171,55 @@ fn log_likelihood_ratio(idx: usize, value: f32) -> f32 {
     }
 }
 
-/// Updates an entity's belief with the current `BehaviorVector` and optional ML LLR.
+/// The behaviour evidence of one vector: the sum of its per-feature LLRs.
+fn behavior_evidence(v: &BehaviorVector) -> f32 {
+    v.to_vec()
+        .iter()
+        .enumerate()
+        .map(|(i, &value)| log_likelihood_ratio(i, value))
+        .sum()
+}
+
+/// The stronger of what is remembered and what was just observed.
+fn strongest(remembered: Option<f32>, observed: f32) -> f32 {
+    remembered.map_or(observed, |llr| llr.max(observed))
+}
+
+/// Judges an entity's belief on the `BehaviorVector` of one of its processes, and on an ML
+/// score when there is one.
 ///
-/// First applies the exponential decay toward the prior, then the Bayesian update from
-/// hand-calibrated per-feature LLRs, then the optional ML contribution.
+/// Every term first decays for the time since the last update. The vector's evidence then
+/// replaces the remembered behaviour evidence only if it is stronger: the same vector seen
+/// again adds nothing, and a sibling process with a quieter vector takes nothing away.
 ///
-/// # Parameters
+/// # ML LLR semantics
 ///
-/// - `state`: The belief state to update
-/// - `v`: The behavior vector extracted from the correlator's event bus
-/// - `ml_llr`: Optional ML contribution from `ml::score_to_llr` (issue #46 Phase 3)
-/// - `now_ns`: Current timestamp for decay calculation
-///
-/// # ML LLR Semantics
-///
-/// - `ml_llr = Some(llr)` → add `llr` to `log_odds` after hand-calibrated LLRs
-/// - `ml_llr = None` → skip ML contribution (no evidence, not "benign")
-///   - Returned when `event_count < MIN_EVENT_COUNT` (gating)
-///   - Returned when features are OOD (`ScorerError::FeatureOutOfBounds`)
-///   - Returned when ML scorer is unavailable or errors
-///
-/// The caller (agent sink via `CorrelationEngine::update_belief_with_ml`) handles
-/// the ML scorer invocation and error handling before passing the LLR here.
+/// - `ml_llr = Some(llr)`: the model's evidence, kept if stronger than what is remembered.
+/// - `ml_llr = None`: no evidence (gated, out of bounds, or no scorer), not "benign".
 pub(crate) fn update_belief(
     state: &mut BeliefState,
     v: &BehaviorVector,
     ml_llr: Option<f32>,
     now_ns: u64,
 ) {
-    // Exponential decay toward the prior when inactive
-    let dt_s = (now_ns.saturating_sub(state.last_update_ns)) as f32 / 1e9;
-    let decay = 1.0 - (-dt_s / DECAY_TAU_S).exp();
-    state.log_odds += (PRIOR_LOG_ODDS - state.log_odds) * decay;
-    state.rarity_llr *= 1.0 - decay;
-
-    // Naive Bayesian update: sum of the per-feature LLRs
-    for (i, &value) in v.to_vec().iter().enumerate() {
-        state.log_odds += log_likelihood_ratio(i, value);
-    }
-
-    // ML contribution (issue #46 Phase 3): only if we have a score.
-    // None means "no evidence" (gated, OOD, or error), not "benign".
+    state.decay_to(now_ns);
+    state.behavior_llr = Some(strongest(state.behavior_llr, behavior_evidence(v)));
     if let Some(llr) = ml_llr {
-        state.log_odds += llr;
+        state.ml_llr = Some(strongest(state.ml_llr, llr));
     }
-
-    state.last_update_ns = now_ns;
+    state.recompute();
 }
 
-/// Adds an ML log-likelihood ratio to an already-updated belief state.
+/// Records an ML log-likelihood ratio on an already-updated belief state.
 ///
-/// Deliberately does NOT call [`update_belief`]: `CorrelationEngine::on_event`
-/// already runs the full decay-then-feature-LLR update for this cycle before
-/// the ML scorer even has a chance to run (ML scoring needs the event on the
-/// bus first). Calling `update_belief` a second time here re-summed the same
-/// hand-calibrated feature LLRs on top of themselves — found in PR #345
-/// review: `log_odds` grew roughly 2x calibration intent once a correlation
-/// model was loaded, causing premature `BAYES` alerts (and, via issue #25,
-/// premature auto-kill) on benign processes. This only ever adds the one new
-/// term the first update didn't have.
+/// It does not re-run the behaviour update: `CorrelationEngine::on_event` already judged
+/// the vector for this cycle, before the ML scorer could run (scoring needs the event on
+/// the bus first). Like the behaviour evidence, the score is kept only if it is stronger
+/// than the one remembered, so scoring an entity at each of its events does not add the
+/// model's opinion to itself.
 pub(crate) fn apply_ml_llr(state: &mut BeliefState, llr: f32) {
-    state.log_odds += llr;
+    state.ml_llr = Some(strongest(state.ml_llr, llr));
+    state.recompute();
 }
 
 /// Adds the "image not in the common set" term to a belief, within its allowance
@@ -202,7 +227,6 @@ pub(crate) fn apply_ml_llr(state: &mut BeliefState, llr: f32) {
 /// term on top of an already-updated belief and does not re-run the feature update.
 pub(crate) fn apply_rarity_llr(state: &mut BeliefState) {
     let room = (RARITY_MAX_TOTAL_LLR - state.rarity_llr).max(0.0);
-    let added = RARITY_LLR.min(room);
-    state.log_odds += added;
-    state.rarity_llr += added;
+    state.rarity_llr += RARITY_LLR.min(room);
+    state.recompute();
 }
