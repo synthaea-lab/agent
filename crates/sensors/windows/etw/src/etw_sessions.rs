@@ -1,4 +1,5 @@
-//! Which ETW sessions enable our providers, from the OS itself (#408). Read
+//! Which ETW sessions enable our providers, from the OS itself (#408), and the
+//! on-demand flush of the process creation session. The enumeration is read
 //! only when our session went blind: a foreign real-time session nobody
 //! consumes stalls real-time delivery for every consumer on the host (lab,
 //! 2026-10-01), so naming it is what the operator needs. Best-effort: any API
@@ -8,9 +9,10 @@ use windows_sys::{
     Win32::{
         Foundation::{ERROR_INSUFFICIENT_BUFFER, ERROR_MORE_DATA, ERROR_SUCCESS},
         System::Diagnostics::Etw::{
-            EVENT_TRACE_PROPERTIES, EVENT_TRACE_REAL_TIME_MODE, EnumerateTraceGuidsEx,
-            QueryAllTracesW, TRACE_ENABLE_INFO, TRACE_GUID_INFO, TRACE_PROVIDER_INSTANCE_INFO,
-            TraceGuidQueryInfo,
+            CONTROLTRACE_HANDLE, ControlTraceW, EVENT_TRACE_CONTROL_FLUSH, EVENT_TRACE_PROPERTIES,
+            EVENT_TRACE_REAL_TIME_MODE, EnumerateTraceGuidsEx, QueryAllTracesW, TRACE_ENABLE_INFO,
+            TRACE_GUID_INFO, TRACE_PROVIDER_INSTANCE_INFO, TraceGuidQueryInfo,
+            WNODE_FLAG_TRACED_GUID,
         },
     },
     core::GUID,
@@ -116,6 +118,61 @@ pub(crate) fn provider_enablements(
         }
     }
     out
+}
+
+/// An `EVENT_TRACE_PROPERTIES` followed by the room `ControlTraceW` writes the session's
+/// logger and log-file names into.
+#[repr(C)]
+struct NamedSessionProperties {
+    properties: EVENT_TRACE_PROPERTIES,
+    logger_name: [u8; NAME_BYTES],
+    log_file_name: [u8; NAME_BYTES],
+}
+
+/// Asks ETW to deliver what `session` has buffered now rather than on its flush timer
+/// (`ControlTraceW`, `EVENT_TRACE_CONTROL_FLUSH`). The session is named, not held by
+/// handle: ferrisetw keeps the control handle of the traces it starts to itself.
+///
+/// # Errors
+///
+/// The Win32 status `ControlTraceW` returned, or `ERROR_INSUFFICIENT_BUFFER` for a block
+/// whose size does not fit the header (it always does).
+pub(crate) fn flush_session(session: &str) -> Result<(), u32> {
+    let block_bytes = u32::try_from(size_of::<NamedSessionProperties>())
+        .map_err(|_| ERROR_INSUFFICIENT_BUFFER)?;
+    let logger_name_offset =
+        u32::try_from(std::mem::offset_of!(NamedSessionProperties, logger_name))
+            .map_err(|_| ERROR_INSUFFICIENT_BUFFER)?;
+    let log_file_name_offset =
+        u32::try_from(std::mem::offset_of!(NamedSessionProperties, log_file_name))
+            .map_err(|_| ERROR_INSUFFICIENT_BUFFER)?;
+    let mut block = NamedSessionProperties {
+        properties: EVENT_TRACE_PROPERTIES::default(),
+        logger_name: [0; NAME_BYTES],
+        log_file_name: [0; NAME_BYTES],
+    };
+    block.properties.Wnode.BufferSize = block_bytes;
+    block.properties.Wnode.Flags = WNODE_FLAG_TRACED_GUID;
+    block.properties.LoggerNameOffset = logger_name_offset;
+    block.properties.LogFileNameOffset = log_file_name_offset;
+    let session_name: Vec<u16> = session.encode_utf16().chain(std::iter::once(0)).collect();
+    // SAFETY: the properties pointer is to the start of `block`, a `repr(C)` struct whose
+    // first field is the `EVENT_TRACE_PROPERTIES`, 8-aligned and `BufferSize` bytes long, so
+    // the names the OS writes at the two offsets stay inside it. `session_name` is
+    // NUL-terminated and both outlive the call.
+    let status = unsafe {
+        ControlTraceW(
+            CONTROLTRACE_HANDLE { Value: 0 },
+            session_name.as_ptr(),
+            (&raw mut block).cast::<EVENT_TRACE_PROPERTIES>(),
+            EVENT_TRACE_CONTROL_FLUSH,
+        )
+    };
+    if status == ERROR_SUCCESS {
+        Ok(())
+    } else {
+        Err(status)
+    }
 }
 
 /// Every running session returned by `QueryAllTracesW` and whether the fixed

@@ -2,12 +2,12 @@
 //! the ETW trace and watches its liveness.
 
 use std::sync::{
-    Arc, Mutex,
+    Arc, Mutex, OnceLock,
     atomic::{AtomicBool, AtomicU64, Ordering},
     mpsc::{Receiver, SyncSender},
 };
 
-use ferrisetw::trace::UserTrace;
+use ferrisetw::trace::{KernelTrace, RealTimeTraceTrait, UserTrace};
 use schema::{
     ContainerContext, EventMeta,
     sensor::{Capabilities, EventSink, Sensor, SensorError},
@@ -16,16 +16,19 @@ use schema::{
 use crate::{
     amsi,
     bits::BitsJobs,
-    budget, cross_process, etw_sessions, hcs, normalize,
+    budget,
+    creation_cmdlines::{CreationCmdlines, OnDemandCmdlines},
+    cross_process, etw_sessions, hcs, normalize,
     path_normalizer::PathNormalizer,
     pid_cache::PidCache,
     providers::{
-        ALL_PROVIDERS, amsi_provider, audit_api_provider, bits_provider, dns_provider,
-        dotnet_provider, file_provider, ldap_provider, network_provider, ntlm_provider,
-        powershell_provider, process_provider, registry_provider, smb_provider, wmi_provider,
+        ALL_PROVIDERS, amsi_provider, audit_api_provider, bits_provider, creation_cmdline_provider,
+        dns_provider, dotnet_provider, file_provider, ldap_provider, network_provider,
+        ntlm_provider, powershell_provider, process_provider, registry_provider, smb_provider,
+        wmi_provider,
     },
     registry_keys::RegistryKeys,
-    shed::{EtwShedding, ShedCounter},
+    shed::{CmdlineShedding, EtwShedding, ShedCounter},
     silo::{self, SiloDirectory},
     sync::LockExt,
     winapi,
@@ -37,6 +40,12 @@ use crate::{
 /// helpers) while bounding memory if `ProcessEnd` events are lost — a documented
 /// ETW behavior under buffer pressure, not a theoretical one.
 const PID_CACHE_CAP: usize = 16_384;
+
+/// Creation records kept for process starts that have not asked for them. A record leaves
+/// when its start takes it, when its process ends or after ten seconds, so this is the
+/// number of processes created in a few seconds; past it the oldest is dropped and counted.
+/// Provisional: sized by reasoning, not from a measured creation storm.
+const CREATION_CMDLINES_CAP: usize = 2_048;
 
 /// Registry key objects tracked at once (#91). Opens and closes pair up, so the table holds
 /// the keys open on the host; the cap is the backstop for closes the session lost.
@@ -209,7 +218,14 @@ fn stop_session_after_failed_start(session: &str) {
 /// which foreign sessions enable our providers: a real-time one nobody consumes
 /// blinds every real-time consumer on the host (lab, 2026-10-01), so naming it
 /// is what the operator needs to act.
-fn silent_session_diagnosis(session: &str, prefix: &str) -> String {
+fn silent_session_diagnosis(names: &SessionNames, prefix: &str) -> String {
+    let session = names.events.as_str();
+    // Our creation session is under the prefix too: left in, it reads as another instance's.
+    let describe = |session_listing: Option<String>| {
+        let others = session_listing
+            .map(|listing| normalize::listing_without_session(&listing, &names.creation));
+        normalize::describe_silent_session(session, prefix, others.as_deref())
+    };
     let (sessions, state) = match etw_sessions::running_sessions() {
         Ok(snapshot) => {
             if snapshot.possibly_truncated {
@@ -229,12 +245,12 @@ fn silent_session_diagnosis(session: &str, prefix: &str) -> String {
                 .collect();
             let state =
                 if normalize::listing_is_conclusive(snapshot.possibly_truncated, &names, session) {
-                    normalize::describe_silent_session(session, prefix, Some(&names.join("\n")))
+                    describe(Some(names.join("\n")))
                 } else {
                     // A full list without our session: it may be one of those not
                     // returned, so "stopped from outside" would be a guess. Ask logman;
                     // if that fails too, the state is unknown.
-                    normalize::describe_silent_session(session, prefix, logman_listing().as_deref())
+                    describe(logman_listing())
                 };
             (sessions, state)
         }
@@ -243,9 +259,7 @@ fn silent_session_diagnosis(session: &str, prefix: &str) -> String {
                 status,
                 "QueryAllTracesW failed during blind-session diagnosis; falling back to logman"
             );
-            let output = logman_listing();
-            let state = normalize::describe_silent_session(session, prefix, output.as_deref());
-            (Vec::new(), state)
+            (Vec::new(), describe(logman_listing()))
         }
     };
     let own_losses = sessions
@@ -289,6 +303,12 @@ pub(crate) struct SharedState {
     /// #284: BITS jobs in flight, between their file-added record and their
     /// last one.
     pub(crate) bits: Mutex<BitsJobs>,
+    /// Command lines recorded at process creation, for a start whose PEB read failed. Unset
+    /// while the creation session does not run: the PEB read is then the only source, and
+    /// no start waits for a record that cannot come.
+    pub(crate) creation_cmdlines: OnceLock<OnDemandCmdlines>,
+    /// Starts whose command line came from the creation record, or from nowhere.
+    pub(crate) cmdlines: CmdlineShedding,
     /// F-2: events observed — the silence watchdog reads this.
     pub(crate) events_seen: AtomicU64,
     /// #91: registry key object → key name, so a value write names its key.
@@ -492,19 +512,86 @@ pub(crate) fn find_lsass(state: &SharedState) -> u32 {
     found.unwrap_or(0)
 }
 
-/// F-2: a freshly randomized session name for this run — anti-fingerprinting of
+/// The names of one run's two sessions, both under the agent's prefix so that orphan
+/// cleanup finds either.
+struct SessionNames {
+    /// The session every provider callback reads.
+    events: String,
+    /// The session that only delivers process creation records.
+    creation: String,
+}
+
+/// F-2: freshly randomized session names for this run — anti-fingerprinting of
 /// the session *name*, see `normalize::random_session_name`. Caller is
 /// responsible for orphan cleanup first (`stop_all_orphaned_sessions`); no state
 /// is persisted between runs, unlike the old per-name file (issue #408).
-fn new_session_name(prefix: &str) -> String {
-    normalize::random_session_name(
-        prefix,
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0),
-        std::process::id(),
-    )
+fn new_session_names(prefix: &str) -> SessionNames {
+    let seed_ns = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let pid = std::process::id();
+    SessionNames {
+        events: normalize::random_session_name(prefix, seed_ns, pid),
+        // The next seed, not a second reading of the clock: two readings can be equal, and
+        // equal names would make the second session's start fail.
+        creation: normalize::random_session_name(prefix, seed_ns.wrapping_add(1), pid),
+    }
+}
+
+/// Starts the session that delivers the command line with each process creation, and hands
+/// its store to the process callbacks. An improvement, never a requirement: when the session
+/// cannot start (another system logger holds the slot, a Windows that has no private system
+/// loggers, a missing privilege), the sensor runs on the PEB read alone and says so once.
+fn start_creation_session(
+    session: &str,
+    state: &SharedState,
+    records_shed: ShedCounter,
+) -> Option<KernelTrace> {
+    let cmdlines = Arc::new(CreationCmdlines::counting(
+        CREATION_CMDLINES_CAP,
+        records_shed,
+    ));
+    let builder = KernelTrace::new()
+        .named(session.to_owned())
+        .enable(creation_cmdline_provider(Arc::clone(&cmdlines)));
+    let started = normalize::start_or_stop_session(
+        session,
+        || builder.start_and_process(),
+        stop_session_after_failed_start,
+    );
+    match started {
+        Ok(trace) if trace.trace_name() == *session => {
+            // Never set before: `state` is built for this run and this is its one writer.
+            let _ = state
+                .creation_cmdlines
+                .set(OnDemandCmdlines::flushing_session(
+                    cmdlines,
+                    session.to_owned(),
+                ));
+            Some(trace)
+        }
+        Ok(shared_kernel_logger) => {
+            // Before Windows 8 ferrisetw ignores the name and takes the host's one
+            // "NT Kernel Logger". It is not under our prefix, so a crash would leave it
+            // running with nothing to stop it: give it back rather than hold it.
+            let _ = shared_kernel_logger.stop();
+            tracing::warn!(
+                "this Windows has no private system logger session; \
+                 command lines come from the PEB read alone"
+            );
+            None
+        }
+        Err(error) => {
+            tracing::warn!(
+                session,
+                ?error,
+                "the process creation session could not start; \
+                 command lines come from the PEB read alone"
+            );
+            None
+        }
+    }
 }
 
 /// The silence watchdog. Every heartbeat writes our own canary file, which must
@@ -515,7 +602,7 @@ fn liveness_watch(
     stop: &AtomicBool,
     state: &SharedState,
     canary_file: &std::path::Path,
-    session: &str,
+    sessions: &SessionNames,
     prefix: &str,
 ) -> Result<(), SensorError> {
     let mut last_seen = state.events_seen.load(Ordering::Relaxed);
@@ -531,7 +618,7 @@ fn liveness_watch(
                 return Err(format!(
                     "sensor produced no events for 30s despite liveness canary \
                      writes: {}",
-                    silent_session_diagnosis(session, prefix)
+                    silent_session_diagnosis(sessions, prefix)
                 )
                 .into());
             }
@@ -643,6 +730,8 @@ impl Sensor for WindowsSensor {
             dedup: Mutex::new(normalize::ConnectDedup::new(60_000_000_000)),
             marks,
             bits: Mutex::new(BitsJobs::default()),
+            creation_cmdlines: OnceLock::new(),
+            cmdlines: self.shedding.cmdlines.clone(),
             events_seen: AtomicU64::new(0),
             registry_keys: Mutex::new(RegistryKeys::counting(
                 REGISTRY_KEY_OBJECTS_CAP,
@@ -684,10 +773,18 @@ impl Sensor for WindowsSensor {
 
         let prefix = self.names.session_prefix.as_str();
         stop_all_orphaned_sessions(prefix);
-        let session = new_session_name(prefix);
+        let sessions = new_session_names(prefix);
+        // Started before the main session, so a creation record is on its way before the
+        // process start that may need it. Dropping the trace stops its session, which is
+        // what covers the early return below.
+        let creation_trace = start_creation_session(
+            &sessions.creation,
+            &state,
+            self.shedding.cmdlines.creation_records_shed.clone(),
+        );
 
         let builder = UserTrace::new()
-            .named(session.clone())
+            .named(sessions.events.clone())
             .enable(process_provider(sink.clone(), state.clone()))
             .enable(network_provider(sink.clone(), state.clone()))
             .enable(file_provider(sink.clone(), state.clone()))
@@ -703,15 +800,16 @@ impl Sensor for WindowsSensor {
             .enable(ntlm_provider(sink.clone(), state.clone()))
             .enable(audit_api_provider(sink, state.clone()));
         let trace = normalize::start_or_stop_session(
-            &session,
+            &sessions.events,
             || builder.start_and_process(),
             stop_session_after_failed_start,
         )
         .map_err(|e| -> SensorError { format!("ETW startup error: {e:?}").into() })?;
 
-        let result = liveness_watch(&self.stop, &state, &canary_file, &session, prefix);
+        let result = liveness_watch(&self.stop, &state, &canary_file, &sessions, prefix);
 
         let _ = trace.stop();
+        let _ = creation_trace.map(KernelTrace::stop);
         let _ = std::fs::remove_file(&canary_file);
         result
     }

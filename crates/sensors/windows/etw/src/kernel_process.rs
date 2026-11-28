@@ -4,7 +4,7 @@
 
 use schema::{EventMeta, ExecEvent};
 
-use crate::normalize::basename;
+use crate::{normalize::basename, shed::CmdlineShedding};
 
 /// What a Kernel-Process record names when its image field is missing.
 pub(crate) const UNKNOWN_IMAGE: &str = "<unknown>";
@@ -73,9 +73,55 @@ pub(crate) struct ProcessStart {
 pub(crate) struct ExecContext {
     pub(crate) meta: EventMeta,
     pub(crate) parent_image_path: Option<String>,
-    /// F-1: the real command line, from the target's PEB; `None` when the read failed.
+    /// F-1: the real command line ([`CommandLine::into_text`]); `None` when no source had it.
     pub(crate) cmdline: Option<String>,
     pub(crate) image_file_id: Option<String>,
+}
+
+/// Where the command line of a started process came from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum CommandLine {
+    /// Read from the process's PEB: the primary source.
+    FromProcess(String),
+    /// The process could not be read (already exited, protected); the kernel recorded this
+    /// with its creation.
+    FromCreation(String),
+    /// Neither source had it.
+    Unavailable,
+}
+
+impl CommandLine {
+    /// The process's own answer when it gave one. The creation record is only asked for
+    /// otherwise: asking may wait, and takes the record out of its store.
+    pub(crate) fn choose(
+        from_process: Option<String>,
+        from_creation: impl FnOnce() -> Option<String>,
+    ) -> Self {
+        match from_process {
+            Some(cmdline) => Self::FromProcess(cmdline),
+            None => from_creation().map_or(Self::Unavailable, Self::FromCreation),
+        }
+    }
+
+    /// Counts a start the process did not answer for: rescued by its creation record, or lost.
+    pub(crate) fn count_into(&self, shedding: &CmdlineShedding) {
+        match self {
+            Self::FromProcess(_) => {}
+            Self::FromCreation(_) => {
+                shedding.from_creation.add();
+            }
+            Self::Unavailable => {
+                shedding.lost.add();
+            }
+        }
+    }
+
+    pub(crate) fn into_text(self) -> Option<String> {
+        match self {
+            Self::FromProcess(cmdline) | Self::FromCreation(cmdline) => Some(cmdline),
+            Self::Unavailable => None,
+        }
+    }
 }
 
 impl ProcessStart {
@@ -96,8 +142,8 @@ impl ProcessStart {
         // pids in the store by now.
         meta.process_generation = self.generation.or(meta.process_generation);
         meta.parent_process_generation = self.parent_generation.or(meta.parent_process_generation);
-        // Fall back to the image path only when the read fails, never to a placeholder
-        // pretending to be arguments.
+        // Fall back to the image path only when no source had the command line, never to a
+        // placeholder pretending to be arguments.
         let cmdline = cmdline.unwrap_or_else(|| self.image_path.clone());
         ExecEvent {
             meta,
@@ -246,6 +292,57 @@ mod tests {
         read.cmdline = Some(r#""C:\a.exe" --flag"#.to_owned());
         let event = start(r"C:\a.exe").exec_event(read);
         assert_eq!(event.cmdline, r#""C:\a.exe" --flag"#);
+    }
+
+    fn never_asked() -> Option<String> {
+        panic!("the creation record is asked for although the process answered")
+    }
+
+    /// The exec event and the counters of a start whose two sources answered as given.
+    fn started_with(
+        from_process: Option<&str>,
+        from_creation: Option<&str>,
+    ) -> (ExecEvent, CmdlineShedding) {
+        let shedding = CmdlineShedding::default();
+        let cmdline = CommandLine::choose(from_process.map(str::to_owned), || {
+            from_creation.map(str::to_owned)
+        });
+        cmdline.count_into(&shedding);
+        let mut context = context(meta(None, None));
+        context.cmdline = cmdline.into_text();
+        (start(r"C:\a.exe").exec_event(context), shedding)
+    }
+
+    #[test]
+    fn the_command_line_read_from_the_process_wins_and_the_creation_record_is_left_alone() {
+        let cmdline = CommandLine::choose(Some("a.exe --from-peb".to_owned()), never_asked);
+        assert_eq!(
+            cmdline,
+            CommandLine::FromProcess("a.exe --from-peb".to_owned())
+        );
+
+        let (event, shedding) = started_with(Some("a.exe --from-peb"), Some("a.exe --other"));
+        assert_eq!(event.cmdline, "a.exe --from-peb");
+        assert_eq!(shedding.from_creation.get(), 0);
+        assert_eq!(shedding.lost.get(), 0);
+    }
+
+    #[test]
+    fn a_process_that_could_not_be_read_gets_the_command_line_of_its_creation_record() {
+        let (event, shedding) = started_with(None, Some("reg.exe save HKLM\\SYSTEM s"));
+
+        assert_eq!(event.cmdline, "reg.exe save HKLM\\SYSTEM s");
+        assert_eq!(shedding.from_creation.get(), 1);
+        assert_eq!(shedding.lost.get(), 0);
+    }
+
+    #[test]
+    fn a_start_no_source_answers_for_reports_its_image_path_and_is_counted_lost() {
+        let (event, shedding) = started_with(None, None);
+
+        assert_eq!(event.cmdline, r"C:\a.exe");
+        assert_eq!(shedding.lost.get(), 1);
+        assert_eq!(shedding.from_creation.get(), 0);
     }
 
     #[test]
