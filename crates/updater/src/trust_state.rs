@@ -461,7 +461,8 @@ mod tests {
 
     #[test]
     fn an_empty_record_does_not_judge_the_embedded_set() {
-        // The public test set has release and content on one key (the content-ring design's shortcut).
+        // The public test set has release and content on one key (the content-ring design's
+        // shortcut).
         let shared = TrustedKeys {
             release: public(0x42),
             content: public(0x42),

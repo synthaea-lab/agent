@@ -25,7 +25,8 @@ pub enum UpdaterError {
     SignatureInvalid,
 
     /// This build embeds no production signing key for the manifest's kind, so nothing can
-    /// be verified (the signing-key design: the key files under `crates/updater/keys/` are unprovisioned).
+    /// be verified (the signing-key design: the key files under `crates/updater/keys/` are
+    /// unprovisioned).
     #[error("this build embeds no production signing key for this manifest")]
     SigningKeyUnprovisioned,
 
@@ -98,7 +99,8 @@ pub enum UpdaterError {
         actual: String,
     },
 
-    /// A snapshot manifest's `kind` is not one this build knows (the snapshot-delivery design: only `common-set`).
+    /// A snapshot manifest's `kind` is not one this build knows (the snapshot-delivery design: only
+    /// `common-set`).
     #[error("snapshot manifest kind `{found}` is not supported")]
     SnapshotKindUnsupported {
         /// The `kind` the snapshot manifest declares.

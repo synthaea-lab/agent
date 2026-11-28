@@ -1,5 +1,6 @@
 //! Credential redaction for free command text: a typed shell line, a `PowerShell` script
-//! block, an AMSI buffer, a WQL query (#895, the command-line redaction design "Command text outside `Exec`").
+//! block, an AMSI buffer, a WQL query (#895, the command-line redaction design "Command text
+//! outside `Exec`").
 //!
 //! [`crate::redact_command_line`] reads one process's command line, whose first word is the
 //! image. Free text holds many commands, so it is cut into statements first (unquoted

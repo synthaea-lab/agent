@@ -1,4 +1,5 @@
-//! The on-disk layout: `bootstrap`/`current`/`versions` (extending `packaging/linux/README.md`'s existing convention). Linux-only — see
+//! The on-disk layout: `bootstrap`/`current`/`versions` (extending `packaging/linux/README.md`'s
+//! existing convention). Linux-only — see
 //! `CLAUDE.md`'s platform-code exception for `updater` and the updater design's
 //! section (Windows/macOS self-update need their own design).
 

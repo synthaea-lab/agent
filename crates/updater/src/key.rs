@@ -5,7 +5,8 @@
 //! ([`crate::rotation`]).
 //!
 //! A production build embeds the keys in `crates/updater/keys/*.pub` (hex). Since 2026-11-12 they
-//! hold TEMPORARY `release`, `content` and `recovery` keys, generated outside the signing-key design ceremony
+//! hold TEMPORARY `release`, `content` and `recovery` keys, generated outside the signing-key
+//! design ceremony
 //! and replaced when the real ones exist; `snapshot` stays `unprovisioned`. A file that says `unprovisioned` makes its static `None` and nothing verifies: the
 //! build fails closed instead of trusting a public seed.
 //!

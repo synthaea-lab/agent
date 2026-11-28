@@ -5,7 +5,8 @@
 //!
 //! The shape is the one the signing-key design chose over TUF's metadata: one signed payload, roles
 //! by key, a root of trust (`recovery`) that can rotate the other two. Where it differs from TUF's
-//! threshold and expiry rules, and why, is written in the signing-key design ("The key-rotation release").
+//! threshold and expiry rules, and why, is written in the signing-key design ("The key-rotation
+//! release").
 //!
 //! Verification only, like [`crate::content`] and [`crate::snapshot`]: fetching the manifest,
 //! remembering the rotated keys across restarts and feeding them to the verifiers is the agent

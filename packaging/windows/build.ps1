@@ -26,7 +26,8 @@ foreach ($exe in @("agent.exe", "watchdog.exe")) {
     }
 }
 
-# The shipped artifacts must not carry the public test signing key (https://github.com/synthaea-lab/agent/issues/43): the
+# The shipped artifacts must not carry the public test signing key
+# (https://github.com/synthaea-lab/agent/issues/43): the
 # marker the updater's `test-key` feature links in is looked up in the binaries themselves,
 # the same check tools/assert-no-test-key.sh makes for the Linux packages. Latin-1 (code
 # page 28591, available on Windows PowerShell 5.1 as well as PowerShell 7) maps each byte

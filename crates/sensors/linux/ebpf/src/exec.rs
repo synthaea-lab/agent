@@ -26,7 +26,8 @@ use crate::PROC_LINEAGE;
 /// needs per-byte loops over `MAX_PATH_LEN`, which blow the verifier's 1M-instruction
 /// budget on pre-6.6 kernels (5.15, 6.1).
 ///
-/// 512 KiB since a record carries the argv bytes it read (<https://github.com/synthaea-lab/agent/issues/48>): a record is the
+/// 512 KiB since a record carries the argv bytes it read
+/// (<https://github.com/synthaea-lab/agent/issues/48>): a record is the
 /// fixed `ExecEvent` plus its command line, so this holds about as many as 256 KiB of fixed
 /// records did.
 #[map]
@@ -48,7 +49,8 @@ static MM_ARG_START_OFFSET: Global<u32> = Global::new(0);
 #[unsafe(no_mangle)]
 static MM_ARG_END_OFFSET: Global<u32> = Global::new(0);
 
-/// Reads the current task's argument block into `rec.argv` (<https://github.com/synthaea-lab/agent/issues/48>): all of it when it
+/// Reads the current task's argument block into `rec.argv`
+/// (<https://github.com/synthaea-lab/agent/issues/48>): all of it when it
 /// fits in `ARGV_WINDOW_BYTES`, else the first `ARGV_HEAD_BYTES` and the last `ARGV_TAIL_BYTES`.
 /// At `sched_process_exec` the new `mm` is installed and `execve` has just copied the strings
 /// onto the new stack, so `arg_start..arg_end` is this exec's argv. A failed head read leaves

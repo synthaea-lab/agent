@@ -47,7 +47,8 @@ pub const FEATURE_NAMES: [&str; 8] = [
 /// `DnsQuery` here would silently inflate both features relative to the training
 /// vectors.
 ///
-/// The correlation-vector design side effect: gating the whole vector on this filter means `event_count`
+/// The correlation-vector design side effect: gating the whole vector on this filter means
+/// `event_count`
 /// and `span_s` grow for any process with netlink traffic, not just the two fields
 /// `NetworkFlow` feeds below. `connect_count` (T1's `BehaviorVector`) is unaffected —
 /// it filters on `Event::Connect` explicitly, independent of this gate.
@@ -215,7 +216,8 @@ mod tests {
 
     #[test]
     fn network_flow_absorbed_into_same_daddr_dport_sets_as_connect() {
-        // the correlation-vector design: Connect and NetworkFlow share one "distinct destinations" count —
+        // the correlation-vector design: Connect and NetworkFlow share one "distinct destinations"
+        // count —
         // an attacker whose traffic is seen only by netlink still shows up here.
         let mut bus = EventBus::new(Duration::from_secs(60));
         bus.push(connect(7, 0, 4444));

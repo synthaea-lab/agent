@@ -3,7 +3,8 @@
 //!
 //! The tool never generates, stores or transports a key; where the production key
 //! lives and who may use it is the updater design's open question, not this tool's. It refuses the
-//! obvious mistake of a key file other users can read, and, per the signing-key design, a key file that does
+//! obvious mistake of a key file other users can read, and, per the signing-key design, a key file
+//! that does
 //! not hold one of the public test keys: a key that can be read from a file is not a production
 //! key, so the file path signs the test set and nothing else (production signs from a PKCS#11
 //! token).

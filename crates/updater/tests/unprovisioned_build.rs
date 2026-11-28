@@ -1,4 +1,5 @@
-//! The production variant of the trust set (<https://github.com/synthaea-lab/agent/issues/43>), which no unit test can reach:
+//! The production variant of the trust set (<https://github.com/synthaea-lab/agent/issues/43>),
+//! which no unit test can reach:
 //! those compile under `cfg(test)`, where the public test seed is always present. An
 //! integration test links the library without `cfg(test)`, so with `--no-default-features`
 //! it sees exactly what a packaged build embeds. CI runs it as
@@ -46,7 +47,8 @@ fn hex(key: &Option<[u8; 32]>) -> Option<String> {
 #[test]
 fn a_build_without_the_test_key_feature_embeds_exactly_the_committed_keys() {
     // A file that says `unprovisioned` embeds no key; a file that holds a key embeds that key
-    // and nothing else. The three roles must differ (the signing-key design: a content signer must not be
+    // and nothing else. The three roles must differ (the signing-key design: a content signer must
+    // not be
     // able to sign releases).
     for (file, embedded) in [
         ("release", &*RELEASE_PUBLIC_KEY),

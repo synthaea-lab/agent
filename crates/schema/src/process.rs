@@ -79,7 +79,9 @@ pub struct ExecEvent {
     /// whole command line was seen": see [`Self::argv_omitted_bytes`]'s `None`.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub cmdline_truncated: bool,
-    /// How many bytes of the argument block the sensor did not capture (<https://github.com/synthaea-lab/agent/issues/48>): `Some(0)` when it captured the whole block, `Some(n)` when `n` bytes
+    /// How many bytes of the argument block the sensor did not capture
+    /// (<https://github.com/synthaea-lab/agent/issues/48>): `Some(0)` when it captured the whole
+    /// block, `Some(n)` when `n` bytes
     /// between a head and a tail window were not read, `None` when unknown (the
     /// sensor saw nothing to measure against, or a cut whose size it did not
     /// measure). A rule must never read `None` as "complete".

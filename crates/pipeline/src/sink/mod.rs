@@ -1074,7 +1074,8 @@ fn load_sigma_rules(content_root: &Path) -> Load<sigma::SigmaEngine> {
 
 /// How many hosts a snapshot must cover before "not in the common set" counts as evidence
 ///: on a fleet that has just enrolled the snapshot is empty or thin, and every
-/// binary would look rare. **Provisional**: The fleet-prevalence design leaves it to calibration on lab data
+/// binary would look rare. **Provisional**: The fleet-prevalence design leaves it to calibration on
+/// lab data
 /// (slice 6 of `docs/detection/fleet-prevalence-snapshot-plan.md`).
 const RARITY_MIN_HOSTS_COVERED: u64 = 10;
 

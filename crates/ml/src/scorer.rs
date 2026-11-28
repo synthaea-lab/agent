@@ -1,5 +1,6 @@
 //! On-device ML scoring: runs an Isolation Forest (ONNX) through onnxruntime
-//! (`ort`, statically linked — the model-delivery design) and pairs every score with the per-feature
+//! (`ort`, statically linked — the model-delivery design) and pairs every score with the
+//! per-feature
 //! attribution from [`crate::forest`], so a detection is never a bare number
 //! (`docs/detection/ml.md`).
 //!

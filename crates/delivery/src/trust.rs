@@ -1,4 +1,5 @@
-//! The refusal to act on a manifest the build cannot really verify: a build that trusts the public test key acts only on an explicit acknowledgement
+//! The refusal to act on a manifest the build cannot really verify: a build that trusts the public
+//! test key acts only on an explicit acknowledgement
 //! (`--allow-test-key`, which exists only in a `test-key` build), and a build that embeds no
 //! production key yet cannot verify anything, so it says so instead of failing at the
 //! signature.

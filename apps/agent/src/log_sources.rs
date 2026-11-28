@@ -19,7 +19,8 @@
 //! credential redaction of an `HttpRequest`'s evidence value belongs there (no
 //! second redaction path).
 //!
-//! No silence alert and no heartbeat: a quiet log is normal on a quiet site (decision 4). A line that does not parse is counted and sampled in the log, never
+//! No silence alert and no heartbeat: a quiet log is normal on a quiet site. A line
+//! that does not parse is counted and sampled in the log, never
 //! skipped silently, and a source whose lines mostly fail raises the `LOG-SOURCE` alert.
 
 use std::{

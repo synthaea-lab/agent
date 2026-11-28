@@ -1,4 +1,5 @@
-//! Content-manifest fetch, verification, download, and apply (issue #30/#73): the agent-side half of "fetch a signed manifest for my
+//! Content-manifest fetch, verification, download, and apply (issue #30/#73): the agent-side half
+//! of "fetch a signed manifest for my
 //! ring, verify it, download what changed, write it to disk."
 //!
 //! [`cmd_check_content_manifest`] does the fetch-and-verify-only report;
@@ -231,8 +232,10 @@ pub fn cmd_check_content_manifest(
 /// The line for an offer that is not newer than what this agent has applied (#665). Two
 /// different situations used to read the same, "up to date": an offer of the release already
 /// applied (nothing to do), and an **older** one, which is what the server offers after it
-/// rolled a release back. The agent never goes to a lower release number (anti-replay), so an agent that already applied the rolled-back release stays on it, and the
-/// operator must be told that, not that all is well. The content-withdrawal rule: such content is withdrawn by a
+/// rolled a release back. The agent never goes to a lower release number (anti-replay), so an agent
+/// that already applied the rolled-back release stays on it, and the
+/// operator must be told that, not that all is well. The content-withdrawal rule: such content is
+/// withdrawn by a
 /// corrective release with a higher number.
 fn describe_unchanged_offer(ring: &str, offered: u64, current: u64) -> String {
     if offered < current {

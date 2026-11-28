@@ -17,7 +17,8 @@ const TRUNCATED_CMDLINE_QUOTE_BYTES: usize = 256;
 /// and tail) can guarantee the payload is kept; the cut itself is the signal. Two
 /// causes, graded and worded apart:
 ///
-/// - **The bytes between the Linux probe's head and tail windows** (  `argv_omitted_bytes = Some(n > 0)`): any argument block over 1 KiB. **Low**, as
+/// - **The bytes between the Linux probe's head and tail windows**
+///   (`argv_omitted_bytes = Some(n > 0)`): any argument block over 1 KiB. **Low**, as
 ///   the argv-window design fixed it: in #1112's sample at most 3 of 3,451 execs exceed 1 KiB, and
 ///   none of 1,592 lab execs did, but both samples are small and from lab hosts.
 /// - **Any other cut** (`argv_omitted_bytes = None`): the 32 KiB budget of #1112

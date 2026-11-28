@@ -81,7 +81,8 @@ fn exec_keeps_argv_and_joins_cmdline() {
     );
 }
 
-/// The argv-window design's truth table, the probe rows: bytes known to lie between the windows set the
+/// The argv-window design's truth table, the probe rows: bytes known to lie between the windows set
+/// the
 /// flag; a whole block or an unknown count does not.
 #[test]
 fn omitted_argv_bytes_set_the_truncation_flag_only_when_known_to_be_missing() {

@@ -52,7 +52,8 @@ pub(super) fn crosses_kill_gate(technique: &str) -> bool {
 // (where the image lives, who started it), never "package-owned", which nothing verifies.
 const SERVICE_MAIN_REFUSAL: &str = "main process of a system service (image under a system path, started by init); escalated, not killed";
 
-/// Why the kill gate refuses the process holding a login session (<https://github.com/synthaea-lab/agent/issues/50>).
+/// Why the kill gate refuses the process holding a login session
+/// (<https://github.com/synthaea-lab/agent/issues/50>).
 /// Same care as [`SERVICE_MAIN_REFUSAL`]: it states what was checked (the image and
 /// its parent's image), not that the session is legitimate, nor that the parent was
 /// started by init: the listener's exec is usually never seen.

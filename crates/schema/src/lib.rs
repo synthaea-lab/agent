@@ -358,12 +358,14 @@ pub mod time;
 ///
 /// Bumped 66 → 67 for [`Event::RemoteThread`] and [`Event::ProcessAccess`] (<https://github.com/synthaea-lab/agent/issues/41>): a thread
 /// created in another process and a memory-reading open of LSASS, from the driver-free ETW
-/// providers the Sysmon decision's lab capture (#715) confirmed, as the native equivalents of Sysmon 8
+/// providers the Sysmon decision's lab capture (#715) confirmed, as the native equivalents of
+/// Sysmon 8
 /// and 10. Windows only. [`ProcessAccessEvent::caller_image_path`] carries the caller's
 /// full image, for the LSASS rule's expected readers (<https://github.com/synthaea-lab/agent/issues/45>). First claimed 63, then 64; #1112 and #1103 merged first and took 65
 /// and 66, so this takes 67.
 ///
-/// Bumped 67 → 68 for [`ExecEvent::argv_omitted_bytes`] (<https://github.com/synthaea-lab/agent/issues/48>): the
+/// Bumped 67 → 68 for [`ExecEvent::argv_omitted_bytes`]
+/// (<https://github.com/synthaea-lab/agent/issues/48>): the
 /// Linux exec probe reads a head and a tail window of the argument block and says
 /// how much of it lies between them. First claimed 67;
 /// <https://github.com/synthaea-lab/agent/issues/41> merged first and took it, so this takes 68.

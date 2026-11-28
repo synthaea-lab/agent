@@ -131,7 +131,8 @@ fn exec_cmdline_truncated_golden() {
 
 #[test]
 fn exec_argv_omitted_bytes_golden() {
-    // v68 (https://github.com/synthaea-lab/agent/issues/48): the Linux exec probe read a head and a tail window and
+    // v68 (https://github.com/synthaea-lab/agent/issues/48): the Linux exec probe read a head and a
+    // tail window and
     // says how many bytes lay between them; the field only appears when known.
     assert_golden(
         &Event::Exec(ExecEvent {

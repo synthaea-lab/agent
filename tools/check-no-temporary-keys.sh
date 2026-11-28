@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# A release must not embed the temporary signing keys (https://github.com/synthaea-lab/agent/issues/43).
+# A release must not embed the temporary signing keys
+# (https://github.com/synthaea-lab/agent/issues/43).
 #
 # The three keys committed on 2026-11-12 were generated on a developer machine outside the
 # ceremony: no custody, no holders, a private half in a plain file. They let the lab run the

@@ -1,7 +1,8 @@
 //! The rarity feature: is the executed image on this fleet's common set? The Rust mirror of
 //! `ml/synthaea_ml/features/rarity.py` (issue #640).
 //!
-//! The fleet-prevalence design: the server publishes, per tenant, a **common-set snapshot** (the image hashes seen
+//! The fleet-prevalence design: the server publishes, per tenant, a **common-set snapshot** (the
+//! image hashes seen
 //! on at least K hosts) and the device checks an executed image against it locally. The model
 //! input is a small ordinal derived from that snapshot, never a host count (a count is not
 //! something the device can compute). Two numbers, because "rare" must be distinguishable from

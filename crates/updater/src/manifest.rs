@@ -39,7 +39,8 @@ pub struct ReleaseManifest {
     pub signature: String,
 }
 
-/// The canonical bytes keep `entries` in its `BTreeMap`'s natural sorted key order (the updater design
+/// The canonical bytes keep `entries` in its `BTreeMap`'s natural sorted key order (the updater
+/// design
 /// decision 2).
 impl SignedDocument for ReleaseManifest {
     fn signature(&self) -> &str {
