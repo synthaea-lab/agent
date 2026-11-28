@@ -228,7 +228,7 @@ encrypted PEM key with an explicit error and asks for an unencrypted one. So tod
 file's protection comes from file permissions only.
 
 **Credentials in telemetry.** Detection needs raw command text, but every copy that
-leaves the process should be scrubbed. [`RedactingSink`](../apps/agent/src/redact.rs) applies
+leaves the process should be scrubbed. [`RedactingSink`](../crates/redact/src/event.rs) applies
 that split. Live detection pipelines see `Exec`, `ReadlineInput`, `ScriptBlock`,
 `AmsiContent` and `WmiActivity` raw, while capture and output sinks get them redacted.
 URL secrets in download provenance, BITS jobs and HTTP evidence are always redacted. The

@@ -8,5 +8,10 @@ publish.workspace = true
 [lints]
 workspace = true
 
+[dependencies]
+schema = { path = "../schema" }
+
 [dev-dependencies]
+schema = { path = "../schema", features = ["test-fixtures"] }
+serde_json = { workspace = true }
 proptest = "1"

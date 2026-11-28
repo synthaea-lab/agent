@@ -32,6 +32,7 @@ mod network_state;
 mod ntlm;
 mod osascript;
 mod privesc;
+mod ransomware_join;
 mod rdp;
 mod recon;
 mod securitytool;
@@ -58,6 +59,7 @@ pub use ldap::evaluate_ldap_search;
 // NTLM rules (#364): Internet-bound authentication and weak versions.
 pub use logon::LocalOffsetAt;
 pub use ntlm::evaluate_ntlm_auth;
+pub use ransomware_join::RansomwareJoin;
 use schema::detection::Severity;
 pub use signature_gate::{ImageSignature, SignatureGatedAlert};
 pub use state::RuleState;

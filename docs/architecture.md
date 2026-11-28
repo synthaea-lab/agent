@@ -121,7 +121,7 @@ The detection sink ([`sink/mod.rs`](../apps/agent/src/sink/mod.rs)) has no platf
 | [`spawn`](../crates/workers/src/spawn.rs) | `spawn_named`, which starts a named background thread and returns the OS error, with the thread's name, instead of panicking. |
 | [`shutdown`](../crates/workers/src/shutdown.rs) | `ShutdownPlan`, a bounded join of the registered workers. |
 | [`kill_loudness`](../apps/agent/src/kill_loudness.rs) | Attributes SIGTERM/SIGHUP/SIGQUIT to their sender before exiting (Linux). |
-| [`redact`](../apps/agent/src/redact.rs) | `RedactingSink` and `redact_event`, which redact data at the point where events leave the process. |
+| [`redact::event`](../crates/redact/src/event.rs) | `RedactingSink` and `redact_event`, which redact data at the point where events leave the process. |
 | [`content`](../apps/agent/src/content.rs), [`release`](../apps/agent/src/release.rs), [`rotation`](../apps/agent/src/rotation.rs), [`trust`](../apps/agent/src/trust.rs) | Signed content, release and key-rotation commands. |
 | [`protected`](../apps/agent/src/protected.rs), [`integrity`](../apps/agent/src/integrity.rs), [`inventory`](../apps/agent/src/inventory.rs) | Linux self-protection and inventory monitors. |
 

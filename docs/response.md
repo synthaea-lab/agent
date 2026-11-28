@@ -82,7 +82,7 @@ Exactly two triggers reach [`DetectionSink::kill_for`](../apps/agent/src/sink/re
    [`crosses_kill_gate`](../apps/agent/src/sink/response.rs) is true (technique `BAYES`) is passed to
    [`maybe_kill`](../apps/agent/src/sink/response.rs). The audit reason is "a high-confidence
    correlated verdict".
-2. **The ransomware reflex.** [`RansomwareJoin`](../apps/agent/src/ransomware_join.rs)
+2. **The ransomware reflex.** [`RansomwareJoin`](../crates/rules/src/ransomware_join.rs)
    records, per process incarnation, the last ransomware burst rule (T1486) and the
    last canary touch. When both are fresh within 60 s of each other, in either order,
    [`ransomware_reflex`](../apps/agent/src/sink/response.rs) kills that pid. Neither signal kills

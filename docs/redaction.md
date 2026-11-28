@@ -8,7 +8,7 @@ The in-memory event that detection evaluates stays untouched.
 
 Sources: the pure functions in [`crates/redact`](../crates/redact/src)
 (plus [`text.rs`](../crates/redact/src/text.rs)) and the event-level boundary in
-[`apps/agent/src/redact.rs`](../apps/agent/src/redact.rs).
+[`crates/redact/src/event.rs`](../crates/redact/src/event.rs).
 
 ## Where redaction happens
 
@@ -33,13 +33,13 @@ flowchart LR
 
 | Boundary | Code | What is redacted |
 |---|---|---|
-| Sensor sink wrapper | [`RedactingSink`](../apps/agent/src/redact.rs), built by [`redacting`](../apps/agent/src/redact.rs) | Always: URL and evidence fields (below). Command text only when `redact_commands` is set, which the capture commands do. Live `run` pipelines leave command events raw ([`carries_command_text`](../apps/agent/src/redact.rs)). |
+| Sensor sink wrapper | [`RedactingSink`](../crates/redact/src/event.rs), built by [`redacting`](../crates/redact/src/event.rs) | Always: URL and evidence fields (below). Command text only when `redact_commands` is set, which the capture commands do. Live `run` pipelines leave command events raw ([`carries_command_text`](../crates/redact/src/event.rs)). |
 | Event output | enrichment worker in [`sink/mod.rs`](../apps/agent/src/sink/mod.rs) | A redacted clone goes to `events.jsonl` and the event spool. |
 | Detection output | [`record_detection`](../apps/agent/src/sink/recording.rs) and `safe_detection_message` | Every evidence event, and the detection title when a rule quoted the command line or an AMSI excerpt. The raw quote is replaced with the matching excerpt from the redacted copy. |
 | Baseline capture | baseline writer in [`sink/mod.rs`](../apps/agent/src/sink/mod.rs) | The training corpus stores the redacted `argv` and `cmdline`. Training and runtime scoring must use the same redacted canonical input. |
 | Service-log events | [`log_sources::deliver`](../apps/agent/src/log_sources.rs) | `HttpRequest` evidence before it reaches the sink. |
 
-[`redact_event`](../apps/agent/src/redact.rs) is the single per-variant dispatcher:
+[`redact_event`](../crates/redact/src/event.rs) is the single per-variant dispatcher:
 
 | Event | Field(s) | Function |
 |---|---|---|
@@ -191,7 +191,7 @@ above applies regardless.
   `argv` and joined-cmdline paths agree, and, in `text.rs`, that free text is
   panic-free and idempotent. Past failing seeds are checked in under
   `crates/redact/proptest-regressions/` and replayed first.
-- Boundary tests in [`apps/agent/src/redact.rs`](../apps/agent/src/redact.rs) check that
+- Boundary tests in [`crates/redact/src/event.rs`](../crates/redact/src/event.rs) check that
   the sink redacts URLs, leaves unrelated events unchanged, and that the real
   output wrapper redacts both Linux `argv` and raw Windows command lines.
 

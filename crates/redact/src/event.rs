@@ -1,29 +1,30 @@
-//! Event-boundary redaction wrappers for the agent.
+//! Redaction at the event boundary: what an event may carry once it leaves detection.
 //!
 //! `FileQuarantine`'s `origin_url`/`referrer_url`, a `BitsJob`'s `url` (#284), and an
 //! `HttpRequest`'s evidence value (#478, ADR-0022 §4) are redacted here before any
 //! consumer sees the event — see [`redact_event`]'s doc for exactly what each path
 //! covers. `Exec` command lines/argv (#705, ADR-0034) and the command text of `ReadlineInput`,
 //! `ScriptBlock`, `AmsiContent` and `WmiActivity` (#895) go through the same boundary,
-//! via the pure functions in `crates/redact`; [`RedactingSink::redact_commands`] controls
+//! via the pure functions of this crate; [`RedactingSink::redact_commands`] controls
 //! whether a given sink sees them raw (live detection pipelines) or redacted
 //! (capture/output paths).
 
-// The shared sink wrapper is used by all platform run and capture commands.
-
 use std::sync::Arc;
 
-pub(crate) use redact::{
+use schema::{Event, ExecEvent, sensor::EventSink};
+
+use crate::{
     CommandDialect, REDACTED, is_secret_key, redact_argv, redact_command_line, redact_command_text,
     redact_url_secrets,
 };
-use schema::{Event, ExecEvent, sensor::EventSink};
 
 /// Redacts output copies while allowing live detection pipelines to inspect raw command
 /// events ([`carries_command_text`]).
-pub(crate) struct RedactingSink<S> {
-    pub(crate) inner: S,
-    pub(crate) redact_commands: bool,
+pub struct RedactingSink<S> {
+    /// The sink that receives each event after redaction.
+    pub inner: S,
+    /// Whether command text is redacted too; a live detection pipeline leaves it raw.
+    pub redact_commands: bool,
 }
 
 impl<S: EventSink> EventSink for RedactingSink<S> {
@@ -52,26 +53,17 @@ fn carries_command_text(event: &Event) -> bool {
 
 /// Puts a [`RedactingSink`] in front of a sensor sink used by run or capture commands.
 /// Capture callers set `redact_commands`; live detection pipelines leave command events raw.
-pub(crate) fn redacting(sink: Box<dyn EventSink>, redact_commands: bool) -> Arc<dyn EventSink> {
+#[must_use]
+pub fn redacting(sink: Box<dyn EventSink>, redact_commands: bool) -> Arc<dyn EventSink> {
     Arc::new(RedactingSink {
         inner: Arc::<dyn EventSink>::from(sink),
         redact_commands,
     })
 }
 
-#[cfg(target_os = "linux")]
-pub(crate) struct SharedSink(pub(crate) Arc<dyn EventSink>);
-
-#[cfg(target_os = "linux")]
-impl EventSink for SharedSink {
-    fn on_event(&self, event: Event) {
-        self.0.on_event(event);
-    }
-}
-
 /// Redacts sensitive fields on an event copy immediately before output. Run-mode
 /// sensor wrappers preserve Exec until detection; capture-mode wrappers redact it
-/// at their output boundary. `log_sources::deliver` also uses this for Linux HTTP
+/// at their output boundary. The agent's log sources also use this for Linux HTTP
 /// evidence (ADR-0018/0022).
 ///
 /// An `HttpRequest`'s evidence is the one query parameter a signature matched on,
@@ -79,7 +71,7 @@ impl EventSink for SharedSink {
 /// marks it as a secret (`?token=…`, `?password=…`), the whole value is replaced by
 /// [`REDACTED`], the name is kept so the finding still reads. A parameter that is not
 /// named like a secret (`?id=1 union select 1`) keeps its value: it is the evidence.
-pub(crate) fn redact_event(event: &mut Event) {
+pub fn redact_event(event: &mut Event) {
     match event {
         Event::FileQuarantine(quarantine) => {
             for url in [&mut quarantine.origin_url, &mut quarantine.referrer_url]
@@ -127,7 +119,7 @@ pub(crate) fn redact_event(event: &mut Event) {
 /// Redacts an exec's command line in place: the argv when the sensor provides one
 /// (the command line is then rebuilt from it), the raw command line otherwise
 /// (Windows/ETW reports no argv).
-pub(crate) fn redact_exec(exec: &mut ExecEvent) {
+pub fn redact_exec(exec: &mut ExecEvent) {
     if exec.argv.is_empty() {
         exec.cmdline = redact_command_line(&exec.image_path, &exec.cmdline).into_owned();
     } else {

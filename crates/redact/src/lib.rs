@@ -8,6 +8,7 @@
 
 mod argv;
 mod cmdline;
+pub mod event;
 mod form;
 mod headers;
 mod net;

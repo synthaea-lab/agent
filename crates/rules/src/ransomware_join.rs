@@ -48,14 +48,22 @@ enum Kind {
 }
 
 /// Joins the two signals per process.
-pub(crate) struct RansomwareJoin {
+pub struct RansomwareJoin {
     seen: BoundedMap<u32, Signals>,
     /// `seen.evicted()` when it was last reported, so each loss is logged once.
     reported_evictions: u64,
 }
 
+impl Default for RansomwareJoin {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl RansomwareJoin {
-    pub(crate) fn new() -> Self {
+    /// A join that has seen no signal yet.
+    #[must_use]
+    pub fn new() -> Self {
         Self {
             seen: BoundedMap::new(MAX_TRACKED),
             reported_evictions: 0,
@@ -64,13 +72,13 @@ impl RansomwareJoin {
 
     /// The process raised the ransomware burst rule. True when it also touched a canary
     /// inside the window: the corroborated case, reported once.
-    pub(crate) fn note_burst(&mut self, pid: u32, generation: Option<u64>, now_ns: u64) -> bool {
+    pub fn note_burst(&mut self, pid: u32, generation: Option<u64>, now_ns: u64) -> bool {
         self.note(Kind::Burst, pid, generation, now_ns)
     }
 
     /// The process touched a canary. True when it also raised the burst rule inside the
     /// window.
-    pub(crate) fn note_canary(&mut self, pid: u32, generation: Option<u64>, now_ns: u64) -> bool {
+    pub fn note_canary(&mut self, pid: u32, generation: Option<u64>, now_ns: u64) -> bool {
         self.note(Kind::Canary, pid, generation, now_ns)
     }
 
