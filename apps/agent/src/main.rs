@@ -32,34 +32,14 @@ mod deception;
     allow(dead_code)
 )]
 mod host_counters;
-// Linux-only: the module itself calls raw POSIX signal APIs
-// (sigemptyset/pthread_sigmask/sigwaitinfo) that don't exist in the `libc` crate on
-// Windows, and `apps/agent/Cargo.toml` only pulls `libc` in under
-// `cfg(target_os = "linux")` — unlike `heartbeat`/`sink` above, there's no
-// cross-platform body here to keep alive with an `allow(dead_code)`.
-#[cfg(target_os = "linux")]
-mod integrity;
-// Linux-only: `dpkg` has no Windows/macOS equivalent to fall back to (unlike
-// `heartbeat`/`protected`, which compile everywhere and are just unwired
-// elsewhere) — there is nothing this module could do on another platform, so
-// it is gated out rather than kept as dead weight that always takes the
-// "file not found" skip path.
-#[cfg(target_os = "linux")]
-mod inventory;
-#[cfg_attr(
-    not(any(target_os = "linux", target_os = "macos", windows)),
-    allow(dead_code)
-)]
-mod ipc_handler;
+// Linux-only: the module calls raw POSIX signal APIs (sigemptyset, pthread_sigmask,
+// sigwaitinfo) that the `libc` crate does not have on Windows.
 #[cfg(target_os = "linux")]
 mod kill_loudness;
 #[cfg(target_os = "linux")]
 mod log_sources;
 #[cfg(target_os = "linux")]
 mod memscan;
-mod protected;
-mod quarantine_cmd;
-mod silence;
 
 use clap::{Parser, Subcommand};
 #[cfg(target_os = "linux")]
@@ -572,11 +552,12 @@ fn try_main() -> anyhow::Result<std::process::ExitCode> {
             },
         ),
         Command::Quarantine { alerts, action } => match action {
-            QuarantineAction::List => {
-                quarantine_cmd::cmd_quarantine_list(&alerts, &mut std::io::stdout().lock())
-            }
+            QuarantineAction::List => pipeline::quarantine_cmd::cmd_quarantine_list(
+                &alerts,
+                &mut std::io::stdout().lock(),
+            ),
             QuarantineAction::Restore { sha256 } => {
-                quarantine_cmd::cmd_quarantine_restore(&alerts, &sha256)
+                pipeline::quarantine_cmd::cmd_quarantine_restore(&alerts, &sha256)
             }
         },
         Command::ApplyRelease {

@@ -18,7 +18,8 @@ use sinks::alert_log::AlertLog;
 
 /// Where `agent run` quarantines payloads for the alert log at `alerts`. The one
 /// definition both `run` and this command use, so they cannot disagree.
-pub(crate) fn quarantine_dir_for(alerts: &Path) -> PathBuf {
+#[must_use]
+pub fn quarantine_dir_for(alerts: &Path) -> PathBuf {
     alerts.with_file_name("quarantine")
 }
 
@@ -28,7 +29,7 @@ pub(crate) fn quarantine_dir_for(alerts: &Path) -> PathBuf {
 ///
 /// Returns an error if the quarantine directory or a sidecar cannot be read, or
 /// `out` cannot be written.
-pub(crate) fn cmd_quarantine_list(alerts: &Path, out: &mut impl Write) -> anyhow::Result<()> {
+pub fn cmd_quarantine_list(alerts: &Path, out: &mut impl Write) -> anyhow::Result<()> {
     let items = response::list_quarantined(&quarantine_dir_for(alerts))?;
     if items.is_empty() {
         writeln!(out, "nothing is quarantined")?;
@@ -46,7 +47,7 @@ pub(crate) fn cmd_quarantine_list(alerts: &Path, out: &mut impl Write) -> anyhow
 ///
 /// Returns the restore error (refused digest, altered payload, occupied
 /// original path, I/O failure); the failure is audited first.
-pub(crate) fn cmd_quarantine_restore(alerts: &Path, sha256_hex: &str) -> anyhow::Result<()> {
+pub fn cmd_quarantine_restore(alerts: &Path, sha256_hex: &str) -> anyhow::Result<()> {
     let log = AlertLog::open(alerts, 8)?;
     let quarantine_dir = quarantine_dir_for(alerts);
     match response::unquarantine(&quarantine_dir, sha256_hex) {

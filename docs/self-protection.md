@@ -24,10 +24,10 @@ hardening step can be undone by an administrator through the documented commands
 | Kill the agent | watchdog respawns it | [`supervise.rs`](../apps/watchdog/src/supervise.rs) |
 | Kill the watchdog | service manager respawns it; the agent dies with it | [`service/`](../apps/watchdog/src/service/mod.rs), [`die_with_parent`](../apps/watchdog/src/supervise.rs) |
 | Freeze or wedge the agent | progress heartbeat stalls, watchdog kills and restarts it | [`progress.rs`](../crates/tamper/src/progress.rs), [`HeartbeatMonitor`](../apps/watchdog/src/supervise.rs) |
-| Detach or stop one sensor | sensor-silence alert (T1562) | [`tamper::heartbeat`](../crates/tamper/src/heartbeat.rs), [`silence.rs`](../apps/agent/src/silence.rs) |
-| Swap the binary on disk | watchdog refuses to launch it; periodic manifest check alerts (T1601) | [`BinaryPin`](../apps/watchdog/src/tamper.rs), [`integrity.rs`](../apps/agent/src/integrity.rs) |
+| Detach or stop one sensor | sensor-silence alert (T1562) | [`tamper::heartbeat`](../crates/tamper/src/heartbeat.rs), [`silence.rs`](../crates/pipeline/src/silence.rs) |
+| Swap the binary on disk | watchdog refuses to launch it; periodic manifest check alerts (T1601) | [`BinaryPin`](../apps/watchdog/src/tamper.rs), [`integrity.rs`](../crates/pipeline/src/integrity.rs) |
 | Edit or disable the service definition | drift report (Linux) | [`drift_report`](../apps/watchdog/src/service/linux.rs) |
-| Write, delete or rename the agent's own files | protected-resource alert (T1562) | [`protected.rs`](../apps/agent/src/protected.rs) |
+| Write, delete or rename the agent's own files | protected-resource alert (T1562) | [`protected.rs`](../crates/pipeline/src/protected.rs) |
 | Send `SIGTERM`/`SIGHUP`/`SIGQUIT` | sender recorded before exit (T1562) | [`kill_loudness.rs`](../apps/agent/src/kill_loudness.rs) |
 | Broken release after an update | probation, rollback and ban | [`probation.rs`](../apps/watchdog/src/probation.rs), [`recovery.rs`](../apps/watchdog/src/recovery.rs) |
 
@@ -117,7 +117,7 @@ the same observable, telemetry stops, and
   `AtomicU64` it pulses with one relaxed increment per event (or per batch with
   `pulse_n`). Sensor crates may not depend on `tamper`, so a sensor exposes a plain
   counter and the binary wraps it with `SensorHeartbeat::from_counter`. On the main
-  Linux path, [`PulsingSink`](../apps/agent/src/silence.rs) pulses before forwarding each
+  Linux path, [`PulsingSink`](../crates/pipeline/src/silence.rs) pulses before forwarding each
   event to the sink.
 - A [`SilenceMonitor`](../crates/tamper/src/heartbeat.rs) holds a deadline per sensor.
   [`SilenceMonitor::poll`](../crates/tamper/src/heartbeat.rs) reports a
@@ -126,14 +126,14 @@ the same observable, telemetry stops, and
   pulses is caught one deadline after registration. A sensor that is switched off on
   purpose (an optional capture whose flag is not set) is never registered, so it is not
   reported.
-- [`silence::spawn_monitor`](../apps/agent/src/silence.rs) polls every 10 s
+- [`silence::spawn_monitor`](../crates/pipeline/src/silence.rs) polls every 10 s
   (`POLL_INTERVAL`) on its own thread and emits each verdict as a `T1562` alert through
   `DetectionSink::emit_tamper`, which also counts it for the health beacon. The same
   monitor feeds per-sensor health to the beacon
-  ([`SilenceHealthSource`](../apps/agent/src/silence.rs)).
+  ([`SilenceHealthSource`](../crates/pipeline/src/silence.rs)).
 - A source that is down for a reason the agent knows (a socket that failed to open)
   is reported as degraded through the beacon via
-  [`SourceStatus`](../apps/agent/src/silence.rs), not as tampering.
+  [`SourceStatus`](../crates/pipeline/src/silence.rs), not as tampering.
 
 **Determinism.** A healthy sensor on an idle host is indistinguishable from a
 blinded one unless it can generate its own traffic. Where a sensor has a canary (a
@@ -186,7 +186,7 @@ so `watchdog uninstall` can reset it first
 against a hand-typed `sc stop`, not a boundary.
 
 **Agent manifest check** ([`tamper::integrity`](../crates/tamper/src/integrity.rs),
-wired by [`apps/agent/src/integrity.rs`](../apps/agent/src/integrity.rs), Linux).
+wired by [`crates/pipeline/src/integrity.rs`](../crates/pipeline/src/integrity.rs), Linux).
 Every 300 s (`CHECK_INTERVAL`) a thread reads the active release's signed manifest
 from the updater layout, verifies its signature, and hashes every listed file
 ([`Manifest::verify`](../crates/tamper/src/integrity.rs)). Each
@@ -199,7 +199,7 @@ from the updater layout, verifies its signature, and hashes every listed file
 - The manifest is the root of trust; its authenticity is the updater's signature
   check. A build without a provisioned release key cannot verify any manifest, and
   that case is not reported as tampering
-  ([`signature_failure_is_tamper`](../apps/agent/src/integrity.rs)).
+  ([`signature_failure_is_tamper`](../crates/pipeline/src/integrity.rs)).
 - Before the first promoted release (package-installed bootstrap binaries) there is no
   manifest and nothing is checked.
 - The cadence is coarse on purpose: it is real I/O, and an on-disk swap is not a race
@@ -207,15 +207,15 @@ from the updater layout, verifies its signature, and hashes every listed file
 
 ## Protected resources
 
-[`ProtectedResourceGuard`](../apps/agent/src/protected.rs) wraps the main Linux sink and
+[`ProtectedResourceGuard`](../crates/pipeline/src/protected.rs) wraps the main Linux sink and
 watches the live event stream for another process touching the agent's own files:
 
 - a `FileOpen` with write intent, a `FileDelete`, or a `FileRename` with either side
   on a protected path, by any pid other than the agent's own, raises a `T1562` alert;
-- protected paths ([`protected_paths`](../apps/agent/src/protected.rs)) are the agent
+- protected paths ([`protected_paths`](../crates/pipeline/src/protected.rs)) are the agent
   executable, the resolved config file, and the alert, events and heartbeat files it
   was started with, all made absolute first, because matching is a path-component
-  suffix comparison ([`matches_protected`](../apps/agent/src/protected.rs)) that tolerates
+  suffix comparison ([`matches_protected`](../crates/pipeline/src/protected.rs)) that tolerates
   the eBPF sensor's dirfd-relative fragments without matching `myagent` against
   `agent`.
 
@@ -352,7 +352,7 @@ are compile-time constants.
 - Pin, world-writable refusal, permission hardening: [`apps/watchdog/src/tamper.rs`](../apps/watchdog/src/tamper.rs).
 - Service SDDL: [`service/windows.rs`](../apps/watchdog/src/service/windows.rs).
 - Silence monitor episodes, re-arming: [`tamper/src/heartbeat.rs`](../crates/tamper/src/heartbeat.rs);
-  silence to alert: [`apps/agent/src/silence.rs`](../apps/agent/src/silence.rs).
+  silence to alert: [`crates/pipeline/src/silence.rs`](../crates/pipeline/src/silence.rs).
 - Manifest verification: [`tamper/src/integrity.rs`](../crates/tamper/src/integrity.rs) and
-  [`apps/agent/src/integrity.rs`](../apps/agent/src/integrity.rs).
-- Protected resources (write, delete, rename, relative config path): [`protected.rs`](../apps/agent/src/protected.rs).
+  [`crates/pipeline/src/integrity.rs`](../crates/pipeline/src/integrity.rs).
+- Protected resources (write, delete, rename, relative config path): [`protected.rs`](../crates/pipeline/src/protected.rs).

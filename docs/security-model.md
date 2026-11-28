@@ -167,7 +167,7 @@ flowchart TD
    have been rotated away.
 
 The self-integrity monitor treats `SigningKeyUnprovisioned` differently from a bad
-signature ([`signature_failure_is_tamper`](../apps/agent/src/integrity.rs)). A build with no
+signature ([`signature_failure_is_tamper`](../crates/pipeline/src/integrity.rs)). A build with no
 key would otherwise raise a false tamper alert on every pass.
 
 ### Keeping the test key out of packages
@@ -245,7 +245,7 @@ recognized.
 ### Local IPC (cli and ui to agent)
 
 Implemented in [`crates/ipc`](../crates/ipc/src/lib.rs), served by
-[`ipc_handler`](../apps/agent/src/ipc_handler.rs).
+[`ipc_handler`](../crates/pipeline/src/ipc_handler.rs).
 
 - **Transport.** A Unix domain socket at `ipc.endpoint` (default
   `/var/run/synthaea/agent.sock`), or a named pipe `\\.\pipe\...` on Windows. The config
@@ -380,9 +380,9 @@ products rightly flag hiding behavior whatever the intent.
 | Catchable signal (`SIGTERM`, `SIGHUP`, `SIGQUIT`) | Records who sent it with `sigwaitinfo` before exiting, after a bounded flush | [`kill_loudness.rs`](../apps/agent/src/kill_loudness.rs) |
 | `SIGKILL` | Cannot be attributed by the dying process. The eBPF sensor records the sender in a map pinned under `/sys/fs/bpf/synthaea`, and the restarted agent reports it | [`ebpf.rs`](../crates/sensors/linux/userspace/src/ebpf.rs) |
 | Freeze or wedge the agent | The agent writes a progress-backed heartbeat file. The watchdog kills the agent after repeated checks see no progress | [`progress.rs`](../crates/tamper/src/progress.rs), [`supervise.rs`](../apps/watchdog/src/supervise.rs) |
-| Detach a sensor and leave the process running | Per-sensor heartbeat: the silence becomes an alert | [`silence.rs`](../apps/agent/src/silence.rs), [`tamper::heartbeat`](../crates/tamper/src/heartbeat.rs) |
-| Swap the agent binary on disk | The watchdog pins its hash at startup and refuses to launch a mismatch. Every 300 s the agent re-hashes the active release against its signed manifest | [`tamper.rs`](../apps/watchdog/src/tamper.rs), [`integrity.rs`](../apps/agent/src/integrity.rs) |
-| Write, delete or rename the agent's own files | Any process other than the agent doing so raises a high-severity detection | [`protected.rs`](../apps/agent/src/protected.rs) |
+| Detach a sensor and leave the process running | Per-sensor heartbeat: the silence becomes an alert | [`silence.rs`](../crates/pipeline/src/silence.rs), [`tamper::heartbeat`](../crates/tamper/src/heartbeat.rs) |
+| Swap the agent binary on disk | The watchdog pins its hash at startup and refuses to launch a mismatch. Every 300 s the agent re-hashes the active release against its signed manifest | [`tamper.rs`](../apps/watchdog/src/tamper.rs), [`integrity.rs`](../crates/pipeline/src/integrity.rs) |
+| Write, delete or rename the agent's own files | Any process other than the agent doing so raises a high-severity detection | [`protected.rs`](../crates/pipeline/src/protected.rs) |
 | Edit the service definition | Linux: drift against an install-time snapshot is reported | [`service/linux.rs`](../apps/watchdog/src/service/linux.rs) |
 | `sc stop` / `sc delete` as a non-SYSTEM admin | A hardened service DACL removes stop, pause and delete from Administrators. Admins keep `WRITE_DAC`, so this is friction, not a boundary | [`service/windows.rs`](../apps/watchdog/src/service/windows.rs) |
 | Install into a world-writable directory | Refused on Unix, and installed binaries are set to root-owned `0755` | [`tamper.rs`](../apps/watchdog/src/tamper.rs), [`service/mod.rs`](../apps/watchdog/src/service/mod.rs) |

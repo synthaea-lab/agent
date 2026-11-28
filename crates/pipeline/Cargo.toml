@@ -27,6 +27,8 @@ enrich = { path = "../enrich" }
 getrandom = "0.4"
 health = { path = "../health" }
 intel = { path = "../intel" }
+inventory = { path = "../inventory" }
+ipc = { path = "../ipc" }
 ml = { path = "../ml", default-features = false }
 policy = { path = "../policy" }
 redact = { path = "../redact" }
@@ -38,7 +40,9 @@ serde_json = { workspace = true }
 sigma = { path = "../sigma" }
 sinks = { path = "../sinks" }
 store = { path = "../store" }
+tamper = { path = "../tamper" }
 thiserror = { workspace = true }
+tokio = { workspace = true }
 tracing = { workspace = true }
 transport = { path = "../transport" }
 updater = { path = "../updater", default-features = false }

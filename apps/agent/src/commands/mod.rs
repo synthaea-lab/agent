@@ -18,7 +18,7 @@ mod windows;
 
 /// Everything `cmd_run` needs, bundled so the function stays under clippy's
 /// argument-count lint — `state_dir` (#30/#71, the updater base directory
-/// `crate::integrity` reads the persisted release manifest from) was the eighth
+/// `pipeline::integrity` reads the persisted release manifest from) was the eighth
 /// positional parameter, past the seventh clippy already flags. Every platform's
 /// `cmd_run` takes the same struct, even the ones that only use part of it — same
 /// "accepted for parity, inert here" posture the individual fields already had.

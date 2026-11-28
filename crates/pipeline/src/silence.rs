@@ -11,8 +11,6 @@
 //! what catches that instead. See `tamper::heartbeat`'s own doc for the F-2 lesson
 //! this generalizes and the honest limitation repeated on [`PulsingSink`] below.
 
-#![cfg_attr(not(any(target_os = "linux", windows)), allow(dead_code))]
-
 use std::{
     sync::{
         Arc, Mutex,
@@ -22,15 +20,16 @@ use std::{
 };
 
 use health::SensorHealthSource;
-use pipeline::sink::DetectionSink;
 use schema::{Event, sensor::EventSink};
 use tamper::heartbeat::{SensorHeartbeat, SilenceMonitor};
 use workers::sync::LockExt;
 
+use crate::sink::DetectionSink;
+
 /// How often the dedicated monitor thread checks every registered heartbeat against
 /// its deadline. Independent of the health beacon's own (much longer) cadence —
 /// silence should turn into an alert quickly, not wait for the next beacon tick.
-pub(crate) const POLL_INTERVAL: Duration = Duration::from_secs(10);
+pub const POLL_INTERVAL: Duration = Duration::from_secs(10);
 
 /// Wraps an inner [`EventSink`], pulsing `heartbeat` before forwarding every event.
 ///
@@ -42,13 +41,14 @@ pub(crate) const POLL_INTERVAL: Duration = Duration::from_secs(10);
 /// activity, incidental network traffic), so the deadline is set generously rather
 /// than tightened with a synthetic canary, which is tracked as a gap, not solved
 /// here.
-pub(crate) struct PulsingSink<S> {
+pub struct PulsingSink<S> {
     inner: S,
     heartbeat: SensorHeartbeat,
 }
 
 impl<S> PulsingSink<S> {
-    pub(crate) fn new(inner: S, heartbeat: SensorHeartbeat) -> Self {
+    /// Wraps `inner` so every event it receives also pulses `heartbeat`.
+    pub fn new(inner: S, heartbeat: SensorHeartbeat) -> Self {
         Self { inner, heartbeat }
     }
 }
@@ -66,27 +66,30 @@ impl<S: EventSink> EventSink for PulsingSink<S> {
 /// through the health beacon instead, as a sensor that is `silent`, so the fleet page shows
 /// the host as degraded without an alert that says someone killed the source.
 #[derive(Clone)]
-pub(crate) struct SourceStatus {
+pub struct SourceStatus {
     name: &'static str,
     down: Arc<AtomicBool>,
 }
 
-// Only the Linux AVC reader marks a source down (#878, #879); the Windows build never calls these.
+// Only the Linux AVC reader marks a source down (#878, #879).
 impl SourceStatus {
-    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-    pub(crate) fn new(name: &'static str) -> Self {
+    /// A source called `name`, up until told otherwise.
+    #[must_use]
+    pub fn new(name: &'static str) -> Self {
         Self {
             name,
             down: Arc::new(AtomicBool::new(false)),
         }
     }
 
-    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-    pub(crate) fn set_down(&self, down: bool) {
+    /// Records whether the source is down.
+    pub fn set_down(&self, down: bool) {
         self.down.store(down, Ordering::SeqCst);
     }
 
-    pub(crate) fn is_down(&self) -> bool {
+    /// Whether the source is down right now.
+    #[must_use]
+    pub fn is_down(&self) -> bool {
         self.down.load(Ordering::SeqCst)
     }
 }
@@ -94,13 +97,15 @@ impl SourceStatus {
 /// Feeds a shared [`SilenceMonitor`]'s current snapshot to the health beacon
 /// (#134) — a real replacement for `health::NoopSensorHealth` — plus any best-effort source
 /// that is down ([`SourceStatus`]).
-pub(crate) struct SilenceHealthSource {
+pub struct SilenceHealthSource {
     monitor: Arc<Mutex<SilenceMonitor>>,
     sources: Vec<SourceStatus>,
 }
 
 impl SilenceHealthSource {
-    pub(crate) fn new(monitor: Arc<Mutex<SilenceMonitor>>, sources: Vec<SourceStatus>) -> Self {
+    /// The health view of `monitor` and of the best-effort `sources`.
+    #[must_use]
+    pub fn new(monitor: Arc<Mutex<SilenceMonitor>>, sources: Vec<SourceStatus>) -> Self {
         Self { monitor, sources }
     }
 }
@@ -139,7 +144,11 @@ fn poll_and_emit(monitor: &Mutex<SilenceMonitor>, sink: &DetectionSink, now_ns: 
 /// finding (issue #71's "Done when: stopping a sensor... produces a local alert").
 /// Runs until the process exits, same as every other background worker in
 /// `commands::linux` (no `Sensor::stop`-style shutdown exists for `agent run` today).
-pub(crate) fn spawn_monitor(
+///
+/// # Errors
+///
+/// When the thread cannot be spawned.
+pub fn spawn_monitor(
     monitor: Arc<Mutex<SilenceMonitor>>,
     sink: Arc<DetectionSink>,
 ) -> std::io::Result<()> {

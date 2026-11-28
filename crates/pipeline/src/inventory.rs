@@ -17,11 +17,12 @@ use std::{
 };
 
 use inventory::{PackageChangeKind, PackageSnapshot};
-use pipeline::sink::DetectionSink;
 use schema::{
     Event, EventMeta, PackageChangeEvent, PackageChangeKind as SchemaChangeKind, User,
     sensor::EventSink,
 };
+
+use crate::sink::DetectionSink;
 
 /// How often the snapshot is re-read and re-diffed after the first, immediate
 /// check (see [`spawn_monitor`]'s doc for why the first one does not wait).
@@ -30,7 +31,7 @@ use schema::{
 /// investigated an hour after a dropper's `apt install` benefits from the
 /// record existing promptly, so this matches `integrity::CHECK_INTERVAL`
 /// rather than going slower.
-pub(crate) const CHECK_INTERVAL: Duration = Duration::from_secs(300);
+pub const CHECK_INTERVAL: Duration = Duration::from_secs(300);
 
 /// Where `dpkg` keeps its status database on every Debian/Ubuntu host.
 const DPKG_STATUS_PATH: &str = "/var/lib/dpkg/status";
@@ -44,7 +45,11 @@ const SNAPSHOT_FILE: &str = "packages.json";
 /// before the first pass costs nothing), this check establishes the baseline
 /// every later diff is computed against, so delaying it only delays the point
 /// where the feature starts working, for no benefit.
-pub(crate) fn spawn_monitor(state_dir: PathBuf, sink: Arc<DetectionSink>) -> std::io::Result<()> {
+///
+/// # Errors
+///
+/// When the thread cannot be spawned.
+pub fn spawn_monitor(state_dir: PathBuf, sink: Arc<DetectionSink>) -> std::io::Result<()> {
     workers::spawn::spawn_named("inventory", move || {
         let snapshot_path = snapshot_path_for(&state_dir);
         loop {

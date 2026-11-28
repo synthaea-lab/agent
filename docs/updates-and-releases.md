@@ -225,7 +225,7 @@ lives in a root-owned state directory. There is no un-ban command: remove the en
 
 **Integrity checks reuse the release manifest.** `persist_manifest` keeps the signed manifest in
 `versions/vN/manifest.json`; the periodic self-integrity check
-([`integrity.rs`](../apps/agent/src/integrity.rs)) re-verifies its signature (against any key in the
+([`integrity.rs`](../crates/pipeline/src/integrity.rs)) re-verifies its signature (against any key in the
 release lineage, since a promoted release was signed by the key in force at the time) and re-hashes
 the files.
 

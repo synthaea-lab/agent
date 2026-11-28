@@ -16,7 +16,7 @@ default = ["dynamic-onnx", "test-key"]
 dynamic-onnx = ["pipeline/dynamic-onnx"]
 # The public test signing key set (ADR-0027) and the `--allow-test-key` flag that
 # acknowledges it. A packaged build turns it off: it then embeds only the production keys.
-test-key = ["updater/test-key", "delivery/test-key", "pipeline/test-key"]
+test-key = ["delivery/test-key", "pipeline/test-key"]
 
 [dependencies]
 schema = { path = "../../crates/schema" }
@@ -30,21 +30,11 @@ deception = { path = "../../crates/deception" }
 sinks = { path = "../../crates/sinks" }
 tamper = { path = "../../crates/tamper" }
 inventory = { path = "../../crates/inventory" }
-response = { path = "../../crates/response" }
 delivery = { path = "../../crates/delivery" }
 pipeline = { path = "../../crates/pipeline", default-features = false }
 health = { path = "../../crates/health" }
 workers = { path = "../../crates/workers" }
 transport = { path = "../../crates/transport" }
-# Content-manifest fetch/verify (ADR-0016, issue #30/#73): cross-platform, unlike
-# `updater::layout`'s Linux-only bootstrap/current/versions binary-update layout —
-# content distribution has no such constraint, so this sits in the main
-# dependency block, not the Linux-only one.
-updater = { path = "../../crates/updater", default-features = false }
-# Local control channel served to `cli` (issue #388). The agent is otherwise
-# thread-based: tokio only runs the IPC server, on its own dedicated thread.
-ipc = { path = "../../crates/ipc" }
-tokio = { workspace = true }
 
 anyhow = "1"
 serde_json = { workspace = true }
@@ -99,6 +89,4 @@ aya = { version = "0.16", default-features = false }
 pipeline = { path = "../../crates/pipeline", default-features = false, features = ["test-fixtures"] }
 deception = { path = "../../crates/deception", features = ["test-fixtures"] }
 tempfile = "3"
-# Tests sign manifests with the public test key.
-updater = { path = "../../crates/updater", features = ["test-key"] }
 schema = { path = "../../crates/schema", features = ["test-fixtures"] }

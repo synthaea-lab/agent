@@ -106,26 +106,42 @@ All `cfg(target_os)` dispatch in the agent sits in [`apps/agent/src/commands/`](
 | [`commands/windows.rs`](../apps/agent/src/commands/windows.rs) | ETW plus the Event Log, socket-table and minifilter sources. |
 | [`commands/macos.rs`](../apps/agent/src/commands/macos.rs) | EndpointSecurity plus the unified log, socket-table and NetworkExtension sources. |
 
-The detection sink ([`sink/mod.rs`](../crates/pipeline/src/sink/mod.rs)) has no platform dispatch of its own. A few agent modules are compiled only on Linux because the mechanism exists only there: `integrity`, `inventory`, `kill_loudness`, `log_sources`, `memscan`, `captures`. See the `mod` declarations in [`main.rs`](../apps/agent/src/main.rs).
+The detection sink ([`sink/mod.rs`](../crates/pipeline/src/sink/mod.rs)) has no platform dispatch of its own. Three modules of the binary are compiled only on Linux because the mechanism exists only there: `kill_loudness`, `log_sources`, `memscan`. See the `mod` declarations in [`main.rs`](../apps/agent/src/main.rs).
 
-## Agent modules at a glance
+## Where the agent's parts live
 
-| Module | Responsibility |
+The binary keeps what only a binary can do: start the sensors and wire them to the rest. A
+module stays in it when it needs a sensor crate or an OS call; everything else is in a crate.
+
+**In the binary** ([`apps/agent/src`](../apps/agent/src/main.rs)):
+
+| Module | Responsibility | Why it stays |
+| --- | --- | --- |
+| [`main`](../apps/agent/src/main.rs), [`commands/`](../apps/agent/src/commands/mod.rs) | The command line and the per-OS wiring of `run`. | The wiring itself. |
+| [`deception`](../apps/agent/src/deception.rs) | Plants and refreshes the canaries, registers decoys, and answers the allow-list's questions about live processes. | Reads `/proc` and the Linux sensor's path filter. |
+| [`host_counters`](../apps/agent/src/host_counters.rs) | Host and sensor counters for the health beacon. | Reads sensor crates' counters. |
+| [`kill_loudness`](../apps/agent/src/kill_loudness.rs) | Attributes SIGTERM/SIGHUP/SIGQUIT to their sender before exiting (Linux). | POSIX signal calls. |
+| [`log_sources`](../apps/agent/src/log_sources.rs) | The journal, web-server and database log sources (Linux). | Sensor crates. |
+| [`memscan`](../apps/agent/src/memscan.rs) | The memory source the pipeline scans processes through (Linux). | `sensor-linux-procmem`. |
+
+**In crates:**
+
+| Where | Responsibility |
 | --- | --- |
 | [`pipeline::sink`](../crates/pipeline/src/sink/mod.rs) (crate) | `DetectionSink`, the `EventSink` that runs every engine, records findings and drives response. Also [`BaselineSink`](../crates/pipeline/src/sink/baseline.rs) for ML baseline capture. |
 | [`pipeline::EnrichQueue`](../crates/pipeline/src/enrich_queue.rs) (crate) | Bounded worker that moves hashing, signature checks, raw-event logging and spool appends off the capture thread. |
-| [`sinks::alert_log`](../crates/sinks/src/alert_log.rs) | `AlertLog`, the single alert funnel: `alerts.ndjson`, stderr, and the 256-entry in-memory buffer that `cli detections` reads. |
+| [`pipeline::silence`](../crates/pipeline/src/silence.rs) | Per-sensor heartbeats, the silence-monitor thread, and `PulsingSink`. |
+| [`pipeline::protected`](../crates/pipeline/src/protected.rs), [`integrity`](../crates/pipeline/src/integrity.rs), [`inventory`](../crates/pipeline/src/inventory.rs) | The guard on the agent's own files, the self-integrity check (Linux) and the package inventory monitor. |
+| [`pipeline::ipc_handler`](../crates/pipeline/src/ipc_handler.rs) | IPC server thread answering `cli` requests and content reloads. |
+| [`pipeline::quarantine_cmd`](../crates/pipeline/src/quarantine_cmd.rs) | `quarantine list` and `quarantine restore`. |
 | [`delivery::upload`](../crates/delivery/src/upload.rs) (crate) | The event spool and detection spool, plus their upload threads. Resolves which control plane `run` talks to. |
-| [`silence`](../apps/agent/src/silence.rs) | Per-sensor heartbeats, the silence-monitor thread, and `PulsingSink`. |
+| [`delivery::content`](../crates/delivery/src/content.rs), [`release`](../crates/delivery/src/release.rs), [`rotation`](../crates/delivery/src/rotation.rs), [`trust`](../crates/delivery/src/trust.rs) (crate `delivery`) | Signed content, release and key-rotation commands, and the refusal to act on a manifest only the test key can verify. |
+| [`sinks::alert_log`](../crates/sinks/src/alert_log.rs) | `AlertLog`, the single alert funnel: `alerts.ndjson`, stderr, and the 256-entry in-memory buffer that `cli detections` reads. |
 | [`health`](../crates/health/src/lib.rs) (crate) | Health-beacon collector, sent every 30 s by default. |
 | [`tamper::progress`](../crates/tamper/src/progress.rs) | Progress-counter file for the watchdog (in the `tamper` crate, which the watchdog reads it through). |
-| [`ipc_handler`](../apps/agent/src/ipc_handler.rs) | IPC server thread answering `cli` requests and content reloads. |
-| [`spawn`](../crates/workers/src/spawn.rs) | `spawn_named`, which starts a named background thread and returns the OS error, with the thread's name, instead of panicking. |
-| [`shutdown`](../crates/workers/src/shutdown.rs) | `ShutdownPlan`, a bounded join of the registered workers. |
-| [`kill_loudness`](../apps/agent/src/kill_loudness.rs) | Attributes SIGTERM/SIGHUP/SIGQUIT to their sender before exiting (Linux). |
 | [`redact::event`](../crates/redact/src/event.rs) | `RedactingSink` and `redact_event`, which redact data at the point where events leave the process. |
-| [`delivery::content`](../crates/delivery/src/content.rs), [`release`](../crates/delivery/src/release.rs), [`rotation`](../crates/delivery/src/rotation.rs), [`trust`](../crates/delivery/src/trust.rs) (crate `delivery`) | Signed content, release and key-rotation commands, and the refusal to act on a manifest only the test key can verify. |
-| [`protected`](../apps/agent/src/protected.rs), [`integrity`](../apps/agent/src/integrity.rs), [`inventory`](../apps/agent/src/inventory.rs) | Linux self-protection and inventory monitors. |
+| [`workers::spawn`](../crates/workers/src/spawn.rs) | `spawn_named`, which starts a named background thread and returns the OS error, with the thread's name, instead of panicking. |
+| [`workers::shutdown`](../crates/workers/src/shutdown.rs) | `ShutdownPlan`, a bounded join of the registered workers. |
 
 ## Known gaps
 

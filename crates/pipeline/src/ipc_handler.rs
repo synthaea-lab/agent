@@ -14,17 +14,18 @@ use ipc::{
     ReloadContentResponse, SensorHealth, SensorHealthResponse, SensorState, Server, StatusResponse,
     SuppressionEntry, SuppressionResponse,
 };
-use pipeline::sink::DetectionSink;
 use sinks::alert_log::{AlertLog, RecentAlert};
+
+use crate::sink::DetectionSink;
 
 /// Where a platform deposits its sensor-health source once it has built one.
 /// Empty until then: `cli health` reports no sensors rather than inventing
 /// any. A `OnceLock` because on Linux the silence monitor is created after the
 /// shared pipeline (and therefore after this handler) is wired.
-pub(crate) type SensorHealthSlot = Arc<OnceLock<Arc<dyn SensorHealthSource>>>;
+pub type SensorHealthSlot = Arc<OnceLock<Arc<dyn SensorHealthSource>>>;
 
 /// Answers the IPC requests from the running agent's own state.
-pub(crate) struct AgentHandler {
+pub struct AgentHandler {
     agent_version: String,
     started_at_ns: u64,
     alerts: Arc<AlertLog>,
@@ -36,12 +37,9 @@ pub(crate) struct AgentHandler {
 }
 
 impl AgentHandler {
+    /// A handler that answers from `alerts`, the sensors' health and `sink`'s state.
     #[must_use]
-    pub(crate) fn new(
-        alerts: Arc<AlertLog>,
-        sensors: SensorHealthSlot,
-        sink: Arc<DetectionSink>,
-    ) -> Self {
+    pub fn new(alerts: Arc<AlertLog>, sensors: SensorHealthSlot, sink: Arc<DetectionSink>) -> Self {
         Self {
             agent_version: env!("CARGO_PKG_VERSION").to_string(),
             started_at_ns: schema::time::now_ns(),
@@ -183,7 +181,7 @@ fn to_ipc_health(h: schema::SensorHealth) -> SensorHealth {
 /// Serves the IPC endpoint on a dedicated thread with its own single-threaded
 /// tokio runtime, detached like the heartbeat writer. Every failure path is a
 /// log line, never a panic or an early return from `run`.
-pub(crate) fn spawn(endpoint: String, handler: AgentHandler) {
+pub fn spawn(endpoint: String, handler: AgentHandler) {
     let spawned = std::thread::Builder::new()
         .name("ipc-server".to_string())
         .spawn(move || {
